@@ -1,0 +1,18 @@
+{
+  "specversion": "1.0",
+  "id": "a9b8c7d6-e5f4-4a3b-9c2d-1e0f9a8b7c03",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-10-01T09:30:00Z",
+  "subject": "PED-300",
+  "datacontenttype": "application/json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "pedidoId": "PED-300",
+    "clienteId": "CLI-77",
+    "valorTotal": { "quantia": "89.90", "moeda": "BRL" },
+    "cepDeEntrega": "40010-000",
+    "formaDePagamento": "PIX_PARCELADO",
+    "cupom": "PRIMAVERA10"
+  }
+}

@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: fintech-core
+
+springdoc:
+  swagger-ui:
+    path: /docs          # interface do Swagger em http://localhost:8080/docs

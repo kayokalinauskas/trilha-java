@@ -1,0 +1,106 @@
+---
+titulo: Motor de regras de crédito com funções
+codigo: "04.03"
+resumo: Monte uma política de crédito em que cada regra é um Predicate com nome, avalie propostas explicando todas as reprovações e combine regras com and e reduce.
+modulo: 04-java-moderno
+ordem: 3
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [lambdas, Predicate, composição de funções, Streams, reduce]
+aulas: [04-java-moderno/01-lambdas, 04-java-moderno/02-streams]
+java:
+  modulo: m04-java-moderno
+  teste: MotorCreditoTest
+---
+
+## Contexto
+
+Uma fintech de crédito pessoal muda a política de aprovação quase toda semana: sobe o score mínimo, cria uma faixa de idade, limita o comprometimento de renda. Hoje, cada mudança exige editar um método com 15 `if`s aninhados e fazer deploy. Além disso, quando reprova alguém, o sistema só diz "reprovado" — e o time de atendimento não consegue explicar o motivo ao cliente, o que também é uma exigência regulatória.
+
+O objetivo: um **motor de regras** em que cada regra é um **dado** (um `Predicate` com nome), e o motor não conhece nenhuma regra específica.
+
+## O modelo (pronto)
+
+```java
+record Proposta(String cpf, int idade, BigDecimal rendaMensal, int score,
+                BigDecimal valorSolicitado, int parcelas, boolean negativado) {
+    BigDecimal parcelaEstimada();   // valorSolicitado / parcelas
+}
+record Regra(String nome, Predicate<Proposta> condicao) { boolean aprova(Proposta p); }
+record Avaliacao(boolean aprovada, List<String> regrasReprovadas) { }
+```
+
+## Requisitos
+
+**Fábricas de predicados** (cada uma devolve uma lambda):
+
+| Método | Aprova quando |
+|---|---|
+| `idadeEntre(min, max)` | `min ≤ idade ≤ max` |
+| `rendaMinima(valor)` | renda ≥ valor |
+| `scoreMinimo(n)` | score ≥ n |
+| `semNegativacao()` | não está negativado |
+| `comprometimentoMaximo(pct)` | parcela estimada ≤ renda × pct |
+
+**Motor:**
+
+- `politicaPadrao()` — nesta ordem: `"idade"` (18 a 75), `"renda mínima"` (1.500), `"score"` (600), `"sem negativação"`, `"comprometimento de renda"` (30%).
+- `avaliar(proposta, regras)` — aplica **todas** as regras (não para na primeira) e lista as reprovadas **na ordem da política**.
+- `todas(regras)` — um único `Predicate` equivalente a "todas aprovam"; lista vazia aprova tudo.
+- `limiteSugerido(proposta)` — score ≥ 850: 6× a renda; ≥ 650: 3×; ≥ 500: 1×; abaixo: zero.
+
+## Exemplo
+
+```text
+Proposta: 17 anos, renda 1.000, score 400, R$ 12.000 em 12x, negativado
+→ reprovada: [idade, renda mínima, score, sem negativação, comprometimento de renda]
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `MotorCreditoTest` passam, inclusive `extensivel` (uma regra criada no teste funciona sem mudar o motor).
+- [ ] `avaliar` e `todas` não mencionam nenhuma regra específica.
+- [ ] `todas` usa `reduce`, e você consegue explicar por que a identidade é `p -> true`.
+
+## Desafios opcionais
+
+- **Regras com peso**: em vez de aprovar/reprovar, cada regra soma pontos e a proposta passa com uma pontuação mínima.
+- **Política configurável por arquivo**: carregue os limites (idade, score, percentual) de um `Map<String, String>` e monte as regras dinamicamente.
+
+<Dicas>
+<Dica nivel={1}>
+Uma "fábrica de predicados" é um método que **devolve** uma lambda. Os parâmetros do método (o mínimo, o máximo) são capturados pela lambda: `return p -> p.score() >= minimo;`.
+</Dica>
+<Dica nivel={2}>
+`avaliar` é uma Stream sobre as regras: filtre as que **não** aprovam e mapeie para o nome. `semNegativacao()` fica elegante com `Predicate.not(Proposta::negativado)`.
+</Dica>
+<Dica nivel={3}>
+`todas`: `regras.stream().map(Regra::condicao).reduce(p -> true, Predicate::and)`. A identidade do "e lógico" é o "sempre verdadeiro", assim como a identidade da soma é o zero. Por isso a lista vazia aprova tudo.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m04-java-moderno/solucao/src/main/java/dev/trilhajava/m04/credito/MotorCredito.java" />
+
+### Por que este design funciona
+
+- **Regras são dados.** Uma `List<Regra>` pode ser montada a partir de configuração, variar por produto (crédito pessoal, consignado) ou ser testada isoladamente. Adicionar uma regra não toca o motor — o Princípio Aberto/Fechado aplicado com funções em vez de classes.
+- **Explicabilidade.** `avaliar` percorre todas as regras e devolve **todas** as reprovações. Na vida real, isso é o que permite ao atendimento responder "por quê?" — e, em crédito, é também uma exigência regulatória.
+- **`reduce` com identidade.** `p -> true` é o elemento neutro do `and`. O mesmo raciocínio vale para somas (`ZERO`) e produtos (`ONE`).
+- **Closures.** `minima` e `maxima` são capturados pela lambda no momento da criação: cada chamada a `idadeEntre` produz um predicado independente.
+- **`multiplicadorPorScore` com guard clauses**: mais legível que ternários aninhados ou um `switch` em faixas calculadas.
+
+### E no mundo real?
+
+Motores de regras em produção costumam guardar a política em banco ou configuração, versioná-la (qual política aprovou esta proposta em março?) e registrar a avaliação completa para auditoria. Ferramentas como Drools existem para casos muito complexos, mas a maioria dos times começa exatamente com `Predicate`s bem nomeados.
+
+### Avalie sua solução
+
+- Seu `avaliar` para na primeira reprovação? O teste espera todas.
+- Existe algum `if` sobre o nome da regra dentro do motor?
+- Você consegue escrever uma regra nova (por exemplo, `parcelas <= 24`) só no teste, sem mudar `MotorCredito`?
+
+</Solucao>

@@ -1,0 +1,187 @@
+---
+titulo: Encapsulamento e invariantes
+descricao: Modificadores de acesso, por que getters e setters automáticos são uma armadilha, invariantes garantidas no construtor, fail-fast e cópias defensivas.
+modulo: 02-poo
+ordem: 2
+duracao: 50
+objetivos:
+  - Usar private, pacote, protected e public com intenção
+  - Identificar e proteger as invariantes de uma classe
+  - Aplicar fail-fast no construtor e nos métodos
+  - Evitar vazamento de estado com cópias defensivas
+tags: [encapsulamento, invariantes, imutabilidade]
+flashcards:
+  - frente: O que é uma invariante de classe?
+    verso: Uma regra que deve ser verdadeira durante toda a vida do objeto (ex. saldo nunca abaixo de -limite). A classe é responsável por garanti-la.
+  - frente: O que significa fail-fast?
+    verso: Detectar e rejeitar um estado inválido o mais cedo possível (no construtor ou na entrada do método), lançando exceção em vez de seguir com dados ruins.
+  - frente: Por que devolver List.copyOf(lista) em vez da lista interna?
+    verso: Para que quem chama não consiga alterar o estado interno do objeto por fora (cópia defensiva, e imutável).
+  - frente: Quais são os 4 níveis de acesso em Java?
+    verso: private (só a classe), pacote/default (mesmo pacote), protected (pacote + subclasses) e public (todos).
+  - frente: Por que setters para tudo quebram o encapsulamento?
+    verso: Porque permitem colocar o objeto em qualquer estado, pulando as regras de negócio. O estado deve mudar por operações com significado.
+---
+
+Encapsular não é "deixar os atributos `private` e gerar getters e setters". Isso é só a sintaxe. Encapsulamento de verdade é **garantir que um objeto nunca esteja em um estado inválido**, não importa quem o use nem como.
+
+## Modificadores de acesso
+
+| Modificador | Visível para | Uso típico |
+|---|---|---|
+| `private` | Só a própria classe | **Padrão para atributos** |
+| *(nenhum)* — "pacote" | Classes do mesmo pacote | Detalhes internos de um módulo; construtores usados em testes |
+| `protected` | Pacote + subclasses | Pontos de extensão em herança (use pouco) |
+| `public` | Todo mundo | A API da classe |
+
+Regra prática: **comece com o mais restrito e abra só quando precisar**. Tudo o que é `public` vira um compromisso — alguém vai depender daquilo, e mudar depois é caro.
+
+## Invariantes: as regras que nunca podem ser quebradas
+
+Uma **invariante** é uma condição que precisa ser verdadeira **durante toda a vida** do objeto. Exemplos:
+
+- Um `Pedido` tem pelo menos um item.
+- O saldo de uma `ContaCorrente` nunca fica abaixo de `-limite`.
+- Um `Email` sempre contém `@`.
+- Uma `Reserva` tem data de saída depois da data de entrada.
+
+A classe é **a única responsável** por garantir as próprias invariantes. Para isso, ela precisa de duas coisas: validar na **criação** e só permitir mudanças por **operações que preservam as regras**.
+
+### 1. Fail-fast no construtor
+
+```java
+public class Reserva {
+
+    private final LocalDate entrada;
+    private final LocalDate saida;
+
+    public Reserva(LocalDate entrada, LocalDate saida) {
+        if (entrada == null || saida == null) {
+            throw new IllegalArgumentException("Datas são obrigatórias");
+        }
+        if (!saida.isAfter(entrada)) {
+            throw new IllegalArgumentException("Saída deve ser depois da entrada");
+        }
+        this.entrada = entrada;
+        this.saida = saida;
+    }
+}
+```
+
+Se os dados são inválidos, **o objeto nem chega a existir**. Isso é *fail-fast*: o erro aparece exatamente onde foi cometido, com uma mensagem clara, e não três telas depois como um `NullPointerException` misterioso.
+
+<Callout tipo="dica">
+`Objects.requireNonNull(valor, "nome")` é um atalho da JDK para a checagem de `null`: lança `NullPointerException` com a mensagem informada. Para regras de negócio, prefira `IllegalArgumentException` com uma mensagem que explique a regra.
+</Callout>
+
+### 2. Mudança só por operações com significado
+
+<Comparar antes="Setters expõem o estado" depois="Operações protegem a regra">
+```java
+public class ContaCorrente {
+    private BigDecimal saldo;
+
+    public BigDecimal getSaldo() { return saldo; }
+    public void setSaldo(BigDecimal s) { saldo = s; }
+}
+
+// qualquer um pode fazer:
+conta.setSaldo(new BigDecimal("-1000000"));
+```
+
+```java
+public class ContaCorrente {
+    private BigDecimal saldo = BigDecimal.ZERO;
+
+    public BigDecimal getSaldo() { return saldo; }
+
+    public void depositar(BigDecimal valor) { ... }
+    public void sacar(BigDecimal valor) {
+        // valida limite antes de alterar
+    }
+}
+```
+</Comparar>
+
+Não existe `setSaldo`. O saldo só muda por `depositar` e `sacar`, e cada uma dessas operações **verifica as regras antes de alterar o estado**. Ninguém consegue colocar a conta num estado impossível.
+
+<Callout tipo="erro" titulo="O vício dos getters e setters gerados">
+IDEs e bibliotecas como o Lombok geram getters e setters para todos os campos com um clique. É conveniente e é a forma mais rápida de destruir o encapsulamento. Crie **getters só quando alguém precisa ler** e **quase nunca crie setters** em objetos de domínio. (Em DTOs, objetos que só transportam dados, a história é outra: você vai ver no módulo 08.)
+</Callout>
+
+## Vazamento de estado e cópias defensivas
+
+Mesmo com tudo `private`, dá para vazar estado sem perceber:
+
+```java
+public class Pedido {
+    private final List<Item> itens = new ArrayList<>();
+
+    public List<Item> getItens() {
+        return itens;                // devolve a lista INTERNA
+    }
+}
+
+pedido.getItens().clear();           // esvaziou o pedido por fora!
+```
+
+`final` impede trocar a lista, mas não impede **modificá-la**. A correção é devolver uma **cópia imutável**:
+
+```java
+public List<Item> getItens() {
+    return List.copyOf(itens);       // cópia que lança exceção se alguém tentar alterar
+}
+```
+
+O mesmo vale na **entrada**: se o construtor recebe uma lista e só guarda a referência, quem criou o objeto continua podendo alterá-la depois.
+
+```java
+public Poligono(List<Ponto> vertices) {
+    this.vertices = List.copyOf(vertices);   // cópia defensiva na entrada
+}
+```
+
+Os testes dos exercícios 02.01 e 02.02 verificam exatamente esses dois vazamentos.
+
+<Callout tipo="info" titulo="E o desempenho?">
+Copiar uma lista de 10 itens custa nanossegundos. Um bug de estado compartilhado custa dias de investigação. Copie por padrão; otimize só quando um profiler mostrar que é um gargalo real.
+</Callout>
+
+## Checklist de uma classe bem encapsulada
+
+- [ ] Atributos `private`, e `final` sempre que possível.
+- [ ] Construtor valida tudo e deixa o objeto completo.
+- [ ] Nenhum setter "genérico"; o estado muda por operações com nome de negócio.
+- [ ] Coleções e objetos mutáveis são copiados na entrada e na saída.
+- [ ] As mensagens de erro explicam a regra violada.
+
+<Quiz
+  id="02-encapsulamento"
+  questoes={[
+    {
+      pergunta: 'Qual destas é uma invariante?',
+      opcoes: ['O pedido tem um método calcularTotal', 'A quantidade de um item de pedido é sempre maior que zero', 'O pedido é salvo no banco', 'O pedido tem um getter para o id'],
+      correta: 1,
+      explicacao: 'Invariante é uma regra sobre o estado que precisa valer sempre. As outras são detalhes de implementação.',
+    },
+    {
+      pergunta: 'Um atributo `private final List<Item> itens` está protegido contra alterações externas?',
+      opcoes: ['Sim, final impede qualquer alteração', 'Só se o getter devolver uma cópia imutável (e o construtor copiar a entrada)', 'Sim, private resolve', 'Não há como proteger listas'],
+      correta: 1,
+      explicacao: '`final` impede trocar a referência, não modificar o objeto. É preciso não expor a lista interna.',
+    },
+    {
+      pergunta: 'Onde validar que a data de saída é depois da data de entrada em uma Reserva?',
+      opcoes: ['No controller da API', 'No construtor da Reserva', 'No banco de dados, apenas', 'Em um utilitário estático'],
+      correta: 1,
+      explicacao: 'A classe garante as próprias invariantes. Validações em outras camadas podem existir, mas a última linha de defesa é o próprio objeto.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Encapsular é **proteger invariantes**, não gerar getters e setters.
+- Valide tudo no **construtor** (fail-fast) e mude o estado só por **operações de negócio**.
+- `final` não protege o conteúdo de objetos mutáveis: use **cópias defensivas** na entrada e na saída.
+- Comece com `private` e abra a visibilidade só quando necessário.

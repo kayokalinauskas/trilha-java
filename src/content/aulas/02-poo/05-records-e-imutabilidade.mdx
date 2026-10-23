@@ -1,0 +1,191 @@
+---
+titulo: Records, enums e objetos imutáveis
+descricao: Por que imutabilidade elimina classes inteiras de bugs, records com construtor compacto, value objects como Dinheiro e CEP, e enums com comportamento.
+modulo: 02-poo
+ordem: 5
+duracao: 55
+objetivos:
+  - Explicar as vantagens de objetos imutáveis
+  - Criar records com validação e normalização no construtor compacto
+  - Modelar value objects (Dinheiro, CEP, Email) em vez de usar tipos primitivos soltos
+  - Usar enums com atributos e comportamento
+tags: [record, imutabilidade, value object, enum]
+flashcards:
+  - frente: O que um record gera automaticamente?
+    verso: Construtor canônico, métodos de acesso (sem get), equals, hashCode e toString — todos baseados nos componentes. Os campos são private final.
+  - frente: O que é o construtor compacto de um record?
+    verso: Um construtor sem lista de parâmetros (public Nome { ... }) onde você valida e pode reatribuir os parâmetros antes de eles virarem campos.
+  - frente: O que é um value object?
+    verso: Um objeto definido pelo seu valor, não por identidade (Dinheiro, CEP, Email). É imutável, valida a si mesmo e dois com o mesmo valor são iguais.
+  - frente: O que é primitive obsession?
+    verso: Usar tipos primitivos (String, BigDecimal) para conceitos de domínio, espalhando validações e permitindo trocas acidentais (passar um CPF onde se espera um email).
+  - frente: Records podem ter métodos?
+    verso: Sim — métodos de instância, estáticos e construtores extras. Não podem ter campos de instância além dos componentes nem estender outra classe.
+---
+
+Na aula de encapsulamento, você protegeu invariantes controlando **como o estado muda**. Existe uma forma ainda mais simples de proteger: **não deixar o estado mudar**. Um objeto imutável é validado uma vez, na criação, e continua válido para sempre.
+
+## Por que imutabilidade?
+
+- **Sem estados inválidos intermediários.** Se o objeto nasceu válido, ele é válido. Ponto.
+- **Seguro para compartilhar.** Dá para passar o mesmo objeto para dez métodos e cinco threads sem medo de alguém alterá-lo. No módulo 06 (concorrência), isso vale ouro.
+- **Seguro como chave** de `HashMap` e elemento de `HashSet` (o hash nunca muda).
+- **Fácil de entender.** Para saber o valor de um objeto imutável, basta olhar onde ele foi criado.
+
+A JDK está cheia de imutáveis: `String`, `BigDecimal`, `LocalDate`, `Integer`, `List.of(...)`. Operações que "modificam" devolvem **um novo objeto** — você já viu isso com `valor = valor.add(...)`.
+
+## Records: imutáveis em uma linha
+
+Desde o Java 16, um `record` declara uma classe **imutável e transparente** que só carrega dados:
+
+```java
+public record Ponto(double x, double y) { }
+```
+
+Essa linha gera:
+
+- campos `private final double x` e `y`;
+- construtor `Ponto(double x, double y)`;
+- métodos de acesso `x()` e `y()` (sem o prefixo `get`);
+- `equals` e `hashCode` baseados em **todos** os componentes;
+- `toString()` legível: `Ponto[x=1.0, y=2.0]`.
+
+```java
+Ponto a = new Ponto(1, 2);
+Ponto b = new Ponto(1, 2);
+a.equals(b);          // true — igualdade por valor
+a == b;               // false — objetos diferentes
+Set.of(a).contains(b) // true
+```
+
+A mesma classe escrita "à mão" teria umas 40 linhas.
+
+### Construtor compacto: validar e normalizar
+
+```java
+public record Cep(String digitos) {
+
+    public Cep {                                   // sem parênteses: construtor compacto
+        if (digitos == null) {
+            throw new IllegalArgumentException("CEP é obrigatório");
+        }
+        String limpo = digitos.strip();
+        if (!limpo.matches("[0-9]{5}-?[0-9]{3}")) {
+            throw new IllegalArgumentException("CEP inválido: " + digitos);
+        }
+        digitos = limpo.replace("-", "");         // reatribui o PARÂMETRO
+    }                                              // os campos recebem os parâmetros aqui
+
+    public String formatado() {
+        return digitos.substring(0, 5) + "-" + digitos.substring(5);
+    }
+}
+
+new Cep("01310-100").equals(new Cep(" 01310100 "))  // true: normalizados igual
+```
+
+No construtor compacto, você **valida** e pode **reatribuir os parâmetros** (normalizar). A atribuição aos campos acontece automaticamente no fim. É o lugar perfeito para garantir as invariantes do record.
+
+<Callout tipo="erro" titulo="Record imutável com componente mutável">
+`record Pedido(List<Item> itens)` guarda a **referência** da lista. Quem criou o pedido continua podendo alterar a lista. Corrija no construtor compacto: `itens = List.copyOf(itens);`. O `record` torna os **campos** finais, não os objetos para os quais eles apontam.
+</Callout>
+
+### O que records não fazem
+
+- Não podem **estender** outra classe (já estendem `java.lang.Record`), mas podem **implementar interfaces**.
+- Não podem ter **campos de instância extras** além dos componentes.
+- São `final`: ninguém estende um record.
+
+Use records para **dados**: DTOs, value objects, resultados de consultas, eventos, chaves compostas. Para entidades com ciclo de vida e identidade (uma `ContaCorrente` que muda de saldo), use classes comuns.
+
+## Value objects: acabe com a obsessão por primitivos
+
+Olhe esta assinatura:
+
+```java
+void transferir(String cpfOrigem, String cpfDestino, BigDecimal valor, String moeda)
+```
+
+Nada impede trocar origem e destino, passar `"BRL "` com espaço ou um valor com 5 casas decimais. Esse cheiro de código tem nome: ***primitive obsession*** (obsessão por primitivos). A cura são os **value objects**:
+
+```java
+void transferir(Cpf origem, Cpf destino, Dinheiro valor)
+```
+
+- `Cpf` só existe se for válido (a validação do exercício 01.01 mora nele).
+- `Dinheiro` sempre tem moeda e 2 casas; somar reais com dólares é erro (exercício 02.03).
+- O compilador impede passar um `Email` onde se espera um `Cpf`.
+
+Um **value object** é definido pelo **valor**, não pela identidade: duas notas de R$ 10 são intercambiáveis. Ele é imutável, se valida sozinho e concentra as operações relacionadas (`Dinheiro.somar`, `Cep.formatado`). É um conceito central do *Domain-Driven Design*, que você vai rever no módulo 13.
+
+## Enums com comportamento
+
+Um `enum` é um conjunto **fechado** de instâncias nomeadas. Mas ele também pode ter atributos, construtor e métodos:
+
+```java
+public enum Moeda {
+    BRL("R$", 2),
+    USD("US$", 2),
+    JPY("¥", 0);            // iene não tem centavos
+
+    private final String simbolo;
+    private final int casasDecimais;
+
+    Moeda(String simbolo, int casasDecimais) {
+        this.simbolo = simbolo;
+        this.casasDecimais = casasDecimais;
+    }
+
+    public String simbolo() { return simbolo; }
+    public int casasDecimais() { return casasDecimais; }
+}
+```
+
+- Enums são **singletons** por constante e são comparados com `==` com segurança.
+- `Moeda.valueOf("BRL")` converte de texto; `Moeda.values()` lista todas.
+- Combinados com o `switch` com setas, o compilador garante que todos os casos foram tratados.
+
+<Callout tipo="dica" titulo="Enum ou String para status?">
+Nunca use `String status = "PAGO"` para um conjunto fechado de valores: um erro de digitação (`"PGO"`) compila normalmente. Com `enum Status { PENDENTE, PAGO }`, o compilador pega na hora.
+</Callout>
+
+<Callout tipo="entrevista">
+"Por que imutabilidade é importante?" — cite **thread safety sem sincronização**, **chaves de hash estáveis** e **ausência de estados intermediários inválidos**. Se perguntarem sobre records, mencione o **construtor compacto** para validação e a armadilha dos **componentes mutáveis**.
+</Callout>
+
+<Quiz
+  id="02-records"
+  questoes={[
+    {
+      pergunta: 'Dado `record Item(String sku, int qtd) {}`, como se lê a quantidade?',
+      opcoes: ['`item.getQtd()`', '`item.qtd()`', '`item.qtd`', '`Item.qtd(item)`'],
+      correta: 1,
+      explicacao: 'Records geram métodos de acesso com o mesmo nome do componente, sem prefixo get.',
+    },
+    {
+      pergunta: 'No construtor compacto de um record, como normalizar o componente `email` para minúsculas?',
+      opcoes: ['`this.email = email.toLowerCase();`', '`email = email.toLowerCase(Locale.ROOT);`', 'Não é possível', '`setEmail(email.toLowerCase())`'],
+      correta: 1,
+      explicacao: 'No construtor compacto você reatribui o parâmetro; a atribuição ao campo acontece automaticamente depois.',
+    },
+    {
+      pergunta: '`record Carrinho(List<String> itens)` — por que ele NÃO é totalmente imutável?',
+      opcoes: ['Records nunca são imutáveis', 'A lista referenciada ainda pode ser alterada por quem a criou', 'Porque List é uma interface', 'Porque falta o final'],
+      correta: 1,
+      explicacao: 'O campo é final, mas o objeto lista não. Use `itens = List.copyOf(itens)` no construtor compacto.',
+    },
+    {
+      pergunta: 'Qual é um bom candidato a value object?',
+      opcoes: ['Cliente (com histórico de pedidos)', 'Email', 'ContaCorrente', 'Sessão de usuário logado'],
+      correta: 1,
+      explicacao: 'Email é definido pelo valor, é imutável e pode se validar sozinho. Os outros têm identidade e ciclo de vida.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Objetos **imutáveis** são validados uma vez e ficam válidos para sempre, além de seguros para compartilhar.
+- **Records** geram construtor, acessores, `equals`, `hashCode` e `toString`. Valide e normalize no **construtor compacto** e copie componentes mutáveis.
+- **Value objects** (`Dinheiro`, `Cep`, `Cpf`) acabam com a obsessão por primitivos.
+- **Enums** modelam conjuntos fechados e podem ter atributos e métodos.

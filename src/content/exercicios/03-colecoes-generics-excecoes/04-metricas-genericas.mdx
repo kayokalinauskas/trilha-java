@@ -1,0 +1,107 @@
+---
+titulo: Métricas genéricas de sensores IoT
+codigo: "03.04"
+resumo: Implemente estatísticas genéricas que aceitam qualquer tipo numérico (PECS na prática, Comparable com super) e uma janela deslizante genérica sobre um buffer circular.
+modulo: 03-colecoes-generics-excecoes
+ordem: 4
+dificuldade: medio
+tempo: 2h
+conceitos: [generics, wildcards, PECS, type erasure, buffer circular]
+aulas: [03-colecoes-generics-excecoes/04-generics]
+java:
+  modulo: m03-colecoes-generics-excecoes
+  teste: MetricasGenericasTest
+---
+
+## Contexto
+
+Uma empresa de automação predial coleta leituras de centenas de sensores: temperatura (inteiros), umidade (decimais), consumo de energia (`BigDecimal`). O time de dados quer **um único conjunto de funções estatísticas** que funcione para todos os tipos numéricos, sem copiar código para cada um, e uma **janela deslizante** que mantenha só as últimas N leituras de cada sensor na memória.
+
+Neste exercício, as **assinaturas já estão prontas** no starter, porque os testes dependem delas. O desafio é duplo: implementar os corpos **e** entender cada wildcard a ponto de explicá-lo.
+
+## Requisitos
+
+### `Estatisticas`
+
+| Assinatura | Comportamento |
+|---|---|
+| `double media(Collection<? extends Number>)` | Média; coleção vazia → `IllegalArgumentException` |
+| `<T extends Comparable<? super T>> T maximo(Collection<? extends T>)` | Maior elemento; vazia → `NoSuchElementException` |
+| `void copiarAcimaDe(Collection<? extends Number> origem, Collection<? super Number> destino, double limite)` | Copia para o destino os valores **estritamente** maiores que o limite |
+| `Map<String, Double> mediaPorSensor(Collection<? extends Leitura<? extends Number>>)` | Média por sensor, com as chaves em ordem alfabética |
+
+`maximo` precisa funcionar com `Integer`, `String` e **`LocalDate`** (que implementa `Comparable<ChronoLocalDate>`, não `Comparable<LocalDate>`).
+
+### `Janela<T>`
+
+Janela de tamanho fixo (buffer circular):
+
+- `adicionar(T)`: quando cheia, descarta o **mais antigo**. Todas as operações são O(1), exceto `ultimos()`.
+- `ultimos()`: cópia imutável, do mais antigo ao mais novo.
+- `tamanho()`, `estaCheia()`.
+- Capacidade menor que 1 ou elemento nulo: `IllegalArgumentException`.
+
+```java
+Janela<Integer> j = new Janela<>(3);
+for (int i = 1; i <= 5; i++) j.adicionar(i);
+j.ultimos();   // [3, 4, 5]
+```
+
+## Perguntas que você deve saber responder
+
+1. Por que `media(Collection<Number>)` **não** aceitaria uma `List<Integer>`?
+2. Por que `copiarAcimaDe` usa `extends` na origem e `super` no destino?
+3. O que mudaria se `maximo` fosse declarado como `<T extends Comparable<T>>`? Qual teste quebraria (na compilação)?
+4. Por que você não pode escrever `new T[capacidade]` na `Janela`?
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `MetricasGenericasTest` passam.
+- [ ] A `Janela` não usa `ArrayList.remove(0)` (que é O(n)).
+- [ ] Você escreveu as respostas das 4 perguntas (em comentários ou num README).
+
+## Desafios opcionais
+
+- `desvioPadrao(Collection<? extends Number>)`.
+- Uma `Janela` por tempo, e não por quantidade: mantém só as leituras dos últimos 5 minutos.
+
+<Dicas>
+<Dica nivel={1}>
+Para as estatísticas, `Number.doubleValue()` funciona para qualquer tipo numérico. Para `maximo`, use o `Iterator` para pegar o primeiro elemento (e detectar a coleção vazia) e compare os demais com `compareTo`.
+</Dica>
+<Dica nivel={2}>
+Na `Janela`, guarde os elementos em um `Object[]` com dois inteiros: `inicio` (índice do mais antigo) e `tamanho`. A próxima posição livre é `(inicio + tamanho) % capacidade`. Quando a janela está cheia, escrever nessa posição sobrescreve o mais antigo, e `inicio` avança.
+</Dica>
+<Dica nivel={3}>
+Em `ultimos()`, leia `elementos[(inicio + i) % capacidade]` para `i` de 0 até `tamanho - 1`, fazendo cast para `T` e anotando o método com `@SuppressWarnings("unchecked")`. Em `mediaPorSensor`, um `TreeMap<String, double[]>` com `[soma, quantidade]` e `computeIfAbsent` acumula tudo em uma passada.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### Estatísticas
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/metricas/Estatisticas.java" />
+
+### Janela (buffer circular)
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/metricas/Janela.java" />
+
+### Respostas às perguntas
+
+1. **Invariância.** `List<Integer>` não é subtipo de `List<Number>`. Se fosse, o método poderia chamar `valores.add(3.14)` e corromper a lista de inteiros. Com `? extends Number`, o compilador aceita qualquer lista de subtipos de `Number`, mas proíbe adicionar.
+2. **PECS.** A origem só **produz** valores que o método lê (extends); o destino só **consome** valores que o método escreve (super). Assim, o teste consegue copiar de uma `List<Integer>` para uma `List<Number>` ou até para uma `List<Object>`.
+3. `LocalDate` implementa `Comparable<ChronoLocalDate>`. Com `<T extends Comparable<T>>`, `T = LocalDate` não satisfaz o limite, e o teste `maximo` **não compila**. `Comparable<? super T>` aceita comparação com um supertipo.
+4. **Type erasure.** Em tempo de execução, `T` não existe, e arrays precisam do tipo concreto. O `Object[]` com cast na leitura é seguro porque só elementos do tipo `T` são colocados no array (o método `adicionar` garante isso).
+
+### Por que o buffer circular
+
+A solução "óbvia" com `ArrayList` e `remove(0)` desloca todos os elementos a cada inserção: O(n). O buffer circular só move um índice: O(1). É a mesma técnica usada em filas de alta performance (como o `ArrayDeque` e o LMAX Disruptor) e em buffers de log.
+
+### Avalie sua solução
+
+- Você consegue explicar as 4 respostas sem olhar?
+- Sua `Janela` funciona com capacidade 1?
+- `ultimos()` devolve uma cópia ou uma visão do seu array interno?
+
+</Solucao>

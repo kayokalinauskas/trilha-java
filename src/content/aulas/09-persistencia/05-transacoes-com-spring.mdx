@@ -1,0 +1,180 @@
+---
+titulo: "@Transactional a fundo"
+descricao: Como o Spring gerencia transações com proxies, onde colocar as fronteiras, propagação, readOnly, regras de rollback e as armadilhas clássicas — auto-invocação, métodos privados, exceções checadas e chamadas externas dentro da transação.
+modulo: 09-persistencia
+ordem: 5
+duracao: 55
+objetivos:
+  - Explicar como @Transactional funciona por meio de proxies
+  - Posicionar as fronteiras de transação na camada de serviço
+  - Escolher propagação e readOnly, e entender as regras de rollback
+  - Evitar auto-invocação, transações longas e chamadas externas dentro delas
+tags: [transações, Transactional, propagação, rollback, proxy]
+flashcards:
+  - frente: Por que chamar um método @Transactional de dentro da mesma classe não abre transação?
+    verso: O @Transactional é aplicado por um proxy que envolve o bean. Uma chamada this.metodo() não passa pelo proxy, então a anotação é ignorada (auto-invocação).
+  - frente: Quais exceções causam rollback por padrão no Spring?
+    verso: RuntimeException e Error. Exceções checadas NÃO causam rollback, a menos que você use rollbackFor.
+  - frente: Qual a propagação padrão e o que ela faz?
+    verso: REQUIRED — participa da transação existente ou abre uma nova se não houver.
+  - frente: Quando usar REQUIRES_NEW?
+    verso: Quando algo precisa ser gravado mesmo que a transação principal falhe (ex. log de auditoria de uma tentativa). Suspende a atual e abre outra independente.
+  - frente: Por que não chamar uma API HTTP externa dentro de uma transação?
+    verso: A transação segura uma conexão e locks durante toda a chamada; uma API lenta esgota o pool e bloqueia outras transações. E se a transação fizer rollback, a chamada externa não é desfeita.
+---
+
+No módulo 07 você controlou transações à mão com JDBC: `setAutoCommit(false)`, `commit()`, `rollback()` e a mesma `Connection` passada para todos os métodos. Com o Spring, isso cabe numa anotação — e é exatamente por ela parecer mágica que tanta gente erra. Nesta aula você vai entender o truque.
+
+## O que `@Transactional` faz
+
+```java
+@Service
+public class ServicoDeTransferencias {
+
+    @Transactional
+    public Resultado transferir(String chave, UUID origem, UUID destino, BigDecimal valor) {
+        // travar contas, debitar, creditar, gravar transferência e movimentos
+    }
+}
+```
+
+Na subida, o Spring não injeta o seu `ServicoDeTransferencias` diretamente nos outros beans: injeta um **proxy** que o envolve. Ao chamar `transferir`, o proxy:
+
+1. obtém uma conexão do pool e desliga o autocommit (ou entra numa transação já existente);
+2. liga a conexão (e o `EntityManager`) à **thread** atual — todos os repositórios chamados dentro usam a mesma;
+3. chama o seu método;
+4. se ele terminar normalmente: **flush + commit**; se lançar `RuntimeException`: **rollback**;
+5. devolve a conexão ao pool.
+
+É o código JDBC do exercício 07.04, escrito uma vez só pelo framework.
+
+<Figura legenda="Quem chama fala com o proxy; o proxy abre e fecha a transação em volta do seu método">
+<svg viewBox="0 0 660 170" width="660" role="img" aria-label="O controller chama o proxy, que inicia a transação, chama o serviço real e faz commit ou rollback">
+  <defs><marker id="tx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="60" width="130" height="50" rx="10" class="d-box"/><text x="75" y="90" text-anchor="middle" class="d-mono">Controller</text>
+  <rect x="190" y="20" width="440" height="130" rx="14" class="d-violet"/>
+  <text x="300" y="44" text-anchor="middle" class="d-title">Proxy (@Transactional)</text>
+  <rect x="210" y="60" width="160" height="70" rx="10" class="d-accent"/><text x="290" y="84" text-anchor="middle" class="d-label">begin</text><text x="290" y="104" text-anchor="middle" class="d-label">commit / rollback</text>
+  <rect x="440" y="60" width="170" height="70" rx="10" class="d-ok"/><text x="525" y="90" text-anchor="middle" class="d-mono">Serviço real</text><text x="525" y="110" text-anchor="middle" class="d-label">seu método</text>
+  <path d="M140 85 H206" class="d-line" marker-end="url(#tx)"/><path d="M370 95 H436" class="d-line" marker-end="url(#tx)"/>
+</svg>
+</Figura>
+
+## Onde colocar a fronteira
+
+A transação deve envolver **um caso de uso inteiro** — tudo o que precisa acontecer junto. Por isso ela mora na **camada de serviço** (aplicação):
+
+- no **repositório** é tarde demais: cada `save` seria sua própria transação, e um erro no meio deixaria metade gravada;
+- no **controller** é cedo demais: a transação passaria a incluir serialização JSON, validação e o que mais a camada web fizer.
+
+Os métodos de leitura ganham `@Transactional(readOnly = true)`: o Hibernate desliga o dirty checking daquele contexto e o driver pode rotear para réplicas de leitura.
+
+## As armadilhas clássicas
+
+<Callout tipo="erro" titulo="1. Auto-invocação">
+```java
+@Service
+public class ServicoDePedidos {
+    public void processarLote(List<Pedido> pedidos) {
+        for (Pedido p : pedidos) {
+            this.processar(p);          // ← não passa pelo proxy: SEM transação
+        }
+    }
+
+    @Transactional
+    public void processar(Pedido p) { ... }
+}
+```
+A chamada `this.processar(p)` vai direto ao objeto, sem passar pelo proxy. Soluções: mover o método para **outro bean** (a solução do exercício 09.03, com `TransferenciasComRetentativa`), ou usar `TransactionTemplate` programaticamente.
+</Callout>
+
+<Callout tipo="erro" titulo="2. Métodos privados e final">
+Proxies só interceptam métodos **públicos** (e não `final`) chamados de fora. `@Transactional` num método `private` é silenciosamente ignorado.
+</Callout>
+
+<Callout tipo="erro" titulo="3. Exceções checadas não fazem rollback">
+Por padrão, só `RuntimeException` e `Error` causam rollback. Um `throws IOException` que escapa do método **faz commit** do que já foi feito. Use exceções de negócio unchecked (como a trilha faz) ou `@Transactional(rollbackFor = Exception.class)`.
+</Callout>
+
+<Callout tipo="erro" titulo="4. Engolir a exceção">
+```java
+@Transactional
+public void transferir(...) {
+    try {
+        repositorio.saveAndFlush(t);
+    } catch (DataIntegrityViolationException e) {
+        log.warn("ignorando");           // a transação já foi marcada como rollback-only!
+    }
+}                                        // → UnexpectedRollbackException no commit
+```
+Depois de certos erros do banco, a transação fica **condenada**: não dá para "continuar". Traduza a exceção para uma exceção de negócio e deixe sair, ou trate numa transação nova.
+</Callout>
+
+## Propagação
+
+O que acontece quando um método transacional chama outro?
+
+| Propagação | Comportamento |
+|---|---|
+| `REQUIRED` (padrão) | usa a transação existente; se não houver, cria |
+| `REQUIRES_NEW` | **suspende** a atual e cria uma independente (commit/rollback próprios) |
+| `MANDATORY` | exige uma transação existente (erro se não houver) |
+| `SUPPORTS` | usa se houver; senão, roda sem |
+| `NOT_SUPPORTED` / `NEVER` | roda sem transação / exige que não haja |
+
+`REQUIRES_NEW` serve para registrar algo **mesmo que a transação principal falhe** — um log de auditoria de tentativa de acesso, por exemplo. Cuidado: ele usa **outra conexão** do pool; num laço sob carga, esgota o pool.
+
+## Transações curtas, sem efeitos externos
+
+Uma transação segura uma conexão e, muitas vezes, **locks**. Enquanto ela está aberta, outras requisições que precisam das mesmas linhas **esperam**. Por isso:
+
+- nada de **chamadas HTTP** a outros serviços dentro da transação (e se a transação fizer rollback, a chamada não é desfeita);
+- nada de enviar **e-mail** ou publicar **mensagem** lá dentro: se o commit falhar depois, você avisou de algo que não aconteceu. A saída correta é o padrão **outbox** (módulo 12) ou `@TransactionalEventListener(phase = AFTER_COMMIT)`;
+- nada de esperar **entrada do usuário** ou fazer processamento pesado com locks abertos.
+
+```java
+@TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+public void notificar(TransferenciaConcluida evento) {
+    notificador.enviar(evento);        // só roda se o commit deu certo
+}
+```
+
+## Isolamento no Spring
+
+`@Transactional(isolation = Isolation.REPEATABLE_READ)` muda o nível de isolamento (aula de transações do módulo 07). Na prática, a maioria das aplicações fica no padrão do banco (`READ COMMITTED` no PostgreSQL) e resolve concorrência com **locks** e **versões** — o assunto da próxima aula.
+
+<Callout tipo="entrevista">
+"Como funciona o @Transactional?" é pergunta certa em entrevista Pleno. Explique o **proxy** (e por isso a auto-invocação e os métodos privados não funcionam), a **fronteira no serviço**, o **rollback só para unchecked** por padrão, `REQUIRED` × `REQUIRES_NEW`, e termine com boas práticas: transações curtas, `readOnly` nas leituras, nada de chamadas externas dentro, eventos **após o commit**.
+</Callout>
+
+<Quiz
+  id="09-transacoes"
+  questoes={[
+    {
+      pergunta: 'Um método público chama this.salvar(), anotado com @Transactional, na mesma classe. O que acontece?',
+      opcoes: ['Abre uma transação nova', 'Participa da transação do chamador', 'A anotação é ignorada: a chamada não passa pelo proxy', 'Erro de compilação'],
+      correta: 2,
+      explicacao: 'Auto-invocação: o proxy só intercepta chamadas que vêm de fora do bean.',
+    },
+    {
+      pergunta: 'O método @Transactional lança IOException (checada) depois de dois INSERTs. Por padrão:',
+      opcoes: ['Rollback dos dois INSERTs', 'Commit dos dois INSERTs', 'Rollback só do segundo', 'Depende do banco'],
+      correta: 1,
+      explicacao: 'Exceções checadas não causam rollback, a menos que se configure rollbackFor.',
+    },
+    {
+      pergunta: 'Onde enviar o e-mail de "transferência concluída" com segurança?',
+      opcoes: ['No meio da transação, logo após o débito', 'Num @TransactionalEventListener AFTER_COMMIT (ou outbox)', 'Antes de iniciar a transação', 'No controller, antes de chamar o serviço'],
+      correta: 1,
+      explicacao: 'Só depois do commit você sabe que a transferência realmente aconteceu.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `@Transactional` funciona via **proxy**: begin, sua lógica, commit ou rollback — o JDBC do módulo 07 automatizado.
+- Fronteira no **serviço**, envolvendo o caso de uso; `readOnly = true` nas leituras.
+- Armadilhas: **auto-invocação**, métodos **privados**, exceções **checadas** (commit!), exceção **engolida** (rollback-only).
+- Propagação `REQUIRED` por padrão; `REQUIRES_NEW` para o que precisa sobreviver a um rollback.
+- Transações **curtas**, sem HTTP/e-mail/mensagens dentro: use eventos **após o commit** ou outbox.

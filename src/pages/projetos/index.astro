@@ -1,0 +1,282 @@
+---
+import Base from '../../layouts/Base.astro';
+import Icon from '../../components/Icon.astro';
+import { NIVEL_PROJETO, getProjetos, type Projeto } from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+const projetos = await getProjetos();
+const niveis: { id: Projeto['data']['nivel']; titulo: string; texto: string }[] = [
+  {
+    id: 'junior',
+    titulo: 'Júnior',
+    texto:
+      'Uma API completa e bem acabada: regras de negócio de verdade, banco com migrations, testes, Docker, CI e deploy. Mostra que você entrega sozinho uma funcionalidade do começo ao fim.',
+  },
+  {
+    id: 'pleno',
+    titulo: 'Pleno',
+    texto:
+      'Um sistema com segurança, mensageria, cache, concorrência e observabilidade. Mostra que você toma decisões de arquitetura, lida com falhas e mantém o sistema no ar.',
+  },
+  {
+    id: 'senior',
+    titulo: 'Sênior',
+    texto:
+      'Uma plataforma com vários serviços, metas de confiabilidade, dados em escala e decisões documentadas. Mostra que você desenha, mede e explica trade-offs para o time e para o negócio.',
+  },
+];
+---
+
+<Base title="Projetos de portfólio" description="Projetos completos de nível Júnior, Pleno e Sênior, com requisitos detalhados, marcos, rubrica e roteiro para a entrevista.">
+  <section class="head">
+    <div class="container">
+      <p class="eyebrow">Portfólio</p>
+      <h1>Projetos para mostrar na entrevista</h1>
+      <p class="lead">
+        Nove projetos completos, do Júnior ao Sênior, pensados para o que recrutadores e gestores procuram num repositório. Cada um tem
+        contexto de negócio, requisitos com critérios de aceite, contrato da API, modelo de dados, um plano em marcos com começo, meio e
+        fim, uma rubrica para você se avaliar e um roteiro para apresentar o projeto. Você cria tudo do zero, no seu GitHub.
+      </p>
+    </div>
+  </section>
+
+  <div class="container">
+    <section class="como card" aria-labelledby="como-usar">
+      <h2 id="como-usar"><Icon name="target" size={18} /> Como usar</h2>
+      <ol>
+        <li><strong>Escolha um projeto do nível da vaga que você quer</strong> (ou do nível logo abaixo, para ganhar ritmo). Um projeto bem terminado vale mais que três pela metade.</li>
+        <li><strong>Crie um repositório público desde o marco 1</strong> e faça commits pequenos, com mensagens claras: o histórico também é avaliado.</li>
+        <li><strong>Siga os marcos na ordem</strong> e marque cada um aqui quando cumprir a definição de pronto. Cada marco termina com o projeto funcionando.</li>
+        <li><strong>No fim, passe pela rubrica</strong>, grave a demonstração e ensaie o roteiro da entrevista.</li>
+      </ol>
+    </section>
+
+    {
+      niveis.map((n) => {
+        const lista = projetos.filter((p) => p.data.nivel === n.id);
+        return (
+          <section class="nivel" aria-labelledby={`nivel-${n.id}`}>
+            <div class="nivel-head">
+              <h2 id={`nivel-${n.id}`} class={`tit-${n.id}`}>
+                <Icon name="briefcase" size={20} /> {n.titulo}
+              </h2>
+              <p>{n.texto}</p>
+            </div>
+            {lista.length > 0 ? (
+              <ul class="grid">
+                {lista.map((p) => (
+                  <li data-projeto={p.id} data-total={p.data.marcos.length}>
+                    <a class={`card card-link pj pj-${n.id}`} href={url(`projetos/${p.id}`)}>
+                      <div class="pj-top">
+                        <span class={`nv nv-${n.id}`}>{NIVEL_PROJETO[p.data.nivel]}</span>
+                        <span class="dom">{p.data.dominio}</span>
+                      </div>
+                      <h3>{p.data.titulo}</h3>
+                      <p class="res">{p.data.resumo}</p>
+                      <div class="chips">
+                        {p.data.stack.slice(0, 6).map((s) => (
+                          <span class="badge">{s}</span>
+                        ))}
+                        {p.data.stack.length > 6 && <span class="badge">+{p.data.stack.length - 6}</span>}
+                      </div>
+                      <div class="pj-foot">
+                        <span>
+                          <Icon name="clock" size={13} /> ~{p.data.horas}h
+                        </span>
+                        <span>
+                          <Icon name="flag" size={13} /> <span data-feitos>0</span>/{p.data.marcos.length} marcos
+                        </span>
+                        <span class="barra" aria-hidden="true">
+                          <span data-barra />
+                        </span>
+                      </div>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p class="muted vazio">Em produção.</p>
+            )}
+          </section>
+        );
+      })
+    }
+  </div>
+</Base>
+
+<script>
+  import { aoMudar, ler } from '../../lib/progresso';
+
+  function aplicar() {
+    const p = ler();
+    document.querySelectorAll<HTMLElement>('[data-projeto]').forEach((li) => {
+      const feitos = p.projetos[li.dataset.projeto!]?.marcos.length ?? 0;
+      const total = Number(li.dataset.total);
+      li.querySelector('[data-feitos]')!.textContent = String(feitos);
+      li.querySelector<HTMLElement>('[data-barra]')!.style.width = `${total ? (feitos / total) * 100 : 0}%`;
+    });
+  }
+  aplicar();
+  aoMudar(aplicar);
+</script>
+
+<style>
+  .head {
+    padding-block: 40px 28px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 260px at 90% 0%, var(--accent-soft), transparent 70%);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .lead {
+    max-width: 80ch;
+  }
+  .como {
+    margin-top: 28px;
+    padding: 20px 24px;
+  }
+  .como h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.05rem;
+    color: var(--accent);
+  }
+  .como ol {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+    gap: 10px 28px;
+    margin: 12px 0 0;
+    padding-left: 1.2em;
+    font-size: 0.92rem;
+    color: var(--text-2);
+  }
+  .nivel {
+    margin-top: 48px;
+  }
+  .nivel-head {
+    display: grid;
+    grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+    gap: 8px 28px;
+    align-items: baseline;
+    margin-bottom: 18px;
+  }
+  .nivel-head h2 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: var(--step-2);
+  }
+  .nivel-head p {
+    max-width: 90ch;
+    color: var(--text-3);
+  }
+  .tit-junior {
+    color: var(--lvl-jr);
+  }
+  .tit-pleno {
+    color: var(--lvl-pleno);
+  }
+  .tit-senior {
+    color: var(--lvl-senior);
+  }
+  .grid {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 18px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  }
+  .grid li {
+    display: flex;
+  }
+  .pj {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 100%;
+    padding: 22px 24px;
+    border-top: 3px solid var(--c);
+  }
+  .pj-junior {
+    --c: var(--lvl-jr);
+  }
+  .pj-pleno {
+    --c: var(--lvl-pleno);
+  }
+  .pj-senior {
+    --c: var(--lvl-senior);
+  }
+  .pj-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .nv {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c);
+  }
+  .dom {
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .pj h3 {
+    font-size: 1.25rem;
+    line-height: 1.3;
+  }
+  .res {
+    flex: 1;
+    color: var(--text-2);
+    font-size: 0.93rem;
+    line-height: 1.55;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .pj-foot {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .pj-foot > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .barra {
+    flex: 1;
+    min-width: 80px;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    overflow: hidden;
+  }
+  .barra span {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--ok);
+  }
+  .vazio {
+    padding: 20px 0;
+  }
+  @media (max-width: 720px) {
+    .nivel-head {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

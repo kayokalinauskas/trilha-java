@@ -1,0 +1,327 @@
+---
+titulo: "Assistentes de código com responsabilidade: onde ajudam, onde erram e como revisar"
+descricao: Como usar assistentes de código (autocompletar, chat e agentes) como dev Jr ou Pleno sem terceirizar o julgamento — onde eles aceleram, os erros típicos (APIs inventadas ou desatualizadas, dependências inexistentes, falhas de segurança, testes que só confirmam o código), um fluxo de trabalho seguro, um checklist de revisão e como falar disso em entrevista.
+modulo: 16-ia-backend
+ordem: 6
+duracao: 50
+objetivos:
+  - Identificar tarefas em que um assistente de código acelera o trabalho e tarefas em que ele costuma errar
+  - Revisar código gerado com um checklist e encontrar problemas de API, segurança e concorrência
+  - Aplicar um fluxo de trabalho de pedidos pequenos, leitura completa, testes e revisão do diff
+  - Respeitar a política da empresa sobre ferramentas de IA e privacidade do código
+  - Falar sobre o uso de IA numa entrevista com honestidade e segurança
+tags: [assistentes de código, IA, code review, segurança, slopsquatting, Spring Boot 4, carreira]
+flashcards:
+  - frente: Por que assistentes de código sugerem APIs desatualizadas?
+    verso: Foram treinados com muito código antigo e têm uma data de corte. Em projetos recentes (Spring Boot 4, Java 25) sugerem com frequência javax.*, @MockBean ou RestTemplate. O compilador e a documentação oficial são o árbitro.
+  - frente: O que é slopsquatting?
+    verso: Registrar num repositório público (Maven Central, npm, PyPI) um pacote com o nome que modelos costumam inventar. Quem aceita a dependência sugerida sem conferir instala o pacote do atacante.
+  - frente: Qual o problema de um teste gerado a partir da implementação?
+    verso: Ele tende a confirmar o que o código faz, inclusive os bugs, em vez de verificar o que o código deveria fazer. Escreva ou revise os casos a partir da regra de negócio - erro, borda, concorrência.
+  - frente: Qual a regra de ouro ao revisar código gerado?
+    verso: Revisar como se fosse o pull request de um colega - ler todas as linhas, entender cada uma, rodar os testes. Se você não consegue explicar uma linha, ela não entra no commit.
+  - frente: Que dados nunca devem ir para um assistente de código fora da política da empresa?
+    verso: Segredos (chaves, senhas, tokens), dados de clientes e código proprietário numa conta pessoal ou ferramenta não aprovada. Use só as ferramentas e planos que a empresa liberou.
+  - frente: Qual a substituta de @MockBean no Spring Boot 4?
+    verso: "@MockitoBean (e @MockitoSpyBean no lugar de @SpyBean), do pacote org.springframework.test.context.bean.override.mockito. O @MockBean do Boot foi removido na versão 4.0."
+  - frente: Como falar do uso de IA numa entrevista?
+    verso: Com honestidade e exemplos - para que você usa, como valida (testes, leitura, documentação) e um caso em que a ferramenta errou e você percebeu. Se a entrevista proíbe IA, respeite; treine sem ela.
+---
+
+Assistentes de código viraram parte do dia a dia: o autocompletar que termina a linha, o chat que explica um erro, o agente que edita vários arquivos e roda os testes sozinho. Copilot, Claude Code, Cursor, Codeium, JetBrains AI e outros mudam de nome e de recurso a cada trimestre, mas a pergunta que importa para quem está começando é sempre a mesma: **quem responde pelo código que entra no repositório?** A resposta é você. O assistente não participa da reunião de incidente.
+
+Esta aula não é contra nem a favor de ferramenta nenhuma. É sobre usá-las como um dev que entende o que está entregando — e sobre não deixar que elas atrapalhem o seu aprendizado justamente na fase em que ele mais conta.
+
+## Onde eles ajudam
+
+Pense no assistente como um colega muito rápido, que leu muito código, mas **não conhece o seu projeto** e às vezes fala com confiança sobre o que não sabe. Com isso em mente, ele rende bem em:
+
+- **Boilerplate**: um `record` de DTO com as validações, o mapeamento entre entidade e resposta, a configuração inicial de um teste com Testcontainers.
+- **Esqueleto de testes**: a lista de casos que você esqueceu ("e se a lista vier vazia?"), a estrutura do teste parametrizado.
+- **Explicar código legado**: "o que esse método de 200 linhas faz?", "por que esse `synchronized` está aqui?". Ótimo ponto de partida; confirme lendo o código.
+- **Regex e SQL**: "uma regex para CEP com ou sem hífen", "reescreva essa subconsulta com `JOIN`". Sempre com testes e com o `EXPLAIN` (m07).
+- **Tarefas mecânicas**: renomear, migrar um padrão repetido em 30 arquivos, converter um formato de configuração.
+- **Primeiro rascunho** de documentação, mensagens de commit e descrições de PR, que você edita.
+
+## Onde eles erram
+
+### APIs inventadas ou desatualizadas
+
+O modelo aprendeu com anos de código público, e a maior parte dele é de versões antigas. Num projeto Spring Boot 4 com Java 25, as sugestões desatualizadas mais comuns são:
+
+| Sugestão | Situação no Boot 4 / Framework 7 |
+|---|---|
+| `javax.persistence`, `javax.validation` | **não compila**: desde o Boot 3 é `jakarta.*` |
+| `@MockBean`, `@SpyBean` | **removidos** no Boot 4.0: use `@MockitoBean` e `@MockitoSpyBean` |
+| `RestTemplate` em código novo | ainda existe, mas o time do Spring anunciou a depreciação; prefira `RestClient` (m08) |
+| `WebSecurityConfigurerAdapter` | removido desde o Spring Security 6 |
+| `new ObjectMapper()` do Jackson 2 | o Boot 4 usa o Jackson 3 (`tools.jackson`) por padrão |
+
+Pior do que a API antiga é a **API inventada**: um método que "deveria existir" (`Optional.orElseThrowIfEmpty()`, uma propriedade `spring.datasource.auto-retry`). Soa plausível, e às vezes só falha em tempo de execução, como uma propriedade de configuração que ninguém lê. O compilador, os testes e a documentação oficial são o árbitro, não a confiança do texto.
+
+### Dependências que não existem
+
+O modelo pode sugerir uma dependência com nome plausível que **não existe**. Atacantes aproveitam isso: registram no repositório público um pacote com o nome que os modelos costumam inventar. A técnica ganhou o nome de **slopsquatting**, parente do *typosquatting*. É o A03 Software Supply Chain Failures do OWASP (m11) com um novo vetor.
+
+Antes de aceitar uma dependência sugerida: confira no Maven Central quem publica (o `groupId` bate com o projeto oficial?), a data e o volume de versões, o repositório de código-fonte; e pergunte se precisa mesmo dela.
+
+### Segurança
+
+O modelo reproduz os padrões mais frequentes do código de treino, e muito código público é inseguro: SQL concatenado, `catch (Exception e)` que engole o erro, segredos direto no código ou no `application.yml`, CORS com `*`, endpoints sem checagem de posse (BOLA). Estudos acadêmicos com assistentes encontraram vulnerabilidades numa parcela relevante das sugestões; o número exato varia com o modelo e o estudo, mas a conclusão é estável: **código gerado precisa da mesma revisão de segurança que qualquer outro** — e, muitas vezes, de mais.
+
+### Testes que só confirmam a implementação
+
+Peça "escreva testes para esta classe" e você recebe testes que descrevem o que o código **faz**, inclusive os bugs. Se o método aceita valor negativo, o teste gerado pode muito bem verificar que aceita. Os casos certos vêm da **regra de negócio**, não da implementação.
+
+## Um exemplo: o endpoint de transferência
+
+O pedido ao assistente foi: "crie um endpoint REST de transferência entre contas com Spring Boot". A resposta compila no editor, parece limpa e tem cinco problemas sérios. Tente achá-los antes de ler a lista.
+
+```java
+import javax.transaction.Transactional;
+import javax.validation.Valid;
+
+@RestController
+@RequestMapping("/api/transferencias")
+public class TransferenciaController {
+
+    private static final Logger log = LoggerFactory.getLogger(TransferenciaController.class);
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @PostMapping
+    @Transactional
+    public ResponseEntity<String> transferir(@Valid @RequestBody TransferenciaRequest req) {
+        try {
+            Double saldo = jdbc.queryForObject(
+                    "SELECT saldo FROM conta WHERE id = '" + req.getContaOrigem() + "'", Double.class);
+            if (saldo >= req.getValor()) {
+                jdbc.update("UPDATE conta SET saldo = saldo - " + req.getValor()
+                        + " WHERE id = '" + req.getContaOrigem() + "'");
+                jdbc.update("UPDATE conta SET saldo = saldo + " + req.getValor()
+                        + " WHERE id = '" + req.getContaDestino() + "'");
+                return ResponseEntity.ok("Transferência realizada");
+            }
+            return ResponseEntity.badRequest().body("Saldo insuficiente");
+        } catch (Exception e) {
+            log.error("Erro na transferência: " + req);
+            return ResponseEntity.ok("Transferência em processamento");
+        }
+    }
+}
+```
+
+<Callout tipo="erro" titulo="Os cinco problemas">
+1. **`javax.*` num projeto Boot 4.** `javax.validation` e `javax.transaction` não estão no classpath: o código nem compila. E trocar só o import não basta — veja o item 5.
+2. **A conta de origem vem do corpo da requisição.** Qualquer cliente autenticado pode debitar **qualquer** conta mandando outro id. É BOLA (A01, m11). A origem vem do usuário autenticado.
+3. **SQL concatenado.** `contaOrigem = "x' OR '1'='1"` e o `UPDATE` atinge todas as contas. Parâmetros de bind, sempre (A05).
+4. **`double` para dinheiro.** `0.1 + 0.2 != 0.3`; em saldo, isso é centavo sumindo. `BigDecimal` no Java e `NUMERIC` no banco (m01).
+5. **O `catch` engole a exceção e responde 200.** Como a exceção não sai do método, o `@Transactional` **confirma** o que já foi feito: se o crédito falhar depois do débito, o dinheiro some e o cliente lê "em processamento". Falhe fechado e deixe a exceção provocar o rollback (A10). De quebra, o log concatena o objeto inteiro (que pode ter dados pessoais) e perde o stack trace.
+
+**Bônus:** ler o saldo e depois atualizar é *check-then-act*. Duas transferências simultâneas leem o mesmo saldo e as duas passam (m06, m09). E não há idempotência: um retry do cliente transfere duas vezes.
+</Callout>
+
+A versão revisada, com o controller fino e a regra no serviço:
+
+```java
+public record TransferenciaRequest(
+        @NotNull UUID contaDestino,
+        @NotNull @Positive @Digits(integer = 13, fraction = 2) BigDecimal valor) { }   // jakarta.validation
+
+@RestController
+@RequestMapping("/api/transferencias")
+class TransferenciaController {
+
+    private final TransferenciaService servico;
+
+    TransferenciaController(TransferenciaService servico) {
+        this.servico = servico;
+    }
+
+    @PostMapping
+    ResponseEntity<TransferenciaResponse> transferir(@AuthenticationPrincipal Jwt jwt,
+                                                     @RequestHeader("Idempotency-Key") UUID chave,
+                                                     @Valid @RequestBody TransferenciaRequest pedido) {
+        UUID cliente = UUID.fromString(jwt.getSubject());   // a origem vem de quem está autenticado
+        return ResponseEntity.status(HttpStatus.CREATED).body(servico.transferir(cliente, chave, pedido));
+    }
+}
+
+@Service
+class TransferenciaService {
+
+    private final JdbcClient jdbc;
+
+    TransferenciaService(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @Transactional   // org.springframework.transaction.annotation
+    TransferenciaResponse transferir(UUID cliente, UUID chave, TransferenciaRequest pedido) {
+        UUID origem = jdbc.sql("SELECT id FROM conta WHERE titular_id = :cliente")
+                .param("cliente", cliente)
+                .query(UUID.class).optional()
+                .orElseThrow(ContaNaoEncontradaException::new);
+
+        // chave única no banco: um retry com a mesma chave falha aqui (DuplicateKeyException)
+        // e um @ExceptionHandler devolve a transferência original
+        jdbc.sql("INSERT INTO transferencia (chave_idempotencia, origem, destino, valor) VALUES (:chave, :origem, :destino, :valor)")
+                .param("chave", chave).param("origem", origem)
+                .param("destino", pedido.contaDestino()).param("valor", pedido.valor())
+                .update();
+
+        // débito condicional e atômico: sem check-then-act
+        int debitadas = jdbc.sql("UPDATE conta SET saldo = saldo - :valor WHERE id = :origem AND saldo >= :valor")
+                .param("valor", pedido.valor()).param("origem", origem)
+                .update();
+        if (debitadas == 0) {
+            throw new SaldoInsuficienteException(origem);   // exceção → rollback de tudo
+        }
+        int creditadas = jdbc.sql("UPDATE conta SET saldo = saldo + :valor WHERE id = :destino")
+                .param("valor", pedido.valor()).param("destino", pedido.contaDestino())
+                .update();
+        if (creditadas == 0) {
+            throw new ContaNaoEncontradaException();         // desfaz o débito
+        }
+        return new TransferenciaResponse(chave, origem, pedido.contaDestino(), pedido.valor());
+    }
+}
+```
+
+As exceções viram respostas Problem Details num `@RestControllerAdvice` (m08), sem stack trace para o cliente. Note que nenhum desses problemas é "coisa de IA": são os erros clássicos que a trilha inteira ensinou a evitar. O assistente só os produz **mais rápido** e com mais cara de pronto.
+
+E o teste que o mesmo assistente sugeriu:
+
+```java
+@WebMvcTest(TransferenciaController.class)
+class TransferenciaControllerTest {
+
+    @MockBean TransferenciaService servico;   // removido no Boot 4: use @MockitoBean
+    @Autowired MockMvc mvc;
+
+    @Test
+    void deveTransferir() throws Exception {
+        when(servico.transferir(any(), any(), any())).thenReturn(RESPOSTA);
+        mvc.perform(post("/api/transferencias").contentType(APPLICATION_JSON).content(JSON_VALIDO))
+                .andExpect(status().isOk());
+        verify(servico).transferir(any(), any(), any());
+    }
+}
+```
+
+Além do `@MockBean`, ele só confirma que o mock devolve o que foi mandado devolver. Os testes que protegem o dinheiro são outros: saldo insuficiente não altera nenhum saldo; um cliente não debita a conta de outro; duas transferências simultâneas não deixam o saldo negativo; o mesmo `Idempotency-Key` duas vezes transfere uma vez só. Esses precisam do banco de verdade (Testcontainers, m10).
+
+## Um fluxo de trabalho que funciona
+
+<Figura legenda="O ciclo de trabalho com um assistente: passos pequenos e você no controle de cada um">
+<svg viewBox="0 0 680 220" width="680" role="img" aria-label="Ciclo: pedir pequeno, ler tudo, compilar e rodar testes, revisar o diff e commitar; se algo não for entendido ou falhar, volta ao pedido">
+  <defs><marker id="m1661" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="120" height="64" rx="8" class="d-info"/><text x="70" y="68" text-anchor="middle" class="d-title">Pedir</text><text x="70" y="88" text-anchor="middle" class="d-label">pequeno e claro</text>
+  <rect x="148" y="40" width="120" height="64" rx="8" class="d-box"/><text x="208" y="68" text-anchor="middle" class="d-title">Ler tudo</text><text x="208" y="88" text-anchor="middle" class="d-label">cada linha</text>
+  <rect x="286" y="40" width="120" height="64" rx="8" class="d-violet"/><text x="346" y="68" text-anchor="middle" class="d-title">Verificar</text><text x="346" y="88" text-anchor="middle" class="d-mono">mvn verify</text>
+  <rect x="424" y="40" width="120" height="64" rx="8" class="d-box"/><text x="484" y="68" text-anchor="middle" class="d-title">Revisar diff</text><text x="484" y="88" text-anchor="middle" class="d-label">como PR de colega</text>
+  <rect x="562" y="40" width="108" height="64" rx="8" class="d-ok"/><text x="616" y="68" text-anchor="middle" class="d-title">Commit</text><text x="616" y="88" text-anchor="middle" class="d-label">você assina</text>
+  <path d="M130 72 H144" class="d-line" marker-end="url(#m1661)"/>
+  <path d="M268 72 H282" class="d-line" marker-end="url(#m1661)"/>
+  <path d="M406 72 H420" class="d-line" marker-end="url(#m1661)"/>
+  <path d="M544 72 H558" class="d-line" marker-end="url(#m1661)"/>
+  <path d="M346 104 C346 170, 70 170, 70 108" class="d-line" marker-end="url(#m1661)"/>
+  <path d="M484 104 C484 190, 70 190, 70 108" class="d-line" marker-end="url(#m1661)"/>
+  <rect x="160" y="150" width="360" height="56" rx="8" class="d-accent"/><text x="340" y="174" text-anchor="middle" class="d-label">não entendeu, falhou ou ficou grande demais?</text><text x="340" y="194" text-anchor="middle" class="d-label">volte e peça menor (ou escreva você)</text>
+</svg>
+</Figura>
+
+1. **Peça pequeno e com contexto.** "Crie um método que valida a chave PIX do tipo e-mail, com estes casos de teste" rende mais do que "crie o módulo de PIX". Diga a versão das ferramentas: "Spring Boot 4, Java 25, JUnit 6, `jakarta.*`". Se o assistente aceita um arquivo de instruções do projeto, registre ali as convenções.
+2. **Leia tudo.** Se você não consegue explicar uma linha, ela não entra. Pergunte ao próprio assistente "por que isso?", e confira a resposta na documentação.
+3. **Compile e rode os testes** — os seus, não só os que vieram junto. Com agentes que rodam comandos sozinhos, confira o que foi executado.
+4. **Revise o diff como se fosse de um colega.** Arquivos alterados que você não pediu, dependências novas, configuração mexida, testes apagados ou "ajustados" para passar.
+5. **Commite pequeno**, com uma mensagem que você escreveu ou revisou, e só os arquivos que você revisou (nada de adicionar tudo de uma vez).
+
+## Checklist de revisão de código gerado
+
+- [ ] **Compila** com as versões do projeto? Nada de `javax.*`, `@MockBean`, APIs removidas?
+- [ ] Cada método e propriedade usados **existem** na documentação da versão em uso?
+- [ ] **Dependências novas**: existem de verdade, são do `groupId` oficial, são mantidas, são necessárias?
+- [ ] **Entrada**: validada? SQL com parâmetros? Nenhuma URL, comando ou caminho montado com dado do cliente?
+- [ ] **Autorização**: o recurso pertence a quem está pedindo? A identidade vem do token, não do corpo?
+- [ ] **Dinheiro e tempo**: `BigDecimal`, `Instant`/`LocalDate`, fuso explícito?
+- [ ] **Erros**: nenhum `catch` vazio ou que devolve sucesso; transação faz rollback quando deve?
+- [ ] **Concorrência**: há *check-then-act*? Operação repetida é idempotente?
+- [ ] **Segredos e dados pessoais**: nada no código, na configuração versionada nem nos logs?
+- [ ] **Testes**: cobrem a regra de negócio (erro, borda, concorrência) e não só o caminho feliz do mock?
+- [ ] **Escopo**: o diff mexe só no que foi pedido?
+
+## Política da empresa e privacidade do código
+
+Antes de usar qualquer assistente num projeto da empresa, descubra a política — e siga-a mesmo quando for inconveniente:
+
+- **Ferramentas aprovadas**: muitas empresas liberam uma ou duas, em planos corporativos com cláusulas de privacidade (retenção, não uso do código para treinamento). Colar o código da empresa num chat com a sua conta pessoal pode violar contrato e LGPD.
+- **Segredos e dados de clientes nunca** vão para o prompt: nem a chave do ambiente de homologação "só para testar", nem um dump de produção para "entender o bug". Agentes que leem o projeto inteiro também leem o `.env`; configure as exclusões que a ferramenta oferecer.
+- **Licenças**: algumas ferramentas oferecem filtro de sugestões que reproduzem código público; a empresa pode exigir que ele esteja ligado.
+- **Transparência**: algumas equipes pedem para indicar no PR quando uma parte relevante foi gerada. Não é confissão; é contexto para quem revisa.
+
+## Aprender ou terceirizar o aprendizado
+
+Na trilha, você está construindo o modelo mental que permite **revisar** código: saber por que `double` quebra dinheiro, por que o `catch` engolido commita pela metade, por que o `UPDATE` condicional resolve a corrida. Quem pula essa etapa com a ajuda da ferramenta não consegue achar os cinco problemas do exemplo — e é exatamente isso que o mercado paga a um dev.
+
+Uma regra prática para os exercícios: **resolva primeiro sem assistente**. Travou? Use-o como tutor, não como gabarito: "me dê uma dica sem código", "explique por que este teste falha", "o que há de errado nesta abordagem?". Depois de passar nos testes, peça uma revisão da sua solução e compare com a de referência. Você ganha velocidade sem perder o aprendizado.
+
+<Callout tipo="entrevista">
+"Você usa IA para programar?" É uma pergunta cada vez mais comum, e a resposta ruim é tanto "não, nunca" (soa desatualizado ou pouco honesto) quanto "sim, para tudo" (soa como alguém que não revisa). Uma boa resposta:
+
+- **para quê**: boilerplate, esqueleto de testes, entender código legado, SQL e regex;
+- **como valida**: leitura linha a linha, testes que você escreveu a partir da regra, documentação oficial;
+- **um caso concreto** em que a ferramenta errou e você percebeu (um `@MockBean` num projeto Boot 4, um SQL concatenado);
+- **limites**: segue a política da empresa e não coloca segredos nem dados de clientes em prompts.
+
+Muitas entrevistas técnicas (live coding, testes online) **proíbem** IA, e algumas usam ferramentas para detectar. Respeite a regra — usar escondido é desonestidade, e costuma aparecer quando pedem para você explicar ou alterar o código. Treine resolver problemas sem assistente; é o que o módulo 5 e os exercícios da trilha fazem. Se o teste para casa permite IA, diga como a usou.
+</Callout>
+
+<Quiz
+  id="16-assistentes-de-codigo"
+  questoes={[
+    {
+      pergunta: 'O assistente sugeriu `@MockBean` num teste de um projeto Spring Boot 4. O que fazer?',
+      opcoes: ['Aceitar: é a anotação padrão', 'Trocar por `@MockitoBean`, que substitui o `@MockBean` removido no Boot 4.0', 'Adicionar uma dependência do Boot 3 para ela funcionar', 'Remover o teste'],
+      correta: 1,
+      explicacao: 'O @MockBean do Spring Boot foi removido na versão 4.0 em favor do @MockitoBean do Spring Framework. É o exemplo típico de sugestão desatualizada.',
+    },
+    {
+      pergunta: 'O assistente sugeriu uma dependência com nome plausível que você não conhece. Qual o risco específico?',
+      opcoes: ['Nenhum, o Maven Central só tem pacotes seguros', 'Slopsquatting: alguém pode ter registrado o nome que os modelos costumam inventar', 'Deixar o build mais lento', 'Conflito de licença, apenas'],
+      correta: 1,
+      explicacao: 'Confira se a dependência existe, quem publica (groupId oficial), se é mantida e se é necessária. É um risco de supply chain (A03 do OWASP).',
+    },
+    {
+      pergunta: 'No endpoint gerado, o `catch (Exception e)` devolvia 200 dentro de um método `@Transactional`. Qual a consequência?',
+      opcoes: ['Nenhuma, o Spring faz rollback mesmo assim', 'A exceção não sai do método, a transação é confirmada e um débito sem crédito pode ficar gravado', 'O Spring lança outra exceção', 'O log fica mais completo'],
+      correta: 1,
+      explicacao: 'O rollback é disparado pela exceção que atravessa o proxy transacional. Engolida, a transação commita o que já foi feito e o cliente recebe uma resposta falsa.',
+    },
+    {
+      pergunta: 'Qual teste mais protege a transferência?',
+      opcoes: ['Um teste com mock que verifica que o serviço foi chamado', 'Um teste com banco real que dispara duas transferências simultâneas e verifica que o saldo nunca fica negativo', 'Um teste que confere o texto da resposta', 'Um teste gerado a partir da implementação atual'],
+      correta: 1,
+      explicacao: 'Testes que vêm da regra de negócio (concorrência, saldo insuficiente, posse da conta, idempotência) pegam bugs; testes que espelham a implementação confirmam os bugs.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Assistentes de código aceleram boilerplate, esqueletos de teste, explicação de legado, regex e SQL; **a responsabilidade pelo código continua sua**.
+- Erros típicos: APIs **desatualizadas** (`javax.*`, `@MockBean`, `RestTemplate`) ou **inventadas**, dependências inexistentes (**slopsquatting**), falhas de segurança clássicas e testes que só confirmam a implementação.
+- Fluxo: pedir pequeno com contexto, ler tudo, compilar e testar, revisar o diff como PR de colega, commitar só o que revisou.
+- Use o **checklist**: versão, existência da API, dependências, entrada, autorização, dinheiro, erros, concorrência, segredos, testes e escopo.
+- Siga a **política da empresa**: ferramentas aprovadas, nada de segredos ou dados de clientes em prompts.
+- Nos estudos, resolva primeiro sem IA e use o assistente como tutor. Em entrevistas, seja honesto — e respeite quando a IA é proibida.
+
+## Referências
+
+- Spring Boot — *Spring Boot 4.0 Migration Guide* (wiki do projeto no GitHub)
+- Spring Blog — *The state of HTTP clients in Spring* (set/2025)
+- OWASP Top 10:2025 — A03 Software Supply Chain Failures, A05 Injection, A10 Mishandling of Exceptional Conditions
+- OWASP Cheat Sheet Series — *Secure Code Review*
+- Pearce et al. — *Asleep at the Keyboard? Assessing the Security of GitHub Copilot's Code Contributions* (IEEE S&P 2022)
+- Documentação do Spring Framework — *Bean Overriding in Tests* (`@MockitoBean`)

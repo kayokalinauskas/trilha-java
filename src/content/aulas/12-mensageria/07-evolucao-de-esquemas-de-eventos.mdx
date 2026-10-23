@@ -1,0 +1,935 @@
+---
+titulo: "Evolução de esquemas de eventos: mudar o evento sem quebrar quem consome"
+descricao: "O evento é um contrato público entre times: compatibilidade backward, forward e full, o que quebra (renomear, remover, mudar tipo, enum novo), leitor tolerante com Jackson 3, envelope CloudEvents, upcasting de versões antigas, Schema Registry com Avro e Protobuf, portão de compatibilidade no CI, eventos gordos e magros e dados pessoais em eventos."
+modulo: 12-mensageria
+ordem: 7
+duracao: 110
+objetivos:
+  - Classificar uma mudança de esquema como compatível para trás, para frente, completa ou incompatível, e dizer a ordem de deploy que ela exige
+  - Escrever um consumidor tolerante com Jackson 3 que ignora campos novos, aceita um nome antigo com @JsonAlias e trata valores de enum desconhecidos
+  - Montar um envelope CloudEvents com id, source, type e specversion e usar o type para versionar o esquema
+  - Implementar um upcaster que converte eventos v1 em v2 antes de chegarem ao código de negócio
+  - Criar um teste de compatibilidade no CI com exemplos de eventos já publicados e explicar quando um Schema Registry com Avro ou Protobuf compensa
+  - Decidir entre evento magro e evento gordo e tirar dados pessoais do payload sem perder a utilidade do evento
+tags: [esquemas, compatibilidade, CloudEvents, upcasting, Schema Registry, Avro, Protobuf, Jackson 3, LGPD]
+flashcards:
+  - frente: O que significa compatibilidade backward (para trás) num esquema de evento?
+    verso: O consumidor com o esquema NOVO consegue ler eventos escritos com o esquema ANTIGO. Exige atualizar os consumidores primeiro. É o padrão do Confluent Schema Registry, porque permite reler o tópico desde o começo.
+  - frente: E compatibilidade forward (para frente)?
+    verso: O consumidor com o esquema ANTIGO consegue ler eventos escritos com o esquema NOVO. Exige atualizar o produtor primeiro. Full é as duas ao mesmo tempo, e aí a ordem de deploy não importa.
+  - frente: Por que acrescentar um valor novo num enum é perigoso?
+    verso: Para quem lê, é um valor que o código não conhece. Um enum Java estrito lança InvalidFormatException e o evento vai para a DLT. A defesa é um valor padrão (@JsonEnumDefaultValue com EnumFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE) e um tratamento explícito para "desconhecido".
+  - frente: O que mudou no Jackson 3 sobre campos desconhecidos?
+    verso: FAIL_ON_UNKNOWN_PROPERTIES passou a ser false por padrão (no Jackson 2 era true). Campo novo no JSON deixou de quebrar a desserialização sem configuração nenhuma. Já FAIL_ON_NULL_FOR_PRIMITIVES passou a ser true, então um int ausente quebra.
+  - frente: O que é upcasting?
+    verso: Converter um evento de uma versão antiga do esquema para a atual ANTES de ele chegar ao código de negócio (v1 → v2 → v3). O código de negócio só conhece a versão atual; cada upcaster conhece um degrau.
+  - frente: Quais são os atributos obrigatórios de um CloudEvent?
+    verso: id, source, specversion e type. O par source + id identifica o evento de forma única (serve para idempotência); o type diz o que aconteceu e, por convenção, pode carregar a versão do esquema.
+  - frente: Evento magro × evento gordo
+    verso: O magro (notificação) leva só identificadores e o fato; quem precisa de detalhes consulta o produtor. O gordo (event-carried state transfer) leva o estado necessário, desacoplando em tempo de execução, mas aumentando o contrato e espalhando dados.
+  - frente: Como lidar com dado pessoal num tópico Kafka que não permite apagar mensagens?
+    verso: "Não colocar (só identificadores), ou cifrar o campo com uma chave por titular e jogar a chave fora quando for preciso apagar (crypto-shredding). E lembrar das cópias: DLT, logs, réplicas e data lake."
+---
+
+Na segunda-feira, o time de pedidos fez um deploy pequeno: renomeou o campo `cepDestino` para `cepDeEntrega` no evento "pedido confirmado", porque o nome antigo confundia quem lia o código. Os testes do serviço de pedidos passaram, a revisão aprovou, nada de errado apareceu nos painéis. Na terça, o time de frete percebeu que 1.800 coletas tinham sido agendadas sem endereço. O consumidor do frete lia `cepDestino`, recebia `null` e, como o campo não era validado, seguia em frente. Nenhum erro, nenhum alerta: só um prejuízo silencioso que cresceu durante um dia inteiro.
+
+Na quarta, o mesmo time de pedidos lançou o pagamento "PIX parcelado". O evento passou a sair com `"formaDePagamento": "PIX_PARCELADO"`. O consumidor de notificações, escrito com um `enum` Java estrito, começou a lançar exceção em todo evento desse tipo. A DLT, que você conheceu na [aula 12.06](../../12-mensageria/06-retry-e-dlq/), encheu com milhares de mensagens, e os clientes que pagaram com a novidade não receberam a confirmação da compra. Duas mudanças que pareciam inofensivas, dois incidentes em dois dias.
+
+O problema de fundo é que o time de pedidos tratou o evento como um detalhe interno do serviço, quando ele é uma **API pública**. Só que é uma API mais traiçoeira do que uma API HTTP: o produtor não sabe quem consome, as mensagens antigas continuam guardadas no tópico por dias ou semanas, e uma quebra quase nunca dá erro na hora em que acontece. Nesta aula você vai aprender a classificar cada mudança antes de fazê-la, escrever consumidores que aguentam a evolução do produtor, versionar eventos com um envelope padrão (CloudEvents), converter versões antigas (upcasting) e transformar tudo isso num portão automático no CI. No fim, você vai ver quando vale a pena adotar um Schema Registry com Avro ou Protobuf, quanto o evento deve carregar e o que fazer com dados pessoais num log que não se apaga.
+
+## A intuição: o formulário que todo mundo preenche
+
+Pense na nota fiscal em papel de uma loja, preenchida no balcão e depois lida por vários setores: o estoque confere os itens, o financeiro confere o valor, a expedição lê o endereço. Cada setor aprendeu a procurar a informação em um lugar do formulário. Agora imagine que a gráfica imprime um modelo novo.
+
+- Se o modelo novo **acrescenta** um campo no rodapé ("cupom de desconto"), ninguém se incomoda: quem não usa o cupom simplesmente não olha para ele. Mudança compatível.
+- Se o modelo novo **troca o nome** de "Endereço de destino" para "Local de entrega" e muda o campo de lugar, a expedição, que procura onde sempre procurou, encontra o espaço vazio. E não reclama: acha que o pedido não tem endereço. Mudança incompatível e silenciosa.
+- Se o campo "Forma de pagamento" ganha uma opção nova, "PIX parcelado", o financeiro, que só conhecia quatro opções, não sabe o que fazer com a nota e a devolve. Mudança que parece aditiva, mas quebra quem tem uma lista fechada de valores.
+
+E **as notas antigas continuam no arquivo**: ao rever o mês passado, o financeiro lê o modelo antigo com as regras do novo. No Kafka, isso é a retenção e o reprocessamento (*replay*): um consumidor lê eventos escritos por versões do produtor que nem existem mais.
+
+A gráfica responsável faz três coisas: muda o formulário só acrescentando, imprime no canto o número do modelo ("Modelo 2"), e entrega aos setores um guia para ler os modelos antigos. Nesta aula, essas três coisas se chamam **evolução compatível**, **versionamento no envelope** e **upcasting**.
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Esquema** (*schema*) | A descrição da forma do evento: quais campos, de que tipo, quais obrigatórios. Pode estar escrita (JSON Schema, Avro, Protobuf) ou só implícita no código |
+| **Produtor** e **consumidor** | Quem escreve o evento no tópico e quem lê. Um produtor costuma ter vários consumidores, de vários times |
+| **Compatibilidade para trás** (*backward*) | O código **novo** lê dados **antigos**. Atualize os consumidores primeiro |
+| **Compatibilidade para frente** (*forward*) | O código **antigo** lê dados **novos**. Atualize o produtor primeiro |
+| **Compatibilidade completa** (*full*) | As duas ao mesmo tempo. A ordem de deploy deixa de importar |
+| **Transitiva** | A regra vale contra **todas** as versões anteriores, não só contra a última |
+| **Leitor tolerante** | Consumidor que lê só o que usa, ignora o que não conhece e tem padrões para o que falta |
+| **Envelope** | Os metadados em volta do dado: identificador, origem, tipo, versão, horário. O dado de negócio vai dentro |
+| **CloudEvents** | Especificação da CNCF que padroniza esse envelope (`id`, `source`, `type`, `specversion`...) |
+| **Upcasting** | Converter um evento de uma versão antiga para a atual antes de ele chegar ao código de negócio |
+| **Schema Registry** | Serviço que guarda as versões de cada esquema e recusa uma versão nova que viole a regra de compatibilidade configurada |
+| **Evento magro** e **evento gordo** | O magro leva só o fato e os identificadores (notificação); o gordo leva o estado de que os consumidores precisam (*event-carried state transfer*) |
+
+Guarde especialmente as definições de *backward* e *forward*: elas aparecem invertidas em muito texto na internet. O ponto de vista é sempre o do **leitor**. *Backward*: o leitor novo aguenta dados de trás (antigos). *Forward*: o leitor antigo aguenta dados da frente (novos).
+
+## Evento é contrato público
+
+Na [aula 10.07](../../10-testes/07-testes-de-contrato/#contratos-de-eventos) você viu que quebra em evento é mais silenciosa do que quebra em API HTTP. Vale detalhar os motivos, porque são eles que justificam todo o resto desta aula.
+
+- **O produtor não conhece os consumidores.** Qualquer serviço com permissão de leitura cria um *consumer group* novo sem avisar. O tópico que começou com frete e notificações, um ano depois, alimenta antifraude, fidelidade e o data lake.
+- **Os dados vivem mais do que o código.** Um tópico com retenção de sete dias guarda eventos de vários deploys; um compactado, de anos. No reprocessamento, o código de hoje lê dados de ontem: compatibilidade para trás é inegociável.
+- **Não há negociação.** Uma API HTTP serve `/v1` e `/v2` e o cliente escolhe. No tópico, todos recebem o que o produtor escreveu; duas versões em paralelo exigem publicar duas vezes.
+- **A falha aparece longe e tarde.** O broker não valida o conteúdo. O erro surge no consumidor de outro time, horas depois, como `null` no banco ou mensagem na DLT. Quem quebrou não vê; quem vê não sabe o que mudou.
+- **A ordem de deploy não é garantida.** Durante semanas convivem eventos e consumidores das duas versões, e toda combinação precisa funcionar.
+
+A consequência: **o formato do evento é tão público quanto uma API REST** e precisa de dono, documentação e política de mudança. Times maduros mantêm um catálogo de eventos (muitas vezes em AsyncAPI, a especificação irmã do OpenAPI para mensageria).
+
+## Compatibilidade: backward, forward e full
+
+A figura abaixo mostra as quatro combinações possíveis durante uma migração. O produtor pode estar na versão antiga (v1) ou na nova (v2); o consumidor também. A pergunta é: em cada quadrante, a leitura funciona?
+
+<Figura legenda="Durante uma migração convivem as quatro combinações. Backward garante a diagonal do consumidor novo lendo dado antigo; forward garante o consumidor antigo lendo dado novo; full garante as duas">
+<svg viewBox="0 0 720 430" width="720" role="img" aria-labelledby="compat-titulo compat-desc">
+  <title id="compat-titulo">Matriz de compatibilidade entre versões de produtor e consumidor</title>
+  <desc id="compat-desc">Uma grade de dois por dois. As colunas são o esquema usado por quem escreveu o evento: v1 antigo e v2 novo. As linhas são o esquema de quem lê: consumidor v1 e consumidor v2. A combinação v1 com v1 e a v2 com v2 sempre funcionam. Consumidor v2 lendo evento v1 é a compatibilidade backward, para trás. Consumidor v1 lendo evento v2 é a compatibilidade forward, para frente. Full exige as duas.</desc>
+  <text x="440" y="26" text-anchor="middle" class="d-title">Evento escrito com o esquema</text>
+  <rect x="200" y="40" width="230" height="44" rx="8" class="d-box"/>
+  <text x="315" y="68" text-anchor="middle" class="d-mono">v1 (antigo)</text>
+  <rect x="450" y="40" width="230" height="44" rx="8" class="d-box"/>
+  <text x="565" y="68" text-anchor="middle" class="d-mono">v2 (novo)</text>
+  <rect x="20" y="100" width="164" height="130" rx="8" class="d-box"/>
+  <text x="102" y="160" text-anchor="middle" class="d-title">Consumidor</text>
+  <text x="102" y="184" text-anchor="middle" class="d-mono">v1 (antigo)</text>
+  <rect x="20" y="246" width="164" height="130" rx="8" class="d-box"/>
+  <text x="102" y="306" text-anchor="middle" class="d-title">Consumidor</text>
+  <text x="102" y="330" text-anchor="middle" class="d-mono">v2 (novo)</text>
+  <rect x="200" y="100" width="230" height="130" rx="10" class="d-ok"/>
+  <text x="315" y="158" text-anchor="middle" class="d-title">sempre funciona</text>
+  <text x="315" y="182" text-anchor="middle" class="d-label">mesma versão dos dois lados</text>
+  <rect x="450" y="100" width="230" height="130" rx="10" class="d-violet"/>
+  <text x="565" y="148" text-anchor="middle" class="d-title">FORWARD</text>
+  <text x="565" y="172" text-anchor="middle" class="d-label">leitor antigo, dado novo</text>
+  <text x="565" y="194" text-anchor="middle" class="d-label">atualize o produtor antes</text>
+  <rect x="200" y="246" width="230" height="130" rx="10" class="d-info"/>
+  <text x="315" y="294" text-anchor="middle" class="d-title">BACKWARD</text>
+  <text x="315" y="318" text-anchor="middle" class="d-label">leitor novo, dado antigo</text>
+  <text x="315" y="340" text-anchor="middle" class="d-label">atualize os consumidores antes</text>
+  <rect x="450" y="246" width="230" height="130" rx="10" class="d-ok"/>
+  <text x="565" y="304" text-anchor="middle" class="d-title">sempre funciona</text>
+  <text x="565" y="328" text-anchor="middle" class="d-label">mesma versão dos dois lados</text>
+  <text x="360" y="414" text-anchor="middle" class="d-text">FULL = os dois quadrantes coloridos funcionam: deploy em qualquer ordem</text>
+</svg>
+</Figura>
+
+Em palavras:
+
+- **Backward** (para trás): o consumidor com o esquema novo lê eventos escritos com o esquema antigo. É a garantia de que você pode reprocessar o tópico desde o começo com o código de hoje. Como o consumidor novo é o que aguenta os dois formatos, **os consumidores são atualizados primeiro**; depois o produtor passa a publicar a versão nova. O Confluent Schema Registry usa *backward* como padrão justamente porque ela permite voltar os consumidores ao início do tópico.
+- **Forward** (para frente): o consumidor com o esquema antigo lê eventos escritos com o esquema novo. É a garantia de que o produtor pode evoluir sem esperar ninguém. **O produtor é atualizado primeiro**, e os consumidores migram no ritmo deles.
+- **Full** (completa): as duas. Os times implantam em qualquer ordem. É a mais restritiva: na prática, só permite acrescentar ou remover campos **opcionais**, com valor padrão.
+- **Transitiva**: cada uma das três acima pode ser verificada só contra a versão anterior ou contra **todas** as anteriores (`BACKWARD_TRANSITIVE`, `FORWARD_TRANSITIVE`, `FULL_TRANSITIVE`, nos nomes do Schema Registry). A diferença importa: v3 pode ser compatível com v2, que era compatível com v1, sem que v3 seja compatível com v1. Se o tópico ainda guarda eventos v1, só a versão transitiva protege você.
+- **None**: nenhuma verificação. Toda mudança é permitida, e toda coordenação fica por sua conta.
+
+<Callout tipo="atencao" titulo="A definição depende de quem fala">
+Em JSON sem registro de esquemas, "compatível" costuma ser uma conversa informal ("não quebra ninguém"). Com Avro ou Protobuf e um registro, os termos têm definição precisa, verificada por máquina. Em revisão de código e em entrevista, diga sempre **quem lê o quê**: "essa mudança é backward: o consumidor novo lê os eventos antigos que ainda estão no tópico". Evita a confusão entre as duas direções.
+</Callout>
+
+### O que quebra e o que não quebra
+
+A tabela abaixo vale para JSON lido por um consumidor que segue as regras desta aula (leitor tolerante). Com Avro e Protobuf as regras são parecidas, com nuances que aparecem mais adiante.
+
+| Mudança no produtor | Consumidor antigo lê o novo? (forward) | Consumidor novo lê o antigo? (backward) | Comentário |
+|---|---|---|---|
+| Acrescentar campo opcional | Sim, se ignora desconhecidos | Sim, se tem padrão para o ausente | A mudança mais segura que existe |
+| Acrescentar campo obrigatório | Sim | **Não**: eventos antigos não têm o campo | Precisa de padrão ou de upcaster |
+| Remover campo opcional | Sim, se o consumidor tem padrão | Sim | Confirme antes que ninguém usa |
+| Remover campo obrigatório | **Não**: quem lia recebe ausente | Sim | Expandir e contrair, nunca de uma vez |
+| Renomear campo | **Não** | **Não** | É remover um e acrescentar outro ao mesmo tempo |
+| Mudar o tipo (`11230` → `"112.30"`) | **Não** | **Não** | Nova versão do evento, com upcaster |
+| Acrescentar valor num enum | **Depende**: quebra quem tem lista fechada | Sim | O incidente da quarta-feira |
+| Remover valor de um enum | Sim | **Depende**: eventos antigos ainda têm o valor | Raro; prefira deixar de produzir |
+| Mudar a semântica (centavos → reais, dias corridos → úteis) | Passa em qualquer verificação | Passa em qualquer verificação | A pior de todas: nenhuma ferramenta pega |
+| Mudar a chave de partição | Formato igual | Formato igual | Quebra a **ordem** por entidade (aula 12.03) |
+| Trocar o tópico de destino | Consumidor fica sem eventos | Consumidor fica sem eventos | É outro contrato, não uma evolução |
+
+Três linhas merecem atenção especial.
+
+**Renomear** é a mudança que parece cosmética e não é. Para o leitor, um campo renomeado é um campo que sumiu e um campo novo que apareceu. O roteiro seguro é o *expand and contract* que você viu na [aula 10.07](../../10-testes/07-testes-de-contrato/#o-roteiro-de-uma-mudança-incompatível): publicar os dois nomes, migrar os consumidores, e só então parar de publicar o antigo. Do lado do consumidor, o `@JsonAlias` do Jackson ajuda a aceitar os dois nomes durante a transição.
+
+**Enum novo** quebra em uma direção só, e por isso engana. Do ponto de vista do esquema, acrescentar um valor parece aditivo. Do ponto de vista do código que faz `switch` sobre o enum, é um caso que não existia. Todo consumidor de um enum que pertence a outro time precisa ter um caminho para "valor que eu não conheço".
+
+**Mudança de semântica** não muda nenhum byte do esquema. Se `valorEmCentavos` passa a carregar reais, todos os testes de formato passam e todo cálculo fica cem vezes errado. A defesa é de projeto: nomes que carregam a unidade (`valorEmCentavos`, `prazoEmDiasUteis`, `pesoEmGramas`) e **campo novo** (ou versão nova) quando o significado muda.
+
+## O código que vamos construir
+
+O exemplo desta aula é o evento "pedido confirmado", publicado pelo serviço de pedidos e lido pelo serviço de frete. Ele tem duas versões:
+
+- **v1**, que ainda está no tópico porque a retenção é longa: o valor ia como inteiro em centavos (`valorEmCentavos`) e o CEP se chamava `cepDestino`.
+- **v2**, a atual: o valor virou um objeto com quantia decimal e moeda (`valorTotal`), o CEP virou `cepDeEntrega`, e apareceu a `formaDePagamento`.
+
+Todo o código está em `java/m12-mensageria/aulas`, no pacote `dev.trilhajava.m12.aulas.esquemas`, e roda sem Docker, sem Kafka e sem Spring: o assunto é o formato do evento, e o broker não muda nada nele. As peças:
+
+| Classe | Papel |
+|---|---|
+| `EnvelopeDeEvento` | O envelope CloudEvents; o `data` fica como árvore JSON |
+| `PedidoConfirmado`, `ValorTotal`, `FormaDePagamento` | O evento v2 como o frete enxerga: o leitor tolerante |
+| `MapeadoresJson` | O mapper tolerante (para consumir) e o estrito (para comparar) |
+| `Upcaster`, `PedidoConfirmadoV1ParaV2` | A conversão de versões antigas |
+| `LeitorDePedidoConfirmado` | Junta tudo: lê o envelope, sobe a versão e devolve o record |
+| `TipoDeEventoDesconhecidoException` | A falha permanente para versões que ninguém sabe ler |
+
+Os exemplos de eventos ficam em `src/test/resources/esquemas/pedido-confirmado/`, um arquivo por versão e por variação relevante. Eles são a peça central do teste de compatibilidade do passo 5.
+
+## Mão na massa
+
+Para rodar os testes desta aula, a partir da pasta `java/`:
+
+```bash
+cd java
+mvn -pl m12-mensageria/aulas test "-Dtest=dev.trilhajava.m12.aulas.esquemas.*Test"
+```
+
+Para rodar uma classe só, troque o filtro pelo nome dela, como `-Dtest=LeitorToleranteTest`.
+
+### Passo 1: o evento como o consumidor o enxerga
+
+**O que vamos fazer e por quê.** O primeiro reflexo de muita gente é copiar a classe do evento do produtor para o consumidor, ou pior, compartilhar um jar com as classes de eventos entre todos os serviços. As duas coisas acoplam o consumidor a **todo** o evento, inclusive aos campos que ele não usa. Aqui o frete declara a **sua** visão do evento: só os campos de que precisa, com as regras de tolerância explícitas.
+
+Primeiro, a forma de pagamento, com um valor reservado para "não conheço":
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/FormaDePagamento.java" />
+
+O valor monetário, que nunca trafega como número de ponto flutuante:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/ValorTotal.java" />
+
+E o evento:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/PedidoConfirmado.java" />
+
+**O que acabou de acontecer.**
+
+- `@JsonIgnoreProperties(ignoreUnknown = true)` ignora campos que o record não declara. A anotação fica no tipo, e não só no mapper, porque em produção o mapper pode não ser o seu (o do Spring Kafka, o de um teste): a tolerância viaja com o tipo.
+- `@JsonAlias("cepDestino")` aceita **também** o nome antigo na leitura; o nome principal continua `cepDeEntrega`. É a metade do consumidor no *expand and contract*.
+- O construtor compacto **falha** sem `pedidoId`, `valorTotal` ou `cepDeEntrega`: melhor recusar o evento do que agendar coleta para lugar nenhum. Para `formaDePagamento`, usada numa regra secundária, **assume um padrão**.
+- Em `ValorTotal`, a moeda ausente vira `"BRL"`: padrão de negócio (antes da v2 a loja só vendia em reais). Um padrão errado é pior do que uma falha.
+- `@JsonEnumDefaultValue` marca o valor usado para textos desconhecidos, desde que o mapper ligue `READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE`.
+
+Agora os mappers:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/MapeadoresJson.java" />
+
+<Callout tipo="novidade" titulo="Jackson 3 mudou o padrão para campos desconhecidos">
+No Jackson 2, `DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES` vinha ligada: um campo a mais no JSON derrubava a desserialização. No Jackson 3 (pacote `tools.jackson`, o que acompanha o Spring Boot 4), o padrão passou a ser **desligado**: campos desconhecidos são ignorados sem configuração nenhuma. Outros padrões também mudaram, entre eles `FAIL_ON_NULL_FOR_PRIMITIVES`, que agora vem **ligada** (você vai ver a mensagem dela em "Quando dá errado"). E as opções de enum saíram de `DeserializationFeature` e foram para `tools.jackson.databind.cfg.EnumFeature`. As anotações continuam no pacote antigo, `com.fasterxml.jackson.annotation`.
+
+O Spring Boot 4 tem a propriedade `spring.jackson.use-jackson2-defaults`, que volta os padrões do Jackson 2 para facilitar a migração. Se o seu projeto a usa, os consumidores voltam a quebrar com campos novos. Mais um motivo para deixar a tolerância explícita no tipo.
+</Callout>
+
+### Passo 2: provando a tolerância
+
+**O que vamos fazer e por quê.** O teste a seguir lê dois eventos v2 que o consumidor "não esperava": um com campos e valores novos (`cupom`, `traceparent` no envelope e `PIX_PARCELADO`) e outro com o nome antigo do CEP. E compara com o mapper estrito, para você ver a diferença.
+
+O exemplo com novidades, `v2-com-campos-novos.json`:
+
+```json
+{
+  "specversion": "1.0",
+  "id": "a9b8c7d6-e5f4-4a3b-9c2d-1e0f9a8b7c03",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-10-01T09:30:00Z",
+  "subject": "PED-300",
+  "datacontenttype": "application/json",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "pedidoId": "PED-300",
+    "clienteId": "CLI-77",
+    "valorTotal": { "quantia": "89.90", "moeda": "BRL" },
+    "cepDeEntrega": "40010-000",
+    "formaDePagamento": "PIX_PARCELADO",
+    "cupom": "PRIMAVERA10"
+  }
+}
+```
+
+E o com o nome antigo, `v2-cep-com-nome-antigo.json`, produzido durante a fase de expansão (repare: sem `formaDePagamento` e com `cepDestino`):
+
+```json
+{
+  "specversion": "1.0",
+  "id": "0d1e2f3a-4b5c-4d6e-8f70-819203a4b504",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-09-01T10:00:00Z",
+  "subject": "PED-150",
+  "datacontenttype": "application/json",
+  "data": {
+    "pedidoId": "PED-150",
+    "clienteId": "CLI-12",
+    "valorTotal": { "quantia": "35.00", "moeda": "BRL" },
+    "cepDestino": "80010-000"
+  }
+}
+```
+
+O teste e um apoio que carrega os arquivos:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/esquemas/LeitorToleranteTest.java" semImports />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/esquemas/Exemplos.java" semImports />
+
+```bash
+mvn -pl m12-mensageria/aulas test -Dtest=LeitorToleranteTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.LeitorToleranteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.050 s -- in dev.trilhajava.m12.aulas.esquemas.LeitorToleranteTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- No primeiro teste, `cupom` foi ignorado pelo record e `traceparent` pelo envelope (que também é tolerante: a especificação do CloudEvents permite **extensões**, atributos extras no envelope, e um leitor precisa aceitá-las). `PIX_PARCELADO` virou `DESCONHECIDA`.
+- No segundo, `cepDestino` preencheu `cepDeEntrega` graças ao alias, e a forma de pagamento ausente virou `DESCONHECIDA` pelo construtor do record.
+- No terceiro, o mesmo evento do primeiro teste, lido com o mapper estrito, quebra. E repare **onde** quebra: não no `cupom` (a anotação do record o protege), mas no enum. É a demonstração de que a anotação no tipo resolve os campos, e a opção do mapper resolve os enums. Você precisa das duas.
+
+E **o que o consumidor faz com `DESCONHECIDA`?** No frete, pode seguir o fluxo do cartão, com uma métrica para alguém perceber; numa conciliação financeira, deve parar e alertar. É uma decisão de negócio, e precisa estar escrita.
+
+### Passo 3: o envelope CloudEvents
+
+**O que vamos fazer e por quê.** Até aqui, o consumidor sabia de antemão que o JSON era um "pedido confirmado v2". Num tópico real, isso não é garantido: o mesmo tópico pode carregar mais de um tipo de evento (pedido confirmado, pedido cancelado), em mais de uma versão. O consumidor precisa de metadados **fora** do dado de negócio para saber o que está lendo antes de tentar ler. É o papel do envelope.
+
+Você pode inventar o seu envelope, e muitas empresas fizeram isso. A alternativa é usar o **CloudEvents**, uma especificação da CNCF (a fundação do Kubernetes) que padroniza esses metadados e define como transportá-los em HTTP, Kafka, AMQP e outros protocolos. A versão atual da especificação é a 1.0. Os atributos:
+
+| Atributo | Obrigatório | No exemplo | Para que serve |
+|---|---|---|---|
+| `specversion` | Sim | `"1.0"` | A versão da especificação CloudEvents (não do seu esquema!) |
+| `id` | Sim | um UUID | Identifica o evento. O par `source` + `id` é único: é a chave natural para a idempotência da [aula 12.05](../../12-mensageria/05-consumidores-idempotentes/) |
+| `source` | Sim | `"/servicos/pedidos"` | Quem produziu, como uma referência de URI |
+| `type` | Sim | `"br.com.loja.pedidos.pedido-confirmado.v2"` | O que aconteceu. Por convenção, nome reverso de domínio |
+| `time` | Não | `"2026-09-10T15:00:00Z"` | Quando o fato aconteceu (não quando foi publicado) |
+| `subject` | Não | `"PED-200"` | A entidade de que o evento trata, útil para filtrar sem abrir o `data` |
+| `datacontenttype` | Não | `"application/json"` | O formato do `data` |
+| `dataschema` | Não | URI do JSON Schema | Onde está o esquema do `data` |
+| `data` | Não | o pedido | O dado de negócio |
+
+O exemplo v2 completo, `v2.json`:
+
+```json
+{
+  "specversion": "1.0",
+  "id": "c4e8f0d2-1a3b-4f5c-8d9e-0b1a2c3d4e02",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-09-10T15:00:00Z",
+  "subject": "PED-200",
+  "datacontenttype": "application/json",
+  "dataschema": "https://esquemas.loja.com.br/pedidos/pedido-confirmado/v2.json",
+  "data": {
+    "pedidoId": "PED-200",
+    "clienteId": "CLI-42",
+    "valorTotal": { "quantia": "249.90", "moeda": "BRL" },
+    "cepDeEntrega": "30130-010",
+    "formaDePagamento": "PIX"
+  }
+}
+```
+
+E o envelope em Java:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/EnvelopeDeEvento.java" />
+
+**O que acabou de acontecer.**
+
+- Os nomes dos componentes do record são exatamente os da especificação, em minúsculas e sem separador (`specversion`, `datacontenttype`). A especificação define esses nomes; não os "corrija" para `specVersion`.
+- O `data` fica como `JsonNode`, uma árvore JSON genérica, e não como `PedidoConfirmado`. O motivo aparece no próximo passo: antes de virar objeto, o dado de uma versão antiga precisa ser reescrito.
+- `time` vira `Instant` sem módulo extra: no Jackson 3, o suporte a `java.time` faz parte do próprio `jackson-databind`.
+- A versão do **seu esquema** está no final do `type` (`.v2`). Há outras escolhas, todas válidas: um atributo de extensão (`"esquemaversao": 2`), o `dataschema` com a versão na URI, ou o identificador do esquema no registro, quando há um. O importante é que a versão esteja no envelope, visível antes de abrir o `data`. Colocar a versão **no tipo** tem uma vantagem: v1 e v2 são tipos diferentes, e um consumidor que não sabe ler v3 recusa o evento de forma explícita, em vez de tentar e falhar no meio.
+
+<Callout tipo="info" titulo="Modo estruturado e modo binário no Kafka">
+Acima está o **modo estruturado**: o envelope inteiro vai no valor da mensagem, com `content-type` `application/cloudevents+json; charset=UTF-8`. No **modo binário**, o valor é só o `data` e os atributos viram cabeçalhos com o prefixo `ce_` (`ce_id`, `ce_type`...): mais eficiente e filtrável sem desserializar; o estruturado é mais fácil de depurar. Existe um SDK Java oficial (`io.cloudevents`); esta aula usa um record próprio para mostrar cada campo.
+</Callout>
+
+### Passo 4: upcasting, lendo a v1 como se fosse v2
+
+**O que vamos fazer e por quê.** O tópico ainda tem eventos v1, e eles são incompatíveis com a v2 nas duas direções: o valor mudou de tipo (inteiro em centavos para objeto com decimal) e o CEP mudou de nome. Uma saída seria o consumidor ter dois records (`PedidoConfirmadoV1` e `PedidoConfirmadoV2`) e dois caminhos no código de negócio. Funciona para duas versões; com cinco, o código de negócio vira um emaranhado de `if (versao == ...)`. A saída mais limpa é o **upcasting**: um tradutor converte a v1 em v2 antes do código de negócio, que só conhece a versão atual.
+
+<Figura legenda="O código de negócio só conhece a versão atual. Eventos antigos sobem degrau por degrau na cadeia de upcasters; tipos fora da cadeia são falha permanente e vão para a DLT">
+<svg viewBox="0 0 760 360" width="760" role="img" aria-labelledby="upcast-titulo upcast-desc">
+  <title id="upcast-titulo">Cadeia de upcasting no consumidor</title>
+  <desc id="upcast-desc">À esquerda, três eventos chegam do tópico: um v1, um v2 e um v9. Todos passam pela leitura do envelope, que olha o type. O v1 passa pelo upcaster v1 para v2 e segue. O v2 segue direto. Os dois chegam ao mapeamento para o record PedidoConfirmado e ao código de negócio. O v9 não tem upcaster e vira TipoDeEventoDesconhecidoException, que leva o evento para a DLT.</desc>
+  <defs><marker id="mk-upcast" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="16" y="40" width="110" height="44" rx="8" class="d-box"/>
+  <text x="71" y="68" text-anchor="middle" class="d-mono">evento v1</text>
+  <rect x="16" y="150" width="110" height="44" rx="8" class="d-box"/>
+  <text x="71" y="178" text-anchor="middle" class="d-mono">evento v2</text>
+  <rect x="16" y="260" width="110" height="44" rx="8" class="d-box"/>
+  <text x="71" y="288" text-anchor="middle" class="d-mono">evento v9</text>
+  <rect x="170" y="130" width="150" height="84" rx="10" class="d-info"/>
+  <text x="245" y="164" text-anchor="middle" class="d-title">Envelope</text>
+  <text x="245" y="188" text-anchor="middle" class="d-label">lê o type</text>
+  <path d="M126 62 L168 150" class="d-line" marker-end="url(#mk-upcast)"/>
+  <path d="M126 172 L168 172" class="d-line" marker-end="url(#mk-upcast)"/>
+  <path d="M126 282 L168 196" class="d-line" marker-end="url(#mk-upcast)"/>
+  <rect x="370" y="30" width="170" height="64" rx="10" class="d-violet"/>
+  <text x="455" y="58" text-anchor="middle" class="d-title">Upcaster</text>
+  <text x="455" y="80" text-anchor="middle" class="d-mono">v1 → v2</text>
+  <path d="M300 130 L370 80" class="d-line" marker-end="url(#mk-upcast)"/>
+  <path d="M540 62 L590 140" class="d-line" marker-end="url(#mk-upcast)"/>
+  <path d="M320 172 L588 172" class="d-line" marker-end="url(#mk-upcast)"/>
+  <text x="455" y="164" text-anchor="middle" class="d-label">já é v2</text>
+  <rect x="590" y="130" width="156" height="84" rx="10" class="d-ok"/>
+  <text x="668" y="162" text-anchor="middle" class="d-title">Record v2</text>
+  <text x="668" y="188" text-anchor="middle" class="d-label">código de negócio</text>
+  <path d="M300 214 L370 270" class="d-line" marker-end="url(#mk-upcast)"/>
+  <rect x="370" y="250" width="270" height="64" rx="10" class="d-accent"/>
+  <text x="505" y="276" text-anchor="middle" class="d-mono" textLength="250" lengthAdjust="spacingAndGlyphs">TipoDeEventoDesconhecido</text>
+  <text x="505" y="300" text-anchor="middle" class="d-label">falha permanente → DLT</text>
+  <text x="380" y="350" text-anchor="middle" class="d-text">Cada upcaster conhece um degrau; a cadeia aplica quantos forem precisos</text>
+</svg>
+</Figura>
+
+O exemplo v1, `v1.json`:
+
+```json
+{
+  "specversion": "1.0",
+  "id": "7f1c2a9e-5b1d-4c37-9a0e-2f6d8b3c1a01",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v1",
+  "time": "2026-03-02T14:05:00Z",
+  "subject": "PED-100",
+  "datacontenttype": "application/json",
+  "data": {
+    "pedidoId": "PED-100",
+    "clienteId": "CLI-42",
+    "valorEmCentavos": 11230,
+    "cepDestino": "01310-100"
+  }
+}
+```
+
+A interface de um degrau e o upcaster v1 → v2:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/Upcaster.java" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/PedidoConfirmadoV1ParaV2.java" />
+
+E o leitor, que junta envelope, cadeia e record:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/esquemas/LeitorDePedidoConfirmado.java" />
+
+O teste:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/esquemas/UpcasterTest.java" semImports />
+
+```bash
+mvn -pl m12-mensageria/aulas test -Dtest=UpcasterTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.UpcasterTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in dev.trilhajava.m12.aulas.esquemas.UpcasterTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O upcaster trabalha na **árvore JSON** (`ObjectNode`), não em classes Java da v1. Isso é deliberado: se ele dependesse de um `PedidoConfirmadoV1`, o projeto precisaria manter vivas as classes de todas as versões antigas. Na árvore, o upcaster é uma transformação pequena e isolada, e o único lugar do código que sabe que a v1 existiu.
+- `v1.deepCopy()` evita alterar o nó original. Se o processamento falhar e o evento for para a DLT, você quer o evento **como chegou**, não meio convertido.
+- `BigDecimal.valueOf(centavos, 2)` dá 112.30 sem passar por `double`. A moeda vira `"BRL"` porque a v1 só existia em reais: o upcaster codifica **conhecimento histórico** do produtor e deve ser revisado por esse time.
+- `formaDePagamento` **não é inventada**: o record assume `DESCONHECIDA`. "Na v1 era tudo cartão" seria um dado falso.
+- No leitor, o `while` aplica degraus até chegar ao `TIPO_ATUAL`. Com um upcaster v2 → v3 registrado na lista, um evento v1 passaria pelos dois sem nenhuma mudança no leitor. Um tipo sem degrau (v9, ou um evento de outro domínio no mesmo tópico) vira `TipoDeEventoDesconhecidoException`, uma falha permanente: na configuração da [aula 12.06](../../12-mensageria/06-retry-e-dlq/), ela vai direto para a DLT sem *retry*, porque tentar de novo nunca vai ensinar ao consumidor uma versão que ele não conhece.
+- O `specversion` é conferido antes de tudo. Uma especificação CloudEvents futura (2.0) pode mudar o próprio envelope; recusar explicitamente é melhor do que interpretar errado.
+
+<Callout tipo="dica" titulo="Onde o upcaster mora">
+Com muitos consumidores, o time do produtor pode publicar os upcasters numa biblioteca pequena (só transformações de árvore, sem classes de domínio), para que ninguém reescreva a mesma conversão.
+</Callout>
+
+### Passo 5: o portão de compatibilidade no CI
+
+**O que vamos fazer e por quê.** Os passos anteriores dependem de disciplina: alguém precisa lembrar do alias, do padrão, do upcaster. Disciplina falha. O que segura uma base de código ao longo de anos é um **teste que quebra o build** quando alguém faz uma mudança incompatível. A técnica mais simples, que funciona com JSON e sem infraestrutura nenhuma, é a dos **exemplos guardados** (*golden files*): cada formato de evento que já foi publicado em produção vira um arquivo no repositório, e um teste garante que o consumidor atual lê todos eles.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/esquemas/CompatibilidadeDeEsquemasTest.java" semImports />
+
+```bash
+mvn -pl m12-mensageria/aulas test -Dtest=CompatibilidadeDeEsquemasTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.472 s -- in dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@TestFactory` (JUnit) gera um teste dinâmico por arquivo `.json` da pasta: quatro arquivos, quatro testes. Ninguém precisa lembrar de registrar um exemplo novo; basta colocar o arquivo na pasta.
+- As asserções são poucas e de propósito: o objetivo aqui não é testar a regra de negócio, é provar que **a leitura não quebra** e que os campos essenciais chegam preenchidos. As regras de negócio têm os próprios testes.
+- A regra de ouro dos exemplos: **nunca se apaga um arquivo** enquanto eventos daquele formato puderem existir no tópico (retenção, compactação, backups que alguém pode querer reprocessar). Um exemplo removido é uma garantia removida.
+
+Para ver o portão funcionando, foi feito um experimento: remover o `@JsonAlias("cepDestino")` do record, como faria alguém "limpando" o código. O resultado:
+
+```text
+[ERROR] Tests run: 4, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 0.344 s <<< FAILURE! -- in dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest
+[ERROR] dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest.todoEventoJaPublicadoContinuaLegivel()[2] -- Time elapsed: 0.008 s <<< ERROR!
+tools.jackson.databind.exc.ValueInstantiationException:
+Cannot construct instance of `dev.trilhajava.m12.aulas.esquemas.PedidoConfirmado`, problem: cepDeEntrega
+Caused by: java.lang.NullPointerException: cepDeEntrega
+```
+
+O teste dinâmico `[2]` é o segundo arquivo em ordem alfabética, `v2-cep-com-nome-antigo.json` (na IDE, o nome do arquivo aparece como nome do teste). O PR que removeu o alias não passa, e a conversa acontece na revisão, não num incidente. O alias só pode sair quando os eventos com o nome antigo tiverem saído do tópico, e aí o exemplo correspondente sai junto, numa decisão consciente.
+
+<Callout tipo="info" titulo="De onde vêm os exemplos">
+O ideal é que os exemplos sejam **cópias de eventos reais**, anonimizados (nada de CPF ou e-mail real num repositório). Um jeito prático: o produtor tem um teste que serializa o evento atual e compara com o arquivo mais recente da pasta; quando o formato muda, o teste do produtor falha e obriga a criar um arquivo novo (o antigo fica). O mesmo conjunto de arquivos pode ser publicado como artefato pelo produtor e usado pelos consumidores, o que se aproxima dos contratos de mensagens da [aula 10.07](../../10-testes/07-testes-de-contrato/#contratos-de-eventos).
+</Callout>
+
+### Passo 6: a suíte inteira
+
+```bash
+mvn -pl m12-mensageria/aulas test "-Dtest=dev.trilhajava.m12.aulas.esquemas.*Test"
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.472 s -- in dev.trilhajava.m12.aulas.esquemas.CompatibilidadeDeEsquemasTest
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.LeitorToleranteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.050 s -- in dev.trilhajava.m12.aulas.esquemas.LeitorToleranteTest
+[INFO] Running dev.trilhajava.m12.aulas.esquemas.UpcasterTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in dev.trilhajava.m12.aulas.esquemas.UpcasterTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Oito testes, menos de um segundo, nenhum broker. Repare que nada disso precisou de Kafka: compatibilidade de esquema é uma propriedade do **formato** e do **código que lê**, e pode (deve) ser verificada no teste de unidade. O teste de integração com o broker (aulas 12.03 e 12.06) verifica outra coisa: configuração, serialização no fio, comportamento de erro.
+
+## Quando dá errado
+
+As mensagens abaixo são reais, do Jackson 3, geradas com o código desta aula e com uma classe de teste temporária (`TemporarioErrosTest`, já removida do projeto) que provocou cada erro de propósito. Para cada uma: o que significa e o que fazer.
+
+### Enum com valor desconhecido
+
+O evento com `PIX_PARCELADO`, lido com um mapper sem `READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE`:
+
+```text
+tools.jackson.databind.exc.InvalidFormatException: Cannot deserialize value of type
+`dev.trilhajava.m12.aulas.esquemas.FormaDePagamento` from String "PIX_PARCELADO": not one of the values accepted for
+Enum class: [DESCONHECIDA, CARTAO_DE_CREDITO, PIX, BOLETO]
+```
+
+**Como ler:** o texto `"PIX_PARCELADO"` não corresponde a nenhuma constante; a mensagem lista as que existem. É o incidente da quarta-feira. **Como corrigir:** no curto prazo, a mensagem já está na DLT; o consumidor precisa ganhar um valor padrão (`@JsonEnumDefaultValue` com a opção no mapper) ou ler o campo como `String` e converter com uma regra explícita. Depois de corrigido, reprocesse a DLT. No longo prazo, combine com o produtor que valores novos de enum são anunciados antes, e trate enum de outro time sempre como lista aberta.
+
+### O campo mudou de tipo
+
+O produtor publicou `"valorTotal": 11230` (o número em centavos da v1) num evento marcado como v2:
+
+```text
+tools.jackson.databind.exc.MismatchedInputException: Cannot construct instance of
+`dev.trilhajava.m12.aulas.esquemas.ValorTotal` (although at least one Creator exists): no int/Int-argument
+constructor/factory method to deserialize from Number value (11230)
+```
+
+**Como ler:** o record esperava um objeto (`ValorTotal`) e chegou um número; o Jackson procurou um construtor que recebesse um inteiro e não achou. **Como corrigir:** não há configuração que resolva, e não deveria haver. Mudança de tipo é mudança incompatível: precisa de uma versão nova no `type` e de um upcaster. Se chegou um número num evento que diz ser v2, o bug está no produtor, que mudou o formato sem mudar a versão. Esse caso é falha permanente e vai para a DLT.
+
+### Campo obrigatório ausente
+
+Um evento v2 sem `cepDeEntrega` (e sem o nome antigo):
+
+```text
+tools.jackson.databind.exc.ValueInstantiationException: Cannot construct instance of
+`dev.trilhajava.m12.aulas.esquemas.PedidoConfirmado`, problem: cepDeEntrega
+```
+
+**Como ler:** o Jackson chamou o construtor do record, e o `Objects.requireNonNull(cepDeEntrega, ...)` lançou `NullPointerException`; o Jackson embrulhou a exceção e repetiu a mensagem dela (`problem: cepDeEntrega`). Por isso vale dar mensagem a todo `requireNonNull`: é ela que aparece aqui. **Como corrigir:** isto é o sistema funcionando. O evento foi recusado em vez de gerar uma coleta sem endereço. O trabalho é investigar o produtor.
+
+### Primitivo ausente
+
+Um record de teste com `int quantidadeDeItens`, lendo um JSON sem esse campo:
+
+```text
+tools.jackson.databind.exc.MismatchedInputException: Cannot map `null` into type `int` (set
+`DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES` to 'false' to allow)
+```
+
+**Como ler:** é a mudança de padrão do Jackson 3. No Jackson 2, o campo ausente virava `0` em silêncio; agora falha. Para eventos, a mudança é bem-vinda: um `0` inventado em `quantidadeDeItens` é exatamente o tipo de erro silencioso desta aula. **Como corrigir:** se o campo pode faltar (porque é novo e eventos antigos não o têm), use o tipo objeto (`Integer`) e decida o padrão no construtor do record. Não desligue a opção para o mapper inteiro.
+
+### Campo desconhecido com o comportamento do Jackson 2
+
+Um record de teste sem `@JsonIgnoreProperties` (`PedidoEstrito`), lido com `FAIL_ON_UNKNOWN_PROPERTIES` ligada:
+
+```text
+tools.jackson.databind.exc.UnrecognizedPropertyException: Unrecognized property "cupom" (class
+dev.trilhajava.m12.aulas.esquemas.TemporarioErrosTest$PedidoEstrito), not marked as ignorable (2 known properties:
+"pedidoId", "cepDeEntrega")
+```
+
+**Como corrigir:** anote o tipo de leitura com `@JsonIgnoreProperties(ignoreUnknown = true)`.
+
+### Versão que ninguém conhece
+
+Um evento `...pedido-confirmado.v3` chegando antes de o consumidor ganhar o upcaster:
+
+```text
+dev.trilhajava.m12.aulas.esquemas.TipoDeEventoDesconhecidoException: evento evt-1 com tipo não suportado:
+br.com.loja.pedidos.pedido-confirmado.v3
+```
+
+**Como ler:** a exceção é desta aula, e a mensagem traz o `id` do evento e o tipo, o suficiente para achar o evento na DLT e saber o que falta. **Como corrigir:** isto indica que o produtor publicou a v3 antes de os consumidores estarem prontos, o que só é aceitável se a v3 for compatível para frente. Se não for, a ordem de deploy estava errada: volte o produtor, publique o consumidor com o upcaster, reprocesse a DLT.
+
+### A classe Java renomeada no cabeçalho
+
+Com a configuração padrão do Spring Kafka, o `JacksonJsonSerializer` grava no cabeçalho `__TypeId__` o **nome completo da classe Java** do produtor, e o `JacksonJsonDeserializer` usa esse cabeçalho para escolher a classe de destino. Uma classe interna do produtor vira contrato: renomeá-la ou movê-la quebra os consumidores. **Como corrigir:** desligue o cabeçalho no produtor (`ADD_TYPE_INFO_HEADERS` como `false`) e defina o tipo no consumidor (`VALUE_DEFAULT_TYPE`), ou use `TYPE_MAPPINGS` com nomes lógicos. Melhor ainda: deixe o `type` do envelope decidir. A mensagem exata varia com a configuração, por isso não está reproduzida aqui.
+
+## Schema Registry, Avro e Protobuf
+
+Tudo até aqui usou JSON, sem esquema formal, com a compatibilidade garantida por código e testes. É uma abordagem honesta e muito comum. Mas ela tem limites: a verificação depende de cada consumidor ter bons exemplos, o JSON repete o nome de cada campo em cada mensagem (caro em volume alto), e o broker aceita qualquer coisa que o produtor mandar. A alternativa é um **esquema formal** num **registro de esquemas**.
+
+### Como um registro funciona
+
+Um Schema Registry é um serviço HTTP à parte do broker. O mais conhecido é o da Confluent; o Apicurio Registry, da Red Hat, é uma alternativa de código aberto. O fluxo:
+
+1. O esquema é registrado sob um **assunto** (*subject*), normalmente ligado ao tópico (`pedidos.confirmados-value`). Cada versão registrada recebe um **id** numérico.
+2. Ao registrar uma versão nova, o registro **verifica a compatibilidade** com as anteriores, segundo a regra configurada para o assunto (`BACKWARD`, `FULL_TRANSITIVE`...). Se a versão viola a regra, o registro recusa. **É aqui que a mudança incompatível é barrada**, antes de qualquer evento ser publicado.
+3. O serializador do produtor escreve na mensagem um prefixo curto (no formato da Confluent, um byte "mágico" e os 4 bytes do id do esquema) seguido do dado em binário.
+4. O desserializador do consumidor lê o id, busca o esquema do **escritor** no registro (e guarda em cache), e converte o dado para o esquema do **leitor**, o que o consumidor tem compilado.
+
+O passo 4 é a parte elegante: com Avro, a conversão entre o esquema de quem escreveu e o de quem lê é feita pela própria biblioteca, segundo regras de resolução bem definidas. Campos que o leitor não conhece são ignorados; campos que o leitor espera e o escritor não mandou recebem o **valor padrão** declarado no esquema do leitor.
+
+### Avro
+
+Avro é um formato binário com esquema em JSON. O evento v2 ficaria mais ou menos assim (ilustração, não está no projeto):
+
+```json
+{
+  "type": "record",
+  "name": "PedidoConfirmado",
+  "namespace": "br.com.loja.pedidos",
+  "fields": [
+    { "name": "pedidoId", "type": "string" },
+    { "name": "clienteId", "type": "string" },
+    { "name": "quantia", "type": { "type": "bytes", "logicalType": "decimal", "precision": 12, "scale": 2 } },
+    { "name": "moeda", "type": "string", "default": "BRL" },
+    { "name": "cepDeEntrega", "type": "string", "aliases": ["cepDestino"] },
+    { "name": "formaDePagamento",
+      "type": { "type": "enum", "name": "FormaDePagamento",
+                "symbols": ["CARTAO_DE_CREDITO", "BOLETO", "PIX", "DESCONHECIDA"],
+                "default": "DESCONHECIDA" },
+      "default": "DESCONHECIDA" }
+  ]
+}
+```
+
+As regras que importam no dia a dia:
+
+- **Campo novo precisa de `default`** para ser backward; sem ele, o registro recusa a versão. Campo opcional é uma união com `null` e padrão `null`.
+- **Renomear** usa `aliases` no esquema do leitor (o `@JsonAlias` do Avro); **enum** tem `default` próprio para símbolos desconhecidos.
+- **Mudar tipo** só nas promoções previstas (`int` para `long`, por exemplo). `decimal` é um tipo lógico sobre `bytes`: valor exato.
+
+### Protobuf
+
+Protocol Buffers, do Google, também é binário, mas o esquema é uma linguagem própria (`.proto`) e o que identifica um campo no fio é o **número**, não o nome:
+
+```proto
+// Ilustração, não está no projeto
+syntax = "proto3";
+package br.com.loja.pedidos;
+
+message PedidoConfirmado {
+  reserved 3;                  // era valor_em_centavos (v1): número nunca reaproveitado
+  reserved "valor_em_centavos";
+  string pedido_id = 1;
+  string cliente_id = 2;
+  ValorTotal valor_total = 5;
+  string cep_de_entrega = 4;   // renomear é seguro: o número 4 continua o mesmo
+  FormaDePagamento forma_de_pagamento = 6;
+}
+
+enum FormaDePagamento {
+  FORMA_DE_PAGAMENTO_DESCONHECIDA = 0;   // o valor 0 é o padrão em proto3
+  FORMA_DE_PAGAMENTO_CARTAO_DE_CREDITO = 1;
+  FORMA_DE_PAGAMENTO_BOLETO = 2;
+  FORMA_DE_PAGAMENTO_PIX = 3;
+}
+```
+
+As regras:
+
+- **Renomear é seguro no fio**, porque o binário só carrega o número (mas quebra quem converte para JSON).
+- **Nunca reaproveite um número**: marque números e nomes removidos como `reserved`. Reaproveitar faz o leitor antigo interpretar bytes de um campo como se fossem de outro.
+- Em proto3, campo ausente vira o padrão (`""`, `0`, o enum de número `0`); por isso o valor `0` do enum é o "desconhecido".
+
+### Quando vale a pena
+
+| Situação | Recomendação |
+|---|---|
+| Poucos tópicos, poucos times, volume moderado | JSON com envelope, leitores tolerantes e exemplos guardados no CI (esta aula) |
+| Muitos times publicando e consumindo, consumidores desconhecidos | Registro de esquemas, com regra de compatibilidade por assunto. A verificação central compensa o custo |
+| Volume alto (milhões de eventos por hora), custo de rede e disco relevante | Avro ou Protobuf: o binário sem nomes de campo costuma ser bem menor que o JSON equivalente |
+| Ecossistema com Kafka Connect, ksqlDB, data lake | Avro com registro é o caminho mais suportado pelas ferramentas da Confluent |
+| Já usa gRPC entre serviços | Protobuf: um só sistema de esquemas para chamadas síncronas e eventos |
+| Consumidores fora do seu controle esperam JSON legível (parceiros, webhooks) | JSON, com JSON Schema publicado (o registro também suporta JSON Schema) |
+
+O custo do registro não é a licença (há opções abertas), é a **operação**: mais um serviço crítico, porque, se o registro cai, produtores não conseguem registrar esquemas novos e consumidores sem cache não conseguem desserializar. Somam-se a isso a curva de aprendizado, a geração de código a partir dos esquemas no build e a perda de legibilidade (você não lê mais o tópico com um `kafka-console-consumer` comum). Para muitos sistemas de porte médio, JSON bem disciplinado é a escolha certa; o importante é que seja uma escolha, não um acidente.
+
+## Testes de compatibilidade no CI
+
+Um pipeline maduro combina camadas: os **exemplos guardados** do passo 5, no consumidor; a **verificação do esquema no PR do produtor** (o plugin Maven do Schema Registry tem o objetivo `test-compatibility`, que pergunta ao registro sem registrar; com Protobuf, `buf breaking --against` compara com a branch principal); os **contratos de mensagens** da aula 10.07, que pegam o uso real de cada consumidor; e o **registro feito pelo pipeline**, nunca pela aplicação em produção. A regra para o time: **nenhuma mudança no formato de um evento entra sem um teste que falharia se ela fosse incompatível.**
+
+## Eventos gordos e magros
+
+Até aqui a pergunta foi "como mudar o evento". Uma pergunta anterior, que define o tamanho do problema, é "**o que o evento carrega**". Martin Fowler descreve alguns estilos de evento; os dois extremos que importam aqui:
+
+**Evento magro, ou notificação** (*event notification*): leva o fato e os identificadores. "O pedido PED-200 foi confirmado." Quem precisa de detalhes chama a API de pedidos.
+
+**Evento gordo, ou transferência de estado** (*event-carried state transfer*): leva o estado de que os consumidores precisam. "O pedido PED-200 foi confirmado: valor 249,90, CEP 30130-010, itens tais." Os consumidores não precisam chamar ninguém; muitos guardam uma cópia local do que recebem.
+
+<Figura legenda="Evento magro: contrato pequeno, mas cada consumidor volta ao produtor para buscar detalhes. Evento gordo: consumidores independentes do produtor em tempo de execução, mas um contrato grande e dados copiados em vários lugares">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="gordo-titulo gordo-desc">
+  <title id="gordo-titulo">Comparação entre evento magro e evento gordo</title>
+  <desc id="gordo-desc">À esquerda, o evento magro: o serviço de pedidos publica só o identificador do pedido; o frete e as notificações recebem o evento e depois fazem uma chamada HTTP de volta à API de pedidos para buscar os detalhes. À direita, o evento gordo: o serviço de pedidos publica o evento com valor, CEP e itens; o frete e as notificações usam o que chegou, sem chamar o produtor, e guardam uma cópia local.</desc>
+  <defs><marker id="mk-gordo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="190" y="24" text-anchor="middle" class="d-title">Magro (notificação)</text>
+  <rect x="100" y="40" width="180" height="56" rx="10" class="d-accent"/>
+  <text x="190" y="64" text-anchor="middle" class="d-title">Pedidos</text>
+  <text x="190" y="86" text-anchor="middle" class="d-mono">pedidoId</text>
+  <rect x="20" y="200" width="150" height="56" rx="10" class="d-info"/>
+  <text x="95" y="234" text-anchor="middle" class="d-title">Frete</text>
+  <rect x="210" y="200" width="150" height="56" rx="10" class="d-info"/>
+  <text x="285" y="234" text-anchor="middle" class="d-title">Notificações</text>
+  <path d="M150 96 L100 198" class="d-line" marker-end="url(#mk-gordo)"/>
+  <path d="M230 96 L280 198" class="d-line" marker-end="url(#mk-gordo)"/>
+  <path d="M60 198 L110 98" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-gordo)"/>
+  <path d="M320 198 L270 98" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-gordo)"/>
+  <text x="190" y="290" text-anchor="middle" class="d-label">tracejado: GET /pedidos/id de volta</text>
+  <text x="570" y="24" text-anchor="middle" class="d-title">Gordo (estado no evento)</text>
+  <rect x="460" y="40" width="220" height="56" rx="10" class="d-accent"/>
+  <text x="570" y="64" text-anchor="middle" class="d-title">Pedidos</text>
+  <text x="570" y="86" text-anchor="middle" class="d-mono">valor, CEP, itens</text>
+  <rect x="400" y="200" width="150" height="56" rx="10" class="d-ok"/>
+  <text x="475" y="226" text-anchor="middle" class="d-title">Frete</text>
+  <text x="475" y="246" text-anchor="middle" class="d-label">cópia local</text>
+  <rect x="590" y="200" width="150" height="56" rx="10" class="d-ok"/>
+  <text x="665" y="226" text-anchor="middle" class="d-title">Notificações</text>
+  <text x="665" y="246" text-anchor="middle" class="d-label">cópia local</text>
+  <path d="M530 96 L480 198" class="d-line" marker-end="url(#mk-gordo)"/>
+  <path d="M610 96 L660 198" class="d-line" marker-end="url(#mk-gordo)"/>
+  <text x="570" y="290" text-anchor="middle" class="d-label">ninguém chama o produtor</text>
+  <text x="380" y="322" text-anchor="middle" class="d-text">Mais dados no evento = menos chamadas, mais contrato</text>
+</svg>
+</Figura>
+
+Os trade-offs, lado a lado:
+
+| Aspecto | Magro | Gordo |
+|---|---|---|
+| Tamanho do contrato | Pequeno: muda pouco | Grande: cada campo é uma promessa |
+| Acoplamento em tempo de execução | Alto: consumidor depende da API do produtor estar no ar | Baixo: consumidor funciona com o produtor fora |
+| Carga no produtor | Cada evento gera N chamadas de volta (uma por consumidor) | Nenhuma chamada de volta |
+| Consistência | O consumidor lê o estado **atual**, que pode já ser posterior ao evento | O consumidor lê o estado **do momento** do evento; cópias podem envelhecer |
+| Reprocessamento | Reprocessar um evento antigo busca o estado de hoje (pode ser errado) | O evento antigo carrega o estado da época (reprocessamento fiel) |
+| Dados pessoais | Ficam no produtor, com controle de acesso | Espalham-se por tópicos, consumidores e cópias |
+| Tamanho da mensagem | Mínimo | Pode crescer; o Kafka tem limite de tamanho de mensagem (por padrão, cerca de 1 MB) |
+
+O caminho do meio, comum na prática (e o desta aula): o evento leva **os fatos do evento que não mudam depois** (valor cobrado, CEP de entrega, forma de pagamento) e **identificadores** para o resto (`clienteId`, não nome e e-mail). Regra de bolso: se o consumidor precisaria chamar o produtor para o trabalho principal, o campo pertence ao evento; se ele só "talvez" use, deixe de fora, porque cada campo a mais é um campo que você não remove sem migração.
+
+## Dados pessoais em eventos
+
+Um tópico Kafka é um **log imutável**: você não apaga nem edita uma mensagem específica. As mensagens saem por retenção (tempo ou tamanho) ou, nos tópicos compactados, quando chega uma mensagem mais nova com a mesma chave (inclusive uma com valor nulo, chamada de *tombstone*). Isso conflita diretamente com a LGPD, que dá ao titular o direito de pedir a eliminação dos dados pessoais tratados com o consentimento dele, e com o princípio da necessidade: tratar só os dados mínimos para a finalidade.
+
+Se o evento carregasse nome, CPF e e-mail da cliente e ela pedisse a exclusão, os dados estariam no tópico, na DLT, nos logs de cada consumidor, nas cópias locais, no data lake e nos backups. Responder "apagamos" com honestidade ficaria quase impossível.
+
+As defesas, da mais eficaz para a menos:
+
+1. **Não publicar.** Use identificadores (`clienteId`) e deixe os dados pessoais no serviço dono deles, com controle de acesso e trilha de auditoria. Consumidores que precisam do e-mail (notificações) buscam no momento do uso. É o evento magro aplicado só aos campos sensíveis.
+2. **Minimizar.** Se o frete precisa do endereço, mande o endereço de entrega, não o cadastro inteiro. Se o antifraude precisa saber a faixa de idade, mande a faixa, não a data de nascimento.
+3. **Cifrar com chave por titular (*crypto-shredding*).** Os campos pessoais vão cifrados com uma chave exclusiva daquele cliente, guardada num serviço de chaves. Para "apagar", destrói-se a chave: as mensagens continuam no log, mas os campos viram bytes ilegíveis para sempre, em todas as cópias. Funciona bem, mas exige infraestrutura de chaves e disciplina para nunca logar o dado decifrado.
+4. **Tópicos separados com acesso restrito.** Dados sensíveis num tópico próprio, com ACL para os poucos consumidores autorizados e retenção curta, em vez de espalhá-los pelo tópico que todos leem.
+5. **Tópico compactado com *tombstone*.** Para tópicos de estado por chave (um "cliente atualizado" por cliente), publicar um valor nulo na chave do titular faz a compactação remover as versões anteriores, com um atraso que depende da configuração. Resolve o tópico, não as cópias.
+
+Cuidados que escapam: a **chave e os cabeçalhos** também são dados (nunca CPF como chave de partição); a **DLT copia tudo**, muitas vezes com retenção maior; e os **exemplos do repositório** precisam ser anonimizados. A classificação de dados sensíveis está na [aula 11.08](../../11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/): passe todo esquema novo por ela antes da primeira publicação, porque não publicar um campo é muito mais fácil do que tirá-lo do tópico depois.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Jar compartilhado com as classes de eventos" depois="Cada consumidor declara a sua visão do evento">
+```java
+// biblioteca "eventos-comuns", usada por 7 serviços
+public record PedidoConfirmadoEvent(
+        String pedidoId, String clienteId,
+        String nomeCliente, String emailCliente,
+        BigDecimal valor, String cep,
+        FormaDePagamento forma,      // enum fechado
+        List<ItemDoPedido> itens,
+        String canalDeVenda, String cupom) { }
+
+// mudar qualquer campo = publicar versão nova
+// da biblioteca e atualizar os 7 serviços juntos
+```
+
+```java
+// no serviço de frete: só o que o frete usa
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record PedidoConfirmado(
+        String pedidoId,
+        String clienteId,
+        ValorTotal valorTotal,
+        @JsonAlias("cepDestino") String cepDeEntrega,
+        FormaDePagamento formaDePagamento) { }
+
+// o produtor evolui o resto sem falar com o frete
+```
+</Comparar>
+
+O jar compartilhado parece reaproveitamento, mas é acoplamento: a versão da biblioteca vira uma dependência de deploy entre times (o "monólito distribuído"), um enum fechado quebra todo mundo junto, e cada consumidor carrega campos que não usa, inclusive dados pessoais. Compartilhar o **esquema** (Avro, Protobuf, JSON Schema) com geração de código é diferente: cada consumidor gera as classes na versão que escolher, e o registro garante a compatibilidade entre versões.
+
+Outras armadilhas que aparecem em revisão de código:
+
+- **Serializar a entidade JPA** como evento expõe a estrutura do banco como contrato público. O evento é um tipo próprio, desenhado para quem lê.
+- **Versão no nome do tópico para toda mudança** (`.v2`, `.v3`): cada consumidor troca de tópico e a ordem entre versões da mesma entidade se perde. Tópico novo só para mudança grande.
+- **Padrão que mente.** Preencher ausente com `0`, `false` ou `"SP"` produz dado falso que parece verdadeiro. Use um padrão de negócio explícito (`DESCONHECIDA`) ou falhe.
+- **`double` para dinheiro.** `"valor": 112.3` vira ponto flutuante em muitos consumidores. Use texto decimal (`"112.30"`), inteiro com a unidade no nome (`valorEmCentavos`) ou `decimal` do Avro, sempre com a moeda.
+- **Tolerância na entrada da sua API.** O leitor tolerante vale para o que você **consome**; num DTO de requisição, ignorar desconhecidos esconde erros do cliente e abre espaço para *mass assignment* (módulo 11).
+- **Upcaster que chama serviços.** Upcaster é função pura sobre a árvore; se precisa do banco, é migração de dados, não de formato.
+
+Quando **não** investir em tudo isto:
+
+- **Eventos internos de um mesmo deploy** (`ApplicationEventPublisher`, módulos do mesmo serviço): o compilador já verifica a compatibilidade.
+- **Um único consumidor do mesmo time, retenção curta**: leitor tolerante e exemplos bastam; registro seria custo sem retorno.
+- **Protótipos** ainda descobrindo o domínio. Mas marque a data em que viram produção.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber escrever um upcaster é a parte técnica. O que diferencia quem lidera é definir a **política** que faz o time inteiro evoluir eventos sem incidentes, e saber escolher a infraestrutura certa para o tamanho da organização.
+
+### A política de evolução, escrita
+
+Um documento curto, aprovado pelos times que publicam e consomem, resolve a maior parte das discussões antes de elas começarem. O conteúdo típico:
+
+1. Todo evento tem **dono, esquema publicado e entrada no catálogo**.
+2. A regra padrão é `BACKWARD_TRANSITIVE`; tópicos com muitos consumidores independentes usam `FULL_TRANSITIVE`. A escolha é por tópico, registrada.
+3. **Valores novos de enum** são anunciados com antecedência, porque quebram leitores antigos mesmo sendo "aditivos".
+4. **Mudanças incompatíveis** exigem versão nova no `type`, upcaster ou publicação dupla, prazo de depreciação e um responsável pela migração.
+5. **Dados pessoais** passam por classificação antes do primeiro evento.
+
+Sem política escrita, cada time aprende com o próprio incidente.
+
+### O roteiro de uma mudança incompatível
+
+Quando a mudança não cabe em upcaster (o modelo mudou demais, a chave de partição mudou, o evento foi dividido em dois), as opções são:
+
+| Estratégia | Como funciona | Custo | Quando usar |
+|---|---|---|---|
+| **Versão no envelope + upcaster** | Mesmo tópico; consumidores convertem a versão antiga | Baixo | Mudança de forma que tem tradução mecânica (renomear, mudar tipo, reestruturar) |
+| **Publicação dupla** | O produtor publica v1 e v2 (no mesmo tópico com tipos diferentes, ou em dois tópicos) durante a migração | Médio: dois formatos mantidos, risco de divergirem | Consumidores que não podem migrar logo; prazos longos |
+| **Tópico novo + ponte** | Um processo lê o tópico antigo, converte e escreve no novo; consumidores migram de tópico | Alto: um componente a mais, reprocessamento histórico | Mudança de chave de partição, divisão de evento, mudança de formato de serialização (JSON → Avro) |
+| **Big bang coordenado** | Todos param, atualizam e sobem juntos | Altíssimo em risco | Quase nunca; só com pouquíssimos consumidores do mesmo time |
+
+Em qualquer uma, o produtor deveria saber **quem ainda consome a versão antiga**. Ferramentas de observabilidade ajudam: o *lag* dos *consumer groups* mostra quem lê o tópico, e uma métrica no consumidor, com a versão de cada evento lido, mostra quem ainda recebe v1. Sem isso, a fase de "contrair" vira um palpite.
+
+### Custos e operação
+
+- **O registro de esquemas é infraestrutura crítica:** réplicas, monitoramento, backup e cache nos clientes, para que uma queda curta não pare os consumidores. Desligue o registro automático pelo serializador em produção.
+- **Upcasters custam CPU por evento** enquanto houver eventos antigos. Em tópico compactado (retenção infinita), uma migração única para um tópico novo aposenta a cadeia.
+- **Métricas que valem o painel:** eventos lidos por versão (quando aposentar uma), eventos que caíram em `DESCONHECIDA` (valores novos de enum) e DLT por tipo de exceção de desserialização.
+
+### Como justificar e quando trocar
+
+Para quem pergunta "por que não só JSON?": o JSON fica; o que entra é um teste de milissegundos que evita o incidente da segunda-feira. Mostre o custo de um incidente real (investigação, reprocessamento, coletas refeitas). Troque de abordagem por sinais concretos: de JSON livre para envelope e exemplos no primeiro consumidor de outro time; de exemplos para registro quando surgem consumidores desconhecidos (data lake, times de análise) ou volume alto; de upcaster para tópico novo quando a cadeia passa de três ou quatro degraus ou a chave de partição muda.
+
+<Callout tipo="entrevista">
+Perguntas comuns para Pleno e Sênior: **"Como você evolui o formato de um evento consumido por vários times?"**, **"Qual a diferença entre compatibilidade backward e forward, e qual a ordem de deploy de cada uma?"**, **"Quando você usaria um Schema Registry?"** e **"Como você lida com LGPD num tópico Kafka?"**. Uma boa resposta: evento é contrato público, com consumidores que o produtor não conhece e dados antigos retidos no tópico; por isso compatibilidade backward transitiva é o mínimo, e consumidores são leitores tolerantes (ignoram campos novos, têm padrão para enum desconhecido, aceitam nomes antigos durante a migração). Backward é o leitor novo lendo dado antigo, e os consumidores sobem primeiro; forward é o leitor antigo lendo dado novo, e o produtor sobe primeiro. Mudança incompatível vira versão nova no envelope (CloudEvents, com o `type` versionado) e upcaster, ou tópico novo com ponte quando a mudança é grande. No CI, exemplos de todos os formatos já publicados, mais a verificação do registro quando há um. Pontos que impressionam: citar que renomear é remover mais acrescentar, que enum novo quebra leitores antigos, que mudança de semântica passa por qualquer ferramenta, que o Jackson 3 mudou o padrão de `FAIL_ON_UNKNOWN_PROPERTIES`, que o cabeçalho `__TypeId__` do Spring Kafka acopla ao nome da classe, e que dado pessoal num log imutável se resolve com minimização ou *crypto-shredding*, lembrando das cópias na DLT e nos logs.
+</Callout>
+
+## Checkpoint: a revisão do PR de eventos
+
+O time de pedidos abriu um PR com cinco mudanças no evento "pedido confirmado" (v2) para a próxima sprint. Você foi chamado para revisar. O tópico tem retenção de 14 dias, a regra combinada é `BACKWARD_TRANSITIVE`, e há quatro consumidores conhecidos (frete, notificações, antifraude e o data lake).
+
+1. Acrescentar o campo `canalDeVenda` (`"SITE"`, `"APP"`, `"LOJA"`), opcional.
+2. Acrescentar o valor `"CARTEIRA_DIGITAL"` à `formaDePagamento`.
+3. Trocar `valorTotal.quantia` de texto (`"249.90"`) para número (`249.9`), "para economizar bytes".
+4. Acrescentar `emailDoCliente`, "porque notificações precisa e assim não chama a API de clientes".
+5. Remover `clienteId`, "porque agora tem o e-mail".
+
+**O desafio:** para cada mudança, diga se ela é compatível (e em qual direção), o que pode quebrar, e o que você pede no PR. Depois, escreva a ordem em que as mudanças aceitas devem ser implantadas.
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+| Mudança | Classificação | Decisão |
+|---|---|---|
+| 1. `canalDeVenda` opcional | Full (compatível nas duas direções) | Aprovar, com exemplo novo na pasta e a lista de valores documentada como aberta |
+| 2. `CARTEIRA_DIGITAL` | Backward sim; forward **não** para enum fechado | Aprovar com aviso prévio: consumidores confirmam o tratamento de valor desconhecido antes de o produtor publicar |
+| 3. Quantia como número | **Incompatível** (mudança de tipo) e ainda põe ponto flutuante no dinheiro | Recusar. Para economizar bytes, a conversa é Avro ou Protobuf com `decimal` |
+| 4. `emailDoCliente` | Tecnicamente compatível | Recusar: o e-mail se espalharia por tópico, DLT, logs e data lake. Notificações busca pelo `clienteId` |
+| 5. Remover `clienteId` | Forward **não**; três consumidores usam | Recusar. Remoção só com expandir e contrair, quando ninguém usa |
+
+Ordem: a mudança 1 sobe já. A 2 vai em duas etapas, **consumidores antes**, mesmo que o registro (backward) aprove o esquema: ele verifica o esquema, não o `switch` do consumidor. O ponto mais importante é a mudança 4: passaria por qualquer verificação automática e é a que mais custa no longo prazo.
+
+</details>
+
+<Quiz
+  id="12-evolucao-de-esquemas"
+  questoes={[
+    {
+      pergunta: 'O registro de esquemas está configurado como BACKWARD. Em que ordem você implanta uma mudança aprovada por ele?',
+      opcoes: ['Produtor primeiro, depois os consumidores', 'Consumidores primeiro, depois o produtor', 'Em qualquer ordem', 'Todos ao mesmo tempo, numa janela de manutenção'],
+      correta: 1,
+      explicacao: 'Backward garante que o leitor NOVO lê dados ANTIGOS. Então os consumidores sobem primeiro (aguentam os dois formatos) e só depois o produtor passa a publicar o formato novo. Forward é o inverso; full permite qualquer ordem.',
+    },
+    {
+      pergunta: 'O produtor renomeou `cepDestino` para `cepDeEntrega` no mesmo deploy, sem mais nada. Qual a classificação correta?',
+      opcoes: ['Compatível, porque o tipo do campo não mudou', 'Compatível para trás, porque o campo novo é opcional', 'Incompatível nas duas direções: para o leitor, um campo sumiu e outro apareceu', 'Compatível, desde que o Jackson ignore campos desconhecidos'],
+      correta: 2,
+      explicacao: 'Renomear é remover e acrescentar ao mesmo tempo. O leitor antigo procura `cepDestino` e não acha; ignorar desconhecidos só esconde a quebra. O roteiro seguro é expandir e contrair, com `@JsonAlias` no consumidor durante a transição.',
+    },
+    {
+      pergunta: 'No Jackson 3, um consumidor recebe um evento com um campo que o record não declara, sem nenhuma anotação ou configuração. O que acontece?',
+      opcoes: ['Lança UnrecognizedPropertyException, como no Jackson 2', 'Ignora o campo, porque FAIL_ON_UNKNOWN_PROPERTIES passou a ser false por padrão', 'Guarda o campo num Map automático', 'Depende do Spring Boot estar presente'],
+      correta: 1,
+      explicacao: 'O Jackson 3 mudou o padrão de `FAIL_ON_UNKNOWN_PROPERTIES` para desligado. Ainda assim, deixe a tolerância explícita no tipo (`@JsonIgnoreProperties(ignoreUnknown = true)`), porque a configuração pode voltar ao padrão antigo (por exemplo, com `spring.jackson.use-jackson2-defaults`).',
+    },
+    {
+      pergunta: 'Por que o upcaster desta aula trabalha sobre a árvore JSON (`ObjectNode`) e não sobre uma classe Java da v1?',
+      opcoes: ['Porque é mais rápido', 'Para não manter classes de todas as versões antigas no projeto: a conversão fica isolada num lugar só e o código de negócio só conhece a versão atual', 'Porque o Jackson 3 não desserializa records', 'Porque o CloudEvents exige'],
+      correta: 1,
+      explicacao: 'Na árvore, cada upcaster é uma transformação pequena e é o único lugar que sabe que a versão antiga existiu. Com classes por versão, o código acumularia tipos mortos e ramificações por versão.',
+    },
+    {
+      pergunta: 'O time quer pôr o e-mail do cliente no evento de pedido para evitar uma chamada à API de clientes. O tópico tem retenção de 30 dias e alimenta um data lake. Qual a melhor resposta?',
+      opcoes: ['Aprovar, porque acrescentar campo opcional é compatível', 'Aprovar, desde que o tópico seja compactado', 'Manter só o identificador do cliente e buscar o e-mail no momento do uso; se for inevitável, cifrar com chave por titular para permitir crypto-shredding', 'Colocar o e-mail na chave da mensagem em vez do valor'],
+      correta: 2,
+      explicacao: 'Compatível não quer dizer adequado. O e-mail se espalharia pelo tópico, DLT, logs e data lake, num log que não se apaga. Minimização vem primeiro; crypto-shredding é a saída quando o dado precisa trafegar. A chave da mensagem é ainda pior: aparece em mais lugares.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Evento é **contrato público**: o produtor não conhece todos os consumidores, os dados antigos ficam no tópico, não há negociação de versão e a quebra aparece longe e tarde.
+- **Backward**: leitor novo lê dado antigo (consumidores sobem primeiro). **Forward**: leitor antigo lê dado novo (produtor sobe primeiro). **Full**: as duas. **Transitiva**: contra todas as versões retidas, não só a anterior.
+- Compatível: acrescentar campo opcional com padrão. Incompatível: renomear, remover campo usado, mudar tipo. Enum novo quebra leitores antigos com lista fechada. Mudança de **semântica** passa por qualquer ferramenta.
+- **Leitor tolerante** com Jackson 3: `@JsonIgnoreProperties(ignoreUnknown = true)` no tipo, `@JsonAlias` para nomes antigos, `@JsonEnumDefaultValue` com `EnumFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE`, padrões e obrigatórios decididos no construtor do record. No Jackson 3, ignorar desconhecidos já é o padrão e primitivo ausente falha.
+- **Envelope CloudEvents**: `id`, `source`, `type`, `specversion` obrigatórios; versão do esquema no `type`; `source` + `id` serve à idempotência. No Kafka, modo estruturado (`application/cloudevents+json`) ou binário (cabeçalhos `ce_`).
+- **Upcasting**: cada upcaster converte um degrau na árvore JSON; o código de negócio só conhece a versão atual; tipo desconhecido é falha permanente e vai para a DLT.
+- **Portão no CI**: exemplos de todos os formatos já publicados, lidos por um teste dinâmico; nunca apague um exemplo enquanto o formato puder existir no tópico.
+- **Schema Registry** com Avro ou Protobuf verifica a compatibilidade ao registrar o esquema; compensa com muitos times, consumidores desconhecidos ou volume alto, ao custo de operar mais um serviço crítico.
+- **Gordo × magro**: carregue fatos estáveis do evento e identificadores para o resto. **Dados pessoais**: não publique, minimize, ou cifre com chave por titular; lembre das cópias em DLT, logs e data lake.
+
+## Próximo passo
+
+Os eventos agora evoluem sem quebrar ninguém. Falta colocar o Kafka em produção de verdade: quantas partições, qual fator de replicação, `acks` e `min.insync.replicas`, como dimensionar consumidores, o que monitorar (o *lag* que você viu aqui como sinal de migração) e o que fazer quando um broker cai. Na [aula 12.08, Kafka em produção](../../12-mensageria/08-kafka-em-producao/), você vai tomar essas decisões com números.
+
+## Referências
+
+- [CloudEvents: especificação 1.0](https://github.com/cloudevents/spec/blob/main/cloudevents/spec.md)
+- [CloudEvents: formato JSON](https://github.com/cloudevents/spec/blob/main/cloudevents/formats/json-format.md)
+- [CloudEvents: ligação com o protocolo Kafka](https://github.com/cloudevents/spec/blob/main/cloudevents/bindings/kafka-protocol-binding.md)
+- [CloudEvents: SDK Java](https://cloudevents.github.io/sdk-java/)
+- [Jackson 3.0: notas de versão e mudanças de padrão](https://github.com/FasterXML/jackson/wiki/Jackson-Release-3.0)
+- [Spring for Apache Kafka: serialização e desserialização](https://docs.spring.io/spring-kafka/reference/kafka/serdes.html)
+- [Confluent Schema Registry: evolução e compatibilidade de esquemas](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html)
+- [Confluent Schema Registry: plugin Maven](https://docs.confluent.io/platform/current/schema-registry/develop/maven-plugin.html)
+- [Apache Avro: especificação (resolução de esquemas)](https://avro.apache.org/docs/current/specification/)
+- [Protocol Buffers: atualizando um tipo de mensagem](https://protobuf.dev/programming-guides/proto3/#updating)
+- [Buf: detecção de mudanças incompatíveis](https://buf.build/docs/breaking/)
+- [Apicurio Registry](https://www.apicur.io/registry/docs/)
+- [AsyncAPI: especificação](https://www.asyncapi.com/docs/reference/specification/latest)
+- [Martin Fowler: What do you mean by "Event-Driven"?](https://martinfowler.com/articles/201701-event-driven.html)
+- [Lei Geral de Proteção de Dados (Lei 13.709/2018)](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm)

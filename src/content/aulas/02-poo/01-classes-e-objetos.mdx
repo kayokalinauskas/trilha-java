@@ -1,0 +1,204 @@
+---
+titulo: Classes, objetos e referências
+descricao: O que é uma classe e o que é um objeto, construtores, this, estado versus comportamento, e como os objetos vivem na memória (stack e heap).
+modulo: 02-poo
+ordem: 1
+duracao: 45
+objetivos:
+  - Diferenciar classe (o molde) de objeto (a instância)
+  - Criar construtores que deixam o objeto pronto para uso
+  - Explicar stack, heap e o que acontece com objetos sem referência
+  - Colocar comportamento junto dos dados que ele usa
+tags: [classes, objetos, construtor, memória]
+flashcards:
+  - frente: Qual a diferença entre classe e objeto?
+    verso: A classe é o molde (define estado e comportamento); o objeto é uma instância concreta criada com new, com seus próprios valores.
+  - frente: O que fica na stack e o que fica na heap?
+    verso: Na stack ficam as variáveis locais e referências de cada chamada de método; os objetos (criados com new) ficam na heap.
+  - frente: Quando um objeto é coletado pelo garbage collector?
+    verso: Quando nenhuma referência alcançável aponta mais para ele.
+  - frente: Para que serve o this?
+    verso: Referência ao próprio objeto. Usado para diferenciar atributos de parâmetros com o mesmo nome e para encadear construtores (this(...)).
+  - frente: O que é um modelo anêmico?
+    verso: Classes só com dados e getters/setters, com toda a lógica espalhada em outras classes. O oposto de colocar comportamento junto dos dados.
+---
+
+No módulo 01, todo o código viveu em métodos `static`: funções que recebem dados e devolvem resultados. Funciona bem para problemas pequenos. Mas um sistema real tem **conceitos** — conta, pedido, cliente, pagamento — e cada conceito tem **dados** e **regras**. Orientação a objetos é uma forma de organizar o código em torno desses conceitos.
+
+## Classe é o molde; objeto é a coisa
+
+```java
+public class Produto {
+
+    String nome;           // estado (atributos)
+    BigDecimal preco;
+    int estoque;
+
+    boolean disponivel() { // comportamento (métodos)
+        return estoque > 0;
+    }
+}
+```
+
+`Produto` é uma **classe**: descreve o que todo produto tem e sabe fazer. Um **objeto** é um produto específico, criado com `new`:
+
+```java
+Produto cafe = new Produto();
+cafe.nome = "Café 500g";
+cafe.preco = new BigDecimal("25.90");
+cafe.estoque = 12;
+
+Produto filtro = new Produto();
+filtro.nome = "Filtro de papel";
+filtro.estoque = 0;
+
+cafe.disponivel();    // true
+filtro.disponivel();  // false — mesmo método, estado diferente
+```
+
+Cada objeto tem **seu próprio estado**. O método `disponivel()` é o mesmo para todos, mas responde de acordo com os dados **daquele** objeto.
+
+## Construtores: nascer pronto
+
+O código acima tem um problema: dá para criar um `Produto` sem nome, sem preço, "pela metade". Um **construtor** garante que o objeto já nasce completo:
+
+```java
+public class Produto {
+
+    private final String nome;
+    private final BigDecimal preco;
+    private int estoque;
+
+    public Produto(String nome, BigDecimal preco, int estoqueInicial) {
+        this.nome = nome;
+        this.preco = preco;
+        this.estoque = estoqueInicial;
+    }
+}
+
+Produto cafe = new Produto("Café 500g", new BigDecimal("25.90"), 12);
+```
+
+- O construtor tem o **mesmo nome da classe** e **não tem tipo de retorno**.
+- **`this.nome`** é o atributo do objeto; `nome` sozinho é o parâmetro. O `this` resolve a ambiguidade.
+- Se você não escrever nenhum construtor, o Java cria um **vazio** automaticamente. Ao escrever um, o vazio deixa de existir.
+
+Você pode ter vários construtores, e um pode chamar outro com `this(...)`:
+
+```java
+public Produto(String nome, BigDecimal preco) {
+    this(nome, preco, 0);   // estoque padrão: zero
+}
+```
+
+## Referências e memória: stack e heap
+
+Entender onde as coisas vivem na memória explica metade dos bugs de iniciante.
+
+<Figura legenda="Variáveis locais ficam na stack; objetos ficam na heap">
+<svg viewBox="0 0 680 250" width="680" role="img" aria-label="Stack com as variáveis cafe, outro e qtd; cafe e outro apontam para o mesmo objeto Produto na heap; um segundo objeto sem referência será coletado">
+  <defs><marker id="s6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="100" y="22" text-anchor="middle" class="d-title">Stack (por chamada)</text>
+  <rect x="20" y="35" width="160" height="190" rx="12" class="d-info"/>
+  <text x="36" y="72" class="d-mono">cafe   ●</text>
+  <text x="36" y="118" class="d-mono">outro  ●</text>
+  <text x="36" y="164" class="d-mono">qtd = 12</text>
+  <text x="440" y="22" text-anchor="middle" class="d-title">Heap (objetos)</text>
+  <rect x="250" y="35" width="410" height="190" rx="12" class="d-box"/>
+  <rect x="300" y="55" width="220" height="80" rx="10" class="d-accent"/>
+  <text x="410" y="85" text-anchor="middle" class="d-title">Produto</text>
+  <text x="410" y="108" text-anchor="middle" class="d-mono">"Café 500g", 25.90</text>
+  <rect x="440" y="155" width="200" height="56" rx="10" fill="none" stroke="var(--text-3)" stroke-dasharray="5 5"/>
+  <text x="540" y="180" text-anchor="middle" class="d-label">Produto sem referência</text>
+  <text x="540" y="198" text-anchor="middle" class="d-label">→ garbage collector</text>
+  <path d="M110 68 C200 68, 230 85, 296 88" class="d-line" marker-end="url(#s6)"/>
+  <path d="M120 114 C210 114, 240 108, 296 104" class="d-line" marker-end="url(#s6)"/>
+</svg>
+</Figura>
+
+- A **stack** guarda as variáveis locais de cada chamada de método. Para primitivos, o próprio valor (`qtd = 12`); para objetos, **uma referência**.
+- A **heap** guarda os objetos criados com `new`.
+- `Produto outro = cafe;` **não copia** o produto. Cria uma segunda referência para o **mesmo** objeto. Alterar por uma variável é visível pela outra.
+- Quando nenhuma referência aponta mais para um objeto, o **garbage collector** (GC) libera a memória automaticamente. Em Java você não faz `free`/`delete`.
+
+<Callout tipo="entrevista">
+"Explique stack e heap" e "como funciona o garbage collector?" aparecem em entrevistas Júnior e Pleno. Para Pleno, vale saber que a JVM moderna tem vários coletores (G1 é o padrão; ZGC e Shenandoah para pausas muito curtas) e que **vazamento de memória em Java** existe: acontece quando você mantém referências sem querer, por exemplo em um `static Map` que só cresce.
+</Callout>
+
+## `null`: a referência para nada
+
+```java
+Produto p = null;     // não aponta para nenhum objeto
+p.disponivel();       // NullPointerException
+```
+
+Uma referência pode não apontar para nada. Tony Hoare, que inventou a referência nula em 1965, chamou isso de seu "erro de um bilhão de dólares". Ao longo da trilha você vai ver várias defesas: validar no construtor, nunca devolver `null` quando uma coleção vazia serve, e `Optional` (módulo 04).
+
+## Comportamento junto dos dados
+
+Veja duas formas de implementar "dar baixa no estoque":
+
+<Comparar antes="Modelo anêmico" depois="Objeto com comportamento">
+```java
+// Em algum Service, longe do Produto:
+if (produto.getEstoque() >= qtd) {
+    produto.setEstoque(produto.getEstoque() - qtd);
+} else {
+    throw new EstoqueInsuficienteException();
+}
+```
+
+```java
+// Dentro de Produto:
+public void baixarEstoque(int quantidade) {
+    if (quantidade > estoque) {
+        throw new EstoqueInsuficienteException(nome, estoque, quantidade);
+    }
+    estoque -= quantidade;
+}
+
+// Quem usa:
+produto.baixarEstoque(qtd);
+```
+</Comparar>
+
+Na versão da esquerda, a regra "não pode ficar negativo" vive **fora** do produto. Se outro lugar do código fizer `setEstoque(-5)`, nada impede. Na versão da direita, o **produto protege a própria regra**. Esse princípio tem nome: ***Tell, Don't Ask*** — diga ao objeto o que fazer, em vez de pedir os dados dele e decidir por ele.
+
+A próxima aula aprofunda essa ideia: **encapsulamento e invariantes**.
+
+<Quiz
+  id="02-classes"
+  questoes={[
+    {
+      pergunta: '`Produto a = new Produto("X", preco, 5); Produto b = a; b.baixarEstoque(2);` — qual o estoque de `a`?',
+      opcoes: ['5', '3', '2', 'Depende do garbage collector'],
+      correta: 1,
+      explicacao: '`b = a` copia a referência: é o mesmo objeto. A baixa feita por `b` é vista por `a`.',
+    },
+    {
+      pergunta: 'Onde ficam os objetos criados com `new`?',
+      opcoes: ['Na stack', 'Na heap', 'No disco', 'No string pool, sempre'],
+      correta: 1,
+      explicacao: 'Objetos vivem na heap; a stack guarda variáveis locais e referências.',
+    },
+    {
+      pergunta: 'Ao declarar `public Produto(String nome)`, o que acontece com o construtor vazio padrão?',
+      opcoes: ['Continua existindo', 'Deixa de existir', 'Vira privado', 'Passa a exigir um parâmetro opcional'],
+      correta: 1,
+      explicacao: 'O construtor padrão só é gerado quando a classe não declara nenhum construtor.',
+    },
+    {
+      pergunta: 'Qual opção segue o princípio Tell, Don\'t Ask?',
+      opcoes: ['`conta.setSaldo(conta.getSaldo() - valor)`', '`conta.sacar(valor)`', '`if (conta.getSaldo() > valor) conta.saldo -= valor`', '`ContaUtils.sacar(conta, valor)`'],
+      correta: 1,
+      explicacao: 'Você diz à conta o que fazer; ela aplica as próprias regras.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Classe** define estado e comportamento; **objeto** é uma instância com estado próprio.
+- **Construtores** garantem que o objeto nasce completo; `this` diferencia atributo de parâmetro.
+- Objetos vivem na **heap**; variáveis guardam **referências**. Sem referências, o GC recolhe o objeto.
+- Coloque o comportamento **junto dos dados** que ele protege (*Tell, Don't Ask*).

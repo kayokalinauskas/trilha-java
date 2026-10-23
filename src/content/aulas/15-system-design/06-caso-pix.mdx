@@ -1,0 +1,416 @@
+---
+titulo: "Estudo de caso: projetando o recebimento de PIX num banco digital"
+descricao: O roteiro da aula 4 aplicado a um problema real de fintech — requisitos, estimativas com as contas à mostra, API, modelo de dados e arquitetura para receber PIX; e os aprofundamentos que decidem a entrevista - idempotência pelo EndToEndId, crédito atômico com ledger de partidas dobradas, outbox, cache de dados de conta, timeout como estado desconhecido, saga de devolução, contas quentes, particionamento, observabilidade e picos.
+modulo: 15-system-design
+ordem: 6
+duracao: 75
+objetivos:
+  - Aplicar o roteiro de system design a um sistema financeiro, declarando premissas e mostrando as contas
+  - Projetar um crédito idempotente e atômico usando o EndToEndId como chave natural e um ledger de partidas dobradas
+  - Tratar timeout como estado desconhecido, resolvido por consulta e reconciliação, e desenhar a devolução como saga
+  - Identificar os gargalos (contas quentes, picos de fim de mês) e as garantias de consistência de cada parte do sistema
+tags: [system design, PIX, SPI, DICT, idempotência, ledger, partidas dobradas, outbox, saga, reconciliação, SLO, estudo de caso]
+flashcards:
+  - frente: No recebimento de PIX, qual é a chave de idempotência natural?
+    verso: O EndToEndId, o identificador fim a fim que acompanha a transação desde o participante do pagador. Uma constraint UNIQUE nele faz a mensagem repetida virar um no-op que devolve a mesma resposta, sem creditar duas vezes.
+  - frente: O que é um ledger de partidas dobradas?
+    verso: Um registro imutável em que cada movimento gera lançamentos que somam zero - um débito numa conta e um crédito de mesmo valor em outra. O saldo é derivado (ou conferível) a partir dos lançamentos, e a soma de todas as contas sempre fecha.
+  - frente: A confirmação de liquidação do SPI não chegou no prazo. Creditar ou recusar?
+    verso: Nenhum dos dois. O estado é DESCONHECIDO - consulte a fonte de verdade pelo EndToEndId e deixe a reconciliação fechar o caso. Creditar sem liquidação cria dinheiro; ignorar uma liquidação feita deixa o cliente sem o crédito.
+  - frente: Por que a conta de um grande lojista vira gargalo em dia de pico?
+    verso: Cada crédito atualiza a mesma linha de saldo e segura o lock dessa linha. Se cada transação segura o lock por 5 ms, a linha aceita no máximo cerca de 200 créditos por segundo. Defesas - UPDATE atômico e curto, sub-saldos somados na leitura, lançamentos em lote.
+  - frente: Onde a consistência precisa ser forte no recebimento de PIX, e onde pode ser eventual?
+    verso: Forte no estado do PIX, nos lançamentos e no saldo (uma transação local). Eventual nas notificações, webhooks, antifraude pós-evento e no extrato lido de réplica - tudo o que sai pela outbox.
+  - frente: Por que o caminho síncrono do recebimento deve ser mínimo?
+    verso: Porque há um prazo para responder ao SPI. Só entra nele o que decide aceitar ou recusar (validar a conta, gravar o PIX). Notificação, webhook e análises saem depois, pela outbox, e não podem atrasar nem derrubar a resposta.
+---
+
+"Desenhe o recebimento de PIX de um banco digital." É uma pergunta de entrevista frequente em fintechs brasileiras, e uma ótima síntese deste curso: ela junta locking (módulo 9), idempotência e outbox (módulo 12), resiliência (módulo 13), observabilidade (módulo 14) e as ideias de escala e consistência da aula anterior.
+
+Esta aula resolve o problema seguindo o roteiro da aula 4, etapa por etapa. Leia como se estivesse no quadro: primeiro as perguntas, depois as contas, só então as caixas.
+
+<Callout tipo="atencao" titulo="Um modelo de estudo, não a especificação do Pix">
+O Pix tem regulamento e manuais técnicos próprios, publicados pelo Banco Central do Brasil, com mensagens, prazos e regras que um participante real precisa seguir à risca. Aqui o fluxo está **simplificado** para discutir arquitetura. Todos os números de volume, latência e SLO desta aula são **premissas hipotéticas da estimativa**, não dados oficiais.
+</Callout>
+
+## O que é o PIX, em linhas gerais
+
+O **Pix** é o sistema de pagamentos instantâneos criado e regulado pelo **Banco Central do Brasil (BCB)**, em operação desde novembro de 2020. As peças que importam para o desenho:
+
+- **SPI** (Sistema de Pagamentos Instantâneos): a infraestrutura do BCB que **liquida** as transações, uma a uma e em tempo real, movendo recursos entre as contas que as instituições participantes mantêm no próprio Banco Central (as Contas PI). As instituições trocam com o SPI mensagens no padrão ISO 20022.
+- **DICT** (Diretório de Identificadores de Contas Transacionais): o diretório das **chaves Pix** (CPF, CNPJ, e-mail, celular ou chave aleatória). É consultado pela instituição do **pagador** para descobrir para qual instituição e conta vai o dinheiro.
+- **Disponibilidade 24x7**, todos os dias do ano, inclusive madrugadas e feriados. Não existe "janela de manutenção à noite".
+- **EndToEndId**: um identificador único gerado pela instituição do pagador, que acompanha a transação de ponta a ponta. Ele será a peça central da idempotência.
+
+Na visão do **banco recebedor**, o fluxo simplificado que vamos projetar é:
+
+1. o SPI entrega uma ordem de pagamento destinada a uma conta nossa;
+2. validamos (a conta existe? está ativa?) e respondemos **aceite** ou **recusa**, dentro de um prazo definido nas regras do Pix;
+3. o SPI liquida e confirma;
+4. creditamos o cliente e o avisamos.
+
+## 1. Requisitos
+
+**Funcionais** (confirmando o escopo com o entrevistador):
+
+- receber ordens de pagamento do SPI e aceitá-las ou recusá-las;
+- creditar a conta do cliente quando a liquidação for confirmada;
+- notificar o cliente (push) e, para lojistas, chamar um webhook;
+- consultar os PIX recebidos (extrato) e um PIX pelo EndToEndId;
+- **devolver** um PIX recebido, total ou parcialmente.
+
+Fora do escopo: enviar PIX, cadastro e portabilidade de chaves, QR Code, disputas de fraude. (Menções rápidas quando tocarem no desenho.)
+
+**Não funcionais**, que decidem a arquitetura:
+
+| Requisito | Consequência no desenho |
+|---|---|
+| Nunca creditar duas vezes, nunca perder um crédito | idempotência pelo EndToEndId, transação local, reconciliação |
+| Responder ao SPI dentro do prazo | caminho síncrono mínimo; o resto é assíncrono |
+| Disponível 24x7 | redundância, deploy sem parada, nada de "manutenção à meia-noite" |
+| Saldo sempre correto | consistência forte no saldo e nos lançamentos |
+| Rastreabilidade (auditoria, regulador) | ledger imutável, logs e traces com o EndToEndId |
+| Picos previsíveis (dia de pagamento, Black Friday) | dimensionar pelo pico, com teste de carga |
+
+## 2. Estimativas
+
+Premissas **hipotéticas**, declaradas em voz alta: **10 milhões** de clientes ativos; em média, **2 PIX recebidos** por cliente por dia; no minuto mais cheio do ano, a taxa chega a **10 vezes** a média do dia.
+
+1. **Volume diário.** 10 milhões × 2 = **20 milhões** de recebimentos por dia.
+2. **Taxa média.** 20.000.000 ÷ 86.400 ≈ **230 por segundo**. (Pela conta de bolso: 20 milhões ÷ 100 mil ≈ 200.)
+3. **Pico.** 10 × 230 ≈ **2.300 por segundo**. Arredonde e dimensione para **3.000 por segundo**, com folga.
+4. **Escritas no banco.** Cada PIX gera, por baixo: a linha do PIX (inserida e depois atualizada), dois lançamentos, a atualização do saldo e um evento na outbox, cerca de **6 escritas de linha** em **2 transações** (aceite e liquidação). No pico: 3.000 × 6 = **18 mil escritas de linha por segundo** e 3.000 × 2 = **6 mil commits por segundo**. Isso já é carga séria para um único primário PostgreSQL: não é impossível, mas é aqui que o **particionamento por conta** entra na conversa, e o teste de carga decide.
+5. **Armazenamento.** Suponha cerca de **1 KB** por PIX somando tudo (registro do PIX, dois lançamentos, evento). 20 milhões × 1 KB = **20 GB por dia**; × 365 ≈ **7,3 TB por ano**. Com 5 anos no banco "quente" (o resto arquivado conforme as regras de retenção), ≈ **36 TB**; com 3 réplicas, ≈ **110 TB** em disco. Particione por data e arquive.
+6. **Cache.** Os dados de conta usados na validação (status, titular, tipo): 10 milhões × 200 B = **2 GB**. Cabe com folga na memória de um Redis.
+7. **Orçamento de latência.** Suponha que, para caber no prazo de resposta ao SPI com margem, o nosso p99 interno precise ficar em **algumas dezenas de milissegundos**. Pela tabela da aula 4, cada ida e volta no datacenter custa ~0,5 ms: há espaço para uma consulta ao cache e uma transação curta no banco, **não** para chamar cinco serviços em sequência.
+
+O que os números dizem: o volume médio é modesto; **o pico e as contas quentes** são o problema; e o caminho síncrono tem de ser curto.
+
+## 3. API e modelo de dados
+
+A entrada do SPI não é uma API REST pública: é uma troca de mensagens com o Banco Central por uma rede dedicada. No desenho, ela vira uma **porta** do núcleo (módulo 13), atendida por um **conector** que traduz as mensagens:
+
+```text
+// porta de entrada, chamada pelo conector do SPI
+receberOrdem(endToEndId, contaDestino, valor, pagador)  →  ACEITE | RECUSA(motivo)
+confirmarLiquidacao(endToEndId)                         →  ok
+
+// API para o app e para lojistas
+GET  /contas/{id}/pix/recebidos?cursor=<token>&limite=20   →  200 { itens, proximoCursor }
+GET  /pix/{endToEndId}                                     →  200 { estado, valor, pagador, ... }
+POST /pix/{endToEndId}/devolucoes      Idempotency-Key: <uuid>
+     { valor, motivo }                                     →  202 { devolucaoId, estado }
+```
+
+Repare nas duas formas de idempotência: na entrada do SPI, a chave é **natural** (o EndToEndId, que já vem na mensagem); na devolução, pedida pelo app, a chave é gerada pelo **cliente** (`Idempotency-Key`), exatamente como nas transferências do marco 2 da Fintech Core. O `202` indica que a devolução foi aceita para processamento, não concluída.
+
+As tabelas principais:
+
+```sql
+CREATE TABLE pix_recebido (
+    end_to_end_id   VARCHAR(64)   NOT NULL,
+    conta_id        BIGINT        NOT NULL,
+    valor           NUMERIC(15,2) NOT NULL CHECK (valor > 0),
+    valor_devolvido NUMERIC(15,2) NOT NULL DEFAULT 0,
+    estado          VARCHAR(20)   NOT NULL,   -- RECEBIDO, ACEITO, LIQUIDADO, RECUSADO, DESCONHECIDO...
+    resposta        VARCHAR(40),              -- a resposta enviada ao SPI, para repeti-la igual
+    recebido_em     TIMESTAMPTZ   NOT NULL,
+    PRIMARY KEY (end_to_end_id),
+    CHECK (valor_devolvido <= valor)
+);
+
+CREATE TABLE lancamento (                     -- ledger: só INSERT, nunca UPDATE nem DELETE
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    transacao       VARCHAR(64)   NOT NULL,   -- o EndToEndId ou o id da devolução
+    conta_contabil  VARCHAR(40)   NOT NULL,   -- 'CLIENTE:42', 'LIQUIDACAO_PIX', ...
+    valor           NUMERIC(15,2) NOT NULL,   -- positivo = crédito, negativo = débito
+    criado_em       TIMESTAMPTZ   NOT NULL
+);
+
+-- conta(id, saldo, versao, status) e evento_saida (a outbox do marco 5) completam o modelo
+```
+
+## 4. Arquitetura de alto nível
+
+<Figura legenda="O caminho síncrono (em cima) termina numa transação local. Tudo o que pode esperar sai pela outbox">
+<svg viewBox="0 0 680 410" width="680" role="img" aria-label="O SPI envia a ordem ao conector, que chama o serviço de recebimento; o serviço consulta o Redis e grava numa transação no PostgreSQL; um relay publica os eventos da outbox no Kafka, consumido por notificações, antifraude, extrato e webhooks; um job de reconciliação compara o banco com o SPI">
+  <defs><marker id="m1506" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="30" width="120" height="56" rx="8" class="d-accent"/><text x="70" y="54" text-anchor="middle" class="d-title">SPI</text><text x="70" y="74" text-anchor="middle" class="d-label">Banco Central</text>
+  <rect x="170" y="30" width="140" height="56" rx="8" class="d-info"/><text x="240" y="54" text-anchor="middle" class="d-title">Conector SPI</text><text x="240" y="74" text-anchor="middle" class="d-label">traduz mensagens</text>
+  <rect x="350" y="30" width="150" height="56" rx="8" class="d-ok"/><text x="425" y="54" text-anchor="middle" class="d-title">Recebimento</text><text x="425" y="74" text-anchor="middle" class="d-label">sem estado</text>
+  <rect x="540" y="30" width="130" height="56" rx="8" class="d-violet"/><text x="605" y="54" text-anchor="middle" class="d-title">Redis</text><text x="605" y="74" text-anchor="middle" class="d-label">dados de conta</text>
+  <path d="M130 50 H166" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M170 68 H134" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M310 58 H346" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M500 58 H536" class="d-line" marker-end="url(#m1506)"/>
+  <rect x="335" y="130" width="180" height="72" rx="8" class="d-box"/><text x="425" y="154" text-anchor="middle" class="d-title">PostgreSQL</text><text x="425" y="174" text-anchor="middle" class="d-label">contas · lançamentos</text><text x="425" y="192" text-anchor="middle" class="d-mono">pix · evento_saida</text>
+  <path d="M425 86 V126" class="d-line" marker-end="url(#m1506)"/><text x="435" y="112" class="d-label">uma transação local</text>
+  <rect x="10" y="130" width="150" height="72" rx="8" class="d-info"/><text x="85" y="158" text-anchor="middle" class="d-title">Reconciliação</text><text x="85" y="180" text-anchor="middle" class="d-label">compara com o SPI</text>
+  <path d="M70 126 V90" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M160 166 H331" class="d-line" marker-end="url(#m1506)"/>
+  <rect x="335" y="240" width="180" height="44" rx="8" class="d-box"/><text x="425" y="267" text-anchor="middle" class="d-title">Relay da outbox</text>
+  <path d="M425 202 V236" class="d-line" marker-end="url(#m1506)"/>
+  <rect x="555" y="240" width="115" height="44" rx="8" class="d-violet"/><text x="612" y="267" text-anchor="middle" class="d-title">Kafka</text>
+  <path d="M515 262 H551" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M612 284 V300 H85" class="d-line"/>
+  <path d="M85 300 V318" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M255 300 V318" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M425 300 V318" class="d-line" marker-end="url(#m1506)"/>
+  <path d="M595 300 V318" class="d-line" marker-end="url(#m1506)"/>
+  <rect x="10" y="322" width="150" height="40" rx="8" class="d-ok"/><text x="85" y="347" text-anchor="middle" class="d-title">Notificações</text>
+  <rect x="180" y="322" width="150" height="40" rx="8" class="d-ok"/><text x="255" y="347" text-anchor="middle" class="d-title">Antifraude</text>
+  <rect x="350" y="322" width="150" height="40" rx="8" class="d-ok"/><text x="425" y="347" text-anchor="middle" class="d-title">Extrato</text>
+  <rect x="520" y="322" width="150" height="40" rx="8" class="d-ok"/><text x="595" y="347" text-anchor="middle" class="d-title">Webhooks</text>
+  <text x="10" y="392" class="d-label">Síncrono: só o que decide aceitar ou recusar. O resto é assíncrono, pela outbox.</text>
+</svg>
+</Figura>
+
+Os dois fluxos, em voz alta:
+
+- **Aceite.** O conector recebe a ordem e chama o serviço de recebimento (sem estado, várias instâncias). O serviço valida a conta (dados em cache no Redis, com o banco como fonte de verdade), grava o PIX como `ACEITO` com a resposta, e o conector responde ao SPI.
+- **Liquidação.** Chega a confirmação. Numa **única transação local**: o PIX vira `LIQUIDADO`, os dois lançamentos são gravados, o saldo é atualizado e o evento `PixRecebido` entra na `evento_saida`. O relay publica no Kafka, e os consumidores (idempotentes, como no marco 5) avisam o cliente, alimentam o antifraude, atualizam a projeção do extrato e chamam os webhooks.
+
+Três escolhas saem direto dos requisitos: nenhuma chamada síncrona a outro serviço no caminho do SPI; o conector isolado do resto (instâncias e pool de conexões próprios, um **bulkhead**, módulo 13) para que um pico de acessos ao app não roube recursos do recebimento; e a **reconciliação** como parte do desenho, não como remendo.
+
+## 5. Aprofundamentos
+
+### Idempotência pelo EndToEndId
+
+A mesma ordem pode chegar duas vezes: uma retransmissão, um conector que reinicia no meio, uma mensagem reprocessada. A defesa é a do módulo 12, com a chave que o próprio domínio oferece:
+
+```java
+@Transactional
+public Resposta receber(OrdemDePagamento ordem) {
+    int inseridas = jdbc.sql("""
+            INSERT INTO pix_recebido (end_to_end_id, conta_id, valor, estado, recebido_em)
+            VALUES (:e2e, :conta, :valor, 'RECEBIDO', now())
+            ON CONFLICT (end_to_end_id) DO NOTHING""")
+        .param("e2e", ordem.endToEndId()).param("conta", ordem.contaId()).param("valor", ordem.valor())
+        .update();
+    if (inseridas == 0) {
+        return respostaJaDada(ordem.endToEndId());   // repetida: devolve a MESMA resposta, sem reprocessar
+    }
+    Resposta resposta = validar(ordem);             // conta existe, está ativa, pode receber?
+    registrarResposta(ordem.endToEndId(), resposta); // ACEITO ou RECUSADO, com o motivo
+    return resposta;
+}
+```
+
+A constraint no banco é o que garante, não o `if`: duas entregas simultâneas da mesma ordem disputam a mesma chave primária, e só uma insere. É o mesmo raciocínio da `UNIQUE` na chave de idempotência do marco 2, com uma diferença: lá o cliente inventa a chave; aqui ela já vem no domínio.
+
+### Crédito atômico e ledger de partidas dobradas
+
+Na confirmação de liquidação, tudo acontece numa transação só:
+
+```sql
+UPDATE pix_recebido SET estado = 'LIQUIDADO' WHERE end_to_end_id = :e2e AND estado = 'ACEITO';
+-- 0 linhas: já liquidado (confirmação repetida) ou estado inesperado → não faz mais nada
+
+INSERT INTO lancamento (transacao, conta_contabil, valor, criado_em) VALUES
+    (:e2e, 'LIQUIDACAO_PIX', -:valor, now()),     -- saiu da conta de liquidação do banco
+    (:e2e, 'CLIENTE:' || :conta, :valor, now());  -- entrou na conta do cliente
+
+UPDATE conta SET saldo = saldo + :valor WHERE id = :conta;
+
+INSERT INTO evento_saida (...) VALUES (...);     -- PixRecebido, para notificações e afins
+```
+
+- O `UPDATE ... AND estado = 'ACEITO'` é uma **transição condicional**: a confirmação repetida não credita de novo.
+- **Partidas dobradas**: os lançamentos de cada transação somam **zero**. O dinheiro não aparece nem some; ele muda de conta. Isso permite uma verificação poderosa: a soma de todos os lançamentos do sistema é zero, e o saldo de cada conta bate com a soma dos seus lançamentos. Se não bater, há um bug, e você descobre antes do cliente.
+- O ledger é **só inserção**. Uma devolução ou um estorno é um **novo** lançamento, nunca um `UPDATE` no antigo. É o que dá auditoria.
+- `saldo = saldo + :valor` é uma escrita atômica no banco, sem ler e gravar em Java, que perderia atualizações (o *lost update* do módulo 9). Num débito, a condição vai no próprio `UPDATE` (`WHERE saldo >= :valor`), e o `CHECK (saldo >= 0)` do marco 2 continua como última linha de defesa.
+
+<Callout tipo="dica" titulo="Otimista ou pessimista?">
+Para contas comuns, o lock otimista com `@Version` (módulo 9) funciona bem: conflitos são raros. Para uma conta que recebe centenas de créditos por segundo, ele vira uma tempestade de retentativas. Ali, o `UPDATE` atômico (que segura o lock da linha só durante a instrução) é a escolha, e a próxima seção mostra o limite até dele.
+</Callout>
+
+### Contas quentes
+
+Um varejista grande, na Black Friday, pode receber centenas de PIX por segundo **na mesma conta**. Cada crédito atualiza a mesma linha e segura o lock dela até o commit. A conta de bolso: se cada transação segura o lock por cerca de 5 ms, a linha aceita no máximo 1.000 ÷ 5 = **200 créditos por segundo**, não importa quantas instâncias você suba.
+
+E há uma conta ainda mais quente: a **conta de liquidação do próprio banco**, que é a contrapartida de **todos** os PIX. No pico de 3.000 por segundo, ela não pode ser uma linha de saldo atualizada a cada crédito. As defesas vêm da aula anterior (hot keys):
+
+- **sub-saldos**: a conta quente é dividida em N linhas (`LIQUIDACAO_PIX#0` a `#15`), cada crédito escolhe uma, e o saldo é a soma;
+- **saldo derivado em lote**: para contas que só recebem, grave o lançamento na hora e consolide o saldo a cada fração de segundo;
+- o que **não** fazer: tirar o lock e torcer.
+
+### Outbox para notificações e antifraude
+
+Se o serviço publicasse no Kafka depois do commit, uma queda entre os dois perderia o evento; se publicasse antes, poderia avisar um crédito que não aconteceu. A **outbox** (módulo 12, marco 5) resolve: o evento é gravado na **mesma transação** do crédito, e o relay publica depois. Os consumidores são **idempotentes** (o evento carrega o EndToEndId), porque o relay entrega pelo menos uma vez.
+
+O antifraude, no recebimento, trabalha **depois** do crédito: procura padrões de contas usadas para receber dinheiro de golpes e pode acionar os mecanismos previstos nas regras do Pix (como o MED, o Mecanismo Especial de Devolução). Colocá-lo **síncrono** no caminho do SPI arriscaria o prazo de resposta por uma análise que pode ser feita segundos depois. Essa é uma decisão de produto e de risco, e deve ser dita como tal na entrevista.
+
+### Cache: dados de conta, sim; saldo, nunca
+
+A validação no aceite precisa de poucos dados da conta de destino: se existe, se está ativa, se tem bloqueio. Eles mudam pouco e são lidos em todo PIX: bons candidatos a cache-aside no Redis (aula 1), com **TTL curto** (minutos) e **invalidação** por evento quando a conta muda de status. Um bloqueio judicial ou por fraude que demore o TTL inteiro para valer é um risco real: por isso a remoção da chave no evento, e não só o TTL.
+
+O que **não** vai para o cache: **saldo** e estado do PIX. Eles são lidos e gravados na transação, com consistência forte.
+
+<Callout tipo="atencao" titulo="E a consulta de chaves no DICT?">
+Quem consulta o DICT é a instituição do **pagador**, então isso aparece quando o banco **envia** PIX. O DICT tem regras próprias de consulta, inclusive proteções contra a varredura de chaves, e o regulamento define o que pode ser guardado e por quanto tempo. Antes de propor um cache de respostas do DICT, leia essas regras: numa entrevista, dizer "eu verificaria as regras do DICT antes de cachear" vale mais que inventar um TTL.
+</Callout>
+
+### Timeout não é falha
+
+É o aprofundamento que mais separa respostas medianas de boas. Três situações:
+
+1. **O commit no nosso banco deu timeout.** Não sabemos se gravou. Quando a ordem chegar de novo (ou quando repetirmos), a chave primária no EndToEndId resolve: ou insere agora, ou já estava lá.
+2. **A confirmação de liquidação não chegou.** Respondemos o aceite, mas nada voltou no prazo esperado. Creditar seria criar dinheiro se a liquidação não aconteceu; esquecer seria sumir com o dinheiro do cliente se aconteceu. O PIX vai para **`DESCONHECIDO`**, e um processo consulta a situação da transação na fonte de verdade, pelo EndToEndId.
+3. **A reconciliação** fecha o que sobrar: compara, periodicamente, as transações liquidadas segundo o SPI com o nosso ledger. Toda diferença vira alerta e caso de análise.
+
+<Figura legenda="Os estados de um PIX recebido. Timeout leva a DESCONHECIDO, nunca direto a crédito ou recusa">
+<svg viewBox="0 0 680 320" width="680" role="img" aria-label="RECEBIDO vai para ACEITO ou RECUSADO; ACEITO vai para LIQUIDADO com a confirmação, ou para DESCONHECIDO sem confirmação; DESCONHECIDO, após consulta, vai para LIQUIDADO ou NÃO LIQUIDADO; LIQUIDADO pode ir para DEVOLVIDO">
+  <defs><marker id="m1507" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="130" height="56" rx="10" class="d-info"/><text x="75" y="64" text-anchor="middle" class="d-title">RECEBIDO</text><text x="75" y="84" text-anchor="middle" class="d-label">valida a conta</text>
+  <rect x="190" y="40" width="130" height="56" rx="10" class="d-info"/><text x="255" y="64" text-anchor="middle" class="d-title">ACEITO</text><text x="255" y="84" text-anchor="middle" class="d-label">aguarda o SPI</text>
+  <rect x="370" y="40" width="140" height="56" rx="10" class="d-ok"/><text x="440" y="64" text-anchor="middle" class="d-title">LIQUIDADO</text><text x="440" y="84" text-anchor="middle" class="d-label">credita o cliente</text>
+  <rect x="560" y="40" width="110" height="56" rx="10" class="d-violet"/><text x="615" y="64" text-anchor="middle" class="d-title">DEVOLVIDO</text><text x="615" y="84" text-anchor="middle" class="d-label">via saga</text>
+  <rect x="10" y="190" width="130" height="56" rx="10" class="d-accent"/><text x="75" y="214" text-anchor="middle" class="d-title">RECUSADO</text><text x="75" y="234" text-anchor="middle" class="d-label">motivo enviado</text>
+  <rect x="190" y="190" width="130" height="56" rx="10" class="d-accent"/><text x="255" y="214" text-anchor="middle" class="d-title">DESCONHECIDO</text><text x="255" y="234" text-anchor="middle" class="d-label">sem resposta</text>
+  <rect x="370" y="190" width="140" height="56" rx="10" class="d-box"/><text x="440" y="214" text-anchor="middle" class="d-title">NÃO LIQUIDADO</text><text x="440" y="234" text-anchor="middle" class="d-label">nada a creditar</text>
+  <path d="M140 68 H186" class="d-line" marker-end="url(#m1507)"/>
+  <path d="M320 68 H366" class="d-line" marker-end="url(#m1507)"/><text x="343" y="30" text-anchor="middle" class="d-label">confirmação</text>
+  <path d="M510 68 H556" class="d-line" marker-end="url(#m1507)"/><text x="533" y="30" text-anchor="middle" class="d-label">devolução</text>
+  <path d="M75 96 V186" class="d-line" marker-end="url(#m1507)"/><text x="82" y="150" class="d-label">inválido</text>
+  <path d="M255 96 V186" class="d-line" marker-end="url(#m1507)"/><text x="248" y="122" text-anchor="end" class="d-label">sem confirmação</text>
+  <path d="M320 196 L392 100" class="d-line" marker-end="url(#m1507)"/><text x="372" y="160" class="d-label">consulta: liquidou</text>
+  <path d="M320 218 H366" class="d-line" marker-end="url(#m1507)"/><text x="343" y="264" text-anchor="middle" class="d-label">consulta: não liquidou</text>
+  <text x="10" y="292" class="d-label">Sem confirmação no prazo, o estado é DESCONHECIDO: nem crédito, nem recusa.</text>
+  <text x="10" y="310" class="d-label">Quem decide é a consulta à fonte de verdade e, no limite, a reconciliação.</text>
+</svg>
+</Figura>
+
+### Devolução como saga
+
+A devolução envolve dois sistemas, o nosso ledger e o SPI, e não existe transação entre eles: é uma **saga** (aula 5), orquestrada, com o estado persistido.
+
+1. **Registrar e debitar** (transação local): valida o valor com um `UPDATE` condicional, `SET valor_devolvido = valor_devolvido + :v WHERE end_to_end_id = :e2e AND valor_devolvido + :v <= valor`, que impede duas devoluções parciais simultâneas de somarem mais que o recebido (o mesmo padrão do update atômico da aula 3); grava os lançamentos do débito e a devolução como `PENDENTE`, com um identificador próprio.
+2. **Enviar ao SPI**, com o id da devolução.
+3. **Confirmada**: `CONCLUIDA`, evento pela outbox. **Recusada** (falha confirmada): **compensa** com novos lançamentos que devolvem o valor ao cliente e desfazem o `valor_devolvido`. **Timeout**: continua `PENDENTE`, e o mesmo mecanismo de consulta e reconciliação resolve. Nunca compensar diante de um timeout.
+
+Do lado do app, a `Idempotency-Key` garante que o toque duplo no botão "devolver" não gere duas devoluções.
+
+### Consistência: forte onde dói, eventual no resto
+
+| Dado | Garantia | Por quê |
+|---|---|---|
+| estado do PIX, lançamentos, saldo | **forte** (uma transação local, no primário) | dinheiro |
+| push e webhook do lojista | eventual (segundos) | outbox + Kafka; atraso tolerável, perda não |
+| antifraude pós-evento | eventual | análise pode vir depois do crédito |
+| lista de recebidos no app | eventual, com read-your-writes para o próprio PIX | réplica de leitura; o detalhe de um PIX recém-recebido lê do primário |
+| dados de conta para validação | cache com TTL curto + invalidação | leitura em todo PIX, muda pouco |
+
+### Particionamento por conta
+
+Quando um primário não der mais conta (os 6 mil commits por segundo da estimativa são o sinal), a chave natural de partição é a **conta**: o PIX, os lançamentos e o saldo de uma conta ficam juntos, e o crédito continua sendo uma transação **local** numa partição só.
+
+Dois detalhes que mostram experiência:
+
+- **A unicidade do EndToEndId.** Num banco particionado, uma `UNIQUE` só vale dentro da partição; no PostgreSQL, a chave única de uma tabela particionada precisa incluir a coluna de partição. A saída: a chave passa a ser `(conta_id, end_to_end_id)`. Funciona porque a mesma ordem sempre traz a mesma conta de destino, então uma repetição cai na mesma partição.
+- **A conta de liquidação do banco** é de todas as partições. Com sub-saldos por partição (um por partição) e consolidação, ela deixa de ser um ponto de contenção.
+
+A consulta "todos os PIX acima de R$ 10 mil hoje", que cruza partições, vai para o **data warehouse** alimentado pelos eventos, não para o banco transacional.
+
+### Observabilidade e SLO
+
+O módulo 14 dá as ferramentas; o caso diz **o que** medir:
+
+- **RED** do caminho do SPI: taxa de ordens recebidas, taxa de recusas por motivo (e de erros internos), e duração da resposta, com histograma para o p99.
+- **Métricas de negócio**: PIX em `DESCONHECIDO` há mais de X minutos, diferenças da reconciliação (o esperado é **zero**), eventos pendentes na outbox (o `fintech_outbox_pendentes` do marco 6), atraso entre crédito e notificação.
+- **Um SLO hipotético**: "99,95% das ordens respondidas em até 100 ms, medido em 30 dias". O orçamento de erro diz quando parar de publicar features e cuidar de confiabilidade.
+- **Correlação**: o EndToEndId em todo log, span e evento. Quando o cliente liga dizendo "o PIX não caiu", é a primeira coisa que o suporte vai digitar.
+- **Health**: como no marco 6, a readiness do recebimento depende do banco, e **não** do Kafka: sem Kafka, o crédito continua e o evento espera na outbox.
+
+## 6. Gargalos, picos e trade-offs
+
+**Picos previsíveis.** Dia de pagamento de salários, começo do mês, Black Friday, datas comemorativas: o pico não é surpresa, e se prepara com antecedência:
+
+- teste de carga com o **dobro** do pico estimado, no ambiente mais parecido com produção possível;
+- instâncias e conexões **escaladas antes** do evento (o autoscaling reage em minutos; o pico chega em segundos);
+- **degradação planejada**: notificações e webhooks podem atrasar (a outbox cresce e depois esvazia), o extrato pode vir de cache e réplica; o caminho do SPI não degrada;
+- **rate limit** nas APIs do app (módulo 11 e aula 2), nunca no caminho do SPI, que não se pode recusar por excesso de carga nossa.
+
+| Decisão | Ganho | Custo |
+|---|---|---|
+| caminho síncrono mínimo, resto por outbox | prazo do SPI protegido, falhas isoladas | notificação eventual, mais peças (relay, Kafka) |
+| EndToEndId como chave primária | idempotência garantida pelo banco | com particionamento, a chave precisa incluir a conta |
+| ledger de partidas dobradas, só inserção | auditoria, verificação automática | mais linhas por PIX, saldo a manter coerente |
+| sub-saldos nas contas quentes | escala de escrita | leitura do saldo soma N linhas; código mais complexo |
+| `DESCONHECIDO` + reconciliação | nunca cria nem some com dinheiro | um estado a mais, processos de consulta e análise manual |
+| antifraude assíncrono no recebimento | latência previsível | análise depois do crédito, decisão de risco explícita |
+
+<Callout tipo="erro" titulo="Armadilhas clássicas">
+- **Creditar no aceite**, antes da confirmação da liquidação: se ela não vier, o dinheiro foi criado.
+- **Tratar timeout como recusa** (ou como sucesso). Timeout é `DESCONHECIDO`.
+- **Deduplicar com `SELECT` antes do `INSERT`**, sem constraint: duas entregas simultâneas passam pelo `SELECT` juntas.
+- **Publicar o evento direto no Kafka** dentro ou depois da transação, sem outbox.
+- **Chamadas síncronas em cadeia** no caminho do SPI (antifraude, CRM, notificação): cada uma soma latência e um novo jeito de falhar.
+- **`UPDATE` no lançamento** para "corrigir" um valor. Correção é lançamento novo.
+- **Saldo em cache.**
+</Callout>
+
+<Callout tipo="entrevista">
+Numa entrevista, o caminho que funciona:
+
+1. Pergunte o escopo (só recebimento? devolução entra?) e declare premissas de volume; faça a conta do **pico**.
+2. Desenhe o caminho síncrono **curto** e diga por que o resto é assíncrono (outbox).
+3. Aprofunde sem ser perguntado nos três pontos que o entrevistador espera: **idempotência** pelo EndToEndId com constraint, **crédito atômico** com ledger de partidas dobradas, e **timeout = estado desconhecido**, com consulta e reconciliação.
+4. Mostre que enxerga os gargalos: **conta quente** (faça a conta dos 200 por segundo), particionamento por conta e a unicidade da chave.
+5. Feche com consistência (forte no saldo, eventual no resto), observabilidade (métricas de negócio, SLO) e os trade-offs.
+
+Se você não souber um detalhe do regulamento, diga que consultaria o manual do Banco Central. Inventar números oficiais pega mal; saber onde procurar, não.
+</Callout>
+
+<Quiz
+  id="15-caso-pix"
+  questoes={[
+    {
+      pergunta: 'A mesma ordem de pagamento (mesmo EndToEndId) chega duas vezes, ao mesmo tempo, em duas instâncias. O que garante que o cliente é creditado uma vez só?',
+      opcoes: ['Um SELECT antes do INSERT', 'Uma chave primária (ou UNIQUE) no EndToEndId, com INSERT ... ON CONFLICT DO NOTHING', 'Um lock em memória na instância', 'O TTL do Redis'],
+      correta: 1,
+      explicacao: 'Só a constraint no banco decide entre duas transações simultâneas. O SELECT prévio deixa as duas passarem.',
+    },
+    {
+      pergunta: 'O aceite foi enviado, mas a confirmação de liquidação não chegou no prazo esperado. O que fazer?',
+      opcoes: ['Creditar o cliente, porque o aceite foi enviado', 'Marcar como recusado', 'Marcar como DESCONHECIDO e consultar a situação pelo EndToEndId, com a reconciliação como rede de segurança', 'Esperar o cliente reclamar'],
+      correta: 2,
+      explicacao: 'Timeout não é falha nem sucesso. Creditar sem liquidação cria dinheiro; ignorar uma liquidação feita deixa o cliente sem crédito.',
+    },
+    {
+      pergunta: 'Cada crédito segura o lock da linha de saldo por cerca de 5 ms. Quantos créditos por segundo essa conta aceita, no máximo?',
+      opcoes: ['cerca de 20', 'cerca de 200', 'cerca de 2.000', 'ilimitado, com mais instâncias'],
+      correta: 1,
+      explicacao: '1.000 ms ÷ 5 ms = 200. Mais instâncias não ajudam: todas disputam a mesma linha. Sub-saldos ou consolidação em lote resolvem.',
+    },
+    {
+      pergunta: 'Onde o recebimento de PIX pode aceitar consistência eventual?',
+      opcoes: ['No saldo', 'Nos lançamentos do ledger', 'Nas notificações e webhooks', 'No estado do PIX'],
+      correta: 2,
+      explicacao: 'Saldo, lançamentos e estado mudam juntos numa transação local. Notificações saem pela outbox e podem atrasar segundos.',
+    },
+    {
+      pergunta: 'A tabela de PIX foi particionada por conta no PostgreSQL. Como manter a idempotência pelo EndToEndId?',
+      opcoes: ['Uma UNIQUE só no EndToEndId em cada partição resolve sozinha', 'Usar a chave (conta_id, end_to_end_id), já que a mesma ordem sempre traz a mesma conta', 'Desistir da constraint e usar um lock no Redis', 'Guardar os EndToEndIds em memória'],
+      correta: 1,
+      explicacao: 'A chave única de uma tabela particionada precisa incluir a coluna de partição. Como a repetição traz a mesma conta, ela cai na mesma partição e a constraint funciona.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Roteiro: requisitos → estimativas (com o **pico**) → API e dados → alto nível → aprofundamentos → trade-offs. Premissas declaradas, **nenhum número oficial inventado**.
+- PIX em uma frase: o BCB liquida no **SPI**, as chaves ficam no **DICT**, tudo 24x7 e em tempo real; o **EndToEndId** acompanha cada transação.
+- Caminho síncrono **mínimo** (validar, gravar, responder); o resto pela **outbox**.
+- **Idempotência** pelo EndToEndId com constraint; **crédito atômico** com transição condicional de estado e **ledger de partidas dobradas**, só inserção.
+- **Timeout é `DESCONHECIDO`**: consulta pelo id e **reconciliação**; devolução é **saga** que só compensa falha confirmada.
+- Gargalos: **contas quentes** (a conta dos 200 por segundo), particionamento por conta com a chave `(conta_id, end_to_end_id)`.
+- Consistência forte no dinheiro, eventual no resto; métricas RED, métricas de negócio e SLO; picos preparados com teste de carga e escala antecipada.
+
+## Referências
+
+- Banco Central do Brasil — página do Pix, com o regulamento e os manuais técnicos (bcb.gov.br, seção Estabilidade financeira › Pix)
+- Martin Kleppmann — *Designing Data-Intensive Applications*, capítulos 7 (transações) e 9 (consistência)
+- Pat Helland — *Life beyond Distributed Transactions: an Apostate's Opinion* (2007)
+- Chris Richardson — *Microservices Patterns* (Manning), capítulos sobre sagas e transactional outbox
+- Betsy Beyer e outros — *Site Reliability Engineering* (Google), capítulo *Service Level Objectives*

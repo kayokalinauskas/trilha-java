@@ -1,0 +1,1684 @@
+---
+titulo: Pede Aí — plataforma de pedidos para delivery
+resumo: "Um monólito modular orientado a eventos que leva o pedido do carrinho à porta do cliente: cardápio em cache, pagamento por gateway com webhook, máquina de estados com quem-pode-o-quê, entregadores e notificações, com outbox, idempotência de ponta a ponta e observabilidade de verdade."
+nivel: pleno
+ordem: 1
+dominio: Food delivery · pedidos
+horas: 140
+stack: [Java 25, Spring Boot 4, Spring Modulith, Spring Security 7, Keycloak, PostgreSQL 18, Flyway, Kafka 4, Redis, Resilience4j, OpenTelemetry, Testcontainers 2, k6, Docker Compose, GitHub Actions]
+competencias:
+  - Arquitetura de monólito modular com fronteiras verificadas por teste e decisões registradas em ADRs
+  - Consistência entre módulos com eventos de domínio, outbox transacional e consumidores idempotentes com retry e DLQ
+  - Idempotência de ponta a ponta — no POST do pedido, na chamada ao gateway e no webhook de pagamento
+  - Segurança com OAuth2/JWT e autorização por papel e por dono do recurso, testada numa matriz
+  - Resiliência medida contra uma dependência externa instável (timeout, retry, circuit breaker)
+  - Observabilidade real com métricas de negócio, tracing ponta a ponta e logs correlacionados
+  - Testes com infraestrutura real (Testcontainers) e meta de latência comprovada com teste de carga
+modulos: [04-java-moderno, 06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 12-mensageria, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - id: fundacao
+    titulo: Fundação do repositório
+    resumo: "Projeto gerado, módulos vazios verificados pelo Modulith, Docker Compose com toda a infraestrutura e CI verde."
+  - id: identidade
+    titulo: Identidade e papéis
+    resumo: "Keycloak com realm versionado, API como resource server e a matriz de autorização começando a existir."
+  - id: catalogo
+    titulo: Catálogo com dono
+    resumo: "Restaurantes, horários, cardápio e disponibilidade, com escrita restrita ao responsável e leitura pública paginada."
+  - id: pedidos
+    titulo: Pedido com cotação, cupom e idempotência
+    resumo: "Cotação com taxa por faixa de distância e cupom; criação do pedido com Idempotency-Key e rate limiting."
+  - id: pagamentos
+    titulo: Pagamento simulado e resiliente
+    resumo: "Gateway fake no Compose, cobrança assíncrona com timeout, retry e circuit breaker, webhook assinado e idempotente."
+  - id: ciclo
+    titulo: Ciclo de vida e entregas
+    resumo: "Máquina de estados completa, cancelamento com reembolso, atribuição de entregador e rastreamento."
+  - id: eventos
+    titulo: Eventos no Kafka e notificações
+    resumo: "Externalização dos eventos pelo registro de publicações, consumidor idempotente de notificações, retry e DLT."
+  - id: operacao
+    titulo: Cache, métricas e tracing
+    resumo: "Cardápio em Redis com invalidação por evento, métricas de negócio, tracing ponta a ponta e painel no Grafana."
+  - id: entrega
+    titulo: Carga, documentação e release v1.0.0
+    resumo: "Meta de latência comprovada com k6, README final, vídeo de demonstração, deploy opcional e release."
+---
+
+## Visão geral
+
+Delivery de comida é um dos domínios mais usados em entrevistas de backend, e não por acaso: ele parece simples ("um CRUD de pedidos") e esconde quase todos os problemas que um time de verdade enfrenta. O cliente clica duas vezes em "Pedir" e não pode ser cobrado duas vezes. O gateway de pagamento responde em 8 segundos, ou não responde. O webhook de confirmação chega duplicado, ou chega depois que o pedido já foi cancelado. O restaurante não pode ver o pedido do concorrente. Um entregador não pode receber duas corridas ao mesmo tempo. E, quando algo dá errado às 20h de uma sexta-feira, alguém precisa descobrir o quê em minutos, não em horas.
+
+Neste projeto você constrói o backend da **Pede Aí**, uma plataforma de pedidos para delivery, como um **monólito modular orientado a eventos**: um único deploy, com módulos de fronteira clara (catálogo, pedidos, pagamentos, entregas, notificações) que conversam por eventos de domínio, e eventos que saem para o Kafka pela outbox transacional.
+
+O que será construído:
+
+- **Catálogo** de restaurantes com horário de funcionamento (inclusive virando a meia-noite), pausa manual, cardápio e disponibilidade de itens, com leitura em cache no Redis invalidada por evento.
+- **Cotação e criação de pedido** com taxa de entrega por faixa de distância, pedido mínimo, cupons com limite de uso e **chave de idempotência** no POST.
+- **Pagamento** por um gateway **simulado** (um serviço fake que você escreve e sobe no Compose), com chamada resiliente, **webhook assinado com HMAC**, deduplicação e estorno no cancelamento.
+- **Máquina de estados do pedido** com regras explícitas de quem pode fazer cada transição, prazos automáticos (pagamento que não chega, restaurante que não responde) e trilha de auditoria.
+- **Entregas**: entregadores com disponibilidade e posição, atribuição automática sem corrida dupla, coleta, rastreamento e confirmação.
+- **Notificações** consumidas do Kafka por um consumidor idempotente, com retry, tópico de DLT e e-mail entregue num servidor SMTP fake.
+- **Segurança** com Keycloak (OAuth2/OIDC), JWT, papéis e **dono do recurso**; **rate limiting** no POST do pedido.
+- **Observabilidade**: métricas de negócio, tracing com OpenTelemetry, logs estruturados com correlation id, health checks e um painel no Grafana; **meta de latência** comprovada com k6.
+
+**Pitch de uma frase:** "O Pede Aí é o backend de um delivery, feito como monólito modular com Spring Modulith, em que um pedido atravessa catálogo, pagamento e entrega por eventos com outbox, sem cobrança duplicada nem evento perdido, e que sobe inteiro, com Keycloak, Kafka, Redis e observabilidade, com um `docker compose up`."
+
+**Por que ele chama atenção num portfólio Pleno.** Um projeto Júnior mostra que você sabe fazer uma API correta. Um projeto Pleno precisa mostrar que você sabe **tomar decisões e sustentá-las**: por que monólito modular e não microsserviços, por que a outbox, onde mora a idempotência, o que acontece quando o gateway cai. O gestor que abre este repositório encontra ADRs, um teste que falha se um módulo invadir o outro, testes com Postgres, Kafka e Redis de verdade, um gráfico de p95 medido e um vídeo de 3 minutos mostrando um pedido indo do carrinho à entrega. Isso é o que separa "fiz um curso de Spring" de "eu consigo tocar uma feature de ponta a ponta no time".
+
+## Contexto de negócio
+
+A **Pede Aí Tecnologia** é uma startup fictícia que opera delivery numa cidade média, com cerca de 300 restaurantes parceiros e picos de 40 pedidos por minuto no jantar de sexta-feira. Hoje ela usa uma planilha e um grupo de mensagens; o investimento-anjo chegou e o primeiro backend de verdade é o seu. O time de produto quer, em ordem: (1) nunca cobrar um cliente duas vezes, (2) nunca perder um pedido pago, (3) saber em tempo real quantos pedidos estão travados em cada etapa.
+
+A empresa recebe uma comissão sobre cada pedido e cobra do cliente a taxa de entrega; o repasse ao restaurante e ao entregador fica **fora** deste projeto (é financeiro, e é outra especificação).
+
+### Atores
+
+| Ator | Papel no Keycloak | O que faz no sistema |
+|---|---|---|
+| Cliente | `CLIENTE` | Consulta restaurantes e cardápios, cota o carrinho, cria e paga pedidos, acompanha e cancela (enquanto pode), recebe notificações |
+| Restaurante (responsável) | `RESTAURANTE` | Mantém horários, cardápio e disponibilidade **do próprio restaurante**; aceita, recusa, prepara e marca pedidos como prontos; cancela quando não consegue cumprir |
+| Entregador | `ENTREGADOR` | Fica disponível ou offline, envia a posição, recebe corridas, confirma coleta e entrega |
+| Administrador | `ADMIN` | Cadastra restaurantes e entregadores, cria cupons, cancela qualquer pedido não terminal, reatribui entregas, consulta tudo |
+| Gateway de pagamento (sistema) | — (HMAC) | Recebe cobranças e estornos, confirma por webhook |
+| Agendador interno (sistema) | — | Expira pedidos sem pagamento, cancela pedidos sem resposta do restaurante, tenta de novo atribuições pendentes |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **Cotação** | Cálculo do valor do carrinho (subtotal, taxa de entrega, desconto, total) sem criar pedido. O carrinho mora no aplicativo; o servidor só cota |
+| **Subtotal** | Soma de preço unitário × quantidade dos itens, antes de taxa e desconto |
+| **Taxa de entrega** | Valor por faixa de distância em linha reta entre restaurante e endereço de entrega |
+| **Pedido mínimo** | Subtotal mínimo aceito por um restaurante |
+| **Cupom** | Código que dá desconto sobre o subtotal, com validade, limite de usos e um uso por cliente |
+| **Snapshot** | Cópia de nome e preço do item no momento do pedido; mudanças posteriores no cardápio não afetam pedidos já criados |
+| **Chave de idempotência** | Identificador enviado pelo cliente (`Idempotency-Key`) para que a repetição de uma requisição não crie um segundo pedido |
+| **Cobrança** | Pedido de pagamento enviado ao gateway; tem id externo e status próprio |
+| **Webhook** | Chamada HTTP do gateway para a Pede Aí informando o resultado de uma cobrança ou estorno |
+| **Estorno** | Devolução do valor ao cliente pelo gateway, sempre do valor total do pedido nesta versão |
+| **Estado terminal** | `ENTREGUE`, `CANCELADO` ou `RECUSADO`: nenhuma transição sai dele |
+| **Corrida** | Uma entrega atribuída a um entregador |
+| **Outbox / registro de publicações** | Tabela, gravada na mesma transação da mudança de estado, com os eventos que ainda precisam ser entregues |
+| **DLT** | *Dead letter topic*: tópico que recebe as mensagens que falharam depois de todas as tentativas |
+
+## Escopo
+
+**Dentro:**
+
+- API REST com os quatro atores e os fluxos descritos nos requisitos funcionais.
+- Um serviço **PagaFake** (gateway simulado) escrito por você, com o contrato da seção de API, rodando no Compose.
+- Keycloak com realm exportado no repositório (usuários de teste, papéis e clientes OIDC).
+- Kafka (KRaft) para eventos de integração; Redis para cache e rate limiting; Mailpit como SMTP fake; `grafana/otel-lgtm` para métricas, traces e logs.
+- Testes de unidade, de fatia, de integração com Testcontainers, de módulo do Modulith, de contrato do webhook e de carga com k6.
+- Pipeline no GitHub Actions, imagem Docker, README, ADRs, coleção `.http` e vídeo de demonstração.
+
+**Fora** (vira "Para ir além" ou outro projeto):
+
+- Front-end e aplicativos. A demonstração usa a coleção `.http` ou o Swagger UI.
+- Carrinho persistido no servidor, avaliações, programa de fidelidade, gorjeta.
+- Geocodificação de endereço e rota real: o cliente envia latitude e longitude; a distância é em linha reta (fórmula de haversine).
+- Repasse financeiro a restaurantes e entregadores, emissão de nota fiscal, conciliação.
+- Estorno parcial, troca de itens depois do pagamento, agendamento de pedidos para outro horário.
+- Push real para celular e SMS: o canal "push" é registrado numa tabela e no log.
+- Microsserviços separados e Kubernetes (o projeto Sênior trata disso).
+
+## Requisitos funcionais
+
+Convenções que valem para todos os requisitos:
+
+- Valores em dinheiro trafegam e são guardados em **centavos inteiros** (`long` no Java, `BIGINT` no banco, número inteiro no JSON: `4590` é R$ 45,90). Não há `double` nem `float` em nenhuma camada.
+- Datas e horas trafegam em ISO-8601 com fuso (`2026-10-02T20:15:03Z`); horários de funcionamento são locais, no fuso `America/Sao_Paulo`.
+- O tempo é obtido de um `Clock` injetado, para que prazos (15 min, 8 min) sejam testáveis sem esperar.
+- Todo erro segue Problem Details (RFC 9457) com o campo `codigo` da tabela de erros.
+
+### RF-01 · Autenticação e papéis
+
+A API não tem tela de login nem guarda senhas: a autenticação é do Keycloak, e a API é um **resource server** que valida o JWT (assinatura, emissor, expiração) e extrai os papéis.
+
+**Regras**
+
+- **RN-01 — Papéis vêm do claim `realm_access.roles`.** Um token com `"realm_access": {"roles": ["CLIENTE"]}` vira a autoridade `ROLE_CLIENTE`. Borda: papéis desconhecidos (ex.: `offline_access`) são ignorados, não geram erro.
+- **RN-02 — A identidade é o `sub` do token.** Todo vínculo de dono (cliente do pedido, responsável pelo restaurante, entregador) usa o `sub`, nunca o e-mail ou o `preferred_username`, que podem mudar. Exemplo: o usuário `rest.bella` tem `sub` `7b1e…`; é esse valor que fica em `restaurante.responsavel_sub`.
+- **RN-03 — Token inválido é 401; papel errado é 403.** Sem token, com token expirado ou de outro emissor: `401` com `WWW-Authenticate: Bearer`. Token válido de `CLIENTE` em `POST /admin/cupons`: `403`.
+- **RN-04 — `GET /me` devolve quem é o usuário para a API.** Resposta com `sub`, `nome`, `papeis` e, se houver, `restauranteIds` e `entregadorId`. Borda: um usuário `RESTAURANTE` sem restaurante vinculado recebe `restauranteIds: []`, não erro.
+
+**Critérios de aceite**
+
+- **Dado** um token de `cliente1` emitido pelo Keycloak do Compose, **quando** chamo `GET /me`, **então** recebo `200` com `papeis: ["CLIENTE"]`.
+- **Dado** um token com emissor diferente do configurado, **quando** chamo qualquer rota protegida, **então** recebo `401`.
+- **Dado** um token de `CLIENTE`, **quando** chamo `POST /admin/restaurantes`, **então** recebo `403` com `codigo: ACESSO_NEGADO`.
+
+### RF-02 · Cadastro de restaurantes
+
+O administrador cadastra o restaurante e o vincula a um usuário responsável. O responsável edita os dados operacionais do próprio restaurante.
+
+**Regras**
+
+- **RN-05 — Só `ADMIN` cria restaurante e define o responsável.** Campos obrigatórios: `nome` (3 a 80 caracteres), `latitude` (−90 a 90), `longitude` (−180 a 180), `responsavelSub`, `pedidoMinimoCentavos` (0 a 50000), `tempoPreparoMinutos` (5 a 120). Borda: `latitude: 91` → `400` com o campo apontado em `erros`.
+- **RN-06 — Um responsável pode ter vários restaurantes; um restaurante tem exatamente um responsável.** Exemplo: `rest.bella` responde por "Bella Massa" e "Bella Pizza". Troca de responsável é operação de `ADMIN` e fica registrada no log de auditoria.
+- **RN-07 — Nome único por cidade não é regra; `id` é.** Duas unidades "Burger Zé" podem existir. O que identifica é o UUID.
+- **RN-08 — Restaurante `INATIVO` some do catálogo público.** O `ADMIN` inativa (`PATCH /admin/restaurantes/{id}` com `ativo: false`); pedidos em andamento seguem até o fim. Borda: cotação para restaurante inativo → `404 RESTAURANTE_NAO_ENCONTRADO` (para o cliente, ele não existe).
+
+**Critérios de aceite**
+
+- **Dado** um `ADMIN`, **quando** crio "Bella Massa" com `responsavelSub` de `rest.bella`, **então** recebo `201` com `Location: /restaurantes/{id}`.
+- **Dado** o restaurante de `rest.bella`, **quando** `rest.outro` tenta `PUT /restaurantes/{id}/horarios`, **então** recebe `404 RESTAURANTE_NAO_ENCONTRADO` (não `403`: não revelamos que o recurso existe).
+
+### RF-03 · Horário de funcionamento e pausa
+
+**Regras**
+
+- **RN-09 — Horários por dia da semana, com vários intervalos.** Exemplo: segunda, 11:00–15:00 e 18:00–23:00. Intervalos do mesmo dia não podem se sobrepor: 11:00–15:00 e 14:30–16:00 → `422 HORARIO_SOBREPOSTO`.
+- **RN-10 — Intervalo pode virar a meia-noite.** Sexta 18:00–02:00 significa aberto de sexta 18:00 até sábado 01:59:59. No sábado às 01:30, o restaurante está **aberto** por causa do intervalo de sexta. Borda: `abre` igual a `fecha` (ex.: 10:00–10:00) é inválido (`422`); para 24 horas, use 00:00–23:59.
+- **RN-11 — O fim do intervalo é exclusivo.** Com 18:00–23:00, às 22:59:59 está aberto; às 23:00:00, fechado.
+- **RN-12 — Pausa manual.** O responsável pode pausar (`POST /restaurantes/{id}/pausa`) por 15, 30 ou 60 minutos, ou até reabrir manualmente. Pausado conta como fechado. Borda: pausa com duração 45 → `400` (só 15, 30, 60 ou `null`).
+- **RN-13 — "Aberto agora" é calculado, não guardado.** `aberto = ativo ∧ ¬pausado ∧ dentro de algum intervalo (no fuso America/Sao_Paulo)`. O catálogo público expõe `abertoAgora` e `proximaAbertura` (quando fechado).
+
+**Critérios de aceite**
+
+- **Dado** um restaurante com sexta 18:00–02:00 e um `Clock` fixo em sábado 01:30 (horário de Brasília), **quando** consulto o restaurante, **então** `abertoAgora` é `true`.
+- **Dado** o mesmo restaurante e o `Clock` em sábado 02:00, **quando** consulto, **então** `abertoAgora` é `false` e `proximaAbertura` aponta para o próximo intervalo cadastrado.
+
+### RF-04 · Cardápio e disponibilidade
+
+**Regras**
+
+- **RN-14 — Item de cardápio.** `nome` (2 a 80), `descricao` (até 300), `categoria` (texto livre até 40, ex.: "Massas"), `precoCentavos` (100 a 100000), `disponivel` (padrão `true`). Borda: `precoCentavos: 0` → `400`; preço grátis não existe nesta versão.
+- **RN-15 — Disponibilidade é uma operação própria e barata.** `PATCH /restaurantes/{id}/itens/{itemId}/disponibilidade` com `{"disponivel": false}`. Existe porque, no pico, o restaurante marca "acabou o tiramisù" dezenas de vezes por noite; essa operação não deve exigir reenviar o item inteiro.
+- **RN-16 — Item não é apagado, é arquivado.** `DELETE` marca `arquivado = true`; o item some do cardápio, mas continua referenciável por pedidos antigos. Borda: arquivar um item que está num pedido em andamento é permitido (o pedido tem snapshot).
+- **RN-17 — Controle de concorrência otimista na edição.** `PUT` do item exige `If-Match` com a versão (`ETag`); versão desatualizada → `412 VERSAO_DESATUALIZADA`. Exemplo: dois funcionários editam o preço ao mesmo tempo; o segundo a salvar recebe `412` e recarrega.
+- **RN-18 — Toda alteração de cardápio publica `CardapioAlterado`** (criar, editar, arquivar, mudar disponibilidade, mudar horário ou pausa), usado para invalidar o cache (RF-05).
+
+**Critérios de aceite**
+
+- **Dado** o item "Tiramisù" disponível, **quando** o responsável marca `disponivel: false`, **então** em até 2 s o `GET /restaurantes/{id}/cardapio` não o lista como disponível.
+- **Dado** um `PUT` com `If-Match: "3"` e o item na versão 4, **quando** envio, **então** recebo `412`.
+
+### RF-05 · Consulta pública de restaurantes e cardápio
+
+Rotas de leitura abertas a qualquer usuário autenticado (qualquer papel), e é por elas que passa a maior parte do tráfego.
+
+**Regras**
+
+- **RN-19 — Listagem paginada e filtrável.** `GET /restaurantes?aberto=true&categoria=Massas&page=0&size=20`. `size` padrão 20, máximo 50; `size=500` → `400`. Ordenação padrão: abertos primeiro, depois por nome.
+- **RN-20 — Filtro por distância opcional.** Com `lat` e `lon`, a resposta inclui `distanciaMetros` e exclui restaurantes além de 8 km (a área de entrega). Borda: só `lat` sem `lon` → `400`.
+- **RN-21 — Cardápio em cache (cache-aside) no Redis.** Chave `cardapio:v1:{restauranteId}`, TTL de 10 minutos, invalidada por `CardapioAlterado` **depois do commit**. Meta: dado desatualizado por no máximo 2 s após a alteração.
+- **RN-22 — O cache nunca decide preço de pedido.** Cotação e criação de pedido leem preço e disponibilidade do banco. Exemplo: com o cache ainda mostrando R$ 39,90 e o banco já em R$ 42,90, o pedido é criado a R$ 42,90.
+- **RN-23 — Redis fora do ar não derruba a leitura.** Falha no Redis → leitura direto do banco, com métrica `pedeai.cache.falhas` incrementada e log `WARN`; nada de `500`.
+
+**Critérios de aceite**
+
+- **Dado** o cardápio em cache, **quando** faço duas leituras seguidas, **então** a segunda não executa SQL (verificável pelo contador de consultas ou pelo trace).
+- **Dado** o contêiner do Redis parado, **quando** leio o cardápio, **então** recebo `200` com os dados do banco.
+
+### RF-06 · Cupons
+
+**Regras**
+
+- **RN-24 — Tipos.** `PERCENTUAL` (1 a 50 %, com `tetoCentavos` obrigatório) ou `VALOR_FIXO` (`valorCentavos` de 100 a 5000). Exemplo: `BEMVINDO10` = 10 % com teto de R$ 15,00.
+- **RN-25 — Restrições.** `validoDe`/`validoAte`, `subtotalMinimoCentavos`, `limiteUsos` total (opcional), `restauranteId` (opcional: sem ele, vale para todos). Código com 4 a 20 caracteres `A–Z` e `0–9`, comparado sem diferenciar maiúsculas (`bemvindo10` = `BEMVINDO10`).
+- **RN-26 — Um uso por cliente.** Garantido por restrição única `(cupom_id, cliente_sub)` na tabela `uso_cupom`. Borda: se o pedido que usou o cupom for **cancelado ou recusado**, o uso é liberado e o cliente pode usar de novo.
+- **RN-27 — Desconto só sobre o subtotal, nunca sobre a taxa de entrega, e nunca maior que o subtotal.** Percentual arredondado `HALF_UP` ao centavo. Exemplo: subtotal 4595 com 10 % → 459,5 → **460**. Com `VALOR_FIXO` de 2000 e subtotal 1800 (restaurante sem pedido mínimo), desconto = **1800**.
+- **RN-28 — Limite de usos é à prova de corrida.** O consumo é um `UPDATE cupom SET usos = usos + 1 WHERE id = ? AND (limite_usos IS NULL OR usos < limite_usos)` na mesma transação do pedido; 0 linhas afetadas → `422 CUPOM_ESGOTADO`. Exemplo: cupom com `limiteUsos: 100` e 150 pedidos simultâneos → exatamente 100 pedidos com desconto.
+
+**Critérios de aceite**
+
+- **Dado** o cupom `BEMVINDO10` e subtotal de R$ 200,00, **quando** coto, **então** o desconto é 1500 (teto), não 2000.
+- **Dado** `cliente1` com um pedido `ENTREGUE` que usou `BEMVINDO10`, **quando** coto de novo com o cupom, **então** recebo `422 CUPOM_JA_UTILIZADO`.
+- **Dado** um cupom com `limiteUsos: 5`, **quando** disparo 20 criações de pedido concorrentes de clientes diferentes, **então** exatamente 5 pedidos têm desconto e 15 recebem `422 CUPOM_ESGOTADO`.
+
+### RF-07 · Cotação do carrinho
+
+`POST /cotacoes` recebe o carrinho (restaurante, itens, endereço, cupom opcional) e devolve o cálculo, sem gravar nada. O aplicativo chama a cotação a cada mudança no carrinho.
+
+**Regras**
+
+- **RN-29 — Itens.** De 1 a 30 itens distintos; `quantidade` de 1 a 20; `observacao` até 140 caracteres. O mesmo `itemId` repetido em duas linhas → `400` (junte as quantidades).
+- **RN-30 — Todos os itens precisam ser do restaurante, não arquivados e disponíveis.** Caso contrário `422 ITEM_INDISPONIVEL`, com a lista de `itemIds` problemáticos em `itens` (todos, não só o primeiro). Exemplo: dois itens esgotados → os dois aparecem.
+- **RN-31 — Taxa de entrega por faixa de distância em linha reta (haversine, raio 6 371 km), arredondada ao metro.** Faixas com limite superior inclusivo:
+
+  | Distância | Taxa |
+  |---|---|
+  | até 2 000 m | 499 |
+  | 2 001 m a 5 000 m | 799 |
+  | 5 001 m a 8 000 m | 1199 |
+  | acima de 8 000 m | fora da área → `422 FORA_DA_AREA_DE_ENTREGA` |
+
+  Borda: exatamente 2 000 m → 499; 2 001 m → 799. As faixas ficam em configuração (`pedeai.entrega.faixas`), não no código.
+- **RN-32 — Frete grátis opcional por restaurante.** Se o restaurante define `freteGratisAPartirDeCentavos` e o subtotal (antes do desconto) atinge o valor, a taxa é 0. Exemplo: limite 8000 e subtotal 8000 → frete 0; subtotal 7999 → taxa normal.
+- **RN-33 — Pedido mínimo sobre o subtotal antes do desconto.** Mínimo 2000 e subtotal 1990 → `422 PEDIDO_ABAIXO_DO_MINIMO` com `minimoCentavos` e `faltamCentavos: 10` no corpo.
+- **RN-34 — Restaurante fechado.** Cotação é permitida (o cliente pode montar o carrinho), mas volta com `podeFinalizar: false` e `motivo: "RESTAURANTE_FECHADO"`. A criação do pedido, essa sim, é bloqueada (RN-38).
+- **RN-35 — Fórmula.** `total = subtotal − desconto + taxaEntrega`. Cupom inválido na cotação não é erro fatal: a cotação volta com `cupom.aplicado: false` e `cupom.motivo` (ex.: `CUPOM_EXPIRADO`), e o total sem desconto.
+
+**Critérios de aceite**
+
+- **Dado** o restaurante em (−22.9056, −47.0608) e o endereço a 3,5 km (3 539 m), dois itens de 4590 e 1200 (×2) e o cupom `BEMVINDO10`, **quando** coto, **então** `subtotal = 6990`, `desconto = 699`, `taxaEntrega = 799`, `total = 7090`.
+- **Dado** um endereço a 8,2 km, **quando** coto, **então** recebo `422 FORA_DA_AREA_DE_ENTREGA`.
+
+### RF-08 · Criação do pedido
+
+`POST /pedidos` refaz a cotação no servidor (o cliente não envia preço nem total), grava o pedido em `CRIADO` e solicita a cobrança.
+
+**Regras**
+
+- **RN-36 — `Idempotency-Key` é obrigatório.** UUID gerado pelo aplicativo, um por intenção de compra. Ausente ou fora do formato → `400 IDEMPOTENCY_KEY_INVALIDA`.
+- **RN-37 — Semântica da chave (por cliente, validade de 24 h).**
+  - Mesma chave + mesmo corpo (hash SHA-256 do JSON canônico) → devolve **a mesma resposta** (mesmo status e corpo), com o header `Idempotency-Replayed: true`, sem criar nada.
+  - Mesma chave + corpo diferente → `422 IDEMPOTENCY_KEY_REUTILIZADA`.
+  - Mesma chave com a primeira requisição ainda em processamento → `409 REQUISICAO_EM_ANDAMENTO`, com `Retry-After: 1`.
+  - A mesma chave usada por **outro cliente** é outra chave (o escopo inclui o `sub`).
+  - Respostas `4xx` de validação **não** ficam guardadas (o cliente corrige e reenvia com a mesma chave); `201` fica.
+- **RN-38 — Validações do momento da criação.** Tudo da cotação (RN-29 a RN-33), mais: restaurante aberto agora (senão `422 RESTAURANTE_FECHADO`), cupom válido e disponível (senão `422` com o código do motivo; aqui, cupom inválido **é** erro, porque o cliente viu o total com desconto).
+- **RN-39 — Snapshot.** Cada `item_pedido` guarda `nome` e `precoUnitarioCentavos` do momento; o pedido guarda `subtotal`, `desconto`, `taxaEntrega`, `total`, `enderecoEntrega` (texto, lat, lon) e `restauranteNome`.
+- **RN-40 — Uma transação.** Pedido, itens, uso do cupom, histórico inicial, chave de idempotência, registro do pagamento `PENDENTE` e os eventos (`PedidoCriado`, `CobrancaSolicitada`) no registro de publicações: tudo no mesmo commit, ou nada.
+- **RN-41 — Pagamento.** `metodo` `CARTAO` (com `tokenCartao`, gerado pelo gateway no aplicativo; a API nunca recebe número de cartão) ou `PIX`. O token é mascarado em logs (`tok_…abcd`) e nunca sai em evento externo.
+- **RN-42 — Rate limiting.** No máximo **5 criações de pedido por minuto por cliente** (token bucket no Redis, rajada de 5, reposição de 1 a cada 12 s). Excedeu → `429 MUITAS_REQUISICOES` com `Retry-After` em segundos. Replays idempotentes (RN-37) **não** consomem ficha. Borda: se o Redis cair, o limite **falha aberto** (a requisição passa) e a métrica `pedeai.ratelimit.indisponivel` sobe: vender é mais importante que limitar. Registre essa escolha num ADR.
+- **RN-43 — Resposta.** `201` com `Location: /pedidos/{id}`, status `CRIADO`, `pagamento.status: PENDENTE` e `expiraEm` (criação + 15 min). O POST **não** espera o gateway (ADR-008).
+
+**Critérios de aceite**
+
+- **Dado** `cliente1` e uma chave `K`, **quando** envio o mesmo POST duas vezes em sequência, **então** as duas respostas têm o mesmo `id`, a segunda tem `Idempotency-Replayed: true` e existe um único pedido no banco.
+- **Dado** a chave `K` já usada, **quando** envio um corpo com outra quantidade, **então** recebo `422 IDEMPOTENCY_KEY_REUTILIZADA`.
+- **Dado** 10 requisições concorrentes com a mesma chave, **quando** todas terminam, **então** existe um pedido, uma resposta `201` "original" e as demais são `201` replay ou `409`.
+- **Dado** `cliente1` com 5 pedidos criados nos últimos 60 s, **quando** crio o sexto, **então** recebo `429` com `Retry-After` entre 1 e 12.
+
+### RF-09 · Pagamento e webhook
+
+O módulo de pagamentos conversa com o **PagaFake**, cujo contrato está na seção de API.
+
+**Regras**
+
+- **RN-44 — Cobrança assíncrona e depois do commit.** O listener de `CobrancaSolicitada` chama `POST /v1/cobrancas` do gateway com `Idempotency-Key` igual ao `id` do pagamento. Por usar a mesma chave em todas as tentativas, repetir é seguro.
+- **RN-45 — Resiliência na chamada.** Timeout de conexão 1 s e de resposta 2 s; até 3 tentativas no total (a original e mais duas), com backoff exponencial de 200 ms e 400 ms e jitter, **só** para timeout, erro de conexão e `5xx`; `4xx` não é repetido. Circuit breaker: janela de 20 chamadas, abre com 50 % de falhas ou de chamadas lentas (acima de 2 s), fica aberto 30 s, meio-aberto com 3 chamadas. Circuito aberto → o evento fica **incompleto** no registro de publicações e é reenviado por uma rotina agendada a cada 60 s que chama `IncompleteEventPublications.resubmitIncompletePublicationsOlderThan(...)`; o pagamento continua `PENDENTE`.
+- **RN-46 — Webhook autenticado por HMAC.** `POST /webhooks/pagafake` sem JWT, validado pelo header `PagaFake-Assinatura: t=<epoch>,v1=<hex>`, onde `v1 = HMAC-SHA256(segredo, t + "." + corpoBruto)`. Assinatura inválida → `401`. `t` com mais de 5 minutos de diferença do relógio → `401` (proteção contra replay). A comparação é em tempo constante (`MessageDigest.isEqual`).
+- **RN-47 — Webhook idempotente.** O `id` do evento do gateway (`evt_…`) é chave primária em `webhook_recebido`. Duplicado → `200` sem efeito. Inserir a deduplicação e aplicar o efeito acontecem na mesma transação.
+- **RN-48 — Resultados.** `cobranca.aprovada` → pagamento `APROVADO` e evento `PagamentoAprovado` (o pedido vai a `PAGO`). `cobranca.recusada` → pagamento `RECUSADO`, pedido `CANCELADO` com motivo `PAGAMENTO_RECUSADO`, cupom liberado.
+- **RN-49 — Aprovação tardia vira estorno.** Se `cobranca.aprovada` chega para um pedido já `CANCELADO` (ex.: expirou aos 15 min), o pagamento fica `APROVADO` e um **estorno automático** é solicitado. Nunca se "ressuscita" o pedido.
+- **RN-50 — Expiração.** Pedido em `CRIADO` há 15 minutos → `CANCELADO` com motivo `PAGAMENTO_NAO_CONFIRMADO` (rotina a cada 30 s).
+- **RN-51 — O webhook responde rápido.** Meta de p95 abaixo de 100 ms: só valida, deduplica, grava e publica evento. Nada de chamar outro serviço dentro do webhook.
+
+**Critérios de aceite**
+
+- **Dado** um pedido `CRIADO` com `tok_aprovar`, **quando** o PagaFake confirma, **então** em até 5 s o pedido está `PAGO` e o histórico registra `CRIADO → PAGO` com ator `SISTEMA:PAGAFAKE`.
+- **Dado** o mesmo webhook entregue 3 vezes, **quando** processados, **então** existe uma linha em `webhook_recebido`, uma transição para `PAGO` e um evento `PedidoPago`.
+- **Dado** um corpo alterado depois de assinado, **quando** enviado, **então** recebo `401` e nada muda.
+- **Dado** o PagaFake respondendo `503` sempre, **quando** 20 pedidos são criados, **então** o circuito abre, os POSTs de pedido continuam respondendo `201` e, quando o PagaFake volta, os pagamentos pendentes são cobrados sem intervenção manual.
+
+### RF-10 · Ciclo de vida no restaurante
+
+**Regras**
+
+- **RN-52 — Transições do restaurante.** Só o responsável pelo restaurante do pedido: `PAGO → ACEITO` (`POST /pedidos/{id}/aceite`, com `previsaoMinutos` de 5 a 120, padrão = `tempoPreparoMinutos`), `PAGO → RECUSADO` (`POST /pedidos/{id}/recusa`, com `motivo` obrigatório: `SEM_INGREDIENTE`, `FECHANDO`, `SOBRECARGA` ou `OUTRO` + `detalhe` até 200), `ACEITO → EM_PREPARO`, `EM_PREPARO → PRONTO`.
+- **RN-53 — Transição inválida é `409`.** Exemplo: `PRONTO` num pedido `ACEITO` (pulando `EM_PREPARO`) → `409 TRANSICAO_INVALIDA` com `statusAtual` e `transicoesPermitidas` no corpo.
+- **RN-54 — Prazo de aceite.** Pedido em `PAGO` há 8 minutos sem resposta → `CANCELADO` com motivo `SEM_RESPOSTA_RESTAURANTE` e estorno. Borda: o restaurante aceita no mesmo instante em que a rotina cancela; o **controle otimista** (`@Version`) garante que só um vence. Quem perde recebe `409` (restaurante) ou desiste silenciosamente (rotina).
+- **RN-55 — Histórico de toda transição.** `historico_status` com `de`, `para`, `ator` (`CLIENTE:<sub>`, `RESTAURANTE:<sub>`, `ENTREGADOR:<sub>`, `ADMIN:<sub>` ou `SISTEMA:<rotina>`), `motivo` e `ocorridoEm`. Imutável: sem `UPDATE` nem `DELETE`.
+- **RN-56 — Fila do restaurante.** `GET /restaurantes/{id}/pedidos?status=PAGO,ACEITO&page=0&size=20` lista só pedidos daquele restaurante, ordenados do mais antigo para o mais novo (quem espera há mais tempo aparece primeiro). Responsável de outro restaurante → `404`.
+
+**Critérios de aceite**
+
+- **Dado** um pedido `PAGO` do restaurante A, **quando** o responsável de B tenta aceitar, **então** recebe `404 PEDIDO_NAO_ENCONTRADO` e o pedido continua `PAGO`.
+- **Dado** um pedido `PAGO` e o `Clock` avançado 8 min, **quando** a rotina roda, **então** o pedido está `CANCELADO`, o estorno foi solicitado e o evento `PedidoCancelado` tem `motivo: SEM_RESPOSTA_RESTAURANTE`.
+
+### RF-11 · Cancelamento e reembolso
+
+Quem pode cancelar em cada estado (qualquer outra combinação → `409 CANCELAMENTO_NAO_PERMITIDO` se o ator tem acesso ao pedido, `404` se não tem):
+
+| Estado | Cliente | Restaurante | Admin | Sistema |
+|---|---|---|---|---|
+| `CRIADO` | sim | não | sim | sim (pagamento recusado ou 15 min) |
+| `PAGO` | sim | usa a recusa (RN-52) | sim | sim (8 min sem aceite) |
+| `ACEITO` | não | sim | sim | não |
+| `EM_PREPARO` | não | sim | sim | não |
+| `PRONTO` | não | não | sim | não |
+| `A_CAMINHO` | não | não | sim | não |
+| terminais | não | não | não | não |
+
+**Regras**
+
+- **RN-57 — Motivo obrigatório.** `POST /pedidos/{id}/cancelamento` com `motivo` (enum por ator) e `detalhe` opcional até 200 caracteres.
+- **RN-58 — Reembolso integral quando houve pagamento aprovado.** Cancelar ou recusar pedido com pagamento `APROVADO` gera `EstornoSolicitado`; o módulo de pagamentos chama `POST /v1/cobrancas/{id}/estornos` com `Idempotency-Key = "estorno-" + pagamentoId`, e o webhook `estorno.concluido` leva o pagamento a `ESTORNADO`. Cancelar em `CRIADO` sem pagamento aprovado não gera estorno; se houver cobrança pendente no gateway, ela é cancelada (`POST /v1/cobrancas/{id}/cancelamento`), e uma aprovação que chegue depois cai na RN-49.
+- **RN-59 — Cancelar libera recursos.** Uso de cupom liberado (RN-26); entregador atribuído volta a `DISPONIVEL`.
+- **RN-60 — Cancelamento é idempotente para o mesmo ator.** Cancelar um pedido já `CANCELADO` pelo mesmo ator e motivo → `200` com o estado atual; por outro caminho → `409`.
+
+**Critérios de aceite**
+
+- **Dado** um pedido `ACEITO` de `cliente1`, **quando** `cliente1` tenta cancelar, **então** recebe `409 CANCELAMENTO_NAO_PERMITIDO` e o corpo explica que o restaurante já aceitou.
+- **Dado** um pedido `EM_PREPARO` pago, **quando** o restaurante cancela com `SEM_INGREDIENTE`, **então** o pedido fica `CANCELADO`, o pagamento passa por `ESTORNO_SOLICITADO` e chega a `ESTORNADO` após o webhook, e o cliente recebe uma notificação.
+
+### RF-12 · Entregadores e atribuição
+
+**Regras**
+
+- **RN-61 — Estados do entregador.** `OFFLINE`, `DISPONIVEL`, `EM_ENTREGA`. O próprio entregador alterna `OFFLINE ↔ DISPONIVEL` (`PUT /entregadores/me/disponibilidade`); `EM_ENTREGA` só o sistema define. Borda: ficar `OFFLINE` durante uma entrega → `409 ENTREGA_EM_ANDAMENTO`.
+- **RN-62 — Posição.** `PUT /entregadores/me/posicao` com `lat`, `lon` e `registradaEm`; aceita no máximo 1 atualização a cada 3 s por entregador (a mais frequente → `429`); posição com `registradaEm` mais antiga que a última gravada é ignorada (`202`, sem efeito), porque celulares reenviam fora de ordem.
+- **RN-63 — Atribuição automática.** Ao `PedidoAceito`, o módulo de entregas cria a entrega `AGUARDANDO_ENTREGADOR` e escolhe o entregador `DISPONIVEL` **mais próximo do restaurante**, a no máximo 5 km, com posição atualizada nos últimos 2 minutos. Empate na distância (ao metro) → quem está disponível há mais tempo.
+- **RN-64 — Sem corrida dupla.** A reserva do entregador é `UPDATE entregador SET status = 'EM_ENTREGA' ... WHERE id = ? AND status = 'DISPONIVEL'`; 0 linhas → tenta o próximo candidato. Exemplo: dois pedidos aceitos no mesmo milissegundo e um único entregador perto → um pedido fica com ele, o outro vai para o segundo mais próximo ou fica aguardando.
+- **RN-65 — Sem entregador.** Sem candidato, nova tentativa a cada 30 s por até 10 minutos; depois, a entrega fica `SEM_ENTREGADOR`, a métrica `pedeai.entregas.sem_entregador` sobe e o `ADMIN` pode atribuir manualmente (`POST /admin/entregas/{id}/atribuicao`).
+
+**Critérios de aceite**
+
+- **Dado** dois entregadores disponíveis a 1,2 km e 3,0 km do restaurante, **quando** o pedido é aceito, **então** a entrega é atribuída ao de 1,2 km.
+- **Dado** 1 entregador disponível e 2 pedidos aceitos concorrentemente, **quando** a atribuição termina, **então** exatamente uma entrega está `ATRIBUIDA` a ele.
+
+### RF-13 · Coleta, rastreamento e entrega
+
+**Regras**
+
+- **RN-66 — Coleta.** O entregador da corrida confirma a coleta (`POST /entregas/{id}/coleta`) só com o pedido `PRONTO`; o pedido vai a `A_CAMINHO`. Antes disso → `409 PEDIDO_NAO_ESTA_PRONTO`.
+- **RN-67 — Rastreamento.** `GET /pedidos/{id}/rastreamento` devolve a última posição do entregador **só** para o cliente dono e só em `A_CAMINHO`; em outros estados, `posicao: null`. Posição com mais de 2 min vem com `desatualizada: true`.
+- **RN-68 — Confirmação de entrega.** `POST /entregas/{id}/conclusao` pelo entregador da corrida → pedido `ENTREGUE`, entregador `DISPONIVEL`. Outro entregador → `404`.
+
+**Critérios de aceite**
+
+- **Dado** um pedido `A_CAMINHO` de `cliente1`, **quando** `cliente2` consulta o rastreamento, **então** recebe `404`.
+- **Dado** a corrida de `entregador1`, **quando** ele confirma a entrega, **então** o pedido fica `ENTREGUE`, o histórico registra o ator `ENTREGADOR:<sub>` e `entregador1` volta a `DISPONIVEL`.
+
+### RF-14 · Notificações
+
+**Regras**
+
+- **RN-69 — O módulo de notificações consome o Kafka**, não os eventos internos. Isso prova o contrato externo e deixa o módulo pronto para virar um serviço separado.
+- **RN-70 — Quem recebe o quê.** Cliente: pedido pago, aceito (com previsão), a caminho, entregue, cancelado/recusado (com motivo e informação de estorno). Restaurante: novo pedido pago. Entregador: corrida atribuída. Canais: e-mail (Mailpit) para o cliente em pago, entregue e cancelado; "push" (tabela `notificacao` + log) para todos os eventos.
+- **RN-71 — Exatamente um aviso por evento e destinatário.** Deduplicação por `(eventoId, consumidor)` em `mensagem_processada`, na mesma transação da gravação da notificação. O e-mail é enviado **depois** do commit; se o envio falhar, a notificação fica `FALHOU_ENVIO` e uma rotina tenta de novo 3 vezes.
+- **RN-72 — Retry e DLT.** Erro transitório (banco indisponível): 4 tentativas com backoff 1 s, 2 s, 4 s. Erro permanente (JSON inválido, `tipo` desconhecido, versão de schema não suportada): direto para `pedeai.pedidos.v1-dlt`, sem retry. Mensagem na DLT não bloqueia a partição.
+
+**Critérios de aceite**
+
+- **Dado** o evento `PedidoEntregue` publicado duas vezes (mesmo `eventoId`), **quando** consumido, **então** existe uma notificação e um e-mail no Mailpit.
+- **Dado** uma mensagem com JSON quebrado no tópico, **quando** consumida, **então** ela aparece em `pedeai.pedidos.v1-dlt` com os headers de exceção e as mensagens seguintes da partição são processadas.
+
+### RF-15 · Consultas de pedidos
+
+**Regras**
+
+- **RN-73 — Cliente vê só os próprios pedidos.** `GET /pedidos?status=&page=&size=` (padrão 10, máximo 50), do mais recente ao mais antigo. `GET /pedidos/{id}` de outro cliente → `404`.
+- **RN-74 — Restaurante vê só pedidos dos próprios restaurantes** (RN-56); entregador vê só as próprias corridas (`GET /entregas/minhas`). `ADMIN` vê tudo por `GET /admin/pedidos` com filtros `restauranteId`, `status`, `de`, `ate`.
+- **RN-75 — Detalhe inclui o histórico** (lista de transições com ator e horário) e o resumo do pagamento (`status`, `metodo`, sem token).
+- **RN-76 — O detalhe não tem N+1.** `GET /pedidos/{id}` executa no máximo 3 consultas SQL (pedido + itens + histórico, ou menos com `JOIN FETCH`/entity graph), verificado em teste.
+
+**Critérios de aceite**
+
+- **Dado** 25 pedidos de `cliente1`, **quando** peço `page=2&size=10`, **então** recebo 5 itens e `totalElements: 25`.
+- **Dado** um pedido com 12 itens e 6 transições, **quando** consulto o detalhe, **então** o número de consultas SQL registrado é no máximo 3.
+
+## Requisitos não funcionais
+
+As metas de desempenho são medidas **localmente** (notebook com 16 GB de RAM, tudo no Docker Compose), com o banco populado pelo script de carga: 300 restaurantes, 40 itens cada, 50 mil pedidos históricos. Registre no README a máquina usada.
+
+| RNF | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Latência do `POST /pedidos` | p95 abaixo de 300 ms e p99 abaixo de 600 ms a 50 req/s constantes por 3 min, com menos de 1 % de erros `5xx` | Script k6 (`carga/pedidos.js`) com thresholds; relatório no README |
+| RNF-02 | Latência do cardápio | p95 abaixo de 50 ms a 200 req/s com cache quente | k6 (`carga/cardapio.js`) |
+| RNF-03 | Latência do webhook | p95 abaixo de 100 ms | Métrica `http.server.requests` com `uri=/webhooks/pagafake` no Grafana |
+| RNF-04 | Tempo até o pedido ficar `PAGO` | p95 abaixo de 5 s, do `201` ao `PAGO`, com o PagaFake no atraso padrão (1–3 s) | Timer `pedeai.pedido.tempo_ate_pago` |
+| RNF-05 | Nenhum evento perdido | 0 publicações incompletas com mais de 5 min em operação normal; após derrubar o Kafka por 2 min, tudo é entregue em até 2 min da volta | Gauge `pedeai.outbox.pendentes` + teste manual roteirizado no README |
+| RNF-06 | Nenhuma cobrança duplicada | 0 cobranças duplicadas no PagaFake em 1 000 pedidos com `DUPLICAR_WEBHOOK=true` e retries forçados | Endpoint de auditoria do PagaFake (`GET /v1/auditoria`) comparado com a tabela `pagamento` |
+| RNF-07 | Segurança de acesso | 100 % das rotas cobertas pela matriz de autorização (papel × dono × rota); 0 rotas sem regra explícita (`anyRequest().denyAll()` no fim) | Teste parametrizado da matriz no CI |
+| RNF-08 | Segredos | Nenhum segredo no repositório; segredo do webhook e do banco por variável de ambiente; `.env.example` documentado | Varredura de segredos no CI (ex.: gitleaks) |
+| RNF-09 | Fronteiras dos módulos | Nenhuma dependência fora das permitidas; nenhum ciclo | `ApplicationModules.of(...).verify()` no CI |
+| RNF-10 | Qualidade | Cobertura de linhas de pelo menos 80 % nos pacotes de domínio de `pedidos` e `pagamentos`; build falha abaixo disso | JaCoCo com regra no `verify` |
+| RNF-11 | Tempo de build | Pipeline completo (com Testcontainers) em até 12 min no GitHub Actions | Duração do workflow |
+| RNF-12 | Operação | `docker compose up` sobe tudo em até 3 min numa máquina com as imagens já baixadas; readiness só `UP` com banco e Kafka acessíveis | Cronometrar; `GET /actuator/health/readiness` |
+| RNF-13 | Observabilidade | Todo log de requisição tem `traceId` e `correlationId`; um pedido pode ser seguido do POST ao e-mail num único trace (ou em traces ligados) | Captura de tela do trace no README |
+| RNF-14 | Cardinalidade | Nenhuma métrica com tag de alta cardinalidade (id de pedido, restaurante ou usuário) | Revisão do `/actuator/prometheus` |
+| RNF-15 | Portabilidade | Roda com Java 25; imagem com usuário não root, abaixo de 350 MB | `docker image inspect`; `USER` no Dockerfile |
+
+## Modelo de dados
+
+Cada módulo tem o **próprio schema** no PostgreSQL (`catalogo`, `pedidos`, `pagamentos`, `entregas`, `notificacoes`). Chave estrangeira só existe **dentro** do schema; entre módulos a referência é só pelo id, e a consistência vem dos eventos. Essa é a regra que permite, um dia, mover um módulo para outro banco sem reescrever o modelo (ADR-007).
+
+<Figura legenda="Tabelas agrupadas pelo schema do módulo dono. Setas contínuas são chaves estrangeiras dentro do schema; setas tracejadas são referências só por id entre módulos. A event_publication é o registro de publicações do Spring Modulith, a outbox do sistema">
+<svg viewBox="0 0 900 690" width="900" role="img" aria-labelledby="pedeai-er-titulo pedeai-er-desc">
+  <title id="pedeai-er-titulo">Modelo de dados do Pede Aí por módulo</title>
+  <desc id="pedeai-er-desc">Cinco colunas, uma por schema. Catálogo: restaurante, horario e item_cardapio. Pedidos: pedido, item_pedido, historico_status, cupom, uso_cupom e chave_idempotencia. Pagamentos: pagamento e webhook_recebido. Entregas: entregador e entrega. Notificações: notificacao e mensagem_processada. Pedido referencia restaurante por id; item_pedido referencia item_cardapio por id; pagamento e entrega referenciam pedido por id. A tabela event_publication guarda os eventos a publicar.</desc>
+  <defs>
+    <marker id="pedeai-er-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker>
+  </defs>
+  <text x="92" y="24" text-anchor="middle" class="d-label">schema catalogo</text>
+  <text x="272" y="24" text-anchor="middle" class="d-label">schema pedidos</text>
+  <text x="452" y="24" text-anchor="middle" class="d-label">schema pagamentos</text>
+  <text x="632" y="24" text-anchor="middle" class="d-label">schema entregas</text>
+  <text x="810" y="24" text-anchor="middle" class="d-label">schema notificacoes</text>
+
+  <rect x="10" y="40" width="165" height="110" rx="8" class="d-info"/>
+  <text x="20" y="58" class="d-title">restaurante</text>
+  <text x="20" y="76" class="d-mono">id uuid PK</text>
+  <text x="20" y="92" class="d-mono">responsavel_sub</text>
+  <text x="20" y="108" class="d-mono">nome, lat, lon</text>
+  <text x="20" y="124" class="d-mono">pedido_minimo</text>
+  <text x="20" y="140" class="d-mono">ativo, pausado_ate</text>
+
+  <rect x="10" y="170" width="165" height="78" rx="8" class="d-box"/>
+  <text x="20" y="188" class="d-title">horario</text>
+  <text x="20" y="206" class="d-mono">restaurante_id FK</text>
+  <text x="20" y="222" class="d-mono">dia_semana 1..7</text>
+  <text x="20" y="238" class="d-mono">abre, fecha</text>
+
+  <rect x="10" y="266" width="165" height="94" rx="8" class="d-box"/>
+  <text x="20" y="284" class="d-title">item_cardapio</text>
+  <text x="20" y="302" class="d-mono">restaurante_id FK</text>
+  <text x="20" y="318" class="d-mono">nome, categoria</text>
+  <text x="20" y="334" class="d-mono">preco_centavos</text>
+  <text x="20" y="350" class="d-mono">disponivel, version</text>
+
+  <path d="M60 150 L60 168" class="d-line" marker-end="url(#pedeai-er-seta)"/>
+  <path d="M175 140 L183 140 L183 300 L177 300" class="d-line" fill="none" marker-end="url(#pedeai-er-seta)"/>
+
+  <rect x="190" y="40" width="165" height="142" rx="8" class="d-accent"/>
+  <text x="200" y="58" class="d-title">pedido</text>
+  <text x="200" y="76" class="d-mono">id uuid PK</text>
+  <text x="200" y="92" class="d-mono">cliente_sub</text>
+  <text x="200" y="108" class="d-mono">restaurante_id</text>
+  <text x="200" y="124" class="d-mono">status</text>
+  <text x="200" y="140" class="d-mono">subtotal, taxa</text>
+  <text x="200" y="156" class="d-mono">desconto, total</text>
+  <text x="200" y="172" class="d-mono">version, criado_em</text>
+
+  <rect x="190" y="204" width="165" height="78" rx="8" class="d-box"/>
+  <text x="200" y="222" class="d-title">item_pedido</text>
+  <text x="200" y="240" class="d-mono">pedido_id FK</text>
+  <text x="200" y="256" class="d-mono">item_id, nome, preco</text>
+  <text x="200" y="272" class="d-mono">quantidade, obs</text>
+
+  <rect x="190" y="300" width="165" height="78" rx="8" class="d-box"/>
+  <text x="200" y="318" class="d-title">historico_status</text>
+  <text x="200" y="336" class="d-mono">pedido_id FK</text>
+  <text x="200" y="352" class="d-mono">de, para, ator</text>
+  <text x="200" y="368" class="d-mono">motivo, ocorrido_em</text>
+
+  <rect x="190" y="396" width="165" height="94" rx="8" class="d-box"/>
+  <text x="200" y="414" class="d-title">cupom</text>
+  <text x="200" y="432" class="d-mono">id, codigo UNIQUE</text>
+  <text x="200" y="448" class="d-mono">tipo, valor, teto</text>
+  <text x="200" y="464" class="d-mono">limite_usos, usos</text>
+  <text x="200" y="480" textLength="149" lengthAdjust="spacingAndGlyphs" class="d-mono">valido_de, valido_ate</text>
+
+  <rect x="190" y="508" width="165" height="62" rx="8" class="d-box"/>
+  <text x="200" y="526" class="d-title">uso_cupom</text>
+  <text x="200" y="544" class="d-mono">cupom_id FK</text>
+  <text x="200" y="560" textLength="149" lengthAdjust="spacingAndGlyphs" class="d-mono">cliente_sub, pedido_id</text>
+
+  <rect x="190" y="588" width="165" height="78" rx="8" class="d-box"/>
+  <text x="200" y="606" class="d-title">chave_idempotencia</text>
+  <text x="200" y="624" textLength="149" lengthAdjust="spacingAndGlyphs" class="d-mono">cliente_sub, chave PK</text>
+  <text x="200" y="640" class="d-mono">hash_corpo, resposta</text>
+  <text x="200" y="656" class="d-mono">expira_em</text>
+
+  <path d="M240 182 L240 202" class="d-line" marker-end="url(#pedeai-er-seta)"/>
+  <path d="M240 490 L240 506" class="d-line" marker-end="url(#pedeai-er-seta)"/>
+  <path d="M190 100 L177 100" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-er-seta)"/>
+  <path d="M190 330 L177 330" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-er-seta)"/>
+
+  <rect x="370" y="40" width="165" height="110" rx="8" class="d-ok"/>
+  <text x="380" y="58" class="d-title">pagamento</text>
+  <text x="380" y="76" class="d-mono">id uuid PK</text>
+  <text x="380" y="92" class="d-mono">pedido_id UNIQUE</text>
+  <text x="380" y="108" class="d-mono">cobranca_externa_id</text>
+  <text x="380" y="124" textLength="149" lengthAdjust="spacingAndGlyphs" class="d-mono">status, metodo, valor</text>
+  <text x="380" y="140" class="d-mono">version</text>
+
+  <rect x="370" y="260" width="165" height="78" rx="8" class="d-box"/>
+  <text x="380" y="278" class="d-title">webhook_recebido</text>
+  <text x="380" y="296" class="d-mono">evento_id PK</text>
+  <text x="380" y="312" class="d-mono">tipo, recebido_em</text>
+  <text x="380" y="328" class="d-mono">payload jsonb</text>
+
+  <path d="M370 100 L357 100" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-er-seta)"/>
+
+  <rect x="550" y="40" width="165" height="110" rx="8" class="d-violet"/>
+  <text x="560" y="58" class="d-title">entregador</text>
+  <text x="560" y="76" class="d-mono">id uuid PK</text>
+  <text x="560" y="92" class="d-mono">usuario_sub UNIQUE</text>
+  <text x="560" y="108" class="d-mono">status</text>
+  <text x="560" y="124" class="d-mono">lat, lon, posicao_em</text>
+  <text x="560" y="140" class="d-mono">version</text>
+
+  <rect x="550" y="176" width="165" height="94" rx="8" class="d-box"/>
+  <text x="560" y="194" class="d-title">entrega</text>
+  <text x="560" y="212" class="d-mono">pedido_id UNIQUE</text>
+  <text x="560" y="228" class="d-mono">entregador_id FK</text>
+  <text x="560" y="244" class="d-mono">status, tentativas</text>
+  <text x="560" y="260" class="d-mono">atribuida_em</text>
+
+  <path d="M632 150 L632 174" class="d-line" marker-end="url(#pedeai-er-seta)"/>
+  <path d="M550 223 L542 223 L542 192 L345 192 L345 185" class="d-line" fill="none" stroke-dasharray="4 3" marker-end="url(#pedeai-er-seta)"/>
+
+  <rect x="730" y="40" width="162" height="94" rx="8" class="d-box"/>
+  <text x="740" y="58" class="d-title">notificacao</text>
+  <text x="740" y="76" class="d-mono">id uuid PK</text>
+  <text x="740" y="92" class="d-mono">destinatario_sub</text>
+  <text x="740" y="108" class="d-mono">tipo, canal, status</text>
+  <text x="740" y="124" class="d-mono">evento_id</text>
+
+  <rect x="730" y="152" width="162" height="62" rx="8" class="d-box"/>
+  <text x="740" y="170" textLength="146" lengthAdjust="spacingAndGlyphs" class="d-title">mensagem_processada</text>
+  <text x="740" y="188" textLength="146" lengthAdjust="spacingAndGlyphs" class="d-mono">evento_id, consumidor</text>
+  <text x="740" y="204" class="d-mono">processada_em</text>
+
+  <rect x="550" y="380" width="342" height="94" rx="8" class="d-violet"/>
+  <text x="560" y="398" class="d-title">event_publication (Spring Modulith)</text>
+  <text x="560" y="416" class="d-mono">id, listener_id, event_type</text>
+  <text x="560" y="432" class="d-mono">serialized_event</text>
+  <text x="560" y="448" class="d-mono">publication_date</text>
+  <text x="560" y="464" class="d-mono">status · completion_attempts</text>
+
+  <path d="M560 540 L600 540" class="d-line" marker-end="url(#pedeai-er-seta)"/>
+  <text x="610" y="544" class="d-label">FK dentro do schema</text>
+  <path d="M560 570 L600 570" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-er-seta)"/>
+  <text x="610" y="574" class="d-label">referência só por id, entre módulos</text>
+  <text x="560" y="612" class="d-text">Nenhuma FK cruza schemas:</text>
+  <text x="560" y="632" class="d-text">a consistência entre módulos</text>
+  <text x="560" y="652" class="d-text">vem dos eventos.</text>
+</svg>
+</Figura>
+
+Restrições que o banco garante (e não só o Java):
+
+| Tabela | Restrição | Por quê |
+|---|---|---|
+| `catalogo.horario` | `CHECK (dia_semana BETWEEN 1 AND 7)`, `CHECK (abre <> fecha)` | RN-09, RN-10 |
+| `catalogo.item_cardapio` | `CHECK (preco_centavos BETWEEN 100 AND 100000)`; índice `(restaurante_id) WHERE NOT arquivado` | RN-14; o cardápio só lê itens ativos |
+| `pedidos.pedido` | `CHECK` da lista de status, `CHECK (total = subtotal - desconto + taxa_entrega)`, `CHECK (desconto <= subtotal)`; índices `(cliente_sub, criado_em DESC)` e `(restaurante_id, status, criado_em)` | RN-35; listagens de RN-73 e RN-56 sem varredura |
+| `pedidos.pedido` | índices parciais `(criado_em) WHERE status = 'CRIADO'` e `(pago_em) WHERE status = 'PAGO'` | As rotinas de expiração (RN-50, RN-54) leem poucas linhas |
+| `pedidos.cupom` | `UNIQUE (upper(codigo))`, `CHECK (limite_usos IS NULL OR usos <= limite_usos)` | RN-25, RN-28 |
+| `pedidos.uso_cupom` | `UNIQUE (cupom_id, cliente_sub)` | RN-26 |
+| `pedidos.chave_idempotencia` | `PRIMARY KEY (cliente_sub, chave)` | RN-37 |
+| `pedidos.historico_status` | só `INSERT` para o usuário da aplicação (opcional: `REVOKE UPDATE, DELETE`) | RN-55 |
+| `pagamentos.pagamento` | `UNIQUE (pedido_id)`, `UNIQUE (cobranca_externa_id)` | Um pagamento por pedido; o webhook acha o pagamento pelo id externo |
+| `pagamentos.webhook_recebido` | `PRIMARY KEY (evento_id)` | RN-47 |
+| `entregas.entregador` | `UNIQUE (usuario_sub)`; índice `(status) WHERE status = 'DISPONIVEL'` | RN-63 |
+| `entregas.entrega` | `UNIQUE (pedido_id)`; índice único parcial `(entregador_id) WHERE status IN ('ATRIBUIDA','COLETADA')` | Um entregador com no máximo uma corrida ativa (RN-64), garantido pelo banco |
+| `notificacoes.mensagem_processada` | `PRIMARY KEY (evento_id, consumidor)` | RN-71 |
+
+Migrations (Flyway, em `db/migration`):
+
+| Migration | Cria |
+|---|---|
+| `V1__schemas.sql` | Os cinco schemas e a tabela `event_publication` do Spring Modulith (versionada por você, não criada automaticamente em produção). Copie o DDL de PostgreSQL publicado com a versão do Spring Modulith que você usa, em vez de escrever de memória: na 2.x a tabela tem `status` e `completion_attempts` |
+| `V2__catalogo.sql` | `restaurante`, `horario`, `item_cardapio` e índices |
+| `V3__pedidos.sql` | `pedido`, `item_pedido`, `historico_status`, `chave_idempotencia` |
+| `V4__cupons.sql` | `cupom`, `uso_cupom` |
+| `V5__pagamentos.sql` | `pagamento`, `webhook_recebido` |
+| `V6__entregas.sql` | `entregador`, `entrega` e o índice único parcial |
+| `V7__notificacoes.sql` | `notificacao`, `mensagem_processada` |
+| `R__dados_demo.sql` (só no perfil `demo`, em `db/demo`) | Restaurantes, itens, entregadores e cupons de demonstração, com os `sub` do realm do Keycloak |
+
+## Contrato da API
+
+Base: `http://localhost:8080`. Autenticação: `Authorization: Bearer <jwt>` em tudo, exceto `/webhooks/pagafake` (HMAC) e `/actuator/health/**`. Documentação viva em `/swagger-ui.html` (springdoc-openapi).
+
+### Endpoints
+
+| Método | Caminho | Quem pode | O que faz | Respostas |
+|---|---|---|---|---|
+| GET | `/me` | autenticado | Identidade e vínculos | 200, 401 |
+| POST | `/admin/restaurantes` | ADMIN | Cria restaurante | 201, 400, 403 |
+| PATCH | `/admin/restaurantes/{id}` | ADMIN | Ativa/inativa, troca responsável | 200, 404 |
+| GET | `/restaurantes` | autenticado | Lista paginada e filtrável | 200, 400 |
+| GET | `/restaurantes/{id}` | autenticado | Detalhe, `abertoAgora`, `proximaAbertura` | 200, 404 |
+| PUT | `/restaurantes/{id}/horarios` | RESTAURANTE dono | Substitui a grade semanal | 200, 404, 422 |
+| POST · DELETE | `/restaurantes/{id}/pausa` | RESTAURANTE dono | Pausa e retoma | 200, 400, 404 |
+| GET | `/restaurantes/{id}/cardapio` | autenticado | Cardápio agrupado por categoria (cache) | 200, 404 |
+| POST | `/restaurantes/{id}/itens` | RESTAURANTE dono | Cria item | 201, 400, 404 |
+| PUT | `/restaurantes/{id}/itens/{itemId}` | RESTAURANTE dono | Edita item (`If-Match`) | 200, 404, 412, 428 |
+| PATCH | `/restaurantes/{id}/itens/{itemId}/disponibilidade` | RESTAURANTE dono | Liga/desliga disponibilidade | 200, 404 |
+| DELETE | `/restaurantes/{id}/itens/{itemId}` | RESTAURANTE dono | Arquiva | 204, 404 |
+| POST | `/admin/cupons` | ADMIN | Cria cupom | 201, 400, 409 |
+| POST | `/cotacoes` | CLIENTE | Cota o carrinho | 200, 400, 404, 422 |
+| POST | `/pedidos` | CLIENTE | Cria pedido (`Idempotency-Key`) | 201, 400, 409, 422, 429 |
+| GET | `/pedidos` | CLIENTE | Meus pedidos | 200 |
+| GET | `/pedidos/{id}` | dono, restaurante do pedido, entregador da corrida, ADMIN | Detalhe com histórico | 200, 404 |
+| POST | `/pedidos/{id}/aceite` · `/recusa` · `/preparo` · `/pronto` | RESTAURANTE dono | Transições do restaurante | 200, 404, 409 |
+| POST | `/pedidos/{id}/cancelamento` | conforme a tabela do RF-11 | Cancela | 200, 404, 409 |
+| GET | `/pedidos/{id}/rastreamento` | CLIENTE dono | Posição do entregador | 200, 404 |
+| GET | `/restaurantes/{id}/pedidos` | RESTAURANTE dono | Fila do restaurante | 200, 404 |
+| PUT | `/entregadores/me/disponibilidade` | ENTREGADOR | OFFLINE ou DISPONIVEL | 200, 409 |
+| PUT | `/entregadores/me/posicao` | ENTREGADOR | Atualiza posição | 204, 202, 400, 429 |
+| GET | `/entregas/minhas` | ENTREGADOR | Minhas corridas | 200 |
+| POST | `/entregas/{id}/coleta` · `/conclusao` | ENTREGADOR da corrida | Coleta e conclusão | 200, 404, 409 |
+| POST | `/admin/entregas/{id}/atribuicao` | ADMIN | Atribuição manual | 200, 404, 409 |
+| GET | `/admin/pedidos` | ADMIN | Busca com filtros | 200 |
+| POST | `/webhooks/pagafake` | gateway (HMAC) | Resultado de cobrança e estorno | 200, 400, 401 |
+
+### Exemplos
+
+**Cotação** — `POST /cotacoes`
+
+```json
+{
+  "restauranteId": "0f8c2a5e-6d1b-4a57-9d5e-2f9b1c3a7e10",
+  "itens": [
+    { "itemId": "7a1d9e02-3c4b-4f1a-8e6d-5b2c9f0a1d33", "quantidade": 1, "observacao": "sem cebola" },
+    { "itemId": "c3e5f7a9-1b2d-4e6f-8a0c-2d4f6b8e0a12", "quantidade": 2 }
+  ],
+  "entrega": { "endereco": "Rua das Flores, 120, ap. 32", "latitude": -22.8781, "longitude": -47.0782 },
+  "cupom": "BEMVINDO10"
+}
+```
+
+Resposta `200`:
+
+```json
+{
+  "restauranteId": "0f8c2a5e-6d1b-4a57-9d5e-2f9b1c3a7e10",
+  "itens": [
+    { "itemId": "7a1d9e02-3c4b-4f1a-8e6d-5b2c9f0a1d33", "nome": "Lasanha à bolonhesa", "precoUnitarioCentavos": 4590, "quantidade": 1, "totalCentavos": 4590 },
+    { "itemId": "c3e5f7a9-1b2d-4e6f-8a0c-2d4f6b8e0a12", "nome": "Refrigerante lata", "precoUnitarioCentavos": 1200, "quantidade": 2, "totalCentavos": 2400 }
+  ],
+  "subtotalCentavos": 6990,
+  "descontoCentavos": 699,
+  "taxaEntregaCentavos": 799,
+  "totalCentavos": 7090,
+  "distanciaMetros": 3539,
+  "cupom": { "codigo": "BEMVINDO10", "aplicado": true, "motivo": null },
+  "podeFinalizar": true,
+  "motivo": null
+}
+```
+
+**Criação do pedido** — `POST /pedidos`
+
+```http
+POST /pedidos HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Idempotency-Key: 5d3f7c1a-8e2b-4d6f-9a1c-3e5b7d9f1a2c
+Content-Type: application/json
+
+{
+  "restauranteId": "0f8c2a5e-6d1b-4a57-9d5e-2f9b1c3a7e10",
+  "itens": [
+    { "itemId": "7a1d9e02-3c4b-4f1a-8e6d-5b2c9f0a1d33", "quantidade": 1, "observacao": "sem cebola" },
+    { "itemId": "c3e5f7a9-1b2d-4e6f-8a0c-2d4f6b8e0a12", "quantidade": 2 }
+  ],
+  "entrega": { "endereco": "Rua das Flores, 120, ap. 32", "latitude": -22.8781, "longitude": -47.0782 },
+  "cupom": "BEMVINDO10",
+  "pagamento": { "metodo": "CARTAO", "tokenCartao": "tok_aprovar_9f2c" }
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /pedidos/3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10
+Content-Type: application/json
+
+{
+  "id": "3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10",
+  "status": "CRIADO",
+  "restaurante": { "id": "0f8c2a5e-6d1b-4a57-9d5e-2f9b1c3a7e10", "nome": "Bella Massa" },
+  "subtotalCentavos": 6990,
+  "descontoCentavos": 699,
+  "taxaEntregaCentavos": 799,
+  "totalCentavos": 7090,
+  "pagamento": { "metodo": "CARTAO", "status": "PENDENTE" },
+  "criadoEm": "2026-10-02T23:15:03Z",
+  "expiraEm": "2026-10-02T23:30:03Z"
+}
+```
+
+Repetir exatamente a mesma requisição devolve o mesmo corpo, com `Idempotency-Replayed: true`.
+
+**Detalhe** — `GET /pedidos/{id}` (trecho: o corpo inclui também itens, valores e endereço)
+
+```json
+{
+  "id": "3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10",
+  "status": "EM_PREPARO",
+  "previsaoEntregaEm": "2026-10-02T23:58:00Z",
+  "pagamento": { "metodo": "CARTAO", "status": "APROVADO" },
+  "historico": [
+    { "de": null, "para": "CRIADO", "ator": "CLIENTE", "ocorridoEm": "2026-10-02T23:15:03Z" },
+    { "de": "CRIADO", "para": "PAGO", "ator": "SISTEMA", "ocorridoEm": "2026-10-02T23:15:05Z" },
+    { "de": "PAGO", "para": "ACEITO", "ator": "RESTAURANTE", "ocorridoEm": "2026-10-02T23:17:41Z" },
+    { "de": "ACEITO", "para": "EM_PREPARO", "ator": "RESTAURANTE", "ocorridoEm": "2026-10-02T23:18:02Z" }
+  ]
+}
+```
+
+O cliente vê o tipo do ator, não o `sub` de quem agiu; o `ADMIN` vê o `sub` completo.
+
+**Cancelamento** — `POST /pedidos/{id}/cancelamento`
+
+```json
+{ "motivo": "DESISTENCIA", "detalhe": "Pedi no restaurante errado" }
+```
+
+Resposta `200`:
+
+```json
+{ "id": "3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10", "status": "CANCELADO", "motivo": "DESISTENCIA", "estorno": { "status": "SOLICITADO" } }
+```
+
+### Formato de erro
+
+Todo erro é `application/problem+json` (RFC 9457), com `type` estável, `codigo` para o cliente tratar sem ler texto, `traceId` para o suporte achar o trace e extensões quando ajudam:
+
+```json
+{
+  "type": "https://pedeai.dev/problemas/transicao-invalida",
+  "title": "Transição de status não permitida",
+  "status": 409,
+  "detail": "O pedido está em ACEITO; PRONTO só é permitido a partir de EM_PREPARO.",
+  "instance": "/pedidos/3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10/pronto",
+  "codigo": "TRANSICAO_INVALIDA",
+  "statusAtual": "ACEITO",
+  "transicoesPermitidas": ["EM_PREPARO", "CANCELADO"],
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+```json
+{
+  "type": "https://pedeai.dev/problemas/validacao",
+  "title": "Requisição inválida",
+  "status": 400,
+  "codigo": "VALIDACAO",
+  "erros": [
+    { "campo": "itens[1].quantidade", "mensagem": "deve estar entre 1 e 20" },
+    { "campo": "entrega.latitude", "mensagem": "deve estar entre -90 e 90" }
+  ],
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}
+```
+
+| HTTP | `codigo` | Quando |
+|---|---|---|
+| 400 | `VALIDACAO` | Bean Validation falhou; lista em `erros` |
+| 400 | `IDEMPOTENCY_KEY_INVALIDA` | Header ausente ou não é UUID |
+| 401 | `NAO_AUTENTICADO` | Token ausente, inválido ou expirado; webhook sem assinatura válida |
+| 403 | `ACESSO_NEGADO` | O papel não permite a rota |
+| 404 | `RESTAURANTE_NAO_ENCONTRADO`, `PEDIDO_NAO_ENCONTRADO`, `ITEM_NAO_ENCONTRADO`, `ENTREGA_NAO_ENCONTRADA` | Não existe **ou** não pertence a quem pediu |
+| 409 | `TRANSICAO_INVALIDA` | A máquina de estados recusou |
+| 409 | `CANCELAMENTO_NAO_PERMITIDO` | O ator não pode cancelar nesse estado |
+| 409 | `REQUISICAO_EM_ANDAMENTO` | Mesma `Idempotency-Key` ainda processando |
+| 409 | `CONFLITO_DE_CONCORRENCIA` | A versão otimista mudou durante a operação (ex.: aceite × expiração) |
+| 409 | `ENTREGA_EM_ANDAMENTO`, `PEDIDO_NAO_ESTA_PRONTO` | Regras de entrega (RN-61, RN-66) |
+| 412 | `VERSAO_DESATUALIZADA` | `If-Match` diferente da versão atual |
+| 422 | `ITEM_INDISPONIVEL` | Com `itens` |
+| 422 | `PEDIDO_ABAIXO_DO_MINIMO` | Com `minimoCentavos` e `faltamCentavos` |
+| 422 | `FORA_DA_AREA_DE_ENTREGA` | Com `distanciaMetros` e `limiteMetros` |
+| 422 | `RESTAURANTE_FECHADO` | Com `proximaAbertura` |
+| 422 | `CUPOM_INVALIDO`, `CUPOM_EXPIRADO`, `CUPOM_ESGOTADO`, `CUPOM_JA_UTILIZADO`, `CUPOM_SUBTOTAL_MINIMO` | Regras de cupom |
+| 422 | `IDEMPOTENCY_KEY_REUTILIZADA` | Mesma chave, corpo diferente |
+| 422 | `HORARIO_SOBREPOSTO` | RN-09 |
+| 428 | `IF_MATCH_OBRIGATORIO` | `PUT` de item sem `If-Match` |
+| 429 | `MUITAS_REQUISICOES` | Rate limit; header `Retry-After` |
+| 500 | `ERRO_INTERNO` | Qualquer exceção não tratada; nunca vaza stack trace nem SQL |
+
+### Contrato do PagaFake (gateway simulado)
+
+O PagaFake é um serviço pequeno que **você escreve** (um segundo módulo Maven do repositório, com Spring Boot e armazenamento em memória, basta) e sobe no Compose na porta 8090. O comportamento é decidido pelo token ou por variáveis de ambiente, para que os cenários difíceis sejam reproduzíveis.
+
+| Chamada | Descrição |
+|---|---|
+| `POST /v1/cobrancas` | Header `Idempotency-Key` obrigatório. Corpo: `referencia` (id do pagamento), `valorCentavos`, `metodo`, `tokenCartao` (se cartão), `urlWebhook`. Responde `201` com o `id` (`cob_…`) e `status: PENDENTE`; a mesma chave devolve a mesma cobrança (`200`) |
+| `POST /v1/cobrancas/{id}/estornos` | Header `Idempotency-Key`. Responde `202`; o resultado chega por webhook `estorno.concluido` |
+| `POST /v1/cobrancas/{id}/cancelamento` | Cancela cobrança ainda pendente; `409` se já aprovada |
+| `GET /v1/auditoria` | Lista cobranças e estornos criados (para o RNF-06) |
+
+| Token ou variável | Comportamento |
+|---|---|
+| `tok_aprovar…` | Webhook `cobranca.aprovada` depois de 1 a 3 s |
+| `tok_recusar…` | Webhook `cobranca.recusada` com `motivo: SALDO_INSUFICIENTE` |
+| `tok_lento…` | O `POST /v1/cobrancas` demora 5 s para responder (dispara o timeout) |
+| `tok_erro…` | `503` nas duas primeiras tentativas com a mesma chave, `201` na terceira |
+| PIX | Aprova depois de 5 s |
+| `FALHA_PERCENTUAL=30` | 30 % das chamadas respondem `503` |
+| `DUPLICAR_WEBHOOK=true` | Cada webhook é enviado 2 vezes, e 10 % chegam fora de ordem |
+| `SEGREDO_WEBHOOK` | Segredo do HMAC (o mesmo da API, via `.env`) |
+
+Webhook enviado pelo PagaFake (ele tenta de novo até 5 vezes, com backoff de 1 s a 16 s, enquanto a resposta não for `2xx`):
+
+```http
+POST /webhooks/pagafake HTTP/1.1
+Content-Type: application/json
+PagaFake-Assinatura: t=1790982905,v1=6f1c0e3b9a...e41d
+
+{
+  "id": "evt_01J9ZK3M4Q7R8S",
+  "tipo": "cobranca.aprovada",
+  "criadoEm": "2026-10-02T23:15:05Z",
+  "dados": { "cobrancaId": "cob_8KQ2", "referencia": "9e1f3a5c-2b4d-4c6e-8f0a-1b3d5f7a9c2e", "valorCentavos": 7090, "status": "APROVADA" }
+}
+```
+
+### Catálogo de eventos
+
+Eventos **internos** são records Java publicados com `ApplicationEventPublisher` e consumidos por `@ApplicationModuleListener`; todos passam pelo registro de publicações. Os que têm chave Kafka na tabela também são **externalizados** para o tópico `pedeai.pedidos.v1` (ou o do módulo), sempre com a chave indicada, o que garante a ordem por pedido dentro da partição.
+
+| Evento | Produtor | Consumidores | Chave (Kafka) | Payload (campos) | Garantia |
+|---|---|---|---|---|---|
+| `CardapioAlterado` | catalogo | catalogo (invalida o cache) | interno | `restauranteId`, `ocorridoEm` | pelo menos uma vez, após o commit |
+| `PedidoCriado` | pedidos | notificacoes (via Kafka) | `pedidoId` | `pedidoId`, `clienteSub`, `restauranteId`, `totalCentavos` | pelo menos uma vez, ordenado por pedido |
+| `CobrancaSolicitada` | pagamentos (via `Pagamentos.solicitarCobranca`) | pagamentos (listener que chama o gateway) | interno, nunca externalizado | `pagamentoId`, `pedidoId`, `valorCentavos`, `metodo`, `tokenCartao` | pelo menos uma vez; o gateway deduplica pela chave |
+| `PagamentoAprovado` · `PagamentoRecusado` | pagamentos | pedidos | `pedidoId` | `pagamentoId`, `pedidoId`, `motivo` | pelo menos uma vez; pedidos ignora se a transição já ocorreu |
+| `PedidoPago` | pedidos | notificacoes | `pedidoId` | `pedidoId`, `clienteSub`, `restauranteId`, `totalCentavos` | pelo menos uma vez |
+| `PedidoAceito` | pedidos | entregas, notificacoes | `pedidoId` | `pedidoId`, `restauranteId`, `latRestaurante`, `lonRestaurante`, `previsaoEntregaEm` | pelo menos uma vez; entregas deduplica por `pedido_id UNIQUE` |
+| `PedidoProntoParaColeta` | pedidos | entregas, notificacoes | `pedidoId` | `pedidoId`, `restauranteId` | pelo menos uma vez |
+| `PedidoACaminho` · `PedidoEntregue` | pedidos | notificacoes | `pedidoId` | `pedidoId`, `clienteSub`, `entregadorId` | pelo menos uma vez |
+| `PedidoCancelado` · `PedidoRecusado` | pedidos | pagamentos (estorno, via `Pagamentos.estornar`), entregas (libera), notificacoes | `pedidoId` | `pedidoId`, `statusAnterior`, `motivo`, `ator`, `exigeEstorno` | pelo menos uma vez |
+| `EstornoConcluido` | pagamentos | pedidos (registra), notificacoes | `pedidoId` | `pagamentoId`, `pedidoId`, `valorCentavos` | pelo menos uma vez |
+| `EntregaAtribuida` | entregas | notificacoes | `pedidoId` | `entregaId`, `pedidoId`, `entregadorSub` | pelo menos uma vez |
+
+Tópicos: `pedeai.pedidos.v1` (6 partições), `pedeai.pagamentos.v1` e `pedeai.entregas.v1` (3 partições cada), e os DLT `<tópico>-dlt`. `CobrancaSolicitada` **nunca** é externalizado, porque carrega o token do cartão.
+
+Como pagamentos não conhece pedidos (ver "Organização de pacotes"), o estorno não é disparado por um listener de pagamentos: é o listener de `PedidoCancelado`, **no módulo de pedidos**, que chama `Pagamentos.estornar(pedidoId)`. A seta de dependência continua uma só.
+
+Todo evento externo tem o mesmo envelope, com versão de schema (mudança incompatível = novo tópico `v2`):
+
+```json
+{
+  "eventoId": "0192a8f4-6b1e-7c3d-9a2f-4e6b8d0c2a4e",
+  "tipo": "PedidoCancelado",
+  "versao": 1,
+  "ocorridoEm": "2026-10-02T23:24:10Z",
+  "correlationId": "c-7f3a9e21",
+  "dados": {
+    "pedidoId": "3b9d2f41-7c6e-4a8b-9f1d-0e2c4a6b8d10",
+    "statusAnterior": "EM_PREPARO",
+    "motivo": "SEM_INGREDIENTE",
+    "ator": "RESTAURANTE",
+    "exigeEstorno": true
+  }
+}
+```
+
+## Arquitetura
+
+<Figura legenda="Um único deploy (o monólito modular) com cinco módulos de negócio e um núcleo compartilhado. Os eventos são gravados na mesma transação da mudança de estado e externalizados para o Kafka; toda a infraestrutura roda no Docker Compose">
+<svg viewBox="0 0 900 460" width="900" role="img" aria-labelledby="pedeai-arq-titulo pedeai-arq-desc">
+  <title id="pedeai-arq-titulo">Arquitetura de containers e módulos do Pede Aí</title>
+  <desc id="pedeai-arq-desc">À esquerda, os clientes (aplicativos de cliente, restaurante e entregador) chamam a API com JWT; o Keycloak emite os tokens. No centro, a aplicação pede-ai com os módulos catálogo, pedidos, pagamentos, entregas, notificações e compartilhado, e o registro de publicações. Pedidos depende de catálogo e de pagamentos; entregas depende de pedidos. À direita, PostgreSQL, Redis, PagaFake, Grafana LGTM, Kafka e Mailpit. O registro de publicações envia eventos ao Kafka, de onde o módulo de notificações consome.</desc>
+  <defs>
+    <marker id="pedeai-arq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker>
+  </defs>
+  <rect x="10" y="40" width="150" height="110" rx="10" class="d-box"/>
+  <text x="85" y="64" text-anchor="middle" class="d-title">Clientes</text>
+  <text x="85" y="86" text-anchor="middle" class="d-label">app do cliente</text>
+  <text x="85" y="104" text-anchor="middle" class="d-label">app do restaurante</text>
+  <text x="85" y="122" text-anchor="middle" class="d-label">app do entregador</text>
+  <text x="85" y="140" text-anchor="middle" class="d-label">(coleção .http)</text>
+
+  <rect x="10" y="210" width="150" height="60" rx="10" class="d-info"/>
+  <text x="85" y="236" text-anchor="middle" class="d-title">Keycloak</text>
+  <text x="85" y="256" text-anchor="middle" class="d-label">OIDC · realm pede-ai</text>
+  <path d="M85 152 L85 208" class="d-line" marker-start="url(#pedeai-arq-seta)" marker-end="url(#pedeai-arq-seta)"/>
+  <text x="92" y="184" class="d-label">login</text>
+
+  <path d="M160 95 L198 95" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+  <text x="166" y="88" class="d-label">JWT</text>
+  <path d="M200 240 L162 240" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+  <text x="166" y="233" class="d-label">JWKS</text>
+
+  <rect x="200" y="20" width="460" height="420" rx="12" class="d-box"/>
+  <text x="430" y="46" text-anchor="middle" class="d-title">pede-ai · Spring Boot 4 · monólito modular</text>
+
+  <rect x="220" y="70" width="130" height="56" rx="8" class="d-info"/>
+  <text x="285" y="94" text-anchor="middle" class="d-title">catalogo</text>
+  <text x="285" y="112" text-anchor="middle" class="d-label">cardápio, horários</text>
+
+  <rect x="365" y="70" width="130" height="56" rx="8" class="d-accent"/>
+  <text x="430" y="94" text-anchor="middle" class="d-title">pedidos</text>
+  <text x="430" y="112" text-anchor="middle" class="d-label">cotação, estados</text>
+
+  <rect x="510" y="70" width="130" height="56" rx="8" class="d-ok"/>
+  <text x="575" y="94" text-anchor="middle" class="d-title">pagamentos</text>
+  <text x="575" y="112" text-anchor="middle" class="d-label">cobrança, webhook</text>
+
+  <path d="M365 98 L352 98" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+  <path d="M495 98 L508 98" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="220" y="180" width="130" height="56" rx="8" class="d-violet"/>
+  <text x="285" y="204" text-anchor="middle" class="d-title">entregas</text>
+  <text x="285" y="222" text-anchor="middle" class="d-label">atribuição, posição</text>
+
+  <rect x="365" y="180" width="130" height="56" rx="8" class="d-box"/>
+  <text x="430" y="204" text-anchor="middle" class="d-title">compartilhado</text>
+  <text x="430" y="222" text-anchor="middle" class="d-label">Dinheiro, erros, ids</text>
+
+  <rect x="510" y="180" width="130" height="56" rx="8" class="d-box"/>
+  <text x="575" y="204" text-anchor="middle" class="d-title">notificacoes</text>
+  <text x="575" y="222" text-anchor="middle" class="d-label">consome do Kafka</text>
+
+  <path d="M300 180 L390 128" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+  <text x="226" y="162" class="d-label">usa pedidos</text>
+
+  <path d="M430 238 L430 298" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-arq-seta)"/>
+  <text x="438" y="272" class="d-label">eventos no mesmo commit</text>
+
+  <rect x="220" y="300" width="420" height="50" rx="8" class="d-violet"/>
+  <text x="430" y="322" text-anchor="middle" class="d-title">registro de publicações (outbox)</text>
+  <text x="430" y="340" text-anchor="middle" class="d-label">event_publication · republica incompletos</text>
+
+  <text x="430" y="392" text-anchor="middle" class="d-label">Actuator · Micrometer · OpenTelemetry · logs ECS</text>
+  <text x="430" y="412" text-anchor="middle" class="d-label">Resilience4j na saída para o gateway · rate limit no Redis</text>
+
+  <rect x="700" y="20" width="190" height="50" rx="8" class="d-box"/>
+  <text x="795" y="42" text-anchor="middle" class="d-title">PostgreSQL 18</text>
+  <text x="795" y="60" text-anchor="middle" class="d-label">um schema por módulo</text>
+  <path d="M660 45 L698 45" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="700" y="85" width="190" height="50" rx="8" class="d-box"/>
+  <text x="795" y="107" text-anchor="middle" class="d-title">Redis 8</text>
+  <text x="795" y="125" text-anchor="middle" class="d-label">cache e rate limit</text>
+  <path d="M660 110 L698 110" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="700" y="150" width="190" height="50" rx="8" class="d-accent"/>
+  <text x="795" y="172" text-anchor="middle" class="d-title">PagaFake</text>
+  <text x="795" y="190" text-anchor="middle" class="d-label">cobrança e webhook HMAC</text>
+  <path d="M660 175 L698 175" class="d-line" marker-start="url(#pedeai-arq-seta)" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="700" y="215" width="190" height="50" rx="8" class="d-box"/>
+  <text x="795" y="237" text-anchor="middle" class="d-title">Grafana LGTM</text>
+  <text x="795" y="255" text-anchor="middle" class="d-label">métricas, traces, logs</text>
+  <path d="M660 240 L698 240" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="700" y="300" width="190" height="50" rx="8" class="d-info"/>
+  <text x="795" y="322" text-anchor="middle" class="d-title">Kafka 4 (KRaft)</text>
+  <text x="795" y="340" text-anchor="middle" class="d-label">pedeai.*.v1 e -dlt</text>
+  <path d="M640 312 L698 312" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+  <path d="M698 340 L650 340 L650 214 L642 214" class="d-line" fill="none" stroke-dasharray="4 3" marker-end="url(#pedeai-arq-seta)"/>
+
+  <rect x="700" y="380" width="190" height="50" rx="8" class="d-box"/>
+  <text x="795" y="402" text-anchor="middle" class="d-title">Mailpit</text>
+  <text x="795" y="420" text-anchor="middle" class="d-label">SMTP fake · UI :8025</text>
+  <path d="M660 405 L698 405" class="d-line" marker-end="url(#pedeai-arq-seta)"/>
+</svg>
+</Figura>
+
+Serviços do `compose.yaml` (todos com healthcheck; a API só sobe depois de Postgres, Kafka e Keycloak saudáveis):
+
+| Serviço | Imagem | Portas no host | Observação |
+|---|---|---|---|
+| `api` | build do repositório | 8080 | Perfil `demo` carrega os dados de demonstração |
+| `pagafake` | build do repositório | 8090 | Segredo do HMAC via `.env` |
+| `postgres` | `postgres:18` | 5432 | Volume nomeado |
+| `kafka` | `apache/kafka:4.x` | 9092 | KRaft, um nó; tópicos criados por um serviço `kafka-init` ou pela aplicação (`NewTopic`) |
+| `redis` | `redis:8` | 6379 | Sem persistência (é cache) |
+| `keycloak` | `quay.io/keycloak/keycloak` (26.x) | 8081 | `start-dev --import-realm`, realm em `infra/keycloak/pede-ai-realm.json` |
+| `mailpit` | `axllent/mailpit` | 1025 (SMTP), 8025 (UI) | Caixa de entrada de todos os e-mails |
+| `lgtm` | `grafana/otel-lgtm` | 3000 (Grafana), 4317/4318 (OTLP) | Prometheus, Tempo e Loki num contêiner só |
+
+### Organização de pacotes
+
+Cada pacote direto abaixo do pacote raiz é um módulo do Spring Modulith. O que fica na raiz do módulo é a **API pública** (serviços expostos, eventos, DTOs); o que fica em subpacotes é interno, e o `verify()` impede que outro módulo use.
+
+```text
+dev.seunome.pedeai
+├── PedeAiApplication.java
+├── compartilhado/                  ← módulo aberto: Dinheiro, Problemas, Ator, configuração do relógio
+├── catalogo/
+│   ├── CatalogoConsulta.java       ← API pública usada por pedidos (preço, disponibilidade, aberto agora)
+│   ├── CardapioAlterado.java       ← evento (record)
+│   ├── internal/                   ← entidades, repositórios, cache, regras de horário
+│   └── web/                        ← controllers
+├── pedidos/
+│   ├── PedidoCriado.java, PedidoAceito.java, ...   ← eventos (records)
+│   ├── PedidosConsulta.java        ← API pública usada por entregas
+│   ├── internal/                   ← Pedido (agregado), transições, Cotador, Cupons, Idempotencia
+│   └── web/
+├── pagamentos/
+│   ├── Pagamentos.java             ← API pública: solicitarCobranca(...), estornar(...)
+│   ├── PagamentoAprovado.java, PagamentoRecusado.java, EstornoConcluido.java
+│   ├── internal/                   ← cliente HTTP do gateway (RestClient), resiliência, HMAC
+│   └── web/                        ← controller do webhook
+├── entregas/
+│   ├── internal/
+│   └── web/
+└── notificacoes/
+    └── internal/                   ← listeners Kafka, envio de e-mail, deduplicação
+```
+
+Dependências permitidas (declare com `allowedDependencies` em `@ApplicationModule`, no `package-info.java` de cada módulo):
+
+| Módulo | Pode depender de |
+|---|---|
+| `catalogo` | `compartilhado` |
+| `pagamentos` | `compartilhado` |
+| `pedidos` | `catalogo`, `pagamentos`, `compartilhado` |
+| `entregas` | `pedidos`, `compartilhado` |
+| `notificacoes` | `compartilhado` (conhece só o JSON do Kafka) |
+
+Repare que **pagamentos não conhece pedidos**: recebe um id de referência e publica eventos próprios, que pedidos escuta. Isso evita o ciclo `pedidos ⇄ pagamentos`, que o Modulith recusaria. Pelo mesmo motivo, a coleta e a conclusão da entrega (que mudam o status do pedido) são chamadas de `entregas` para a API pública de `pedidos`, e não eventos de entregas escutados por pedidos.
+
+A transição de estado vive **dentro do agregado `Pedido`**, com uma tabela de transições permitidas por ator. Um `sealed interface` de comandos com `switch` por pattern matching fica natural aqui, e o compilador avisa quando um comando novo não foi tratado. Controllers, listeners e rotinas chamam o agregado; nenhum deles faz `pedido.setStatus(...)`.
+
+### Decisões para registrar em ADRs
+
+Crie `docs/adr/` com um arquivo por decisão (formato curto: contexto, opções, decisão, consequências). As recomendações abaixo são um ponto de partida; o que o entrevistador quer ver é que você **considerou** as alternativas e sabe o preço da escolha.
+
+**ADR-001 · Monólito modular ou microsserviços?**
+- *Monólito modular*: um deploy, transações locais, depuração simples, fronteiras garantidas por teste; exige disciplina para não virar uma "grande bola de lama".
+- *Microsserviços*: deploy e escala independentes; paga-se com rede, consistência eventual em tudo, observabilidade distribuída e um time maior do que existe.
+- **Recomendação:** monólito modular com Spring Modulith, e o critério explícito de quando extrair um módulo (ex.: notificações, se precisar escalar separado ou tiver outro time).
+
+**ADR-002 · Kafka ou RabbitMQ para os eventos de integração?**
+- *Kafka*: log retido e reprocessável, ordem por chave, vários grupos de consumidores lendo o mesmo evento; operação mais pesada.
+- *RabbitMQ*: roteamento flexível, filas por consumidor, DLQ nativa simples; sem replay depois do consumo.
+- **Recomendação:** Kafka, porque o evento de pedido interessa a vários consumidores (notificações hoje, analytics e financeiro amanhã) e a ordem por `pedidoId` importa. RabbitMQ é uma escolha defensável; o que não é defensável é não justificar.
+
+**ADR-003 · Outbox: registro de publicações do Modulith ou tabela própria + relay?**
+- *Registro do Spring Modulith + externalização (`@Externalized`)*: pouco código, republicação de incompletos pronta; menos controle do formato e da ordem de envio.
+- *Tabela `outbox` + relay por polling (`SELECT ... FOR UPDATE SKIP LOCKED`)*: controle total, ótimo para aprender; mais código para manter.
+- **Recomendação:** o registro do Modulith, com a tabela versionada no Flyway, monitorada por um gauge de pendentes e com política de limpeza das publicações completas (ex.: apagar as concluídas há mais de 7 dias).
+
+**ADR-004 · Onde guardar a chave de idempotência do POST?**
+- *PostgreSQL, na mesma transação do pedido*: atomicidade verdadeira (ou existem pedido e chave, ou nenhum dos dois); custa uma escrita a mais.
+- *Redis com `SET NX` e TTL*: rápido; mas o pedido pode ser gravado e a chave não (ou o contrário), e a expiração é aproximada.
+- **Recomendação:** PostgreSQL. A linha entra primeiro com estado `EM_PROCESSAMENTO` (`INSERT ... ON CONFLICT DO NOTHING`: 0 linhas inseridas significa que outra requisição chegou antes, o que produz o replay ou o `409`), e é atualizada com a resposta no mesmo commit do pedido. Limpeza diária das expiradas.
+
+**ADR-005 · Como representar dinheiro?**
+- *Centavos em `long`*: exato, rápido, sem escala a configurar; exige cuidado nas divisões (percentual).
+- *`BigDecimal` com escala 2*: legível; exige `compareTo` em vez de `equals` e `RoundingMode` explícito em toda divisão.
+- **Recomendação:** um record `Dinheiro(long centavos)` com as operações (`somar`, `multiplicar(int)`, `percentual(int, RoundingMode)`) usado no domínio; na API e no banco, centavos inteiros.
+
+**ADR-006 · Como saber que um usuário é dono de um restaurante?**
+- *Claim no token* (lista de restaurantes via mapper do Keycloak): zero consulta; mas a revogação só vale quando o token expira, e o Keycloak vira fonte de dado de negócio.
+- *Tabela no catálogo (`responsavel_sub`)*: uma consulta (cacheável) por verificação; a regra fica na aplicação.
+- **Recomendação:** tabela no catálogo, verificação num único componente (ex.: `AcessoRestaurante.exigirResponsavel(sub, restauranteId)`) e resposta `404` para quem não é dono.
+
+**ADR-007 · Um schema por módulo, sem FK entre eles?**
+- *Sim*: fronteira física, migração futura para outro banco sem cirurgia; perde-se integridade referencial entre módulos (compensada pelos eventos).
+- *Não, FKs livres*: integridade total; os módulos ficam acoplados pelo banco, e o `verify()` do Modulith não enxerga esse acoplamento.
+- **Recomendação:** sim, com as referências entre módulos por id e testes de integração cobrindo os fluxos de consistência.
+
+**ADR-008 · Chamar o gateway dentro do POST ou depois do commit?**
+- *Síncrono no POST*: o cliente sabe na hora se o cartão passou; a latência e a disponibilidade do POST passam a ser as do gateway, e uma falha no meio deixa cobrança sem pedido (ou pedido sem cobrança).
+- *Assíncrono, depois do commit, por evento*: o POST fica rápido e disponível mesmo com o gateway fora; o cliente acompanha o status (polling ou notificação).
+- **Recomendação:** assíncrono. A meta do RNF-01 só é viável assim, e a consistência vem da chave de idempotência no gateway somada ao registro de publicações.
+
+**ADR-009 · Rate limit: falhar aberto ou fechado quando o Redis cai?** Aberto para o POST de pedido (vender importa mais), com alerta; fechado seria a escolha certa para um endpoint de login, onde o limite é defesa contra força bruta. Registre o porquê.
+
+**ADR-010 · Rotinas agendadas com mais de uma instância?** Nesta versão roda uma instância só, e as rotinas (`@Scheduled`) são seguras por usarem transição com versão otimista. Registre o limite: com duas instâncias, a mesma rotina roda duas vezes; as saídas são `SELECT ... FOR UPDATE SKIP LOCKED` na seleção ou um lock distribuído (ex.: ShedLock).
+
+### A máquina de estados do pedido
+
+<Figura legenda="Caminho feliz na linha de cima, com o ator de cada transição. Setas para baixo são saídas para os estados terminais CANCELADO e RECUSADO; a tabela do RF-11 diz quem pode dispará-las em cada estado">
+<svg viewBox="0 0 880 340" width="880" role="img" aria-labelledby="pedeai-est-titulo pedeai-est-desc">
+  <title id="pedeai-est-titulo">Máquina de estados do pedido</title>
+  <desc id="pedeai-est-desc">Sete estados em linha: CRIADO, PAGO, ACEITO, EM_PREPARO, PRONTO, A_CAMINHO e ENTREGUE. CRIADO vai a PAGO pelo webhook do gateway; PAGO a ACEITO, ACEITO a EM_PREPARO e EM_PREPARO a PRONTO pelo restaurante; PRONTO a A_CAMINHO e A_CAMINHO a ENTREGUE pelo entregador. De PAGO sai a transição para RECUSADO, pelo restaurante. De CRIADO, PAGO, ACEITO, EM_PREPARO, PRONTO e A_CAMINHO saem transições para CANCELADO. ENTREGUE, CANCELADO e RECUSADO são terminais.</desc>
+  <defs>
+    <marker id="pedeai-est-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker>
+  </defs>
+  <text x="130" y="30" text-anchor="middle" class="d-label">webhook</text>
+  <text x="130" y="44" text-anchor="middle" class="d-label">gateway</text>
+  <text x="254" y="30" text-anchor="middle" class="d-label">aceitar</text>
+  <text x="254" y="44" text-anchor="middle" class="d-label">restaurante</text>
+  <text x="378" y="30" text-anchor="middle" class="d-label">iniciar</text>
+  <text x="378" y="44" text-anchor="middle" class="d-label">restaurante</text>
+  <text x="502" y="30" text-anchor="middle" class="d-label">pronto</text>
+  <text x="502" y="44" text-anchor="middle" class="d-label">restaurante</text>
+  <text x="626" y="30" text-anchor="middle" class="d-label">coletar</text>
+  <text x="626" y="44" text-anchor="middle" class="d-label">entregador</text>
+  <text x="750" y="30" text-anchor="middle" class="d-label">entregar</text>
+  <text x="750" y="44" text-anchor="middle" class="d-label">entregador</text>
+
+  <rect x="16" y="60" width="104" height="44" rx="8" class="d-info"/>
+  <text x="68" y="87" text-anchor="middle" class="d-mono">CRIADO</text>
+  <rect x="140" y="60" width="104" height="44" rx="8" class="d-box"/>
+  <text x="192" y="87" text-anchor="middle" class="d-mono">PAGO</text>
+  <rect x="264" y="60" width="104" height="44" rx="8" class="d-box"/>
+  <text x="316" y="87" text-anchor="middle" class="d-mono">ACEITO</text>
+  <rect x="388" y="60" width="104" height="44" rx="8" class="d-box"/>
+  <text x="440" y="87" text-anchor="middle" class="d-mono">EM_PREPARO</text>
+  <rect x="512" y="60" width="104" height="44" rx="8" class="d-box"/>
+  <text x="564" y="87" text-anchor="middle" class="d-mono">PRONTO</text>
+  <rect x="636" y="60" width="104" height="44" rx="8" class="d-box"/>
+  <text x="688" y="87" text-anchor="middle" class="d-mono">A_CAMINHO</text>
+  <rect x="760" y="60" width="104" height="44" rx="8" class="d-ok"/>
+  <text x="812" y="87" text-anchor="middle" class="d-mono">ENTREGUE</text>
+
+  <path d="M120 82 L138 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M244 82 L262 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M368 82 L386 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M492 82 L510 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M616 82 L634 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M740 82 L758 82" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+
+  <rect x="120" y="230" width="150" height="44" rx="8" class="d-accent"/>
+  <text x="195" y="257" text-anchor="middle" class="d-mono">RECUSADO</text>
+  <rect x="420" y="230" width="180" height="44" rx="8" class="d-accent"/>
+  <text x="510" y="257" text-anchor="middle" class="d-mono">CANCELADO</text>
+
+  <path d="M190 104 L190 228" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <text x="182" y="160" text-anchor="end" class="d-label">recusar</text>
+  <text x="182" y="174" text-anchor="end" class="d-label">(restaurante)</text>
+  <path d="M68 104 L430 228" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M200 104 L455 228" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M316 104 L480 228" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M440 104 L505 228" class="d-line" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M564 104 L540 228" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-est-seta)"/>
+  <path d="M688 104 L575 228" class="d-line" stroke-dasharray="4 3" marker-end="url(#pedeai-est-seta)"/>
+
+  <text x="640" y="200" class="d-text">Tracejado: só ADMIN.</text>
+  <text x="640" y="226" class="d-label">Sistema cancela CRIADO após 15 min</text>
+  <text x="640" y="244" class="d-label">e PAGO após 8 min sem aceite.</text>
+  <text x="640" y="262" class="d-label">Pagamento aprovado + cancelamento</text>
+  <text x="640" y="280" class="d-label">= estorno automático.</text>
+  <text x="16" y="320" class="d-label">Terminais: ENTREGUE, CANCELADO, RECUSADO. Qualquer outra transição → 409 TRANSICAO_INVALIDA.</text>
+</svg>
+</Figura>
+
+### O fluxo crítico: do POST ao pedido pago
+
+<Figura legenda="O POST grava tudo numa transação e responde sem esperar o gateway. A cobrança sai depois do commit, com a mesma chave de idempotência em todas as tentativas; o webhook é deduplicado e vira um evento que leva o pedido a PAGO">
+<svg viewBox="0 0 880 540" width="880" role="img" aria-labelledby="pedeai-seq-titulo pedeai-seq-desc">
+  <title id="pedeai-seq-titulo">Sequência da criação e do pagamento de um pedido</title>
+  <desc id="pedeai-seq-desc">Seis participantes: Cliente, módulo Pedidos, módulo Pagamentos, PostgreSQL, PagaFake e Kafka. O cliente envia POST /pedidos com Idempotency-Key. Pedidos chama Pagamentos para registrar o pagamento pendente e grava pedido, pagamento e eventos no PostgreSQL numa transação, e responde 201 ao cliente. Depois do commit, Pagamentos chama o PagaFake com a chave de idempotência igual ao id do pagamento e recebe 201 pendente. O PagaFake envia o webhook assinado; Pagamentos deduplica pelo id do evento, marca o pagamento como aprovado e publica PagamentoAprovado. Pedidos leva o pedido a PAGO e grava PedidoPago no registro de publicações, que é externalizado para o Kafka com a chave pedidoId.</desc>
+  <defs>
+    <marker id="pedeai-seq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker>
+  </defs>
+  <rect x="10" y="10" width="110" height="36" rx="8" class="d-box"/>
+  <text x="65" y="33" text-anchor="middle" class="d-title">Cliente</text>
+  <rect x="160" y="10" width="110" height="36" rx="8" class="d-accent"/>
+  <text x="215" y="33" text-anchor="middle" class="d-title">Pedidos</text>
+  <rect x="310" y="10" width="110" height="36" rx="8" class="d-ok"/>
+  <text x="365" y="33" text-anchor="middle" class="d-title">Pagamentos</text>
+  <rect x="460" y="10" width="110" height="36" rx="8" class="d-box"/>
+  <text x="515" y="33" text-anchor="middle" class="d-title">PostgreSQL</text>
+  <rect x="610" y="10" width="110" height="36" rx="8" class="d-violet"/>
+  <text x="665" y="33" text-anchor="middle" class="d-title">PagaFake</text>
+  <rect x="760" y="10" width="110" height="36" rx="8" class="d-info"/>
+  <text x="815" y="33" text-anchor="middle" class="d-title">Kafka</text>
+
+  <path d="M65 46 L65 530" class="d-line" stroke-dasharray="3 4"/>
+  <path d="M215 46 L215 530" class="d-line" stroke-dasharray="3 4"/>
+  <path d="M365 46 L365 530" class="d-line" stroke-dasharray="3 4"/>
+  <path d="M515 46 L515 530" class="d-line" stroke-dasharray="3 4"/>
+  <path d="M665 46 L665 530" class="d-line" stroke-dasharray="3 4"/>
+  <path d="M815 46 L815 530" class="d-line" stroke-dasharray="3 4"/>
+
+  <text x="72" y="78" class="d-label">1. POST /pedidos</text>
+  <text x="72" y="92" class="d-mono">Idempotency-Key</text>
+  <path d="M65 100 L213 100" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="222" y="126" class="d-label">2. solicitarCobranca()</text>
+  <path d="M215 134 L363 134" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="222" y="160" class="d-label">3. uma transação: pedido CRIADO, pagamento</text>
+  <text x="222" y="174" class="d-label">PENDENTE, chave, eventos na outbox</text>
+  <path d="M215 182 L513 182" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="72" y="208" class="d-label">4. 201 CRIADO</text>
+  <path d="M213 216 L67 216" class="d-line" stroke-dasharray="5 3" marker-end="url(#pedeai-seq-seta)"/>
+
+  <rect x="300" y="232" width="430" height="24" rx="6" class="d-info"/>
+  <text x="515" y="248" text-anchor="middle" class="d-label">depois do commit · assíncrono · timeout 2 s, retry, circuit breaker</text>
+
+  <text x="372" y="280" class="d-label">5. POST /v1/cobrancas</text>
+  <text x="372" y="294" class="d-mono">Idempotency-Key = pagamentoId</text>
+  <path d="M365 302 L663 302" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+  <text x="530" y="326" class="d-label">6. 201 PENDENTE</text>
+  <path d="M663 332 L367 332" class="d-line" stroke-dasharray="5 3" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="372" y="362" class="d-label">7. webhook cobranca.aprovada (HMAC)</text>
+  <path d="M665 370 L367 370" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="372" y="396" class="d-label">8. dedup evt_ + APROVADO + evento</text>
+  <path d="M365 404 L513 404" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="222" y="430" class="d-label">9. PagamentoAprovado</text>
+  <path d="M363 438 L217 438" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="222" y="464" class="d-label">10. pedido PAGO + PedidoPago na outbox</text>
+  <path d="M215 472 L513 472" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+
+  <text x="522" y="498" class="d-label">11. externalização, chave = pedidoId</text>
+  <path d="M515 506 L813 506" class="d-line" marker-end="url(#pedeai-seq-seta)"/>
+</svg>
+</Figura>
+
+Dois detalhes do diagrama valem ouro numa entrevista. Primeiro, **entre os passos 4 e 5 o sistema pode cair**, e nada se perde: a publicação de `CobrancaSolicitada` está incompleta no banco e é refeita na volta. Segundo, **o passo 5 pode acontecer duas vezes** (retry depois de um timeout em que o gateway na verdade recebeu), e isso é inofensivo porque a chave de idempotência é o id do pagamento, estável entre tentativas.
+
+## Plano de execução
+
+O plano tem **começo, meio e fim**. O começo (marcos 1 e 2) monta o esqueleto que todo o resto usa: repositório, módulos vazios já verificados, infraestrutura inteira no Compose, CI verde e identidade funcionando. O meio (marcos 3 a 8) são **fatias verticais**: cada marco termina com uma funcionalidade que funciona de ponta a ponta (HTTP → domínio → banco → evento), com testes, e que você consegue demonstrar com a coleção `.http`. Nada de "fazer todas as entidades primeiro". O fim (marco 9) transforma o código em portfólio: carga medida, documentação, vídeo e release.
+
+Trabalhe em branches curtas com pull requests para a `main`, mesmo sozinho: o histórico de PRs, com descrição e CI verde, é parte do que o gestor vê. Ao terminar cada marco, crie uma tag (`m1`, `m2`, …) e atualize o README.
+
+<Marco id="fundacao" numero={1} titulo="Fundação do repositório" horas={12}>
+
+**Objetivo:** ter um repositório que qualquer pessoa clona e sobe com um comando, com o esqueleto modular já verificado em teste.
+
+**Tarefas**
+
+- Gerar o projeto no Spring Initializr: Java 25, Maven, Spring Boot 4.x, dependências Web, Validation, Data JPA, PostgreSQL, Flyway, Actuator, Security, OAuth2 Resource Server, Spring Modulith, Spring for Apache Kafka, Data Redis, Testcontainers, Docker Compose Support.
+- Criar os pacotes dos seis módulos com um `package-info.java` cada (`@ApplicationModule` com `allowedDependencies`) e o teste `ModulosTest` com `ApplicationModules.of(PedeAiApplication.class).verify()`.
+- Escrever o `compose.yaml` com todos os serviços da tabela de arquitetura, healthchecks e `.env.example`. O PagaFake pode começar como um "olá mundo" que responde `201`.
+- Migration `V1__schemas.sql` (schemas e `event_publication`) e configuração do Flyway para os schemas.
+- Pipeline no GitHub Actions: `mvn verify` com cache do Maven, Java 25 (`actions/setup-java`), Testcontainers funcionando no runner, upload do relatório de testes.
+- README inicial: o que é, como rodar, status por marco. Arquivo `docs/adr/0001-monolito-modular.md`.
+- Configurar logs estruturados (`logging.structured.format.console=ecs`) e virtual threads (`spring.threads.virtual.enabled=true`) desde já.
+
+**Entregáveis:** repositório público, `compose.yaml`, CI verde, `ModulosTest`, ADR-001, README.
+
+**Definição de pronto**
+
+- `docker compose up -d` sobe todos os serviços e `GET /actuator/health` responde `UP`.
+- `mvn verify` passa localmente e no CI, incluindo um teste com `@SpringBootTest` + Testcontainers (Postgres).
+- Mover uma classe para `pedidos.internal` e usá-la em `entregas` faz o `ModulosTest` falhar (teste isso uma vez e desfaça).
+
+**Aulas de apoio:** [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/), [Docker](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Flyway e locking](../../../aulas/09-persistencia/06-locking-e-flyway/), [Testcontainers](../../../aulas/10-testes/05-testcontainers/), [Git no time](../../../aulas/14-devops/01-git-no-time/), [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), [Domain-Driven Design](../../../aulas/13-arquitetura/07-domain-driven-design/).
+
+<Callout tipo="erro" titulo="Armadilha: começar pelas entidades">
+Criar as 15 tabelas e entidades no primeiro dia parece produtivo e é o caminho mais curto para um projeto abandonado. Cada marco cria só as tabelas que a fatia dele usa.
+</Callout>
+
+</Marco>
+
+<Marco id="identidade" numero={2} titulo="Identidade e papéis" horas={12}>
+
+**Objetivo:** a API valida tokens do Keycloak, conhece os papéis e tem a base da matriz de autorização.
+
+**Tarefas**
+
+- Criar o realm `pede-ai` no Keycloak: papéis `CLIENTE`, `RESTAURANTE`, `ENTREGADOR`, `ADMIN`; usuários `cliente1`, `cliente2`, `rest.bella`, `rest.outro`, `entregador1`, `entregador2`, `admin`; um client público para a coleção `.http` (password grant **só** no realm de desenvolvimento, ou authorization code com PKCE). Exportar para `infra/keycloak/pede-ai-realm.json`.
+- Configurar o resource server (`issuer-uri`), um conversor que lê `realm_access.roles` (RN-01) e a cadeia de filtros com regras por rota terminando em `anyRequest().denyAll()`.
+- `GET /me` (RN-04) e o tratamento de `401`/`403` em Problem Details.
+- Testes: fatia `@WebMvcTest` com `jwt()` do `spring-security-test`; um teste de integração que obtém um token real do Keycloak via Testcontainers (ou um `JwtDecoder` de teste com chave própria — registre a escolha).
+- Correlation id: filtro que lê `X-Correlation-Id` (ou gera um), coloca no MDC e devolve no header.
+
+**Entregáveis:** realm versionado, `SecurityConfig`, `GET /me`, testes de segurança, ADR-006.
+
+**Definição de pronto**
+
+- Com a coleção `.http`, `cliente1` obtém token e `GET /me` devolve `papeis: ["CLIENTE"]`.
+- Os três critérios de aceite do RF-01 passam como testes automatizados.
+- Toda linha de log de requisição tem `correlationId`.
+
+**Aulas de apoio:** [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/), [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/), [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/), [Observabilidade: id de correlação](../../../aulas/14-devops/05-observabilidade/#id-de-correlação-no-mdc), [OAuth 2 e OpenID Connect](../../../aulas/11-seguranca/07-oauth2-e-openid-connect/).
+
+<Callout tipo="erro" titulo="Armadilha: o emissor do token muda dentro do Docker">
+Pelo navegador o Keycloak é `http://localhost:8081`; de dentro da rede do Compose ele é `http://keycloak:8080`. O claim `iss` do token carrega o endereço por onde ele foi emitido, e o resource server recusa (`401`) se não bater com o `issuer-uri`. Fixe o hostname do Keycloak (opção de hostname dele) para que o emissor seja o mesmo dos dois lados, e documente no README.
+</Callout>
+
+</Marco>
+
+<Marco id="catalogo" numero={3} titulo="Catálogo com dono" horas={16}>
+
+**Objetivo:** restaurantes, horários e cardápio funcionando, com escrita só para o responsável e leitura pública paginada.
+
+**Tarefas**
+
+- Migration `V2__catalogo.sql`, entidades e repositórios do catálogo.
+- RF-02 (cadastro pelo admin), RF-03 (horários com virada da meia-noite e pausa) e RF-04 (cardápio, disponibilidade, arquivamento, `ETag`/`If-Match`).
+- Regra de "aberto agora" como função pura testável: recebe a grade, a pausa e um `ZonedDateTime`, devolve aberto e próxima abertura.
+- `AcessoRestaurante` (ADR-006) usado por todas as rotas de escrita, com `404` para quem não é dono.
+- RF-05 sem cache ainda: listagem paginada, filtros e cálculo de distância (haversine em `compartilhado`).
+- `CatalogoConsulta` como API pública para o módulo de pedidos (preço, disponibilidade, aberto agora), sem expor entidades JPA.
+- Perfil `demo` com 10 restaurantes e 20 itens cada.
+- Publicar `CardapioAlterado` em toda alteração (RN-18), ainda sem consumidor.
+
+**Entregáveis:** endpoints do catálogo, testes de unidade do horário (tabela com pelo menos 12 casos, inclusive meia-noite e fim exclusivo), matriz de autorização do catálogo.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-02 a RF-04 passam como testes.
+- `rest.outro` recebe `404` em todas as rotas de escrita do restaurante de `rest.bella` (teste parametrizado).
+- `GET /restaurantes?size=500` responde `400`.
+
+**Aulas de apoio:** [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/), [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/), [Spring Data JPA](../../../aulas/09-persistencia/03-spring-data-jpa/), [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/), [Java moderno na prática](../../../aulas/04-java-moderno/05-java-moderno-na-pratica/), [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/#bola-o-bug-mais-comum-de-api).
+
+<Callout tipo="erro" titulo="Armadilha: fuso horário">
+`LocalTime.now()` usa o fuso da JVM, que no contêiner costuma ser UTC. Um restaurante que abre às 18:00 "abriria" às 15:00 de Brasília. Converta sempre o instante do `Clock` para `America/Sao_Paulo` antes de comparar com a grade, e tenha um teste com o `Clock` em UTC que prove isso.
+</Callout>
+
+</Marco>
+
+<Marco id="pedidos" numero={4} titulo="Pedido com cotação, cupom e idempotência" horas={20}>
+
+**Objetivo:** o cliente cota o carrinho e cria o pedido, sem duplicar nada, sem passar do limite de uso do cupom e sem abusar da API.
+
+**Tarefas**
+
+- `Dinheiro` (ADR-005) e o `Cotador`: subtotal, taxa por faixa (configurável), frete grátis, pedido mínimo, cupom (RF-06, RF-07). Testes de unidade com tabelas de casos, incluindo as bordas de 2 000 m e 2 001 m e o arredondamento de RN-27.
+- Migrations `V3` e `V4`; `POST /admin/cupons`; `POST /cotacoes`.
+- `POST /pedidos` (RF-08): snapshot, histórico inicial, consumo atômico do cupom (RN-28), `PedidoCriado`.
+- Idempotência (ADR-004): filtro ou aspecto que calcula o hash canônico do corpo, reserva a chave, grava a resposta e trata replay, corpo diferente e concorrência.
+- Rate limiting (RN-42) com token bucket no Redis; replays não consomem ficha; falha aberta com métrica.
+- O pagamento entra só como registro: por enquanto, `Pagamentos.solicitarCobranca(...)` grava `PENDENTE` e publica `CobrancaSolicitada` sem consumidor.
+- `GET /pedidos` e `GET /pedidos/{id}` com dono do recurso (RN-73) e sem N+1 (RN-76).
+
+**Entregáveis:** cotação e criação de pedido funcionando pela coleção `.http`; testes de concorrência do cupom e da chave; ADR-004, ADR-005 e ADR-009.
+
+**Definição de pronto**
+
+- O exemplo do RF-07 (total 7090) é um teste que passa.
+- Teste com 20 threads (ou virtual threads) criando pedidos com cupom de limite 5 termina com exatamente 5 usos.
+- Teste com 10 requisições concorrentes com a mesma `Idempotency-Key` termina com um pedido.
+- O sexto pedido em 60 s recebe `429` com `Retry-After`.
+
+**Aulas de apoio:** [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/), [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/), [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/), [Defesas da API: rate limiting](../../../aulas/11-seguranca/06-defesas-da-api/#limite-de-requisições-rate-limiting), [Redis](../../../aulas/15-system-design/02-redis/), [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/), [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/).
+
+<Callout tipo="erro" titulo="Armadilha: verificar e depois gravar">
+"Se `usos < limite`, então incrementa" em duas instruções é uma condição de corrida: duas transações leem 4, as duas gravam 5, e o cupom foi usado 6 vezes. A verificação e a escrita precisam ser **uma** instrução (`UPDATE ... WHERE usos < limite_usos`) ou estar protegidas por lock. O mesmo vale para a chave de idempotência: `INSERT ... ON CONFLICT`, nunca "busca, e se não achar, insere".
+</Callout>
+
+<Callout tipo="erro" titulo="Armadilha: hash do corpo cru">
+`{"a":1,"b":2}` e `{"b":2,"a":1}` são o mesmo pedido com bytes diferentes. Calcule o hash sobre o DTO desserializado e serializado de novo de forma canônica (campos ordenados), não sobre os bytes recebidos.
+</Callout>
+
+</Marco>
+
+<Marco id="pagamentos" numero={5} titulo="Pagamento simulado e resiliente" horas={20}>
+
+**Objetivo:** o pedido é pago de verdade (contra o fake), com o POST independente do gateway, sem cobrança duplicada e sem webhook processado duas vezes.
+
+**Tarefas**
+
+- Escrever o PagaFake com o contrato completo (cobrança, estorno, cancelamento, auditoria, tokens de comportamento, `DUPLICAR_WEBHOOK`, assinatura HMAC, reenvio do webhook).
+- Cliente HTTP do gateway com `RestClient` (ou uma HTTP interface), timeouts de conexão e leitura, retry só para falhas transitórias e circuit breaker do Resilience4j (RN-45).
+- Listener `@ApplicationModuleListener` de `CobrancaSolicitada` que chama o gateway; configuração de republicação dos eventos incompletos.
+- `POST /webhooks/pagafake`: verificação HMAC em tempo constante, janela de 5 min, deduplicação, `PagamentoAprovado`/`PagamentoRecusado` (RN-46 a RN-48).
+- Em pedidos: listener que leva o pedido a `PAGO` ou `CANCELADO`; rotina de expiração de 15 min (RN-50); aprovação tardia vira estorno (RN-49).
+- Teste de contrato do webhook: exemplos de payload versionados em `src/test/resources/contratos/pagafake/`, usados tanto pelo teste do PagaFake (que gera) quanto pelo da API (que consome).
+- ADR-003 e ADR-008.
+
+**Entregáveis:** PagaFake no Compose, fluxo de pagamento completo, testes de resiliência.
+
+**Definição de pronto**
+
+- Com `tok_aprovar`, o pedido chega a `PAGO` em até 5 s.
+- Com `tok_erro`, o pedido chega a `PAGO` depois dos retries, e o `GET /v1/auditoria` mostra **uma** cobrança.
+- Com o PagaFake parado, `POST /pedidos` continua respondendo `201`; ao religá-lo, os pagamentos pendentes são cobrados sem intervenção.
+- Com `DUPLICAR_WEBHOOK=true`, 100 pedidos geram 100 transições para `PAGO`, nem uma a mais.
+
+**Aulas de apoio:** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/), [RestClient e versionamento](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/), [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/), [Mockito](../../../aulas/10-testes/03-mockito/), [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/), [Testes de contrato](../../../aulas/10-testes/07-testes-de-contrato/).
+
+<Callout tipo="erro" titulo="Armadilha: chamada HTTP dentro da transação">
+Chamar o gateway dentro de um método `@Transactional` segura a conexão do banco durante a chamada (com 2 s de timeout e 3 tentativas, até 7 s por pedido). No pico, o pool de conexões esgota e **tudo** para, inclusive o cardápio. A chamada externa acontece depois do commit, fora de transação.
+</Callout>
+
+<Callout tipo="erro" titulo="Armadilha: HMAC sobre o JSON reserializado">
+A assinatura vale para os **bytes exatos** que chegaram. Se você desserializar e serializar de novo antes de verificar, espaços e ordem mudam e a assinatura não bate. Leia o corpo como `byte[]`/`String`, verifique, e só depois converta.
+</Callout>
+
+</Marco>
+
+<Marco id="ciclo" numero={6} titulo="Ciclo de vida e entregas" horas={18}>
+
+**Objetivo:** o pedido percorre todos os estados, com as regras de quem pode o quê, cancelamento com estorno e entregador atribuído sem corrida dupla.
+
+**Tarefas**
+
+- Transições do restaurante (RF-10), histórico imutável, prazo de aceite de 8 min com versão otimista (RN-54) e fila do restaurante.
+- Cancelamento pela tabela do RF-11, com estorno via `Pagamentos.estornar` e liberação de cupom e entregador.
+- Módulo de entregas (RF-12, RF-13): disponibilidade, posição com limite de frequência e descarte fora de ordem, atribuição pelo mais próximo com reserva atômica, nova tentativa a cada 30 s, atribuição manual pelo admin, coleta, rastreamento e conclusão.
+- Teste da máquina de estados como tabela: para **cada** par (estado, comando, ator), o resultado esperado (transição ou `409`/`404`).
+- Matriz de autorização completa (RNF-07) num teste parametrizado: rota × papel × dono → status esperado.
+
+**Entregáveis:** fluxo completo do pedido pela coleção `.http`, do carrinho ao `ENTREGUE`; ADR-010.
+
+**Definição de pronto**
+
+- O teste de tabela da máquina de estados cobre todas as combinações (9 estados × comandos × 4 atores; nos 3 terminais, todo comando é recusado) e passa.
+- Os critérios de aceite de RF-10 a RF-13 passam, inclusive o de 1 entregador e 2 pedidos concorrentes.
+- Cancelar um pedido `EM_PREPARO` pago termina com o pagamento `ESTORNADO` e o entregador `DISPONIVEL`.
+
+**Aulas de apoio:** [Sealed e pattern matching](../../../aulas/02-poo/06-sealed-e-pattern-matching/), [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/), [Testando autorização: a matriz](../../../aulas/11-seguranca/04-autorizacao-e-bola/#testando-autorização-a-matriz), [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/), [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+
+<Callout tipo="erro" titulo="Armadilha: 403 que vaza existência">
+Responder `403` para "o pedido existe mas não é seu" diz ao atacante quais ids existem. Para recursos de outro dono, a resposta é `404`, idêntica à de um id inexistente. O `403` fica para "seu papel não pode usar esta rota".
+</Callout>
+
+</Marco>
+
+<Marco id="eventos" numero={7} titulo="Eventos no Kafka e notificações" horas={16}>
+
+**Objetivo:** os eventos de integração saem para o Kafka sem se perder, e as notificações são enviadas uma vez por evento, mesmo com duplicatas e mensagens envenenadas.
+
+**Tarefas**
+
+- Externalizar os eventos com chave (`@Externalized`) com o envelope versionado; tópicos criados com o número de partições definido; `correlationId` e contexto de tracing nos headers.
+- Gauge `pedeai.outbox.pendentes` e limpeza das publicações completas.
+- Módulo de notificações: listener Kafka por tópico, deduplicação em `mensagem_processada` na mesma transação, e-mail para o Mailpit depois do commit, nova tentativa de envio (RN-71).
+- Tratamento de erro do consumidor: `DefaultErrorHandler` com backoff exponencial, exceções de desserialização e de tipo desconhecido classificadas como não repetíveis, `DeadLetterPublishingRecoverer` para `<tópico>-dlt`.
+- Roteiro manual no README: parar o Kafka, criar 20 pedidos, religar e conferir que todas as notificações chegaram (RNF-05).
+
+**Entregáveis:** eventos visíveis no Kafka, e-mails no Mailpit, DLT funcionando, ADR-002.
+
+**Definição de pronto**
+
+- Teste de integração (Kafka via Testcontainers) publica o mesmo evento duas vezes e confere uma notificação.
+- Teste que publica JSON inválido confere a mensagem no DLT e o processamento da mensagem seguinte.
+- `ApplicationModuleTest` do módulo de pedidos verifica, com `Scenario`, que aceitar um pedido publica `PedidoAceito`.
+
+**Aulas de apoio:** [Por que mensageria](../../../aulas/12-mensageria/01-por-que-mensageria/), [Kafka](../../../aulas/12-mensageria/03-kafka/), [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/), [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/), [RabbitMQ](../../../aulas/12-mensageria/02-rabbitmq/) (se for a sua escolha no ADR-002), [Evolução de esquemas de eventos](../../../aulas/12-mensageria/07-evolucao-de-esquemas-de-eventos/), [Kafka em produção](../../../aulas/12-mensageria/08-kafka-em-producao/).
+
+<Callout tipo="erro" titulo="Armadilha: e-mail dentro da transação de deduplicação">
+Se o e-mail for enviado e a transação falhar depois, a mensagem é reprocessada e o cliente recebe dois e-mails. Grave notificação e deduplicação na transação; envie depois do commit; trate falha de envio com estado e nova tentativa.
+</Callout>
+
+</Marco>
+
+<Marco id="operacao" numero={8} titulo="Cache, métricas e tracing" horas={14}>
+
+**Objetivo:** o sistema é rápido onde precisa ser e observável o bastante para responder "onde os pedidos estão travando?" em minutos.
+
+**Tarefas**
+
+- Cache-aside do cardápio no Redis (RN-21 a RN-23), invalidado pelo listener de `CardapioAlterado` após o commit; proteção contra stampede no cache frio (ex.: uma única carga por chave).
+- Métricas de negócio com Micrometer, sem tags de alta cardinalidade:
+
+  | Métrica | Tipo | Tags |
+  |---|---|---|
+  | `pedeai.pedidos.criados` | counter | `metodo` |
+  | `pedeai.pedidos.transicoes` | counter | `de`, `para`, `ator` |
+  | `pedeai.pedido.tempo_ate_pago` | timer (histograma) | — |
+  | `pedeai.pedido.tempo_ate_aceite` | timer (histograma) | — |
+  | `pedeai.pedidos.por_status` | gauge | `status` |
+  | `pedeai.outbox.pendentes` | gauge | — |
+  | `pedeai.gateway.chamadas` | counter | `resultado` (`sucesso`, `erro`, `timeout`, `circuito_aberto`) |
+  | `pedeai.entregas.sem_entregador` | counter | — |
+  | `pedeai.cache.falhas`, `pedeai.ratelimit.indisponivel` | counter | — |
+
+- Tracing com Micrometer Tracing e exportação OTLP para o `otel-lgtm`; o trace do POST continua no listener assíncrono e no consumidor Kafka (contexto propagado nos headers).
+- Health: `liveness` e `readiness` separados; readiness com banco e Kafka, **sem** o gateway (uma dependência externa fora não deve tirar a API do ar).
+- Painel no Grafana versionado em `infra/grafana/`: pedidos por status, tempo até aceite (p50/p95), taxa de erro do gateway e estado do circuito, pendentes na outbox, latência p95 por rota.
+
+**Entregáveis:** painel versionado, captura de um trace completo e do painel no README, ADR sobre o que entra no readiness.
+
+**Definição de pronto**
+
+- A segunda leitura do cardápio não executa SQL; com o Redis parado, a leitura responde `200`.
+- No Grafana, um pedido pode ser seguido do `POST /pedidos` ao envio do e-mail pelo `traceId`.
+- Com `FALHA_PERCENTUAL=60`, o painel mostra o circuito abrindo em menos de 1 minuto.
+
+**Aulas de apoio:** [Cache](../../../aulas/15-system-design/01-cache/#cache-aside-na-prática), [Redis](../../../aulas/15-system-design/02-redis/), [Observabilidade](../../../aulas/14-devops/05-observabilidade/), [Cardinalidade de métricas](../../../aulas/14-devops/05-observabilidade/#cardinalidade-a-regra-mais-importante), [Escala e consistência](../../../aulas/15-system-design/05-escala-e-consistencia/).
+
+<Callout tipo="erro" titulo="Armadilha: invalidar o cache antes do commit">
+Se o cache é apagado dentro da transação e outra leitura chega antes do commit, ela lê o valor antigo do banco e o põe de volta no cache, onde ele fica por 10 minutos. Invalide depois do commit (é o que um listener do registro de publicações faz por padrão).
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Carga, documentação e release v1.0.0" horas={12}>
+
+**Objetivo:** provar as metas, deixar o repositório pronto para ser lido por quem contrata e publicar a versão 1.0.0.
+
+**Tarefas**
+
+- Script de dados de carga (300 restaurantes, 12 mil itens, 50 mil pedidos históricos).
+- Scripts k6 (`carga/pedidos.js`, `carga/cardapio.js`) com `thresholds` dos RNF-01 e RNF-02, executados pela imagem `grafana/k6` no Compose; tokens pré-gerados para um conjunto de clientes; perfil `carga` com rate limit elevado (registre isso no relatório: o teste mede latência, não o limitador).
+- Relatório de carga no README: máquina, cenário, p50/p95/p99, erros, e uma frase sobre o gargalo encontrado e o que você mudou (ex.: índice, tamanho do pool, cache).
+- Imagem Docker multi-stage com usuário não root (RNF-15); workflow que publica a imagem no GitHub Container Registry ao criar a tag.
+- README final (modelo na seção "Entregáveis"), diagramas, ADRs revisados, coleção `.http` completa, vídeo de demonstração.
+- Deploy opcional: uma VM pequena ou uma plataforma com plano gratuito rodando o Compose; se não fizer deploy, o vídeo cumpre o papel.
+- Release `v1.0.0` no GitHub com notas: o que tem, limitações conhecidas, próximos passos.
+
+**Entregáveis:** relatório de carga, imagem publicada, release `v1.0.0`, vídeo, post.
+
+**Definição de pronto**
+
+- O k6 termina com todos os thresholds verdes (ou o README explica, com números, por que não, e o que seria feito).
+- Uma pessoa que nunca viu o projeto clona, roda `docker compose up` e executa o fluxo da demonstração seguindo só o README (peça a alguém para testar).
+- A release `v1.0.0` existe, com a imagem correspondente.
+
+**Aulas de apoio:** [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Docker](../../../aulas/14-devops/03-docker/), [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/), [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/), [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/).
+
+<Callout tipo="erro" titulo="Armadilha: medir com o aquecimento">
+Os primeiros segundos de uma JVM recém-iniciada têm JIT frio, pool de conexões vazio e cache frio. Rode um aquecimento de 30 s antes da janela medida (um cenário separado no k6) e diga isso no relatório. Número sem metodologia não convence ninguém.
+</Callout>
+
+</Marco>
+
+## Estratégia de testes
+
+A pirâmide deste projeto é larga na base (regras de negócio puras são muitas e baratas de testar) e tem uma camada de integração forte, porque o que é difícil aqui é justamente a interação com banco, broker e cache.
+
+| Nível | O que cobre | Ferramentas | Exemplos |
+|---|---|---|---|
+| Unidade | Regras puras: horário, cotação, cupom, `Dinheiro`, transições do agregado, HMAC | JUnit 6, AssertJ, `@ParameterizedTest`, `Clock` fixo | Tabela de transições; faixas de distância; meia-noite |
+| Unidade com dublês | Serviços com dependências trocadas | Mockito | Listener de pagamento com gateway que lança timeout |
+| Fatia web | Controllers, validação, Problem Details, segurança por rota | `@WebMvcTest`, `spring-security-test` (`jwt()`) | Matriz de autorização; `400` com `erros` |
+| Fatia de dados | Consultas, constraints, índices parciais, `UPDATE` condicional | `@DataJpaTest` + Testcontainers (Postgres) | Cupom com limite; índice único de corrida ativa |
+| Módulo | Um módulo isolado e os eventos que ele publica | `@ApplicationModuleTest`, `Scenario` | Aceitar publica `PedidoAceito`; `PagamentoAprovado` leva a `PAGO` |
+| Integração | Fluxos de ponta a ponta com infraestrutura real | `@SpringBootTest`, Testcontainers (Postgres, Kafka, Redis), `@ServiceConnection` | Pedido do POST ao `ENTREGUE` com o gateway simulado |
+| Contrato | Payloads do webhook e eventos externos | Arquivos JSON de contrato compartilhados + teste nos dois lados | O exemplo `cobranca.aprovada.json` é aceito pela API |
+| Arquitetura | Fronteiras dos módulos | `ApplicationModules.verify()` | Nenhum acesso a `internal` de outro módulo |
+| Carga | Metas de latência | k6 | RNF-01 e RNF-02 |
+
+Cenários **obrigatórios** (cada um vira pelo menos um teste automatizado, com o nome do cenário no nome do teste):
+
+1. Mesmo POST com a mesma `Idempotency-Key` duas vezes → um pedido, segunda resposta com `Idempotency-Replayed: true`.
+2. Mesma chave com corpo diferente → `422`.
+3. 10 requisições concorrentes com a mesma chave → um pedido.
+4. Cupom com limite 5 e 20 pedidos concorrentes → 5 usos.
+5. Cupom liberado após cancelamento → pode ser usado de novo.
+6. Restaurante fechado às 23:00:00 com grade 18:00–23:00; aberto no sábado 01:30 com grade de sexta 18:00–02:00.
+7. Taxa de entrega em 2 000 m e 2 001 m; fora da área em 8 001 m.
+8. Webhook com assinatura inválida → `401` e nada muda; com `t` de 6 minutos atrás → `401`.
+9. Webhook duplicado → um efeito.
+10. Aprovação depois do cancelamento por expiração → estorno automático, pedido continua `CANCELADO`.
+11. Gateway com timeout → retry com a mesma chave e uma cobrança no fake.
+12. Circuito aberto → POST continua `201`; pagamentos cobrados quando o gateway volta.
+13. Aceite e expiração simultâneos → um vence, o outro recebe `409` ou desiste.
+14. Toda combinação (estado, comando, ator) da máquina de estados.
+15. Matriz de autorização completa, incluindo `404` para outro dono.
+16. 1 entregador e 2 pedidos aceitos ao mesmo tempo → uma corrida atribuída.
+17. Posição fora de ordem ignorada.
+18. Evento Kafka duplicado → uma notificação; JSON inválido → DLT sem travar a partição.
+19. Redis fora → cardápio responde do banco; rate limit falha aberto.
+20. `GET /pedidos/{id}` com no máximo 3 consultas SQL.
+
+<Callout tipo="dica" titulo="Testes de concorrência que não são frágeis">
+Use um `CountDownLatch` para soltar todas as threads ao mesmo tempo, um `ExecutorService` de virtual threads e asserções sobre o **estado final** (quantos pedidos, quantos usos), nunca sobre a ordem. Rode cada um 20 vezes localmente (`@RepeatedTest`) antes de confiar nele.
+</Callout>
+
+## Entregáveis do portfólio
+
+**README** (modelo; adapte, mas mantenha a ordem: quem lê decide em 30 segundos se continua):
+
+```markdown
+# Pede Aí — backend de delivery (monólito modular orientado a eventos)
+
+![CI](badge-do-workflow) ![Release](badge-da-release) ![Java 25](...) ![Spring Boot 4](...)
+
+Backend de uma plataforma de pedidos para delivery: catálogo com cache, pedido com
+cotação e cupom, pagamento por gateway (simulado) com webhook, máquina de estados,
+entregadores e notificações. Um pedido atravessa os módulos por eventos com outbox,
+sem cobrança duplicada nem evento perdido.
+
+▶ Demonstração em vídeo (3 min): <link>
+
+## Destaques técnicos
+- Monólito modular com Spring Modulith — fronteiras verificadas em teste (ADR-001)
+- Outbox + Kafka + consumidores idempotentes com DLT (ADR-002, ADR-003)
+- Idempotência no POST, no gateway e no webhook (ADR-004)
+- OAuth2/JWT com Keycloak, papel e dono do recurso, matriz de autorização testada
+- Resiliência medida: timeout, retry, circuit breaker contra um gateway instável
+- Observabilidade: métricas de negócio, tracing ponta a ponta, painel no Grafana
+- p95 do POST de pedido: XXX ms a 50 req/s (relatório abaixo)
+
+## Rodando em 1 comando
+docker compose up -d   →   API :8080 · Swagger /swagger-ui.html · Grafana :3000 · Mailpit :8025
+Usuários de teste: tabela com login e papel (senhas só do ambiente local)
+
+## Arquitetura
+diagrama de módulos · máquina de estados · sequência do pagamento · links para os ADRs
+
+## Decisões e trade-offs
+uma linha por ADR, com o link
+
+## Testes
+como rodar · o que cada nível cobre · cenários de concorrência
+
+## Carga
+máquina, cenário, p50/p95/p99, gargalo encontrado
+
+## Limitações conhecidas e próximos passos
+```
+
+**Diagramas:** os três desta especificação, redesenhados por você (em Mermaid no README, ou SVG/PNG em `docs/`), mais a documentação de módulos que o Spring Modulith gera (`Documenter`).
+
+**Coleção `.http`** (`http/pede-ai.http`, para IntelliJ ou VS Code REST Client): obtenção de tokens dos usuários, o fluxo feliz completo em ordem e os cenários de erro mais interessantes (replay idempotente, `409` de transição, `429`).
+
+**Vídeo de até 3 minutos** (roteiro sugerido):
+
+1. (0:00–0:20) O problema e a arquitetura, sobre o diagrama.
+2. (0:20–1:20) Fluxo feliz: cotação, pedido, webhook, aceite, entregador atribuído, entrega; o e-mail no Mailpit.
+3. (1:20–1:50) Repetir o POST com a mesma chave: mesmo pedido. Mostrar o webhook duplicado sem efeito.
+4. (1:50–2:30) Derrubar o PagaFake: POST continua `201`, painel mostra o circuito aberto; religar e ver os pedidos pagos.
+5. (2:30–3:00) O trace de um pedido no Grafana e o resultado do k6.
+
+**Badges** de CI e release; **imagem** no GitHub Container Registry; **release `v1.0.0`** com notas.
+
+**Post para o LinkedIn** (curto, com o vídeo): o problema, três decisões com o porquê (ex.: "o POST não espera o gateway"), um número medido e o link do repositório. Evite lista de tecnologias sem contexto.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível (Pleno) | Acima do nível |
+|---|---|---|---|
+| Fronteiras dos módulos | Pacotes por camada (`controller`, `service`); módulos só no nome | Módulos por domínio, `verify()` no CI, dependências permitidas declaradas | Documentação de módulos gerada e um módulo extraível demonstrado (ex.: notificações rodando separado) |
+| Consistência entre módulos | Eventos publicados direto no Kafka dentro da transação | Outbox/registro de publicações, republicação de incompletos, gauge de pendentes | Teste automatizado que derruba o broker e prova a entrega depois |
+| Idempotência | Só no POST, ou com "busca e insere" | POST, gateway e webhook idempotentes, com testes concorrentes | Política de expiração e limpeza documentada; métricas de replays |
+| Máquina de estados | `setStatus` espalhado por serviços | Transições no agregado, tabela de permissões por ator, `409` explicativo, teste de tabela completo | Histórico usado para métricas de tempo por etapa no painel |
+| Segurança | Só papéis; `403` vazando existência | Papel e dono do recurso, `404` para recurso alheio, matriz testada, segredos fora do repositório | Testes com tokens reais do Keycloak e varredura de dependências e segredos no CI |
+| Resiliência | Sem timeout; retry em tudo | Timeout, retry só no transitório com a mesma chave, circuit breaker, demonstrado com o fake | Limite de concorrência (bulkhead) e alertas do circuito no painel |
+| Mensageria | Consumidor sem deduplicação | Consumidor idempotente, backoff, DLT, envelope versionado | Ferramenta ou rotina documentada para reprocessar a DLT |
+| Dados | Sem constraints; regras só no Java | Constraints, índices parciais, `UPDATE` condicional, sem N+1 | `EXPLAIN` das consultas críticas no README |
+| Testes | Só unidade, ou integração com H2 | Pirâmide completa com Testcontainers, cenários obrigatórios, cobertura de domínio acima de 80 % | Testes de concorrência repetidos sem flakiness e testes de mutação em `pedidos` |
+| Observabilidade | `System.out` e logs soltos | Logs estruturados com correlação, métricas de negócio, trace ponta a ponta, painel versionado | SLOs definidos com alertas (ex.: tempo até aceite) |
+| Desempenho | Nenhuma medição | k6 com thresholds, relatório com metodologia e gargalo encontrado | Comparação antes/depois de uma otimização, com números |
+| Comunicação | README genérico, sem ADRs | README no modelo, ADRs com alternativas e consequências, vídeo de 3 min | Post técnico explicando uma decisão difícil |
+
+## Como apresentar na entrevista
+
+**Pitch (60–90 s):**
+
+> "O Pede Aí é o backend de uma plataforma de delivery que eu construí do zero para treinar os problemas que aparecem em produção. Ele é um monólito modular com Spring Boot 4 e Spring Modulith: cinco módulos — catálogo, pedidos, pagamentos, entregas e notificações —, com fronteiras verificadas por teste no CI e comunicação por eventos. A decisão central foi não deixar o pedido depender do gateway de pagamento: o POST grava o pedido e o evento de cobrança na mesma transação e responde em menos de 300 ms no p95; a cobrança sai depois, com timeout, retry e circuit breaker, e a mesma chave de idempotência em todas as tentativas. O webhook é assinado com HMAC e deduplicado, então duplicata e retry nunca viram cobrança dupla. Os eventos vão para o Kafka pela outbox, e o consumidor de notificações é idempotente, com DLT. A segurança é com Keycloak, por papel e por dono do recurso. Tudo sobe com um `docker compose up`, os testes usam Postgres, Kafka e Redis de verdade, e eu registrei as decisões em ADRs. Posso mostrar o trace de um pedido no Grafana, do POST ao e-mail."
+
+**Perguntas prováveis e pontos-chave de uma boa resposta**
+
+1. **"Por que monólito modular e não microsserviços?"** Time pequeno, um domínio ainda em descoberta, transações locais; fronteiras garantidas por teste; critério objetivo para extrair (escala, time ou ciclo de deploy diferente); eventos externalizados já deixam a extração mais barata.
+2. **"O que acontece se a aplicação cair logo depois de gravar o pedido?"** O evento está no registro de publicações, na mesma transação; na volta, os incompletos são republicados; por isso a garantia é "pelo menos uma vez" e o gateway recebe a mesma chave.
+3. **"Como você garante que o cliente não é cobrado duas vezes?"** Três camadas: `Idempotency-Key` no POST (Postgres, mesma transação), chave estável no gateway (id do pagamento), deduplicação do webhook pelo id do evento; e o teste com `DUPLICAR_WEBHOOK` e a auditoria do fake.
+4. **"E se o webhook de aprovação chegar depois que o pedido foi cancelado?"** Não se ressuscita o pedido; registra-se o pagamento aprovado e solicita-se o estorno automático; mencionar a aprovação fora de ordem como caso real.
+5. **"Por que o restaurante de outro dono recebe 404 e não 403?"** BOLA (OWASP API1); não revelar a existência do recurso; `403` é para papel; verificação centralizada e matriz testada.
+6. **"Como funciona o circuit breaker que você configurou e por que esses números?"** Janela de 20, 50 % de falhas ou lentidão, 30 s aberto, 3 chamadas no meio-aberto; `4xx` não conta como falha; o que acontece com os pedidos enquanto ele está aberto (ficam pendentes, republicados depois).
+7. **"Kafka garante exactly-once? Por que você precisou de deduplicação?"** Transações do Kafka cobrem leitura-processamento-escrita **dentro** do Kafka; o efeito no banco e o e-mail estão fora; logo, consumidor idempotente com deduplicação na mesma transação.
+8. **"Como você evitou que dois pedidos pegassem o mesmo entregador?"** `UPDATE ... WHERE status = 'DISPONIVEL'` com contagem de linhas, índice único parcial como segunda barreira, teste concorrente.
+9. **"Como você invalida o cache do cardápio?"** Cache-aside com TTL; invalidação após o commit por evento; cache nunca decide preço; Redis fora não derruba a leitura.
+10. **"Que métrica você olharia primeiro numa sexta à noite com reclamação de pedido demorando?"** Pedidos por status e tempo até aceite (gargalo no restaurante?), estado do circuito do gateway, pendentes na outbox, entregas sem entregador; depois o trace de um pedido específico.
+11. **"Como você testou tudo isso?"** Pirâmide, Testcontainers com infraestrutura real, `ApplicationModuleTest`, contrato do webhook, testes de concorrência com latch, k6; citar um bug que um teste pegou.
+12. **"O que você faria diferente ou faria a seguir?"** Ter uma resposta honesta: ex.: rotinas com várias instâncias (ADR-010), SSE para o restaurante, extrair notificações, SLOs com alertas.
+
+**Trade-offs para mencionar sem esperar a pergunta:** o POST assíncrono troca resposta imediata do pagamento por disponibilidade e latência; o rate limit falha aberto conscientemente; um schema por módulo abre mão de FK entre módulos; o registro do Modulith troca controle por menos código; a distância em linha reta é uma simplificação declarada.
+
+<Callout tipo="entrevista" titulo="Leve um número e um bug">
+Gestores lembram de quem diz "o p95 do POST ficou em 180 ms a 50 req/s, e o primeiro teste deu 900 ms porque faltava um índice em `(restaurante_id, status)`". Um número medido e um problema real que você resolveu valem mais que a lista inteira de tecnologias.
+</Callout>
+
+## Para ir além
+
+- **Tempo real para o restaurante e o cliente:** Server-Sent Events (ou WebSocket) alimentados pelos eventos do Kafka, no lugar do polling.
+- **Carrinho no servidor** em Redis, com expiração e reconciliação de preços.
+- **Extrair o módulo de notificações** como serviço separado, consumindo os mesmos tópicos, e mostrar que nada no monólito mudou.
+- **Estorno parcial** (item faltante) e repasse financeiro ao restaurante, com conciliação diária contra a auditoria do gateway.
+- **Rotinas com várias instâncias** usando `FOR UPDATE SKIP LOCKED` ou ShedLock, e um teste com duas instâncias da aplicação.
+- **Atribuição melhor:** oferecer a corrida ao entregador com prazo para aceitar, em vez de atribuir direto; índices geoespaciais (PostGIS ou Redis GEO).
+- **SLOs e alertas:** "95 % dos pedidos pagos são aceitos em até 5 minutos", com alertas no Grafana.
+- **Testes de mutação** (PIT) no módulo de pedidos e **testes de caos** simples (pausar contêineres durante o k6).
+- **Assistente para o restaurante com Spring AI:** responder "por que este pedido atrasou?" com *tool calling* sobre o histórico do pedido, só leitura e com limite de custo (módulo 16).
+- **Deploy na AWS** (ECS Fargate ou App Runner com RDS) descrito em Terraform ou OpenTofu, e um ADR comparando Kafka e Redis gerenciados com os do Compose, com custo estimado.
+- **Kubernetes:** manifests com probes, `HorizontalPodAutoscaler` e o Kafka fora do cluster — ponte para os projetos Sênior.

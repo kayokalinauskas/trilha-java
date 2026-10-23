@@ -1,0 +1,130 @@
+---
+titulo: Virtual threads (Project Loom)
+descricao: Como virtual threads funcionam, por que mudam a forma de escrever servidores de I/O, como usá-las no Spring Boot, o que não fazer (pool, CPU-bound) e como limitar recursos com Semaphore.
+modulo: 06-concorrencia
+ordem: 5
+duracao: 50
+objetivos:
+  - Explicar a diferença entre threads de plataforma e virtual threads
+  - Usar virtual threads com Executors e no Spring Boot
+  - Limitar o acesso a recursos escassos com Semaphore
+  - Reconhecer quando virtual threads não ajudam
+tags: [virtual threads, Loom, Java 21, Semaphore]
+flashcards:
+  - frente: O que acontece quando uma virtual thread bloqueia em I/O?
+    verso: A JVM a desmonta da carrier thread (thread de plataforma), que fica livre para executar outra virtual thread; quando o I/O termina, ela é remontada.
+  - frente: Deve-se criar um pool de virtual threads?
+    verso: Não. Elas são baratas — cria-se uma por tarefa. Para limitar concorrência a um recurso escasso, use Semaphore ou o pool do próprio recurso.
+  - frente: Como ativar virtual threads no Spring Boot?
+    verso: spring.threads.virtual.enabled=true (Spring Boot 3.2+); o Tomcat e os executores do Spring passam a usar virtual threads.
+  - frente: O que mudou no Java 24 em relação ao pinning?
+    verso: A JEP 491 fez synchronized deixar de fixar (pin) a virtual thread à carrier; o pinning ainda ocorre em chamadas nativas (JNI).
+  - frente: Virtual threads aceleram código CPU-bound?
+    verso: Não. O limite continua sendo o número de núcleos; o ganho é em throughput de tarefas que passam tempo esperando I/O.
+---
+
+Por décadas, servidores Java seguiram o modelo **uma thread por requisição**: simples de escrever e de depurar. O problema é que threads de plataforma são caras, e um servidor fica limitado a algumas centenas de requisições simultâneas **esperando** banco ou APIs externas. A alternativa era a programação reativa: escalável, mas bem mais difícil. As **virtual threads**, oficiais desde o **Java 21**, trazem a escala do modelo reativo com a simplicidade do código síncrono.
+
+## Plataforma × virtual
+
+| | Thread de plataforma | Virtual thread |
+|---|---|---|
+| Mapeamento | 1:1 com thread do SO | muitas sobre poucas threads de plataforma (*carriers*) |
+| Custo | ~1 MB de pilha reservada, criação cara | poucos KB, criação em microssegundos |
+| Quantidade prática | centenas a poucos milhares | milhões |
+| Ao bloquear em I/O | a thread do SO fica parada | é **desmontada**; a carrier roda outra |
+
+<Figura legenda="Enquanto uma virtual thread espera o banco, a carrier executa outra">
+<svg viewBox="0 0 660 190" width="660" role="img" aria-label="Três virtual threads compartilham duas carrier threads; a que está esperando I/O fica estacionada na heap">
+  <text x="110" y="24" text-anchor="middle" class="d-title">virtual threads</text>
+  <rect x="40" y="40" width="140" height="34" rx="8" class="d-accent"/><text x="110" y="62" text-anchor="middle" class="d-label">VT1 executando</text>
+  <rect x="40" y="82" width="140" height="34" rx="8" class="d-box"/><text x="110" y="104" text-anchor="middle" class="d-label">VT2 esperando banco</text>
+  <rect x="40" y="124" width="140" height="34" rx="8" class="d-accent"/><text x="110" y="146" text-anchor="middle" class="d-label">VT3 executando</text>
+  <text x="520" y="24" text-anchor="middle" class="d-title">carriers (núcleos)</text>
+  <rect x="440" y="45" width="160" height="40" rx="10" class="d-info"/><text x="520" y="70" text-anchor="middle" class="d-label">carrier 1 ← VT1</text>
+  <rect x="440" y="115" width="160" height="40" rx="10" class="d-info"/><text x="520" y="140" text-anchor="middle" class="d-label">carrier 2 ← VT3</text>
+  <path d="M180 57 C300 57, 330 65, 436 65" class="d-line"/>
+  <path d="M180 141 C300 141, 330 135, 436 135" class="d-line"/>
+  <text x="300" y="104" text-anchor="middle" class="d-label">VT2 estacionada na heap até o I/O voltar</text>
+</svg>
+</Figura>
+
+## Usando
+
+```java
+try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (String id : pedidos) {
+        executor.submit(() -> emitirNota(id));   // uma virtual thread por tarefa
+    }
+}   // close() espera todas
+
+Thread.ofVirtual().start(() -> processar());      // criação direta
+```
+
+No **Spring Boot** (3.2+), uma propriedade basta:
+
+```properties
+spring.threads.virtual.enabled=true
+```
+
+O Tomcat passa a atender cada requisição numa virtual thread, e `@Async`, agendadores e outros executores do Spring também as usam. Código de controller, service e repositório continua **exatamente igual**.
+
+## Não faça pool de virtual threads
+
+O instinto de "limitar a 200 threads" vem das threads de plataforma, caras. Virtual threads são baratas: crie **uma por tarefa**. Se o que é escasso é outro recurso — conexões de banco, um fornecedor que aceita 50 chamadas simultâneas —, limite **o recurso**, com um **`Semaphore`**:
+
+```java
+Semaphore permissoes = new Semaphore(50);
+
+executor.submit(() -> {
+    permissoes.acquire();          // espera se já houver 50 em andamento
+    try {
+        return sefaz.emitir(id);
+    } finally {
+        permissoes.release();
+    }
+});
+```
+
+A virtual thread que espera no `acquire` também é desmontada: esperar é barato. O exercício 06.04 mede o pico de chamadas simultâneas para garantir que o limite é respeitado. Para o banco, o próprio pool de conexões (HikariCP) já faz o papel de limitador.
+
+## Quando virtual threads não ajudam
+
+- **Trabalho CPU-bound**: compactar arquivos ou calcular hashes continua limitado ao número de núcleos. Virtual threads não criam CPU.
+- **Pinning**: em algumas situações, a virtual thread fica "presa" à carrier e não é desmontada ao bloquear. Até o Java 23, isso acontecia dentro de blocos `synchronized`. **Desde o Java 24 (JEP 491), `synchronized` não causa mais pinning**; ainda acontece em chamadas nativas (JNI). Se você estiver no Java 21, prefira `ReentrantLock` em trechos que bloqueiam em I/O.
+- **`ThreadLocal` com dados pesados**: com milhões de threads, cada cópia custa memória. As **scoped values** (próxima aula) são a alternativa.
+
+<Callout tipo="entrevista">
+Resposta de nível Pleno para "o que são virtual threads?": explique a **desmontagem da carrier no I/O**, diga que o ganho é **throughput em I/O, não velocidade em CPU**, que **não se faz pool** delas (limite o recurso com `Semaphore`) e mencione o **pinning** e a mudança do Java 24. Muita gente ainda repete o conselho antigo sobre `synchronized` — mostrar que você sabe que ele mudou é um diferencial.
+</Callout>
+
+<Quiz
+  id="06-virtual-threads"
+  questoes={[
+    {
+      pergunta: 'Um serviço faz 10 mil chamadas HTTP que demoram 200 ms cada. O que virtual threads mudam?',
+      opcoes: ['Cada chamada fica mais rápida', 'É possível ter milhares de chamadas esperando ao mesmo tempo sem esgotar threads', 'Nada', 'Reduzem o uso de CPU das chamadas'],
+      correta: 1,
+      explicacao: 'O ganho é concorrência barata enquanto se espera I/O — throughput, não latência individual.',
+    },
+    {
+      pergunta: 'O fornecedor aceita no máximo 100 conexões simultâneas. Como limitar com virtual threads?',
+      opcoes: ['newFixedThreadPool(100) de virtual threads', 'Semaphore(100) ao redor da chamada', 'Thread.sleep entre chamadas', 'Não é possível'],
+      correta: 1,
+      explicacao: 'Limite o recurso escasso, não a quantidade de virtual threads.',
+    },
+    {
+      pergunta: 'No Java 25, um bloco synchronized com I/O dentro fixa a virtual thread à carrier?',
+      opcoes: ['Sim, sempre', 'Não, desde o Java 24 (JEP 491)', 'Só em Linux', 'Só com ThreadLocal'],
+      correta: 1,
+      explicacao: 'A JEP 491 removeu o pinning causado por synchronized.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Virtual threads são leves e **desmontadas** ao bloquear em I/O: milhões de tarefas concorrentes com código síncrono.
+- `Executors.newVirtualThreadPerTaskExecutor()` ou `spring.threads.virtual.enabled=true`.
+- **Uma por tarefa**, sem pool; limite recursos escassos com `Semaphore`.
+- Não ajudam em CPU-bound; pinning por `synchronized` acabou no Java 24.

@@ -1,0 +1,252 @@
+---
+titulo: "Kubernetes e cloud: o que um dev backend precisa saber"
+descricao: Noções de Kubernetes para quem escreve a aplicação — Pod, Deployment, Service, Ingress, ConfigMap e Secret, requests e limits, probes apontando para o Actuator, rolling update e HPA —, os 12 fatores, os serviços de nuvem mais comuns (AWS, GCP e Azure), gerenciado × auto-hospedado, custo e a divisão de trabalho com o time de plataforma.
+modulo: 14-devops
+ordem: 6
+duracao: 55
+objetivos:
+  - Ler um manifesto de Deployment e explicar Pod, Deployment, Service, Ingress, ConfigMap e Secret
+  - Configurar requests, limits e probes de liveness e readiness ligadas ao Actuator
+  - Aplicar os 12 fatores a uma aplicação Spring Boot
+  - Relacionar os serviços gerenciados de AWS, GCP e Azure e decidir entre gerenciado e auto-hospedado
+tags: [kubernetes, pod, deployment, service, ingress, configmap, secret, probes, HPA, 12-factor, AWS, cloud]
+flashcards:
+  - frente: Pod × Deployment
+    verso: O Pod é a menor unidade do Kubernetes - um ou mais containers que rodam juntos, com um IP. Pods são descartáveis. O Deployment declara quantas réplicas de um Pod você quer e com qual imagem, recria os que morrem e faz a troca de versão (rolling update).
+  - frente: Para que serve um Service?
+    verso: Pods nascem e morrem com IPs diferentes. O Service dá um nome DNS e um IP estáveis a um conjunto de Pods (escolhidos por labels) e distribui as conexões entre os que estão prontos (readiness OK).
+  - frente: Requests × limits
+    verso: Requests é o que o Pod reserva - o agendador só o coloca num nó com essa capacidade livre, e o HPA calcula o uso em relação a ela. Limits é o teto - acima do limite de memória o container é morto (OOMKilled); acima do limite de CPU, ele é estrangulado (throttling).
+  - frente: Secret do Kubernetes é criptografado?
+    verso: Não por padrão - os valores ficam em base64, que é codificação, não criptografia. É preciso ativar criptografia em repouso no cluster, restringir o acesso por RBAC ou usar um cofre externo (AWS Secrets Manager, Vault).
+  - frente: O que diz o fator III (Config) dos 12 fatores?
+    verso: A configuração que muda entre ambientes (URLs, credenciais, flags) fica no AMBIENTE, e não no código ou na imagem. A mesma imagem vai de homologação para produção; só mudam as variáveis.
+  - frente: O que faz o HPA?
+    verso: O HorizontalPodAutoscaler ajusta o número de réplicas de um Deployment conforme uma métrica - por exemplo, manter a CPU média em 70% dos requests -, entre um mínimo e um máximo definidos.
+---
+
+Chegou a hora de a imagem da aula 3 rodar em produção. Na maioria das empresas, isso significa **Kubernetes** (ou um serviço de containers de um provedor de nuvem) e bancos, filas e armazenamento **gerenciados**. Você não precisa ser especialista em infraestrutura, mas precisa saber ler um manifesto, entender por que o seu Pod foi reiniciado e conversar com o time de plataforma na mesma língua.
+
+**Pré-requisitos:** a imagem Docker (aula 3) e as probes do Actuator (aula 5).
+
+## Intuição: o gerente do restaurante
+
+Você não diz ao Kubernetes "suba o container no servidor 3". Você declara o **estado desejado**: "quero 3 cópias desta imagem, cada uma com meio núcleo e 768 MB, atrás deste endereço". O Kubernetes é o gerente que fica olhando o salão: se um garçom passa mal, chama outro; se o movimento aumenta, escala mais gente. Esse ciclo de comparar o desejado com o real e corrigir a diferença é o **laço de reconciliação**, e é a ideia central do Kubernetes.
+
+## As peças
+
+<Figura legenda="Do usuário ao Pod: o Ingress roteia por host e caminho, o Service distribui entre os Pods prontos, e o Deployment mantém as réplicas">
+<svg viewBox="0 0 680 290" width="680" role="img" aria-label="Usuário chega ao Ingress, que encaminha ao Service, que distribui para três Pods gerenciados por um Deployment; ConfigMap e Secret alimentam os Pods; o HPA ajusta as réplicas">
+  <defs><marker id="m1406" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="110" width="90" height="44" rx="8" class="d-box"/><text x="55" y="137" text-anchor="middle" class="d-label">usuário</text>
+  <rect x="130" y="110" width="100" height="44" rx="8" class="d-info"/><text x="180" y="137" text-anchor="middle" class="d-mono">Ingress</text>
+  <rect x="260" y="110" width="100" height="44" rx="8" class="d-info"/><text x="310" y="137" text-anchor="middle" class="d-mono">Service</text>
+  <path d="M100 132 H126" class="d-line" marker-end="url(#m1406)"/>
+  <path d="M230 132 H256" class="d-line" marker-end="url(#m1406)"/>
+  <rect x="395" y="30" width="170" height="210" rx="10" class="d-box"/>
+  <text x="480" y="52" text-anchor="middle" class="d-title">Deployment</text>
+  <rect x="415" y="68" width="130" height="42" rx="8" class="d-accent"/><text x="480" y="94" text-anchor="middle" class="d-mono">Pod (pronto)</text>
+  <rect x="415" y="120" width="130" height="42" rx="8" class="d-accent"/><text x="480" y="146" text-anchor="middle" class="d-mono">Pod (pronto)</text>
+  <rect x="415" y="172" width="130" height="42" rx="8" class="d-box"/><text x="480" y="198" text-anchor="middle" class="d-mono">Pod (subindo)</text>
+  <path d="M360 126 L411 92" class="d-line" marker-end="url(#m1406)"/>
+  <path d="M360 136 H411" class="d-line" marker-end="url(#m1406)"/>
+  <rect x="585" y="68" width="85" height="42" rx="8" class="d-violet"/><text x="627" y="94" text-anchor="middle" class="d-mono">ConfigMap</text>
+  <rect x="585" y="120" width="85" height="42" rx="8" class="d-violet"/><text x="627" y="146" text-anchor="middle" class="d-mono">Secret</text>
+  <rect x="585" y="172" width="85" height="42" rx="8" class="d-ok"/><text x="627" y="198" text-anchor="middle" class="d-mono">HPA</text>
+  <text x="10" y="268" class="d-label">O Pod que ainda não passou na readiness não recebe tráfego do Service.</text>
+</svg>
+</Figura>
+
+| Objeto | Para que serve |
+|---|---|
+| **Pod** | a menor unidade: um (ou mais) containers com um IP. Descartável: morre e é substituído por outro, com outro IP |
+| **Deployment** | declara a imagem e o número de réplicas; recria Pods que morrem e faz o **rolling update** |
+| **Service** | nome DNS e IP estáveis para um conjunto de Pods (escolhidos por *labels*); só encaminha para os **prontos** |
+| **Ingress** | entrada HTTP do cluster: roteia por host e caminho (`api.fintech.com/pagamentos`) e termina o TLS. O **Gateway API** é a evolução mais recente desse papel |
+| **ConfigMap** | configuração não sensível, injetada como variáveis de ambiente ou arquivos |
+| **Secret** | configuração sensível (senhas, tokens). Os valores ficam em **base64, que não é criptografia**: ative criptografia em repouso, restrinja por RBAC ou use um cofre externo |
+
+## Um Deployment de verdade
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fintech-core
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: fintech-core }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }   # sobe um novo antes de derrubar um antigo
+  template:
+    metadata:
+      labels: { app: fintech-core }
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/minha-org/fintech-core:3f9c2a1      # tag do commit, nunca latest
+          ports: [{ containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: fintech-core-config }    # SPRING_DATASOURCE_URL etc.
+          env:
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: fintech-core-db, key: senha }
+          resources:
+            requests: { cpu: 500m, memory: 768Mi }
+            limits: { memory: 768Mi }
+          startupProbe:                       # dá tempo para a JVM subir antes da liveness valer
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8080 }
+            periodSeconds: 5
+```
+
+### Requests, limits e a JVM
+
+- **`requests`** é a reserva: o agendador só coloca o Pod num nó com essa capacidade livre, e o HPA calcula o uso em relação a ela.
+- **`limits`** é o teto. Acima do limite de **memória**, o container é morto (**OOMKilled**, sem `OutOfMemoryError` no log). Acima do limite de **CPU**, ele é estrangulado (*throttling*) e fica lento. Por isso, muitos times definem limite só de memória, igual ao request, e deixam a CPU sem teto; é uma decisão do time de plataforma.
+- A JVM lê o limite do container: com 768 Mi e o `-XX:MaxRAMPercentage=75.0` do Dockerfile, o heap máximo fica em torno de 576 MB, e o resto sobra para metaspace, threads e buffers.
+
+### Probes e o ciclo de vida
+
+As probes chamam os endpoints da aula 5. **Liveness** falhando `failureThreshold` vezes seguidas: o container é reiniciado. **Readiness** falhando: o Pod sai do Service, sem reinício. A **startupProbe** segura as outras duas até a aplicação subir, para uma inicialização lenta não ser confundida com um processo travado.
+
+No deploy (ou quando um nó é esvaziado), o Kubernetes manda `SIGTERM` ao container e espera `terminationGracePeriodSeconds` (30 s por padrão) antes do `SIGKILL`. Com o `ENTRYPOINT` em formato exec, o Spring Boot recebe o sinal e faz o desligamento gracioso. Como a remoção do Pod do Service acontece em paralelo, a documentação do Spring Boot sugere um pequeno `preStop` (uma pausa de alguns segundos) para não receber requisições novas depois de começar a desligar.
+
+### Rolling update e HPA
+
+O **rolling update** troca os Pods aos poucos: com `maxSurge: 1` e `maxUnavailable: 0`, ele sobe um Pod novo, espera a **readiness** passar e só então derruba um antigo. Uma versão que nunca fica pronta trava o rollout sem derrubar o serviço, e `kubectl rollout undo deployment/fintech-core` volta à versão anterior.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fintech-core
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: fintech-core }
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }   # 70% dos requests de CPU
+```
+
+Escalar **horizontalmente** só funciona se a aplicação for **sem estado**: sessão, cache local e arquivos temporários não podem ser a única cópia de nada.
+
+## Os 12 fatores
+
+A metodologia *The Twelve-Factor App* resume o que torna uma aplicação boa para esse mundo. Os fatores que mais aparecem no dia a dia de um dev Spring:
+
+| Fator | Na prática com Spring Boot |
+|---|---|
+| III. **Config** no ambiente | `SPRING_DATASOURCE_URL` via ConfigMap/Secret; a mesma imagem em todos os ambientes |
+| IV. **Serviços de apoio** como recursos anexados | o banco e a fila são URLs; trocar de instância é mudar configuração |
+| V. **Build, release, run** separados | o CI gera a imagem (build); imagem + config = release; o cluster executa (run) |
+| VI. **Processos sem estado** | nada de sessão em memória; estado no banco ou no Redis |
+| IX. **Descartabilidade** | sobe rápido, desliga graciosamente com `SIGTERM` |
+| X. **Paridade** dev/prod | o mesmo PostgreSQL no Compose, no Testcontainers e em produção, nunca H2 em um e Postgres no outro |
+| XI. **Logs** como fluxo de eventos | JSON no stdout; quem coleta e guarda é a plataforma, não a aplicação |
+
+Os outros são: I. uma **base de código** versionada, II. **dependências** declaradas, VII. **vínculo de porta** (a aplicação expõe o próprio HTTP), VIII. **concorrência** por processos (escala adicionando instâncias) e XII. **tarefas administrativas** como processos pontuais (uma migração roda como job, não à mão no servidor).
+
+## Cloud: os serviços que aparecem em toda vaga
+
+| Necessidade | AWS | GCP | Azure |
+|---|---|---|---|
+| Kubernetes gerenciado | EKS | GKE | AKS |
+| Containers sem gerenciar cluster | ECS (com Fargate) | Cloud Run | Container Apps |
+| PostgreSQL gerenciado | RDS (e Aurora) | Cloud SQL | Azure Database for PostgreSQL |
+| Armazenamento de objetos | S3 | Cloud Storage | Blob Storage |
+| Fila | SQS | Pub/Sub | Service Bus (filas) |
+| Publicação para vários assinantes | SNS | Pub/Sub | Service Bus (tópicos) / Event Grid |
+| Kafka gerenciado | MSK | Managed Service for Apache Kafka | Event Hubs (compatível com Kafka) |
+| Registro de imagens | ECR | Artifact Registry | Container Registry (ACR) |
+| Segredos | Secrets Manager | Secret Manager | Key Vault |
+| Logs e métricas | CloudWatch | Cloud Logging / Monitoring | Azure Monitor |
+
+**Gerenciado × auto-hospedado.** Rodar o PostgreSQL você mesmo, numa VM ou no Kubernetes, parece mais barato na fatura, mas backup, atualização de versão, réplica, failover e o plantão da madrugada passam a ser do seu time. Para a maioria das empresas, o serviço gerenciado (RDS, Cloud SQL) sai mais barato no custo total. Auto-hospedar faz sentido com requisitos muito específicos, escala enorme ou equipe dedicada.
+
+**Custo** é requisito de arquitetura. Os vilões mais comuns: recursos esquecidos ligados (ambientes de teste que ninguém desliga), `requests` superdimensionados, tráfego de saída entre regiões ou para a internet, volume de logs em `DEBUG` e réplicas de banco sem uso. Saber estimar a ordem de grandeza do custo de uma decisão é uma habilidade de pleno.
+
+## O que é seu e o que é da plataforma
+
+| Normalmente do dev (Jr/Pleno) | Normalmente do time de plataforma/SRE |
+|---|---|
+| Dockerfile, imagem enxuta e sem root | criar e atualizar o cluster, rede, nós |
+| endpoints de health e as probes certas | Ingress controller, certificados, DNS |
+| requests e limits coerentes com a JVM | políticas de segurança, RBAC, cotas |
+| config por variáveis, sem segredo na imagem | o cofre de segredos e a rotação |
+| logs em JSON, métricas e traces | a pilha de observabilidade (Prometheus, Grafana, coletor OTel) |
+| ler `kubectl get pods`, `describe`, `logs` e entender um `CrashLoopBackOff` | templates de pipeline, Helm charts ou GitOps compartilhados |
+
+A fronteira varia: em empresas pequenas, você faz as duas colunas; em grandes, a plataforma entrega um "caminho pavimentado" e você preenche um arquivo de valores. Em qualquer caso, a coluna da esquerda é sua.
+
+## Armadilhas comuns
+
+- **Banco na liveness**: uma instabilidade no RDS reinicia todos os Pods ao mesmo tempo.
+- **Sem startupProbe e liveness agressiva**: a JVM ainda está subindo, a liveness falha, o Pod é reiniciado, e o ciclo se repete (`CrashLoopBackOff`).
+- **Limite de memória menor que o heap** (`-Xmx` fixo): OOMKilled sem mensagem de erro na aplicação.
+- **Secret tratado como cofre**: base64 se decodifica com um comando.
+- **Estado local** (upload em disco, sessão em memória): some quando o Pod é recriado e diverge entre réplicas.
+- **Tudo auto-hospedado para economizar**: a economia some no primeiro incidente de banco sem backup testado.
+
+<Callout tipo="entrevista">
+Para Jr/Pleno, as perguntas de Kubernetes costumam ser conceituais: "o que é um Pod e um Deployment?", "qual a diferença entre liveness e readiness?", "o que acontece num rolling update?", "por que a aplicação deve ser stateless?". Responda ligando ao código: "as probes apontam para `/actuator/health/liveness` e `/readiness`; a dependência externa fica só na readiness; o `SIGTERM` chega ao Spring pelo `ENTRYPOINT` em formato exec". Em nuvem, saiba o papel de **S3, RDS, SQS/SNS e ECS/EKS** e o argumento de **gerenciado × auto-hospedado**.
+</Callout>
+
+<Quiz
+  id="14-kubernetes-e-cloud"
+  questoes={[
+    {
+      pergunta: 'Um Pod é recriado e ganha outro IP. Como os outros serviços continuam o encontrando?',
+      opcoes: ['Pelo IP fixo do Pod', 'Pelo Service, que tem nome DNS e IP estáveis e seleciona os Pods por labels', 'Pelo ConfigMap', 'Não encontram até alguém atualizar a configuração'],
+      correta: 1,
+      explicacao: 'Pods são descartáveis; o Service é o endereço estável na frente deles.',
+    },
+    {
+      pergunta: 'O container tem limite de 512 Mi e a JVM foi iniciada com -Xmx1g. O que acontece sob carga?',
+      opcoes: ['A JVM lança OutOfMemoryError', 'O container é morto pelo sistema (OOMKilled)', 'O Kubernetes aumenta o limite', 'Nada: -Xmx é ignorado'],
+      correta: 1,
+      explicacao: 'O heap tenta crescer além do limite do container, e o kernel mata o processo. Use MaxRAMPercentage em vez de um -Xmx fixo.',
+    },
+    {
+      pergunta: 'Qual fator dos 12 fatores diz que a senha do banco não deve estar dentro da imagem?',
+      opcoes: ['I. Base de código', 'III. Configuração no ambiente', 'VII. Vínculo de porta', 'XI. Logs'],
+      correta: 1,
+      explicacao: 'Configuração que muda entre ambientes, inclusive credenciais, vem do ambiente. A mesma imagem vai para todos os ambientes.',
+    },
+    {
+      pergunta: 'Qual serviço da AWS corresponde a uma fila de mensagens gerenciada?',
+      opcoes: ['S3', 'RDS', 'SQS', 'EKS'],
+      correta: 2,
+      explicacao: 'S3 é armazenamento de objetos, RDS é banco relacional e EKS é Kubernetes gerenciado.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Pod** (descartável) → **Deployment** (réplicas, rolling update) → **Service** (endereço estável) → **Ingress** (entrada HTTP); **ConfigMap** e **Secret** (base64 não é criptografia) para configuração.
+- **Requests** reservam, **limits** limitam (memória: OOMKilled; CPU: throttling); a JVM segue o limite com `MaxRAMPercentage`.
+- **Probes** no Actuator: startup, liveness (sem dependências externas) e readiness; `SIGTERM` + desligamento gracioso.
+- **HPA** escala réplicas; só funciona com aplicação **sem estado**.
+- **12 fatores**: config no ambiente, processos sem estado, descartabilidade, paridade, logs no stdout.
+- Nuvem: EKS/GKE/AKS, RDS/Cloud SQL, S3, SQS/SNS; prefira **gerenciado**; custo é requisito.
+
+## Referências
+
+- Documentação do Kubernetes — *Pods*, *Deployments*, *Service*, *Ingress*, *ConfigMaps*, *Secrets* e *Resource Management for Pods and Containers* (kubernetes.io)
+- Documentação do Kubernetes — *Configure Liveness, Readiness and Startup Probes* e *Horizontal Pod Autoscaling* (kubernetes.io)
+- Documentação do Spring Boot — *Deploying to the Cloud* (seção *Kubernetes*) e *Kubernetes Probes* (docs.spring.io)
+- Adam Wiggins — *The Twelve-Factor App* (12factor.net)
+- AWS — *Overview of Amazon Web Services* (docs.aws.amazon.com)

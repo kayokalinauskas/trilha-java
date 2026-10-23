@@ -1,0 +1,84 @@
+---
+titulo: Busca binária (inclusive na resposta)
+codigo: "05.04"
+resumo: Posição de inserção, primeira versão com bug em O(log n) chamadas, busca em array rotacionado e a menor capacidade de caminhão para entregar tudo em D dias.
+modulo: 05-algoritmos
+ordem: 4
+dificuldade: medio
+tempo: 2h
+conceitos: [busca binária, invariantes, busca na resposta, overflow]
+aulas: [05-algoritmos/05-busca-binaria-e-ordenacao]
+java:
+  modulo: m05-algoritmos
+  teste: BuscaBinariaTest
+---
+
+## Contexto
+
+Quatro problemas do dia a dia de uma empresa de logística, todos resolvidos pela mesma ideia:
+
+1. **Tabela de frete ordenada por peso**: em que posição entra uma nova faixa?
+2. **Regressão em produção**: uma das últimas 2 bilhões de builds (é um monorepo enorme) introduziu um bug. Rodar a suíte de uma build custa minutos. Qual foi a **primeira** build com o bug, usando o mínimo de execuções?
+3. **Log circular**: um array de horários ordenado, mas que "deu a volta" (`[15, 18, 22, 3, 7, 9, 12]`). Ache um horário em O(log n).
+4. **Dimensionamento de frota**: pacotes precisam sair **na ordem**; qual a **menor capacidade** de caminhão para entregar tudo em D dias?
+
+## Requisitos
+
+| Método | Retorna |
+|---|---|
+| `posicaoDeInsercao(ordenado, alvo)` | Menor índice `i` com `ordenado[i] >= alvo` (ou `length`) |
+| `primeiraVersaoComBug(total, temBug)` | Primeira versão (1..total) com bug, ou `-1`; no máximo ~log₂(n) + 2 chamadas a `temBug` |
+| `buscarEmRotacionado(nums, alvo)` | Índice do alvo, ou `-1` (sem repetidos) |
+| `menorCapacidade(pesos, dias)` | Menor capacidade que entrega tudo, na ordem, em até `dias` |
+
+## Exemplos
+
+```text
+posicaoDeInsercao([1,3,3,5,8], 3)             → 1
+primeiraVersaoComBug(2_000_000_000, v -> v >= 1_234_567_890) → 1234567890 (≤ 33 chamadas)
+buscarEmRotacionado([15,18,22,3,7,9,12], 7)   → 4
+menorCapacidade([1..10], 5)                    → 15
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `BuscaBinariaTest` passam.
+- [ ] Nenhum `(baixo + alto) / 2`: o cálculo do meio não pode estourar `int`.
+- [ ] `posicaoDeInsercao`, `primeiraVersaoComBug` e `menorCapacidade` usam **o mesmo molde** (primeiro verdadeiro).
+
+## Desafios opcionais
+
+- `ultimaOcorrencia(ordenado, alvo)` reaproveitando o molde.
+- Raiz quadrada inteira de um `long` sem `Math.sqrt`.
+
+<Dicas>
+<Dica nivel={1}>
+Para cada problema, escreva a condição monotônica "falso…falso, verdadeiro…verdadeiro". Inserção: `v[i] >= alvo`. Build: `temBug(v)`. Capacidade: "com C, cabe em D dias?".
+</Dica>
+<Dica nivel={2}>
+Molde: `while (baixo < alto) { meio = baixo + (alto - baixo) / 2; if (cond(meio)) alto = meio; else baixo = meio + 1; } return baixo;`. Para a capacidade, o intervalo vai de `max(pesos)` a `soma(pesos)`, e você precisa de um auxiliar `diasNecessarios(pesos, capacidade)` O(n).
+</Dica>
+<Dica nivel={3}>
+Rotacionado: intervalo fechado `[baixo, alto]`. Se `nums[baixo] <= nums[meio]`, a esquerda está ordenada: o alvo está nela se `nums[baixo] <= alvo < nums[meio]`. Senão, a direita está ordenada: o alvo está nela se `nums[meio] < alvo <= nums[alto]`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/BuscaBinaria.java" />
+
+### Pontos-chave
+
+- **Um molde, três problemas.** Mudar só a condição e o intervalo é o que torna busca binária confiável: você para de "ajustar ±1 até funcionar".
+- **Busca na resposta** em `menorCapacidade`: O(n log S), com S = soma dos pesos. Testar todas as capacidades seria O(n × S).
+- **`primeiraVersaoComBug` confere o `baixo` no final**: se nenhuma versão tem bug, o laço termina em `total` e a checagem devolve `-1`.
+- **Dois estilos de intervalo**: semiaberto para "primeiro verdadeiro", fechado para "achar um valor exato" no rotacionado. Ambos corretos; misturá-los é o que gera bugs.
+
+### Avalie sua solução
+
+- O teste de 2 bilhões de versões passa com no máximo 33 chamadas?
+- `menorCapacidade([7], 10)` devolve 7?
+
+</Solucao>

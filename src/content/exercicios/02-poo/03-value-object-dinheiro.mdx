@@ -1,0 +1,100 @@
+---
+titulo: Value object Dinheiro
+codigo: "02.03"
+resumo: Crie um record Dinheiro imutável que normaliza a escala, impede somar moedas diferentes, rateia sem perder centavos e formata no padrão brasileiro.
+modulo: 02-poo
+ordem: 3
+dificuldade: medio
+tempo: 2h
+conceitos: [record, value object, imutabilidade, BigDecimal, equals/hashCode, enum]
+aulas: [02-poo/05-records-e-imutabilidade, 01-java-essencial/01-tipos-e-variaveis]
+java:
+  modulo: m02-poo
+  teste: DinheiroTest
+---
+
+## Contexto
+
+Uma plataforma de marketplace opera em reais, dólares e euros. O código atual passa `BigDecimal` e `String moeda` separados por todo lado. Os bugs recentes:
+
+- um repasse somou **R$ 100 com US$ 100** e registrou R$ 200;
+- um `HashSet` de valores tinha **R$ 10,0** e **R$ 10,00** como itens diferentes;
+- a divisão de uma comissão entre 3 vendedores **perdeu um centavo**.
+
+O time decidiu criar um **value object** `Dinheiro` e usá-lo em toda a base de código.
+
+## Requisitos
+
+`record Dinheiro(BigDecimal valor, Moeda moeda)` com:
+
+| Membro | Comportamento |
+|---|---|
+| construtor compacto | valor e moeda obrigatórios; valor normalizado para **2 casas, HALF_EVEN** |
+| `de(String, Moeda)`, `reais(String)`, `zero(Moeda)` | fábricas estáticas |
+| `somar`, `subtrair` | só com a **mesma moeda**; senão `IllegalArgumentException` citando as duas moedas |
+| `multiplicar(BigDecimal fator)` | resultado arredondado |
+| `ehNegativo()`, `ehZero()` | consultas |
+| `ratear(int partes)` | divide em N partes cuja soma é **exatamente** o original; centavos extras vão para as **primeiras** partes |
+| `formatado()` | `"R$ 1.234.567,80"`, `"-US$ 5,00"`, `"€ 0,50"` |
+
+O enum `Moeda` (BRL, USD, EUR, com símbolo) já está pronto.
+
+## Exemplos
+
+```java
+Dinheiro.reais("10").equals(Dinheiro.reais("10.00"))   // true
+Dinheiro.reais("10.015").valor()                          // 10.02 (HALF_EVEN)
+Dinheiro.reais("100.00").ratear(3)                        // [33.34, 33.33, 33.33]
+Dinheiro.reais("0.05").ratear(3)                          // [0.02, 0.02, 0.01]
+Dinheiro.reais("1").somar(Dinheiro.de("1", Moeda.EUR))    // IllegalArgumentException
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `DinheiroTest` passam.
+- [ ] Você **não** sobrescreveu `equals` nem `hashCode`: a normalização no construtor resolve.
+- [ ] Nenhuma operação altera a instância original.
+- [ ] A regra "mesma moeda" existe em um único método.
+
+## Desafios opcionais
+
+- `ratear(int... proporcoes)`: divide proporcionalmente (ex.: 70/30 entre vendedor e plataforma) sem perder centavos.
+- Use a `Moeda` para definir as casas decimais (o iene tem 0) e ajuste a normalização.
+- Volte ao exercício 02.01 e troque `BigDecimal` por `Dinheiro` na `ContaCorrente`.
+
+<Dicas>
+<Dica nivel={1}>
+Por que `new BigDecimal("10").equals(new BigDecimal("10.00"))` é `false`? Descubra no JShell. Se todo `Dinheiro` sempre tiver escala 2, o `equals` gerado pelo record passa a funcionar sozinho.
+</Dica>
+<Dica nivel={2}>
+No construtor compacto: `valor = valor.setScale(2, RoundingMode.HALF_EVEN);`. Nas operações, crie **novos** `Dinheiro` com o construtor, e ele cuidará do arredondamento. Para o rateio, trabalhe em centavos (`long`), como no exercício 01.02.
+</Dica>
+<Dica nivel={3}>
+Rateio: `base = centavos / partes`, `resto = centavos % partes`; a parte `i` recebe `base + (i < resto ? 1 : 0)`. Formatação: `new DecimalFormat("#,##0.00", DecimalFormatSymbols.getInstance(Locale.forLanguageTag("pt-BR")))` aplicado ao **valor absoluto**, com o sinal e o símbolo montados à mão.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/dinheiro/Dinheiro.java" />
+
+### Os pontos-chave
+
+- **A normalização faz o `equals` funcionar.** O record compara os componentes com `equals`. Como o construtor compacto garante escala 2, `10` e `10.00` viram o mesmo `BigDecimal("10.00")`, e o `equals`/`hashCode` gerados passam a refletir a regra de negócio. É uma solução mais elegante do que sobrescrever os dois métodos.
+- **Toda operação passa pelo construtor.** `somar` faz `new Dinheiro(valor.add(...), moeda)`. O arredondamento e as validações acontecem automaticamente, sem risco de esquecer em algum método.
+- **Rateio distribuindo centavos.** Diferente do 01.02 (sobra toda na primeira parcela), aqui cada uma das primeiras partes recebe **1 centavo** a mais. As partes ficam o mais parecidas possível — é o algoritmo usado pela biblioteca Moneta (JSR 354) e por boa parte dos sistemas de split de pagamento.
+- **Formatação manual do sinal e do símbolo.** O `NumberFormat.getCurrencyInstance` da JDK usa um espaço especial (U+00A0) e posiciona o sinal de formas diferentes conforme a versão e o *locale*, o que torna testes frágeis. Montar o texto a partir de um `DecimalFormat` dá controle total.
+
+### E no mercado?
+
+Existe uma API padrão para dinheiro em Java: a **JSR 354 (Money and Currency API)**, com a implementação de referência **Moneta**. Muitos projetos a usam; outros preferem um value object próprio, simples como este. Conhecer a existência da JSR 354 é um bom diferencial em entrevistas de fintech.
+
+### Avalie sua solução
+
+- Você sobrescreveu `equals`? Tente remover e ver se os testes continuam passando depois da normalização.
+- Seu rateio de R$ 0,05 em 3 dá `[0.02, 0.02, 0.01]`?
+- `Dinheiro.reais("1").somar(null)` lança uma exceção clara na sua versão?
+
+</Solucao>

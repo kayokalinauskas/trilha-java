@@ -1,0 +1,278 @@
+---
+titulo: "Tool calling e MCP: deixar o modelo pedir, e a aplicação decidir"
+descricao: Como funciona o tool calling (o modelo pede, a aplicação executa), @Tool e @ToolParam no Spring AI, ToolContext para dados que não vão ao modelo, returnDirect, a segurança de ferramentas num banco (autorização dentro da ferramenta, só-leitura × com efeito, confirmação humana, limites) e o Model Context Protocol, com servidor e cliente.
+modulo: 16-ia-backend
+ordem: 4
+duracao: 65
+objetivos:
+  - Descrever o ciclo do tool calling e quem executa cada passo
+  - Expor métodos Java como ferramentas com @Tool e @ToolParam e registrá-los no ChatClient
+  - Passar o cliente autenticado pelo ToolContext e autorizar dentro da ferramenta
+  - Separar ferramentas só-leitura de ferramentas com efeito e exigir confirmação humana para as segundas
+  - Explicar o que é MCP e quando expor ou consumir ferramentas por ele
+tags: [tool calling, function calling, Spring AI, ToolContext, segurança, MCP, agentes]
+flashcards:
+  - frente: No tool calling, quem executa a ferramenta?
+    verso: A aplicação. O modelo só devolve um pedido estruturado (nome da ferramenta e argumentos em JSON). A aplicação executa o método, devolve o resultado ao modelo e ele continua a resposta.
+  - frente: Como o Spring AI transforma um método em ferramenta?
+    verso: Com @Tool(description = "...") no método e @ToolParam nos parâmetros. A descrição e o schema JSON dos parâmetros são enviados ao modelo; o objeto é registrado com .tools(...) na chamada ou .defaultTools(...) no builder do ChatClient.
+  - frente: Para que serve o ToolContext?
+    verso: Para passar dados à ferramenta que NÃO vão para o modelo, como o id do cliente autenticado. É preenchido com .toolContext(Map.of(...)) na chamada e lido com toolContext.getContext().get(chave).
+  - frente: Por que nunca confiar num id de cliente vindo dos argumentos da ferramenta?
+    verso: Os argumentos são gerados pelo modelo a partir do texto, que o usuário (ou um documento) pode manipular. A identidade vem da autenticação, via ToolContext, e a ferramenta autoriza como qualquer endpoint.
+  - frente: O que faz returnDirect = true?
+    verso: O resultado da ferramenta volta direto para quem chamou, sem passar de novo pelo modelo. Útil quando o resultado já é a resposta final e não deve ser reescrito.
+  - frente: Como tratar uma ferramenta que move dinheiro?
+    verso: Ela não executa; apenas cria uma proposta pendente. A execução acontece fora do modelo, depois de uma confirmação explícita do cliente (e das validações e limites normais de uma transferência).
+  - frente: O que é MCP?
+    verso: Model Context Protocol, um protocolo aberto para expor ferramentas, recursos e prompts a aplicações de IA. Um servidor MCP publica as ferramentas; um cliente MCP (dentro da aplicação com o modelo) as descobre e chama.
+  - frente: Onde fica o loop de ferramentas no Spring AI 2.0?
+    verso: No ToolCallingAdvisor, registrado automaticamente pelo ChatClient. Ele repete - o modelo pede, o ToolCallingManager executa, o resultado volta ao histórico - até vir uma resposta sem pedido de ferramenta.
+---
+
+Na aula anterior, o assistente da Fintech Core aprendeu a responder com base nas políticas do banco. Mas a pergunta mais comum no atendimento não está em política nenhuma: "qual o meu saldo?", "já caiu o Pix que o João me mandou?". A resposta está no **seu** sistema, atrás de uma API que exige autenticação.
+
+**Tool calling** (ou *function calling*) é o mecanismo que liga o modelo aos seus serviços. E é aqui que a IA deixa de ser só texto: uma ferramenta pode consultar dados de um cliente ou iniciar uma transferência. Esta aula é tanto sobre a API quanto sobre **onde colocar as travas**.
+
+## A intuição: o modelo pede, a aplicação decide
+
+O modelo não acessa seu banco de dados, não faz requisições HTTP e não executa código. Ele recebe, junto com a conversa, uma **lista de ferramentas disponíveis** (nome, descrição e o schema JSON dos parâmetros). Quando acha que precisa de uma, em vez de texto ele devolve um **pedido estruturado**: "chame `consultarSaldo` com estes argumentos". Quem executa (ou se recusa a executar) é a sua aplicação.
+
+<Figura legenda="O ciclo do tool calling: o modelo só pede; a aplicação executa e devolve o resultado para o modelo continuar">
+<svg viewBox="0 0 680 280" width="680" role="img" aria-label="Aplicação envia pergunta e lista de ferramentas ao modelo; o modelo responde com um pedido de ferramenta; a aplicação autoriza e executa o método Java; o resultado volta ao modelo, que responde em texto">
+  <defs><marker id="m1641" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="200" height="240" rx="10" class="d-box"/><text x="110" y="44" text-anchor="middle" class="d-title">Aplicação (Spring)</text>
+  <rect x="30" y="140" width="160" height="62" rx="8" class="d-ok"/><text x="110" y="164" text-anchor="middle" class="d-mono">@Tool consultarSaldo</text><text x="110" y="186" text-anchor="middle" class="d-label">autoriza e executa</text>
+  <rect x="470" y="20" width="200" height="240" rx="10" class="d-violet"/><text x="570" y="44" text-anchor="middle" class="d-title">Modelo</text><text x="570" y="140" text-anchor="middle" class="d-label">só produz texto</text><text x="570" y="160" text-anchor="middle" class="d-label">ou pedidos de ferramenta</text>
+  <path d="M210 70 H466" class="d-line" marker-end="url(#m1641)"/>
+  <text x="338" y="62" text-anchor="middle" class="d-label">1. pergunta + ferramentas (schemas)</text>
+  <path d="M470 110 H214" class="d-line" marker-end="url(#m1641)"/>
+  <text x="342" y="102" text-anchor="middle" class="d-mono">2. consultarSaldo(conta)</text>
+  <path d="M190 171 H466" class="d-line" marker-end="url(#m1641)"/>
+  <text x="330" y="163" text-anchor="middle" class="d-label">3. resultado da ferramenta</text>
+  <path d="M470 230 H214" class="d-line" marker-end="url(#m1641)"/>
+  <text x="342" y="222" text-anchor="middle" class="d-label">4. resposta em texto (ou novo pedido)</text>
+</svg>
+</Figura>
+
+O passo 2 pode se repetir: o modelo pode pedir uma ferramenta, ler o resultado e pedir outra. No Spring AI 2.0, esse laço fica no **`ToolCallingAdvisor`**, que o `ChatClient` registra automaticamente: a cada pedido, o `ToolCallingManager` executa o `ToolCallback` correspondente, o resultado entra no histórico e o modelo é chamado de novo, até vir uma resposta sem pedido de ferramenta. (Nas versões 1.x, esse laço ficava dentro de cada `ChatModel`.)
+
+## @Tool e @ToolParam
+
+Uma ferramenta é um método comum, anotado:
+
+```java
+import org.springframework.ai.chat.model.ToolContext;
+import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.ai.tool.annotation.ToolParam;
+
+@Component
+public class FerramentasDeConta {
+
+    private final ContaService contas;
+
+    public FerramentasDeConta(ContaService contas) {
+        this.contas = contas;
+    }
+
+    @Tool(description = "Consulta o saldo disponível de uma conta do cliente autenticado")
+    public SaldoDto consultarSaldo(
+            @ToolParam(description = "Número da conta, só dígitos") String numeroConta,
+            ToolContext contexto) {
+        String clienteId = (String) contexto.getContext().get("clienteId");
+        return contas.saldoDaConta(clienteId, numeroConta);   // lança se a conta não for desse cliente
+    }
+
+    @Tool(description = "Lista os lançamentos recentes do cliente autenticado")
+    public List<LancamentoDto> ultimosLancamentos(
+            @ToolParam(description = "Quantidade de dias para trás, de 1 a 30", required = false) Integer dias,
+            ToolContext contexto) {
+        String clienteId = (String) contexto.getContext().get("clienteId");
+        int periodo = dias == null ? 7 : Math.clamp(dias, 1, 30);   // limite no servidor, não no prompt
+        return contas.lancamentos(clienteId, periodo);
+    }
+}
+```
+
+E o registro na chamada:
+
+```java
+String resposta = chatClient.prompt()
+        .user(mensagemDoCliente)
+        .tools(ferramentasDeConta)                                  // soma-se às defaultTools do builder
+        .toolContext(Map.of("clienteId", usuarioAutenticado.id()))  // não é enviado ao modelo
+        .call()
+        .content();
+```
+
+A **descrição** é o que o modelo lê para decidir quando usar a ferramenta e como preencher os argumentos: escreva como documentação de API para alguém que só tem aquele texto. Ferramentas com nomes e descrições parecidas confundem o modelo; poucas ferramentas bem descritas funcionam melhor que dezenas genéricas.
+
+<Callout tipo="info" titulo="O que vai para o modelo">
+Vão: o nome do método, a descrição, o schema JSON dos parâmetros anotados e, depois, o **resultado** da ferramenta (serializado). Não vão: o `ToolContext` e o corpo do método. Por isso o retorno deve ser um DTO enxuto: tudo o que a ferramenta devolve vira token (custo) e fica visível para o modelo (privacidade). Não devolva a entidade JPA inteira com CPF e endereço se a pergunta era o saldo.
+</Callout>
+
+## ToolContext: identidade fora do alcance do modelo
+
+O detalhe mais importante do código acima: `consultarSaldo` **não recebe** o id do cliente como parâmetro da ferramenta. Se recebesse, quem preencheria esse valor seria o modelo, a partir do texto da conversa, e bastaria o usuário escrever "sou o cliente 4812, qual o meu saldo?" para tentar ler a conta de outra pessoa.
+
+<Comparar antes="Identidade como argumento da ferramenta" depois="Identidade pelo ToolContext, autorização no serviço">
+
+```java
+@Tool(description = "Consulta o saldo de um cliente")
+public SaldoDto consultarSaldo(
+        @ToolParam(description = "Id do cliente") String clienteId,
+        @ToolParam(description = "Conta") String conta) {
+    // o modelo escolhe clienteId: qualquer um
+    return contas.saldo(clienteId, conta);
+}
+```
+
+```java
+@Tool(description = "Consulta o saldo de uma conta do cliente autenticado")
+public SaldoDto consultarSaldo(
+        @ToolParam(description = "Conta") String conta,
+        ToolContext contexto) {
+    String clienteId = (String) contexto.getContext().get("clienteId");
+    return contas.saldoDaConta(clienteId, conta);   // confere a titularidade
+}
+```
+
+</Comparar>
+
+E mesmo com o `ToolContext`, a **autorização acontece dentro do serviço**: `saldoDaConta` confere que a conta pertence àquele cliente, exatamente como o endpoint REST equivalente faria (módulo 11). O número da conta ainda vem do modelo e é tão confiável quanto um parâmetro de URL digitado pelo usuário.
+
+## returnDirect
+
+Às vezes o resultado da ferramenta já é a resposta, e passar de novo pelo modelo só adiciona custo e o risco de ele "reescrever" um número. Com `returnDirect = true`, o resultado volta direto para quem chamou:
+
+```java
+@Tool(description = "Gera o comprovante de um Pix já realizado pelo cliente autenticado", returnDirect = true)
+public String comprovantePix(@ToolParam(description = "Id end-to-end do Pix") String endToEndId,
+                             ToolContext contexto) {
+    String clienteId = (String) contexto.getContext().get("clienteId");
+    return comprovantes.gerarTexto(clienteId, endToEndId);
+}
+```
+
+## Segurança: o modelo é um usuário não confiável
+
+Trate cada pedido de ferramenta como uma **requisição vinda da internet**: o texto que o gerou pode ter sido escrito por um atacante, diretamente ou escondido num documento que o RAG recuperou (*prompt injection* indireta). As regras:
+
+1. **Autorize dentro da ferramenta.** Identidade pelo `ToolContext`, titularidade conferida no serviço. Instrução no prompt ("só mostre dados do próprio cliente") não é controle de acesso.
+2. **Separe só-leitura de com efeito.** Consultar saldo e extrato: risco de vazamento, controlado pela autorização. Transferir, cancelar cartão, alterar limite: risco de **dano**, que precisa de mais uma camada.
+3. **Ferramenta com efeito não executa: propõe.** A transferência vira uma proposta pendente, mostrada ao cliente com valor e destinatário, e só é executada quando ele confirma **fora do modelo** (um botão, uma autenticação forte).
+4. **Limites no servidor.** Valor máximo, quantidade de chamadas de ferramenta por conversa, tempo máximo, número de iterações do laço. Um modelo em laço chamando uma API paga é incidente de custo.
+5. **Valide argumentos** como em qualquer endpoint (Bean Validation, formatos, faixas) e registre cada chamada com cliente, ferramenta e argumentos, para auditoria.
+
+```java
+@Tool(description = """
+        Prepara uma transferência Pix do cliente autenticado. NÃO executa:
+        devolve uma proposta que o cliente precisa confirmar no aplicativo.""")
+public PropostaDeTransferencia prepararPix(
+        @ToolParam(description = "Chave Pix do destinatário") String chaveDestino,
+        @ToolParam(description = "Valor em reais, com duas casas decimais, por exemplo 150.00") BigDecimal valor,
+        ToolContext contexto) {
+    String clienteId = (String) contexto.getContext().get("clienteId");
+    if (valor.signum() <= 0 || valor.compareTo(LIMITE_POR_ASSISTENTE) > 0) {
+        throw new IllegalArgumentException("Valor fora do permitido pelo assistente");
+    }
+    return propostas.criarPendente(clienteId, chaveDestino, valor);   // status PENDENTE, expira em 5 minutos
+}
+```
+
+A execução de verdade acontece num endpoint comum (`POST /propostas/{id}/confirmacao`), chamado pelo aplicativo quando o cliente toca em "confirmar", com a mesma autenticação, idempotência (módulo 12) e regras de limite de qualquer transferência. O modelo nunca chega nesse endpoint.
+
+<Callout tipo="erro" titulo="Exceções viram texto para o modelo">
+Por padrão, uma exceção na ferramenta é convertida em mensagem e devolvida ao modelo, para que ele possa explicar o problema ou tentar de novo. Isso é útil ("conta não encontrada"), mas cuidado com o que a mensagem carrega: um stack trace ou um SQL no texto da exceção vai parar no contexto do modelo e, talvez, na resposta ao cliente. Lance exceções de negócio com mensagens pensadas para serem lidas.
+</Callout>
+
+## Testando sem chamar um modelo de verdade
+
+O laço de ferramentas é código seu e pode ser testado sem rede: um `ChatModel` falso devolve, na primeira chamada, uma `AssistantMessage` com um pedido de ferramenta roteirizado e, na segunda, o texto final. Dois detalhes descobertos na prática com o Spring AI 2.0: o falso precisa sobrescrever `getOptions()` devolvendo um `ToolCallingChatOptions` (senão as ferramentas são ignoradas em silêncio), e o pedido é montado com `AssistantMessage.builder().toolCalls(List.of(new AssistantMessage.ToolCall("1", "function", "consultarSaldo", "...json...")))`. Assim você afirma que a ferramenta recebeu o `clienteId` do contexto e que uma conta de outro cliente foi recusada.
+
+## MCP: ferramentas como serviço
+
+Até aqui, as ferramentas vivem **dentro** da aplicação que chama o modelo. Mas e se o time de cartões quiser oferecer "consultar fatura" a vários assistentes (o do aplicativo, o do atendimento interno, a IDE dos desenvolvedores)? Copiar o código em cada um não escala.
+
+O **Model Context Protocol (MCP)** é um protocolo aberto para isso: um **servidor MCP** publica ferramentas (e também *recursos*, dados para leitura, e *prompts* prontos); um **cliente MCP**, dentro da aplicação que conversa com o modelo, se conecta ao servidor, **descobre** as ferramentas e as oferece ao modelo como se fossem locais. Os transportes são STDIO (o cliente inicia o servidor como um processo local) e HTTP (Streamable HTTP; a variante SSE, mais antiga, ainda é suportada).
+
+| | Servidor MCP | Cliente MCP |
+|---|---|---|
+| Papel | expõe ferramentas, recursos e prompts | descobre e chama; entrega ao modelo |
+| No Spring AI | `spring-ai-starter-mcp-server` (STDIO), `-webmvc` ou `-webflux` (HTTP) | `spring-ai-starter-mcp-client` (ou `-webflux`) |
+| Como declara | métodos com `@McpTool` e `@McpToolParam` | conexões em `spring.ai.mcp.client.*`; as ferramentas chegam como um `ToolCallbackProvider` |
+| Quem autoriza | o **servidor**, sempre | o cliente decide quais servidores e ferramentas aceita |
+
+```java
+// no servidor MCP do time de cartões
+@Component
+public class FerramentasDeFatura {
+
+    @McpTool(name = "fatura_atual", description = "Resumo da fatura aberta do cartão do cliente autenticado")
+    public ResumoDeFatura faturaAtual(@McpToolParam(description = "Final do cartão, 4 dígitos", required = true) String finalCartao) {
+        // o cliente vem da autenticação da conexão (OAuth), não de um argumento
+        return faturas.resumo(usuarioDaConexao(), finalCartao);
+    }
+}
+```
+
+No lado do cliente, o starter cria um `ToolCallbackProvider` com as ferramentas de todos os servidores configurados, e você o entrega ao `ChatClient` com `.toolCallbacks(...)` (ou `defaultToolCallbacks` no builder). O Spring AI 2.0 integra a versão 2.0 do SDK Java do MCP.
+
+<Callout tipo="atencao" titulo="MCP não resolve autorização por você">
+Um servidor MCP exposto por HTTP é uma API como outra qualquer: precisa de autenticação (a especificação usa OAuth), autorização por ferramenta e limites. E, do lado do cliente, conectar um servidor MCP de terceiros é dar a ele um canal para o seu modelo: as **descrições** das ferramentas entram no prompt e podem carregar instruções maliciosas. Só conecte servidores em que você confia, e revise quais ferramentas cada um publica.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você deixaria um assistente de IA consultar dados do cliente e fazer transferências?" Pontos que diferenciam a resposta:
+
+1. **Quem executa**: o modelo só pede; a aplicação executa, e o laço tem limite de iterações.
+2. **Identidade**: vem da autenticação pelo `ToolContext`, nunca de argumento gerado pelo modelo; autorização dentro do serviço.
+3. **Efeitos**: ferramentas com efeito criam propostas; execução só com confirmação humana, fora do modelo, com as regras normais de limite e idempotência.
+4. **Dados**: DTOs enxutos no retorno, mensagens de erro limpas, auditoria de cada chamada.
+5. **Reúso**: MCP quando várias aplicações precisam das mesmas ferramentas, com o servidor responsável pela autorização.
+</Callout>
+
+<Quiz
+  id="16-tools"
+  questoes={[
+    {
+      pergunta: 'Quem executa o método anotado com @Tool?',
+      opcoes: ['O provedor do modelo, nos servidores dele', 'A aplicação Spring, quando o modelo devolve um pedido de ferramenta', 'O navegador do cliente', 'O banco de dados, via stored procedure'],
+      correta: 1,
+      explicacao: 'O modelo só produz um pedido estruturado com nome e argumentos. A aplicação decide executar, executa e devolve o resultado.',
+    },
+    {
+      pergunta: 'Qual a forma correta de a ferramenta saber qual cliente está conversando?',
+      opcoes: ['Um @ToolParam clienteId preenchido pelo modelo', 'Pedir ao cliente que informe o CPF na conversa', 'Ler do ToolContext, preenchido pela aplicação com o usuário autenticado', 'Colocar o id no prompt de sistema'],
+      correta: 2,
+      explicacao: 'O ToolContext não vai ao modelo e é preenchido pelo seu código a partir da autenticação. Argumentos e prompt podem ser manipulados pelo texto da conversa.',
+    },
+    {
+      pergunta: 'O assistente deve permitir transferências Pix. Qual desenho é o adequado?',
+      opcoes: ['Uma ferramenta que transfere direto, com limite no prompt', 'Uma ferramenta que cria uma proposta pendente; a execução ocorre num endpoint comum após confirmação do cliente', 'Não usar ferramentas; o modelo gera o JSON da transferência', 'Uma ferramenta com returnDirect = true'],
+      correta: 1,
+      explicacao: 'Ações com efeito exigem confirmação humana fora do modelo, com as mesmas validações, limites e idempotência de qualquer transferência.',
+    },
+    {
+      pergunta: 'O que diferencia um servidor MCP de uma ferramenta @Tool local?',
+      opcoes: ['O servidor MCP dispensa autenticação', 'O servidor MCP publica ferramentas por um protocolo padrão, para qualquer cliente MCP descobrir e chamar', 'Ferramentas MCP não são enviadas ao modelo', 'MCP só funciona com modelos de um único provedor'],
+      correta: 1,
+      explicacao: 'MCP padroniza a descoberta e a chamada de ferramentas entre processos. A autorização continua sendo responsabilidade do servidor.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Tool calling**: o modelo recebe schemas de ferramentas e devolve pedidos; a **aplicação** executa e devolve o resultado. No Spring AI 2.0, o laço é o `ToolCallingAdvisor`.
+- `@Tool(description = ...)` e `@ToolParam`; registre com `.tools(...)` ou `.defaultTools(...)`. Descrições claras, poucas ferramentas, DTOs enxutos.
+- **ToolContext** leva a identidade do cliente sem passar pelo modelo; a **autorização** acontece dentro do serviço.
+- `returnDirect = true` quando o resultado já é a resposta final.
+- Ferramentas **com efeito** criam propostas; execução só com **confirmação humana**. Limites, validação e auditoria no servidor.
+- **MCP**: servidor publica ferramentas, cliente descobre e entrega ao modelo; o servidor continua responsável pela segurança.
+
+## Referências
+
+- Documentação do Spring AI — *Tool Calling*, *Advisors API*, *Model Context Protocol (MCP)* (*MCP Client Boot Starters*, *MCP Server Boot Starters*, *MCP Annotations*)
+- Especificação do Model Context Protocol — modelcontextprotocol.io (arquitetura, transportes e autorização)
+- OWASP — *Top 10 for LLM Applications* (prompt injection, excessive agency)

@@ -1,0 +1,229 @@
+---
+titulo: Exceções como parte do design
+descricao: A hierarquia de Throwable, checked versus unchecked com critério, exceções de negócio com código, try-with-resources, tradução de exceções e os anti-padrões que escondem bugs.
+modulo: 03-colecoes-generics-excecoes
+ordem: 5
+duracao: 60
+objetivos:
+  - Explicar a hierarquia Throwable, Error, Exception e RuntimeException
+  - Decidir entre exceção checked e unchecked com argumentos
+  - Projetar uma hierarquia de exceções de negócio com códigos estáveis
+  - Usar try-with-resources e traduzir exceções preservando a causa
+  - Reconhecer os anti-padrões de tratamento de erro
+tags: [exceções, checked, unchecked, try-with-resources]
+flashcards:
+  - frente: Qual a diferença entre exceção checked e unchecked?
+    verso: Checked (extends Exception) obriga quem chama a tratar ou declarar com throws. Unchecked (extends RuntimeException) não obriga.
+  - frente: Quando preferir exceção checked?
+    verso: Para falhas esperadas e recuperáveis, em que quem chama tem uma ação razoável (ex. arquivo de importação inválido → pedir outro arquivo).
+  - frente: O que o try-with-resources garante?
+    verso: Que recursos AutoCloseable (arquivos, conexões) sejam fechados ao fim do bloco, mesmo com exceção, na ordem inversa de abertura.
+  - frente: O que é tradução de exceção?
+    verso: Capturar uma exceção de baixo nível e lançar outra, do nível de abstração de quem chama, preservando a original como causa (new X(msg, e)).
+  - frente: Por que nunca fazer catch (Exception e) {} vazio?
+    verso: Porque o erro some sem rastro — o sistema segue em estado inválido e o bug fica impossível de diagnosticar.
+  - frente: Para que serve um código de erro em uma exceção de negócio?
+    verso: Dá um identificador estável (ex. LIVRO_INDISPONIVEL) que APIs, logs e front-ends podem tratar sem depender do texto da mensagem.
+---
+
+Em um sistema backend, **erros não são exceção** — são rotina. O cliente informa um CPF inválido, o estoque acaba no meio da compra, o banco de dados demora, o arquivo de importação vem quebrado. A forma como você modela esses erros determina se o sistema falha com clareza ou esconde problemas até eles virarem incidentes.
+
+## A hierarquia
+
+<Figura legenda="Tudo que pode ser lançado herda de Throwable">
+<svg viewBox="0 0 660 240" width="660" role="img" aria-label="Throwable se divide em Error e Exception; Exception tem as checked (como IOException) e RuntimeException, com as unchecked">
+  <defs><marker id="s10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="255" y="10" width="150" height="40" rx="10" class="d-box"/><text x="330" y="35" text-anchor="middle" class="d-mono">Throwable</text>
+  <rect x="60" y="85" width="150" height="40" rx="10" class="d-box"/><text x="135" y="110" text-anchor="middle" class="d-mono">Error</text>
+  <rect x="420" y="85" width="170" height="40" rx="10" class="d-info"/><text x="505" y="110" text-anchor="middle" class="d-mono">Exception</text>
+  <rect x="300" y="165" width="170" height="40" rx="10" class="d-violet"/><text x="385" y="190" text-anchor="middle" class="d-mono">IOException...</text>
+  <rect x="490" y="165" width="160" height="40" rx="10" class="d-accent"/><text x="570" y="190" text-anchor="middle" class="d-mono">RuntimeException</text>
+  <path d="M300 50 L160 83" class="d-line" marker-end="url(#s10)"/>
+  <path d="M360 50 L490 83" class="d-line" marker-end="url(#s10)"/>
+  <path d="M480 125 L400 163" class="d-line" marker-end="url(#s10)"/>
+  <path d="M530 125 L565 163" class="d-line" marker-end="url(#s10)"/>
+  <text x="135" y="150" text-anchor="middle" class="d-label">OutOfMemoryError…</text>
+  <text x="135" y="168" text-anchor="middle" class="d-label">não trate</text>
+  <text x="385" y="228" text-anchor="middle" class="d-label">checked: tratar ou declarar</text>
+  <text x="570" y="228" text-anchor="middle" class="d-label">unchecked: opcional</text>
+</svg>
+</Figura>
+
+- **`Error`**: problemas graves da JVM (`OutOfMemoryError`, `StackOverflowError`). Não se trata; se registra e se deixa o processo cair.
+- **Exceções checked** (herdam de `Exception`, mas não de `RuntimeException`): o compilador **obriga** quem chama a tratar (`catch`) ou declarar (`throws`).
+- **Exceções unchecked** (herdam de `RuntimeException`): o tratamento é opcional.
+
+## Checked ou unchecked?
+
+Esta é uma das discussões mais antigas do Java. O critério mais aceito hoje:
+
+| Use **checked** quando… | Use **unchecked** quando… |
+|---|---|
+| A falha é **esperada** e **recuperável** | A falha é um **erro de programação** (argumento inválido, estado ilegal) |
+| Quem chama tem uma **ação razoável** a tomar | Quem chama não pode fazer nada útil ali |
+| Ex.: arquivo de importação inválido → avisar o operador e pedir outro | Ex.: livro não encontrado → um handler global devolve HTTP 404 |
+
+Na prática, **aplicações Spring usam quase só unchecked** para regras de negócio: a exceção "sobe" até um tratador global (`@RestControllerAdvice`, módulo 08), que a converte em uma resposta HTTP padronizada. Assim, os métodos não ficam poluídos de `throws` em todas as camadas. Checked fica para situações pontuais, como o importador do exercício 03.03.
+
+## Exceções de negócio com código
+
+Exceções genéricas (`RuntimeException("deu erro")`) não dizem nada. Modele as falhas do seu domínio:
+
+```java
+public abstract class BibliotecaException extends RuntimeException {
+    private final String codigo;
+
+    protected BibliotecaException(String codigo, String mensagem) {
+        super(mensagem);
+        this.codigo = codigo;
+    }
+
+    public String codigo() { return codigo; }
+}
+
+public class LivroIndisponivelException extends BibliotecaException {
+    public LivroIndisponivelException(String isbn) {
+        super("LIVRO_INDISPONIVEL", "Nenhum exemplar disponível para o ISBN " + isbn);
+    }
+}
+```
+
+- A **superclasse abstrata** permite tratar todas as falhas do domínio de uma vez (`catch (BibliotecaException e)`) e impede lançar uma genérica sem significado.
+- O **código estável** (`LIVRO_INDISPONIVEL`) é o que APIs, front-ends e alertas usam. A **mensagem** é para humanos e pode mudar.
+- A mensagem traz **contexto** (qual ISBN, qual usuário, qual limite). "Livro indisponível" sozinho não ajuda ninguém às 3h da manhã.
+
+## Lançar, capturar, relançar
+
+```java
+public Emprestimo emprestar(String isbn, String usuario, LocalDate data) {
+    Livro livro = acervo.get(isbn);
+    if (livro == null) {
+        throw new LivroNaoEncontradoException(isbn);     // fail-fast
+    }
+    // ...
+}
+```
+
+```java
+try {
+    servico.emprestar(isbn, usuario, hoje);
+} catch (LivroIndisponivelException e) {
+    fila.entrarNaEspera(isbn, usuario);                  // tratamento específico
+} catch (BibliotecaException e) {
+    log.warn("Empréstimo recusado [{}]: {}", e.codigo(), e.getMessage());
+    throw e;                                             // registra e deixa subir
+}
+```
+
+- Os `catch` são avaliados **em ordem**: o mais específico primeiro.
+- `catch (A | B e)` trata vários tipos no mesmo bloco (*multi-catch*).
+- `finally` executa sempre, com ou sem exceção — mas para liberar recursos, prefira o próximo tópico.
+
+## try-with-resources
+
+Arquivos, conexões e *streams* precisam ser **fechados**, mesmo quando algo dá errado. O jeito antigo era verboso e cheio de armadilhas. O moderno:
+
+```java
+try (BufferedReader leitor = Files.newBufferedReader(arquivo, UTF_8)) {
+    return processar(leitor);
+}   // leitor.close() é chamado aqui, com ou sem exceção
+```
+
+Funciona com qualquer objeto que implemente `AutoCloseable`. Com vários recursos, eles são fechados na **ordem inversa** da abertura. Se o `close()` também falhar, a exceção dele fica anexada como *suppressed*, sem esconder a original.
+
+## Tradução de exceções: mude o nível, preserve a causa
+
+Quem chama `ImportadorAcervo.importar(arquivo)` não deveria precisar conhecer `IOException`, `NumberFormatException` e mais dez exceções de baixo nível. **Traduza** para o vocabulário de quem chama — **sempre preservando a causa**:
+
+```java
+try (Reader leitor = Files.newBufferedReader(arquivo)) {
+    return importar(leitor);
+} catch (IOException e) {
+    throw new ArquivoAcervoInvalidoException("Não foi possível ler " + arquivo, 0, e);  // e = causa
+}
+```
+
+Sem o `e` no construtor, o stack trace original some, e com ele a pista de **por que** a leitura falhou (arquivo inexistente? permissão? disco cheio?).
+
+## Anti-padrões
+
+<Comparar antes="Não faça" depois="Faça">
+```java
+try { processar(); } catch (Exception e) { }
+
+try { ... } catch (Exception e) {
+    throw new RuntimeException("erro");
+}
+
+catch (Exception e) {
+    e.printStackTrace();
+    return null;
+}
+
+if (erro) return -1;   // código de erro "mágico"
+```
+
+```java
+// deixe subir ou trate de verdade
+
+try { ... } catch (IOException e) {
+    throw new ImportacaoException("contexto", e);
+}
+
+catch (PagamentoRecusadoException e) {
+    log.warn("Recusado: {}", e.codigo(), e);
+    throw e;
+}
+
+throw new SaldoInsuficienteException(...);
+```
+</Comparar>
+
+1. **Engolir exceções** (`catch` vazio): o sistema segue em estado inválido e ninguém sabe.
+2. **Perder a causa**: `new RuntimeException("erro")` sem o `e`.
+3. **`printStackTrace` + `return null`**: joga o problema para frente como um `NullPointerException` distante e sem contexto.
+4. **Capturar `Exception` genérica** sem necessidade: captura também bugs que deveriam derrubar o fluxo.
+5. **Usar exceção para controle de fluxo normal** (ex.: `try { parseInt } catch` para descobrir se é número em um laço de milhões): é caro e esconde a intenção.
+6. **Códigos de retorno mágicos** (`-1`, `null`) para sinalizar erro: quem chama esquece de checar.
+
+<Callout tipo="entrevista">
+"Checked ou unchecked?" — responda com o critério (**recuperável e com ação clara → checked; erro de programação ou regra tratada globalmente → unchecked**) e cite o padrão Spring de exceções de negócio unchecked com `@RestControllerAdvice`. Mencionar **tradução de exceção com causa** e **try-with-resources** completa uma resposta de nível Pleno.
+</Callout>
+
+<Quiz
+  id="03-excecoes"
+  questoes={[
+    {
+      pergunta: '`class ArquivoInvalidoException extends Exception` é…',
+      opcoes: ['Unchecked', 'Checked', 'Um Error', 'Inválida: precisa estender Throwable'],
+      correta: 1,
+      explicacao: 'Tudo que estende Exception, mas não RuntimeException, é checked.',
+    },
+    {
+      pergunta: 'Qual a forma correta de traduzir uma SQLException?',
+      opcoes: ['`throw new RepositorioException("falha");`', '`throw new RepositorioException("falha ao salvar pedido " + id, e);`', '`e.printStackTrace(); return null;`', '`catch (SQLException e) {}`'],
+      correta: 1,
+      explicacao: 'Mensagem com contexto e a exceção original como causa: nada se perde.',
+    },
+    {
+      pergunta: 'Em que ordem os recursos de `try (A a = ...; B b = ...)` são fechados?',
+      opcoes: ['A e depois B', 'B e depois A', 'Em paralelo', 'Só o último é fechado'],
+      correta: 1,
+      explicacao: 'Fechamento na ordem inversa de abertura: B depende potencialmente de A.',
+    },
+    {
+      pergunta: 'Por que incluir um código estável (ex.: "LIMITE_EMPRESTIMOS") na exceção de negócio?',
+      opcoes: ['Para deixar a exceção mais rápida', 'Para que APIs, front-ends e alertas tratem o erro sem depender do texto da mensagem', 'Porque o Java exige', 'Para substituir o stack trace'],
+      correta: 1,
+      explicacao: 'Mensagens mudam (tradução, ajustes de texto); códigos são contrato.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `Error` não se trata; **checked** obriga tratamento; **unchecked** não.
+- Checked para falhas **esperadas e recuperáveis**; unchecked para erros de programação e regras tratadas globalmente (padrão em Spring).
+- Modele **exceções de negócio** com superclasse abstrata, **código estável** e mensagens com contexto.
+- **try-with-resources** para tudo que precisa ser fechado.
+- **Traduza** exceções para o nível de quem chama e **sempre preserve a causa**. Nunca engula exceções.

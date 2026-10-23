@@ -1,0 +1,206 @@
+---
+titulo: Collectors — agrupar, contar e resumir
+descricao: groupingBy com coletores de segunda ordem, partitioningBy, toMap com resolução de conflitos, joining, teeing e como escolher o tipo do mapa de resultado.
+modulo: 04-java-moderno
+ordem: 3
+duracao: 50
+objetivos:
+  - Agrupar dados com groupingBy e coletores "downstream"
+  - Usar toMap sem cair na IllegalStateException de chave duplicada
+  - Controlar a ordem e o tipo das coleções resultantes
+  - Montar relatórios com partitioningBy, joining e teeing
+tags: [Collectors, groupingBy, toMap, partitioningBy]
+flashcards:
+  - frente: O que faz groupingBy(classificador, downstream)?
+    verso: Agrupa os elementos pela chave do classificador e aplica o coletor downstream a cada grupo (counting, summingInt, mapping, reducing...).
+  - frente: Por que toMap pode lançar IllegalStateException?
+    verso: Quando duas entradas geram a mesma chave e não foi passada uma função de merge como terceiro argumento.
+  - frente: Como obter um groupingBy com chaves ordenadas?
+    verso: "Passando a fábrica do mapa: groupingBy(Pedido::categoria, TreeMap::new, downstream)."
+  - frente: Qual a diferença entre partitioningBy e groupingBy?
+    verso: partitioningBy divide em exatamente dois grupos (true/false) por um Predicate, e ambos sempre existem no mapa.
+  - frente: Como somar BigDecimal dentro de um groupingBy?
+    verso: "Com reducing(BigDecimal.ZERO, Pedido::valor, BigDecimal::add) como coletor downstream."
+---
+
+Relatórios são o pão de cada dia do backend: faturamento por categoria, pedidos por status, clientes por cidade. A classe `Collectors` transforma esses relatórios em pipelines de poucas linhas — desde que você saiba combinar as peças.
+
+## `groupingBy`: o GROUP BY do Java
+
+```java
+Map<StatusPedido, List<Pedido>> porStatus = pedidos.stream()
+        .collect(Collectors.groupingBy(Pedido::status));
+```
+
+Isso agrupa os pedidos em listas, uma por status. O poder real está no **segundo argumento**, o coletor *downstream*, que diz o que fazer **com cada grupo**:
+
+```java
+import static java.util.stream.Collectors.*;
+
+Map<StatusPedido, Long> quantos = pedidos.stream()
+        .collect(groupingBy(Pedido::status, counting()));
+
+Map<String, Integer> itensPorCliente = pedidos.stream()
+        .collect(groupingBy(Pedido::cliente, summingInt(Pedido::quantidade)));
+
+Map<String, Set<String>> categoriasPorCliente = pedidos.stream()
+        .collect(groupingBy(Pedido::cliente, mapping(Pedido::categoria, toSet())));
+
+Map<String, Optional<Pedido>> maiorPorCliente = pedidos.stream()
+        .collect(groupingBy(Pedido::cliente, maxBy(Comparator.comparing(Pedido::valor))));
+```
+
+| Downstream | Resultado por grupo |
+|---|---|
+| `toList()` (padrão) | lista dos elementos |
+| `counting()` | `Long` com a quantidade |
+| `summingInt/Long/Double(f)` | soma |
+| `averagingDouble(f)` | média |
+| `mapping(f, downstream)` | transforma e depois coleta |
+| `filtering(p, downstream)` | filtra dentro do grupo (Java 9+) |
+| `maxBy/minBy(comparator)` | `Optional` do maior/menor |
+| `reducing(identidade, f, op)` | redução genérica (ex.: somar `BigDecimal`) |
+| `collectingAndThen(c, f)` | coleta e aplica um acabamento (ex.: `List::copyOf`) |
+
+### Somando dinheiro por grupo
+
+Não existe `summingBigDecimal`. Use `reducing`:
+
+```java
+Map<String, BigDecimal> faturamento = pedidos.stream()
+        .filter(Pedido::pago)
+        .collect(groupingBy(Pedido::categoria,
+                reducing(BigDecimal.ZERO, Pedido::valor, BigDecimal::add)));
+```
+
+### Escolhendo o tipo do mapa
+
+`groupingBy` devolve um `HashMap`, **sem ordem garantida**. Para relatórios, quase sempre você quer ordem. A versão com três argumentos recebe a **fábrica do mapa**:
+
+```java
+groupingBy(Pedido::categoria, TreeMap::new, counting());              // chaves ordenadas
+groupingBy(p -> YearMonth.from(p.data()), TreeMap::new, ...);          // meses em ordem cronológica
+groupingBy(Pedido::status, () -> new EnumMap<>(StatusPedido.class), counting()); // ordem do enum
+```
+
+<Callout tipo="atencao" titulo="groupingBy não cria grupos vazios">
+Se nenhum pedido está `CANCELADO`, a chave `CANCELADO` simplesmente não aparece no mapa. Se o relatório precisa mostrar "0 cancelados", complete as chaves que faltam depois (o exercício 04.01 testa isso).
+</Callout>
+
+## `partitioningBy`: dois grupos, sempre
+
+```java
+Map<Boolean, List<Pedido>> acimaDoTicket = pedidos.stream()
+        .collect(partitioningBy(p -> p.valor().compareTo(ticketMedio) >= 0));
+
+acimaDoTicket.get(true);    // pedidos acima
+acimaDoTicket.get(false);   // pedidos abaixo — a chave existe mesmo se a lista for vazia
+```
+
+Também aceita um downstream: `partitioningBy(predicado, mapping(Pedido::id, toList()))`.
+
+## `toMap`: um valor por chave
+
+```java
+Map<String, Pedido> porId = pedidos.stream()
+        .collect(toMap(Pedido::id, Function.identity()));
+```
+
+O perigo: se duas entradas produzirem a **mesma chave**, `toMap` lança `IllegalStateException: Duplicate key`. Quando duplicidade é possível, passe uma **função de merge**:
+
+```java
+Map<String, BigDecimal> maiorCompraPorCliente = pedidos.stream()
+        .collect(toMap(Pedido::cliente, Pedido::valor, BigDecimal::max));
+
+Map<String, Pedido> ultimoPedidoPorCliente = pedidos.stream()
+        .collect(toMap(Pedido::cliente, Function.identity(),
+                (a, b) -> a.data().isAfter(b.data()) ? a : b,
+                TreeMap::new));                 // 4º argumento: fábrica do mapa
+```
+
+Para mapas imutáveis, existe `toUnmodifiableMap`.
+
+## `joining`: montar textos
+
+```java
+String resumo = pedidos.stream()
+        .map(Pedido::id)
+        .collect(joining(", ", "Pedidos: [", "]"));    // "Pedidos: [P1, P2, P3]"
+```
+
+## `teeing`: dois coletores de uma vez
+
+Desde o Java 12, `teeing` roda dois coletores sobre os mesmos dados e combina os resultados:
+
+```java
+record Resumo(long quantidade, BigDecimal total) { }
+
+Resumo r = pedidos.stream()
+        .filter(Pedido::pago)
+        .collect(teeing(
+                counting(),
+                reducing(BigDecimal.ZERO, Pedido::valor, BigDecimal::add),
+                Resumo::new));
+```
+
+Uma passada só pelos dados, com quantidade e total juntos.
+
+## Top N a partir de um mapa agrupado
+
+Um padrão muito comum: agrupar, depois ordenar as entradas do mapa.
+
+```java
+List<String> top3Clientes = pedidos.stream()
+        .filter(Pedido::pago)
+        .collect(groupingBy(Pedido::cliente, reducing(BigDecimal.ZERO, Pedido::valor, BigDecimal::add)))
+        .entrySet().stream()
+        .sorted(Map.Entry.<String, BigDecimal>comparingByValue().reversed()
+                .thenComparing(Map.Entry.comparingByKey()))
+        .limit(3)
+        .map(Map.Entry::getKey)
+        .toList();
+```
+
+O `<String, BigDecimal>` explícito em `comparingByValue` é necessário porque o compilador não consegue inferir os tipos quando você encadeia `.reversed()`. É uma das raras vezes em que é preciso ajudar a inferência.
+
+<Callout tipo="entrevista">
+Em entrevistas com *live coding*, "agrupe e conte" aparece muito: "dada uma lista de transações, devolva o total por categoria" ou "a palavra mais frequente". Mostrar fluência com `groupingBy` + downstream, e lembrar de ordenar o resultado quando a ordem importa, causa ótima impressão.
+</Callout>
+
+<Quiz
+  id="04-collectors"
+  questoes={[
+    {
+      pergunta: 'Qual coletor produz `Map<String, Long>` com a quantidade de pedidos por cliente?',
+      opcoes: ['`groupingBy(Pedido::cliente)`', '`groupingBy(Pedido::cliente, counting())`', '`toMap(Pedido::cliente, 1L)`', '`partitioningBy(Pedido::cliente)`'],
+      correta: 1,
+      explicacao: 'counting() é o downstream que conta os elementos de cada grupo.',
+    },
+    {
+      pergunta: 'O que acontece em `toMap(Pedido::cliente, Pedido::valor)` se um cliente tiver dois pedidos?',
+      opcoes: ['Fica com o último', 'Fica com o primeiro', 'Lança IllegalStateException', 'Soma os valores'],
+      correta: 2,
+      explicacao: 'Sem função de merge, chaves duplicadas lançam IllegalStateException (Duplicate key).',
+    },
+    {
+      pergunta: 'Como garantir que o relatório por mês saia em ordem cronológica?',
+      opcoes: ['Usar groupingBy e depois .sorted()', 'Passar TreeMap::new como fábrica do mapa', 'Usar HashMap', 'Não é possível com Collectors'],
+      correta: 1,
+      explicacao: 'TreeMap mantém as chaves ordenadas (YearMonth é Comparable).',
+    },
+    {
+      pergunta: 'Com `partitioningBy`, o que `mapa.get(false)` devolve se todos os elementos atendem ao predicado?',
+      opcoes: ['null', 'Uma lista vazia', 'Lança exceção', 'Optional.empty()'],
+      correta: 1,
+      explicacao: 'partitioningBy sempre cria as duas chaves; o grupo sem elementos é uma lista vazia.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `groupingBy(chave, [fábrica do mapa], downstream)` é o GROUP BY do Java: `counting`, `summingInt`, `mapping`, `reducing`, `maxBy`…
+- `reducing(ZERO, f, BigDecimal::add)` soma dinheiro por grupo.
+- Escolha o mapa: `TreeMap::new` para chaves ordenadas, `EnumMap` para a ordem do enum.
+- `partitioningBy` sempre tem `true` e `false`; `toMap` precisa de merge se houver duplicatas.
+- `joining` para textos, `teeing` para dois resultados em uma passada.

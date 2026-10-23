@@ -1,0 +1,104 @@
+---
+titulo: Consolidação do catálogo de peças
+codigo: "03.01"
+resumo: Una as exportações de dois sistemas de estoque sem duplicar peças, com igualdade por código normalizado, desempate pela atualização mais recente e registros inválidos contabilizados.
+modulo: 03-colecoes-generics-excecoes
+ordem: 1
+dificuldade: facil
+tempo: 1,5–2h
+conceitos: [equals/hashCode, HashSet, TreeMap, Map.merge, normalização]
+aulas: [03-colecoes-generics-excecoes/03-equals-hashcode-comparable, 03-colecoes-generics-excecoes/01-list-set-map]
+java:
+  modulo: m03-colecoes-generics-excecoes
+  teste: ConsolidadorCatalogoTest
+---
+
+## Contexto
+
+Uma rede de oficinas mecânicas está migrando do sistema de estoque legado para um novo. Durante a transição, **os dois sistemas convivem**, e cada um exporta sua lista de peças. A mesma peça física aparece nas duas fontes, às vezes com nome diferente ("Filtro de óleo" × "Filtro de Óleo Premium"), mas sempre com o mesmo **código de fabricante** — que, para piorar, vem com caixa e espaços diferentes (`"ab-123"`, `"AB-123 "`).
+
+Você vai construir o componente que gera o **catálogo consolidado**.
+
+## Requisitos
+
+### `Peca`
+
+- Construtor `Peca(codigo, nome, preco, atualizadoEm)`.
+- O código é **normalizado** (sem espaços nas pontas, em maiúsculas) e é o **único** critério de igualdade.
+- Código nulo ou em branco: `IllegalArgumentException`.
+
+### `ConsolidadorCatalogo.consolidar(legado, novo)`
+
+Recebe duas coleções de `RegistroPeca` (dados crus, que podem ter campos faltando) e devolve um `ResultadoConsolidacao(List<Peca> pecas, int rejeitados)`.
+
+## Regras de negócio
+
+1. Registros sem código, nome, preço ou data são **rejeitados** e **contados**, sem interromper o processamento.
+2. Entre registros com o mesmo código (em **qualquer** fonte, inclusive duplicados na mesma fonte), vence o de **data de atualização mais recente**.
+3. Em **empate de data**, vence o registro do **sistema novo**.
+4. A lista final vem **ordenada por código**.
+5. O resultado não pode ser modificado por quem o recebe.
+
+## Exemplo
+
+```text
+legado: ab-123 "Filtro de óleo" 35,00 (10/01)   cd-999 "Vela" 12,00 (10/01)
+novo:   AB-123 "Filtro de Óleo Premium" 38,50 (05/03)   ef-001 "Correia" 60,00 (05/03)
+
+resultado: [AB-123 (38,50, Premium), CD-999, EF-001], rejeitados = 0
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ConsolidadorCatalogoTest` passam.
+- [ ] A normalização do código existe em **um único lugar**.
+- [ ] `equals` e `hashCode` usam **exatamente** os mesmos campos.
+- [ ] Nenhuma verificação de duplicidade com laço + `equals` manual: use uma estrutura baseada em hash ou árvore.
+
+## Desafios opcionais
+
+- Gere também um relatório de **conflitos**: peças com o mesmo código cujo preço diverge mais de 20% entre as fontes.
+- Aceite N fontes (não só duas), com uma ordem de prioridade para desempate.
+
+<Dicas>
+<Dica nivel={1}>
+Normalize o código **no construtor** de `Peca`. Se todo objeto já nasce com o código em maiúsculas e sem espaços, o `equals` pode comparar o campo diretamente — e o `hashCode` também.
+</Dica>
+<Dica nivel={2}>
+Use um `Map<String, Peca>` indexado pelo código. `Map.merge(codigo, peca, funcaoDeDesempate)` insere se a chave não existe ou chama a função com (atual, nova) se existe. Qual estrutura de `Map` já entrega as chaves ordenadas?
+</Dica>
+<Dica nivel={3}>
+Com `TreeMap`, a lista final é `new ArrayList<>(mapa.values())`, já ordenada. Para o empate favorecer o sistema novo, **processe o legado primeiro** e faça a função de desempate ficar com a candidata (a que chegou por último), a menos que ela seja **mais antiga**: `candidata.atualizadoEm().isBefore(atual.atualizadoEm()) ? atual : candidata`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### `Peca`
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/catalogo/Peca.java" />
+
+### O consolidador
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/catalogo/ConsolidadorCatalogo.java" />
+
+### Por que assim
+
+- **Normalização única.** O construtor transforma `" ab-123 "` em `"AB-123"`. Todo o resto do sistema lida com o código já canônico, e `equals`/`hashCode` ficam triviais e consistentes.
+- **`TreeMap` resolve três requisitos de uma vez:** unicidade (a chave é única), desempate (`merge`) e ordenação (`TreeMap` itera pela ordem das chaves).
+- **A ordem das fontes codifica a regra de empate.** Processar o novo por último, e fazer o empate favorecer quem chega depois, implementa a regra 3 sem nenhum `if` especial.
+- **Registro inválido vira `null` em `converter`.** É um método privado, com contrato claro. Uma alternativa seria devolver `Optional<Peca>` (módulo 04).
+- **`RegistroPeca` × `Peca`.** Separar o dado "cru" (que pode ser inválido) da entidade de domínio (sempre válida) é um padrão que você vai rever com DTOs no módulo 08.
+
+### Alternativas
+
+- `HashMap` + `sort` no final funciona igualmente: O(n) para consolidar e O(k log k) para ordenar. `TreeMap` faz O(n log k) no total. Para catálogos de oficina, a diferença é irrelevante; a clareza conta mais.
+- Uma `Peca` como **record** com `equals` customizado é possível, mas vai contra a expectativa de quem lê um record (igualdade por todos os componentes). Por isso a solução usa uma classe comum.
+
+### Avalie sua solução
+
+- Seu `hashCode` usa algum campo que o `equals` não usa? (Ex.: `Objects.hash(codigo, nome)` quebra o contrato.)
+- O teste `duplicadosNaMesmaFonte` passa?
+- Se um registro não tiver data, o processamento continua para os demais?
+
+</Solucao>

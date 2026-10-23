@@ -1,0 +1,232 @@
+---
+titulo: Spring Boot 4 e Spring MVC
+descricao: O que o Spring Boot faz por você (starters, auto-configuração, servidor embutido), as novidades da versão 4, e como uma requisição percorre o Spring MVC até o seu controller — com mapeamentos, parâmetros, ResponseEntity e JSON via Jackson 3.
+modulo: 08-spring-boot
+ordem: 4
+duracao: 60
+objetivos:
+  - Criar um projeto Spring Boot 4 e entender starters e auto-configuração
+  - Explicar o caminho de uma requisição pelo DispatcherServlet
+  - Escrever controllers com mapeamentos, parâmetros e respostas corretas
+  - Organizar a aplicação em camadas (controller, serviço, repositório)
+tags: [Spring Boot 4, Spring MVC, controllers, Jackson, REST]
+flashcards:
+  - frente: O que é um starter do Spring Boot?
+    verso: Uma dependência "guarda-chuva" que traz um conjunto coerente de bibliotecas para uma funcionalidade (ex. spring-boot-starter-webmvc traz Spring MVC, Jackson e Tomcat), com versões compatíveis.
+  - frente: O que é auto-configuração?
+    verso: O Boot cria beans automaticamente com base no que está no classpath e nas propriedades (ex. Jackson presente → ObjectMapper/JsonMapper configurado). Seus próprios beans sempre têm prioridade.
+  - frente: Qual o papel do DispatcherServlet?
+    verso: É o front controller do Spring MVC. Recebe todas as requisições, encontra o handler (método do controller), resolve os argumentos, chama o método e converte o retorno em resposta HTTP.
+  - frente: Diferença entre @PathVariable e @RequestParam?
+    verso: "@PathVariable lê um trecho do caminho (/contas/{id}); @RequestParam lê parâmetros de consulta (?pagina=2), com defaultValue e required."
+  - frente: Quando retornar ResponseEntity em vez do objeto?
+    verso: Quando você precisa controlar status ou headers dinamicamente, como 201 + Location. Para 200 simples, retorne o objeto direto.
+---
+
+Spring Framework é o conjunto de bibliotecas (container, MVC, dados, segurança). **Spring Boot** é a camada que torna o Framework **fácil de usar**: escolhe versões compatíveis, configura o que dá para configurar sozinho e empacota tudo num JAR executável com o servidor dentro.
+
+## Criando o projeto
+
+O caminho padrão é o [start.spring.io](https://start.spring.io) (também integrado ao IntelliJ): escolha Maven, Java 25, Spring Boot 4.x e as dependências. O resultado é um projeto com:
+
+```xml
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>4.1.1</version>
+</parent>
+
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-validation</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+```
+
+```java
+@SpringBootApplication
+public class PacientesApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(PacientesApplication.class, args);
+    }
+}
+```
+
+`mvn spring-boot:run` e a API está no ar em `http://localhost:8080`. `mvn package` gera um JAR que roda com `java -jar` — sem instalar Tomcat em lugar nenhum.
+
+## Starters e auto-configuração
+
+- **Starters** são dependências "guarda-chuva": `spring-boot-starter-webmvc` traz Spring MVC, Jackson, Tomcat embutido e logging, em versões testadas juntas. O `parent` (ou o BOM `spring-boot-dependencies`) fixa todas as versões — você não escreve `<version>` nas dependências.
+- **Auto-configuração**: na subida, o Boot olha o **classpath** e as **propriedades** e cria os beans que fazem sentido. Jackson presente? Configura o mapeador JSON. Driver do PostgreSQL e `spring.datasource.url`? Cria o pool de conexões. **Os seus beans sempre vencem**: declarar o seu `Clock` ou o seu `RestClient.Builder` desliga o padrão.
+
+<Callout tipo="dica" titulo="Veja o que foi configurado">
+Rode com `--debug` para ver o relatório de condições (o que foi e o que não foi auto-configurado, e por quê). Com o Actuator (módulo 14), `/actuator/conditions` e `/actuator/beans` mostram o mesmo em tempo de execução.
+</Callout>
+
+## O que mudou no Spring Boot 4
+
+<Callout tipo="novidade" titulo="Spring Boot 4 (nov/2025) e 4.1 (mai/2026)">
+- **Base nova**: Spring Framework 7, Jakarta EE 11 (Servlet 6.1), Java 17+ (recomendado 25), Hibernate 7, Jackson 3.
+- **Módulos menores**: a auto-configuração foi dividida por tecnologia, e os starters seguiram: `spring-boot-starter-webmvc` (o antigo `-web` ficou como apelido), `spring-boot-starter-restclient`, `spring-boot-starter-flyway`… e **starters de teste por tecnologia**, como `spring-boot-starter-webmvc-test`.
+- **Jackson 3**: novo pacote `tools.jackson` (as anotações continuam em `com.fasterxml.jackson.annotation`), datas em ISO 8601 por padrão e `JsonMapper` imutável.
+- **Web**: versionamento de API nativo, clientes HTTP declarativos (`@HttpExchange`) com configuração por propriedades, `RestTestClient` e `MockMvcTester` para testes.
+- **Null safety** com anotações JSpecify em todo o portfólio.
+</Callout>
+
+Se você encontrar tutoriais antigos: `javax.*` virou `jakarta.*` já no Boot 3; `RestTemplate` segue existindo, mas o recomendado é o `RestClient`; e `@MockBean` foi substituído por `@MockitoBean` (módulo 10).
+
+## O caminho de uma requisição
+
+<Figura legenda="Do socket ao seu método: o Spring MVC faz todo o trabalho repetitivo">
+<svg viewBox="0 0 700 200" width="700" role="img" aria-label="Tomcat recebe a requisição, filtros, DispatcherServlet, HandlerMapping encontra o método, argumentos são convertidos e validados, o controller executa e o retorno vira JSON">
+  <defs><marker id="mvc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="5" y="30" width="95" height="44" rx="8" class="d-box"/><text x="52" y="57" text-anchor="middle" class="d-mono">Tomcat</text>
+  <rect x="120" y="30" width="95" height="44" rx="8" class="d-box"/><text x="167" y="57" text-anchor="middle" class="d-mono">Filtros</text>
+  <rect x="235" y="30" width="130" height="44" rx="8" class="d-accent"/><text x="300" y="57" text-anchor="middle" class="d-mono">DispatcherServlet</text>
+  <rect x="385" y="30" width="140" height="44" rx="8" class="d-info"/><text x="455" y="57" text-anchor="middle" class="d-mono">HandlerMapping</text>
+  <rect x="545" y="30" width="150" height="44" rx="8" class="d-info"/><text x="620" y="50" text-anchor="middle" class="d-mono">argumentos</text><text x="620" y="66" text-anchor="middle" class="d-label">JSON→record, @Valid</text>
+  <rect x="545" y="120" width="150" height="44" rx="8" class="d-ok"/><text x="620" y="147" text-anchor="middle" class="d-mono">seu @RestController</text>
+  <rect x="330" y="120" width="190" height="44" rx="8" class="d-info"/><text x="425" y="140" text-anchor="middle" class="d-mono">conversor de mensagem</text><text x="425" y="156" text-anchor="middle" class="d-label">record → JSON (Jackson)</text>
+  <rect x="120" y="120" width="190" height="44" rx="8" class="d-box"/><text x="215" y="140" text-anchor="middle" class="d-mono">@ExceptionHandler</text><text x="215" y="156" text-anchor="middle" class="d-label">se algo lançar exceção</text>
+  <path d="M100 52 H116" class="d-line" marker-end="url(#mvc)"/><path d="M215 52 H231" class="d-line" marker-end="url(#mvc)"/><path d="M365 52 H381" class="d-line" marker-end="url(#mvc)"/><path d="M525 52 H541" class="d-line" marker-end="url(#mvc)"/><path d="M620 74 V116" class="d-line" marker-end="url(#mvc)"/><path d="M545 142 H524" class="d-line" marker-end="url(#mvc)"/><path d="M330 142 H314" class="d-line" marker-end="url(#mvc)"/>
+</svg>
+</Figura>
+
+1. O **Tomcat** embutido aceita a conexão e passa pelos **filtros** (segurança, CORS, logging — módulo 11).
+2. O **`DispatcherServlet`** (o *front controller*) pergunta aos `HandlerMapping`s qual método atende `POST /pacientes`.
+3. Os **argument resolvers** montam os parâmetros: JSON do corpo vira o seu `record` (Jackson), `{id}` vira `long`, e `@Valid` dispara o Bean Validation.
+4. O **seu método** roda.
+5. O retorno é convertido por um `HttpMessageConverter` (Jackson → JSON, conforme o `Accept`).
+6. Se algo lançar exceção, os **exception handlers** decidem a resposta (aula 5).
+
+Cada requisição roda numa thread do Tomcat — ou numa **virtual thread**, com `spring.threads.virtual.enabled=true` (módulo 06).
+
+## Controllers
+
+```java
+@RestController                       // @Controller + @ResponseBody: o retorno vira o corpo (JSON)
+@RequestMapping("/pacientes")         // prefixo comum
+public class PacienteController {
+
+    private final ServicoDePacientes servico;
+
+    public PacienteController(ServicoDePacientes servico) {
+        this.servico = servico;
+    }
+
+    @PostMapping
+    public ResponseEntity<PacienteResposta> cadastrar(@Valid @RequestBody DadosPaciente dados,
+                                                      UriComponentsBuilder uri) {
+        Paciente paciente = servico.cadastrar(dados);
+        URI location = uri.path("/pacientes/{id}").buildAndExpand(paciente.id()).toUri();
+        return ResponseEntity.created(location).body(PacienteResposta.de(paciente));  // 201 + Location
+    }
+
+    @GetMapping("/{id}")
+    public PacienteResposta buscar(@PathVariable long id) {       // 200 por padrão
+        return PacienteResposta.de(servico.buscar(id));
+    }
+
+    @GetMapping
+    public Pagina<PacienteResposta> listar(@RequestParam(defaultValue = "") String nome,
+                                           @RequestParam(defaultValue = "0") @PositiveOrZero int pagina,
+                                           @RequestParam(defaultValue = "20") @Min(1) @Max(50) int tamanho) {
+        ...
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)                          // 204
+    public void remover(@PathVariable long id) {
+        servico.remover(id);
+    }
+}
+```
+
+| Anotação | Lê |
+|---|---|
+| `@PathVariable` | trecho do caminho: `/pacientes/{id}` |
+| `@RequestParam` | parâmetro de consulta: `?pagina=2` (com `defaultValue`, `required`) |
+| `@RequestBody` | corpo (JSON → objeto) |
+| `@RequestHeader` | um header: `Idempotency-Key` |
+| `UriComponentsBuilder`, `Principal`, `HttpServletRequest` | injetados sem anotação |
+
+Retorne o **objeto** quando a resposta é um 200 simples; use **`ResponseEntity`** quando precisar escolher status e headers (201 + `Location`, 304, `Retry-After`).
+
+<Callout tipo="atencao" titulo="Nomes de parâmetros">
+`@PathVariable long id` sem `("id")` depende de o compilador guardar os nomes dos parâmetros (`-parameters`). O `spring-boot-starter-parent` já configura isso; em builds próprios (como o `java/` desta trilha), o `maven-compiler-plugin` precisa de `<parameters>true</parameters>`.
+</Callout>
+
+## JSON com Jackson 3
+
+Records viram JSON sem configuração: os componentes viram campos, `LocalDate` vira `"1990-05-10"`, `Instant` vira `"2026-09-28T13:00:00Z"`, `BigDecimal` vira número. Algumas decisões comuns:
+
+```yaml
+spring:
+  jackson:
+    default-property-inclusion: non_null      # omite campos nulos
+```
+
+```java
+public record ContaResponse(UUID id, @JsonProperty("nome_titular") String titular) {}
+```
+
+<Callout tipo="dica" titulo="Dinheiro em JSON">
+`BigDecimal` sai como número (`150.50`). Clientes em JavaScript leem números como `double` e podem perder precisão em valores enormes. Muitas APIs financeiras enviam valores como **string** (`"150.50"`) ou em **centavos inteiros** (`15050`). Decida uma convenção e documente — o importante é ser igual em toda a API.
+</Callout>
+
+## Camadas: quem faz o quê
+
+| Camada | Responsabilidade | Não deve |
+|---|---|---|
+| **Controller** (`api`) | traduzir HTTP ↔ chamadas de serviço; validar formato | ter regra de negócio ou SQL |
+| **Serviço** (`aplicacao`) | orquestrar o caso de uso e as transações | conhecer HTTP (`ResponseEntity`, status) |
+| **Domínio** | regras de negócio (saldo não fica negativo) | depender de framework web |
+| **Repositório** (`infra`) | persistência | decidir regras de negócio |
+
+Essa separação é o que permite, no projeto integrador, trocar o repositório em memória do marco 1 pelo JPA do marco 2 **sem tocar no controller** — e é verificada com ArchUnit no marco 3.
+
+<Callout tipo="entrevista">
+"O que acontece quando uma requisição chega numa aplicação Spring Boot?" Descreva o caminho: Tomcat → filtros → `DispatcherServlet` → handler mapping → resolução e validação de argumentos → controller → conversão da resposta → exception handlers. Explicar a auto-configuração ("o Boot cria beans com base no classpath e nas propriedades, e os meus beans têm prioridade") completa a resposta.
+</Callout>
+
+<Quiz
+  id="08-boot-mvc"
+  questoes={[
+    {
+      pergunta: 'Você declarou o seu próprio bean do tipo Clock. O que acontece com um Clock que alguma auto-configuração criaria?',
+      opcoes: ['Os dois coexistem e dá erro', 'A auto-configuração recua: o seu bean vence', 'O Boot ignora o seu bean', 'Depende da ordem alfabética'],
+      correta: 1,
+      explicacao: 'Auto-configurações usam condições como @ConditionalOnMissingBean: só criam o padrão se você não criou.',
+    },
+    {
+      pergunta: 'Como ler o 42 de GET /contas/42 e o 3 de ?pagina=3?',
+      opcoes: ['@RequestParam e @PathVariable', '@PathVariable e @RequestParam', '@RequestBody nos dois', '@RequestHeader e @RequestParam'],
+      correta: 1,
+      explicacao: 'Trecho do caminho = @PathVariable; parâmetro de consulta = @RequestParam.',
+    },
+    {
+      pergunta: 'Onde deve ficar a regra "o saldo não pode ficar negativo"?',
+      opcoes: ['No controller, antes de chamar o serviço', 'No domínio/serviço', 'No JavaScript do front-end', 'No @ExceptionHandler'],
+      correta: 1,
+      explicacao: 'Regras de negócio ficam no domínio; o controller só traduz HTTP.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Spring Boot** = starters (dependências coerentes) + auto-configuração (beans a partir do classpath e das propriedades) + servidor embutido.
+- **Boot 4**: Spring 7, Jakarta EE 11, Jackson 3, starters modulares (inclusive de teste), versionamento de API e clientes HTTP declarativos.
+- Requisição: Tomcat → filtros → `DispatcherServlet` → argumentos (JSON, validação) → controller → JSON.
+- `@RestController`, `@GetMapping` e cia., `@PathVariable`, `@RequestParam`, `@RequestBody`, `ResponseEntity` para status e headers.
+- Camadas com responsabilidades claras: controller fino, regras no domínio.

@@ -1,0 +1,862 @@
+---
+titulo: "Defesas da API: limites, headers, CORS, segredos e dependências"
+descricao: "O que protege a API além de autenticação e autorização: rate limiting a fundo (algoritmos, chave, 429 com Retry-After e os headers RateLimit, limite distribuído), limites de custo, os headers de segurança do Spring Security 7, CORS sem mitos, segredos fora do código, supply chain e Idempotency-Key, com uma API de extratos testada passo a passo."
+modulo: 11-seguranca
+ordem: 6
+duracao: 120
+objetivos:
+  - Comparar janela fixa, janela deslizante, token bucket e leaky bucket e justificar a escolha para um caso concreto
+  - Implementar um token bucket por chave com Clock e custo variável, e testá-lo de forma determinística
+  - Devolver 429 com Retry-After, Problem Details e os headers RateLimit e RateLimit-Policy do draft IETF
+  - Configurar e testar headers de segurança e CORS (incluindo o preflight) com MockMvcTester
+  - Limitar o custo de cada requisição (tamanho de página, payload, timeouts) e tornar um POST repetível com Idempotency-Key
+  - Tirar segredos do código, validar a configuração na subida e montar a verificação de dependências no pipeline
+tags: [rate limiting, token bucket, GCRA, "429", CORS, headers de segurança, segredos, supply chain, SBOM, idempotência]
+flashcards:
+  - frente: Como funciona o token bucket?
+    verso: Um balde com capacidade N começa cheio; cada requisição gasta fichas; as fichas voltam a uma taxa constante. Permite rajadas de até N e limita a média de longo prazo à taxa de reposição.
+  - frente: Qual o defeito da janela fixa?
+    verso: O contador zera na virada da janela. Um cliente pode gastar o limite inteiro no fim de uma janela e de novo no começo da seguinte, passando o dobro do limite em poucos segundos.
+  - frente: Que status e headers uma API deve devolver ao estourar o limite?
+    verso: "429 Too Many Requests com Retry-After (em segundos ou data HTTP), corpo em Problem Details (RFC 9457) e, opcionalmente, os headers RateLimit e RateLimit-Policy do draft IETF, que avisam o cliente antes de ele estourar."
+  - frente: CORS protege a API de chamadas indevidas?
+    verso: Não. CORS é uma regra que o NAVEGADOR aplica para decidir se o JavaScript de outra origem pode ler a resposta. curl, Postman e outros servidores ignoram CORS. Autenticação e autorização continuam obrigatórias.
+  - frente: Por que allowedOrigins("*") com credenciais é proibido?
+    verso: Permitiria que qualquer site fizesse requisições com os cookies da pessoa e lesse a resposta. A especificação proíbe o curinga com credenciais, e o Spring lança IllegalArgumentException.
+  - frente: O que a Idempotency-Key resolve?
+    verso: Torna um POST seguro para repetir. O servidor guarda a resposta associada à chave; a repetição com a mesma chave e o mesmo corpo devolve a mesma resposta, sem criar outro recurso. Mesma chave com outro corpo é erro (422).
+  - frente: Onde guardar o segredo de assinatura do JWT em produção?
+    verso: Num cofre de segredos (Vault, AWS Secrets Manager, Azure Key Vault, GCP Secret Manager), injetado como variável de ambiente ou arquivo na subida. Nunca no repositório, e a aplicação não sobe sem ele.
+  - frente: O que é um SBOM?
+    verso: "Software Bill of Materials: a lista de todas as dependências (e versões) de um artefato, num formato padrão (CycloneDX, SPDX). Responde em minutos à pergunta: estamos afetados por esta CVE?"
+---
+
+Segunda-feira, 9h12. O painel da conta digital mostra a API de extratos com o dobro da latência normal e o banco com a CPU em 95%. A investigação acha três culpados, nenhum deles um "ataque" no sentido de filme. O primeiro é um bug no aplicativo novo: quando a tela de extrato recebe um erro, ela tenta de novo imediatamente, sem pausa, e dez mil celulares entraram nesse laço ao mesmo tempo. O segundo é um parceiro que integra pela API e descobriu que `GET /api/extratos?tamanho=100000` devolve o ano inteiro numa chamada só: cada requisição dele lê 100 mil linhas do banco. O terceiro é um robô que, desde as 3h, testa um palpite de senha em milhares de contas diferentes.
+
+Nas aulas anteriores você garantiu que cada requisição sabe **quem** está chamando e se essa pessoa **pode** fazer aquilo. Nada disso ajudou na segunda-feira: os celulares estavam autenticados, o parceiro tinha permissão para ler extratos, e o robô só precisava de uma resposta "senha errada" barata para seguir em frente. O que faltou foram as defesas que **cercam** a API: quantas vezes alguém pode chamar, quanto cada chamada pode custar, o que o navegador pode ler, onde ficam as chaves e quem garante que as bibliotecas são confiáveis. No OWASP API Security Top 10 (2023), a falta delas é o **API4: Unrestricted Resource Consumption**; no Top 10:2025, as bibliotecas entram em **A03: Software Supply Chain Failures**.
+
+Nesta aula você vai construir, testar e entender essas defesas numa API de extratos de uma conta digital: um **token bucket** escrito à mão, com custo variável por rota, um filtro que devolve **429** com `Retry-After`, Problem Details e os headers `RateLimit`; os **headers de segurança** e o **CORS** testados com `MockMvcTester`, incluindo o preflight; um limite de tamanho de página; e uma `Idempotency-Key` que torna um POST seguro para repetir. Em volta disso, a parte de operação: segredos, dependências e as decisões que um time de produção precisa tomar.
+
+## A intuição: créditos de celular pré-pago
+
+Pense num plano pré-pago que tem uma regra curiosa: o saldo máximo é de 60 créditos, e a operadora deposita **1 crédito por segundo**, sempre, até encher. Uma ligação curta custa 1 crédito; mandar um vídeo custa 10. Se você passou a noite sem usar o celular, acorda com 60 créditos e pode fazer uma rajada de 60 ligações seguidas. Depois disso, só consegue fazer uma por segundo, que é a velocidade do depósito. E, quando tenta mandar o vídeo com 5 créditos no saldo, a operadora não aceita e avisa: "volte em 5 segundos".
+
+Esse é o **token bucket** (balde de fichas). A capacidade do balde (60) define o tamanho da **rajada** tolerada; a taxa de reposição (1 por segundo) define a **média** de longo prazo. O custo por operação (1 ou 10) permite cobrar mais pelo que pesa mais. E a mensagem "volte em 5 segundos" é o `Retry-After` da resposta 429.
+
+A analogia também mostra o que o algoritmo **não** faz: ele não sabe se a ligação era importante, não distingue um cliente legítimo com pressa de um robô, e não impede que alguém compre dez chips. Rate limiting é uma camada de proteção da **capacidade** do sistema e de contenção de abuso, não um substituto para autenticação, autorização ou detecção de fraude.
+
+## Vocabulário
+
+| Termo | O que é |
+|---|---|
+| **Rate limiting** | Limitar quantas requisições (ou quanto custo) um cliente pode consumir num intervalo |
+| **Throttling** | Sinônimo frequente; às vezes usado para "atrasar" em vez de "recusar" |
+| **Chave do limite** | O que identifica "um cliente": IP, usuário, API key, rota, ou combinações |
+| **Política** | A regra: capacidade, janela e custo. Ex.: 60 créditos por minuto por usuário |
+| **Rajada (burst)** | Muitas requisições num intervalo curto; o token bucket tolera rajadas até a capacidade |
+| **429 Too Many Requests** | Status HTTP da RFC 6585 para "você passou do limite" |
+| **Retry-After** | Header da RFC 9110: quanto esperar (segundos ou data HTTP) antes de tentar de novo |
+| **RateLimit / RateLimit-Policy** | Headers do draft IETF `draft-ietf-httpapi-ratelimit-headers` que informam cota e saldo |
+| **Preflight** | Requisição `OPTIONS` que o navegador envia antes de uma requisição *cross-origin* "não simples" |
+| **Origem** | Esquema + host + porta (`https://app.contadigital.dev`). Mudou um dos três, é outra origem |
+| **Idempotência** | Repetir a operação tem o mesmo efeito que fazê-la uma vez |
+| **SBOM** | *Software Bill of Materials*: o inventário das dependências de um artefato |
+
+## Limite de requisições (rate limiting)
+
+Sem limite, o login aceita dez mil tentativas por minuto (força bruta e *credential stuffing*), a busca derruba o banco com consultas caras, e um bug num cliente vira uma negação de serviço (DoS) involuntária, como a da segunda-feira. O limite protege três coisas diferentes, e vale nomeá-las porque mudam a política: a **capacidade** do sistema (ninguém derruba o banco sozinho), a **justiça** entre clientes (um parceiro barulhento não degrada todo mundo) e a **segurança** (tentativas de senha, enumeração de contas, raspagem de dados).
+
+### Os algoritmos e seus trade-offs
+
+Quatro algoritmos aparecem em quase toda conversa sobre o tema. Todos respondem à mesma pergunta ("esta requisição passa?"), mas guardam estados diferentes e se comportam diferente nas bordas.
+
+| Algoritmo | Estado por chave | Rajada | Ponto fraco | Onde aparece |
+|---|---|---|---|---|
+| **Janela fixa** | 1 contador + o início da janela | até 2× o limite na virada | a virada da janela | o mais simples; `INCR` + `EXPIRE` no Redis |
+| **Janela deslizante (log)** | o horário de cada requisição | exata, sem rajada extra | memória proporcional ao limite | sorted set no Redis (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD`) |
+| **Janela deslizante (contador)** | 2 contadores (janela atual e anterior) | aproximada | é uma estimativa ponderada | boa relação custo × precisão |
+| **Token bucket** | saldo + último instante (ou 1 instante, no GCRA) | até a capacidade, por desenho | escolher capacidade e taxa | Bucket4j, Envoy, gateways de nuvem |
+| **Leaky bucket** | uma fila ou um "nível" | nenhuma: a saída é constante | aumenta a latência (enfileira) | NGINX `limit_req`, suavização de tráfego |
+
+A **janela fixa** conta requisições por janela de calendário (12:00:00 a 12:00:59, depois 12:01:00...). É barata e fácil de distribuir, mas um cliente pode gastar o limite inteiro no último segundo de uma janela e de novo no primeiro da seguinte: com "10 por minuto", passam 20 em um segundo. Na Mão na massa você vai ver isso acontecer.
+
+A **janela deslizante com log** guarda o horário de cada requisição e conta quantas caíram nos últimos 60 segundos: exata, mas um limite de 10 mil por hora guarda até 10 mil horários por chave. A versão **com contador** guarda só o contador da janela atual e o da anterior e pondera a anterior pela fração que ainda se sobrepõe: aos 15 s da janela atual, a estimativa é `atual + anterior × 0,75`. O erro é pequeno e o estado, mínimo.
+
+O **token bucket** pergunta "quanto saldo resta" em vez de "quantas requisições houve". Aceita rajadas por desenho (o balde cheio é a rajada tolerada), mantém a média sob controle e aceita **custo variável**: uma exportação gasta 10, uma consulta gasta 1. É o algoritmo mais usado em APIs, e o desta aula.
+
+O **leaky bucket** (balde furado) **enfileira**: as requisições saem a uma taxa constante, e o excesso é recusado. A saída regular protege um sistema que não aguenta picos (um fornecedor que aceita exatamente 5 chamadas por segundo), mas a fila vira latência para o cliente. A variante "como medidor", sem fila, é equivalente ao token bucket e dá origem ao **GCRA**, que você vai implementar.
+
+<Callout tipo="info" titulo="Token bucket com um único instante: o GCRA">
+O *Generic Cell Rate Algorithm* nasceu nas redes ATM e é usado por várias implementações de rate limit sobre Redis. Ele guarda **um único valor** por chave: o instante em que o balde estará cheio de novo (*theoretical arrival time*, ou "cheio em"). Gastar `c` créditos empurra esse instante `c × intervalo` para a frente; se ele ficar mais longe do que o tempo de encher um balde vazio, não havia saldo. O comportamento é o de um token bucket, mas sem saldo, sem "última reposição" e sem divisão por ponto flutuante. E um valor só por chave é exatamente o que um `SET chave valor PX ttl` do Redis guarda bem.
+</Callout>
+
+<Figura legenda="O estado do balde é um instante só: quanto falta para ele encher de novo. A distância entre 'agora' e 'cheio em' é o que já foi gasto; o resto da janela é o saldo">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-labelledby="gcra-titulo gcra-desc">
+  <title id="gcra-titulo">Token bucket representado pelo instante em que o balde fica cheio</title>
+  <desc id="gcra-desc">Três linhas do tempo com capacidade de 60 créditos por minuto, um crédito por segundo. Na primeira, o balde está cheio: o instante cheio em ficou no passado e o saldo é 60. Na segunda, depois de gastar 45 créditos, cheio em está 45 segundos à frente de agora e o saldo é 15. Na terceira, uma exportação de custo 20 empurraria cheio em para 65 segundos, além do limite de 60, então é recusada e o cliente deve esperar 5 segundos.</desc>
+  <defs><marker id="mk-gcra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="20" y="28" class="d-title">Política: 60 créditos por minuto (1 por segundo)</text>
+  <text x="20" y="74" class="d-text">balde cheio</text>
+  <line x1="200" y1="70" x2="740" y2="70" class="d-line"/>
+  <line x1="200" y1="58" x2="200" y2="82" class="d-line"/>
+  <text x="200" y="98" text-anchor="middle" class="d-label">agora</text>
+  <line x1="680" y1="58" x2="680" y2="82" class="d-line"/>
+  <text x="680" y="98" text-anchor="middle" class="d-label">agora + 60 s</text>
+  <rect x="200" y="62" width="480" height="16" rx="4" class="d-ok"/>
+  <text x="440" y="52" text-anchor="middle" class="d-mono">saldo 60</text>
+  <text x="20" y="154" class="d-text">gastou 45</text>
+  <line x1="200" y1="150" x2="740" y2="150" class="d-line"/>
+  <rect x="200" y="142" width="360" height="16" rx="4" class="d-accent"/>
+  <rect x="560" y="142" width="120" height="16" rx="4" class="d-ok"/>
+  <line x1="560" y1="132" x2="560" y2="168" class="d-line"/>
+  <text x="560" y="184" text-anchor="middle" class="d-label">cheio em = agora + 45 s</text>
+  <text x="380" y="132" text-anchor="middle" class="d-mono">ocupado 45 s</text>
+  <text x="640" y="132" text-anchor="middle" class="d-mono">saldo 15</text>
+  <text x="20" y="244" class="d-text">custo 20?</text>
+  <line x1="200" y1="240" x2="740" y2="240" class="d-line"/>
+  <rect x="200" y="232" width="360" height="16" rx="4" class="d-accent"/>
+  <rect x="560" y="232" width="160" height="16" rx="4" class="d-violet"/>
+  <line x1="680" y1="222" x2="680" y2="262" class="d-line"/>
+  <text x="680" y="280" text-anchor="middle" class="d-label">limite (60 s)</text>
+  <text x="640" y="222" text-anchor="middle" class="d-mono">+20 → 65 s</text>
+  <path d="M700 270 L720 270" class="d-line" marker-start="url(#mk-gcra)" marker-end="url(#mk-gcra)"/>
+  <text x="380" y="280" text-anchor="middle" class="d-label">recusa: Retry-After 5</text>
+</svg>
+</Figura>
+
+### A chave do limite
+
+O algoritmo decide "quanto"; a **chave** decide "de quem". É a escolha que mais erra na prática, porque cada chave tem um ponto cego:
+
+- **IP**: a única opção para rotas anônimas (login, cadastro, cotações públicas). Mas muitos usuários legítimos podem compartilhar um IP (uma empresa atrás de um NAT, uma operadora móvel com CGNAT, que coloca milhares de celulares atrás de poucos endereços), e um atacante com uma botnet tem milhares de IPs. Use limites por IP generosos e combine com outros sinais.
+- **Usuário**: a escolha certa para rotas autenticadas. Só existe **depois** da autenticação, e por isso o filtro precisa rodar depois dela. Uma pessoa com várias sessões continua sendo uma chave só.
+- **API key ou cliente OAuth**: para integrações entre sistemas, é a chave natural para planos comerciais ("parceiro Ouro: 1.000 por minuto").
+- **Rota**, combinada com as anteriores: o login merece um limite muito mais apertado que `GET /status`. É comum ter várias políticas ao mesmo tempo: uma global por usuário e uma específica para a rota cara.
+- **Conta-alvo**: para força bruta distribuída (um palpite por IP, milhares de IPs), a chave útil é **a conta que está sendo atacada**, não quem ataca. É o bloqueio por conta do exercício 11.01, visto como rate limit.
+
+Atrás de um proxy ou load balancer, `getRemoteAddr()` devolve o IP do **proxy**, e todos os clientes dividiriam o mesmo balde. A correção é `server.forward-headers-strategy` (`native` ou `framework`), que faz o Spring usar o `X-Forwarded-For`. Mas esse header vem do cliente e pode ser forjado: só confie nele se a borda da sua rede **sobrescreve** o valor (o load balancer coloca o IP que viu de verdade), nunca quando ela apenas repassa o que recebeu.
+
+### A resposta: 429, Retry-After e os headers RateLimit
+
+Recusar é só metade do trabalho; a outra metade é recusar de um jeito que o cliente bem-comportado consiga se adaptar. Três peças:
+
+1. **Status 429 Too Many Requests** (RFC 6585). Não use 503 (que significa "o servidor está mal", não "você passou do limite") nem 403 (que significa "você não pode", para sempre).
+2. **`Retry-After`** (RFC 9110, seção 10.2.3): em segundos (`Retry-After: 5`) ou como data HTTP. Segundos inteiros, arredondados **para cima**: dizer "0" ou arredondar para baixo faz o cliente voltar cedo demais e tomar outro 429.
+3. **Corpo em Problem Details** (RFC 9457), com `application/problem+json`, como o resto dos erros da API. Um `type` estável permite que o cliente trate o caso sem ler a mensagem.
+
+Além disso, o grupo de trabalho HTTPAPI do IETF mantém o *draft* **RateLimit header fields for HTTP** (`draft-ietf-httpapi-ratelimit-headers`, versão 11, de maio de 2026). Ele **ainda não é RFC**, e as versões mudaram bastante: as primeiras usavam três headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`), que muitas APIs ainda enviam. A versão atual define dois headers no formato *Structured Fields*:
+
+```http
+RateLimit-Policy: "por-cliente";q=60;w=60
+RateLimit: "por-cliente";r=42;t=18
+```
+
+`RateLimit-Policy` descreve a política: o nome, a cota `q` e a janela `w` em segundos. `RateLimit` informa o estado: o saldo `r` e a "janela efetiva" `t`, em segundos. O draft diz que, quando a resposta traz `RateLimit` e `Retry-After`, o cliente deve dar precedência ao `Retry-After`, e que um saldo positivo **não garante** que a próxima requisição será aceita. O valor dos headers é preventivo: um cliente que lê `r=2` desacelera antes de tomar o 429. Como é um draft, trate os nomes como algo que pode mudar e documente qual versão a sua API segue.
+
+### Onde aplicar: borda, gateway ou aplicação
+
+<Figura legenda="Cada camada limita algo diferente. A borda corta volume bruto por IP; o gateway aplica planos por API key; a aplicação conhece o usuário e o custo de cada rota">
+<svg viewBox="0 0 760 250" width="760" role="img" aria-labelledby="camadas-titulo camadas-desc">
+  <title id="camadas-titulo">Camadas onde o limite de requisições pode ser aplicado</title>
+  <desc id="camadas-desc">Quatro caixas da esquerda para a direita, ligadas por setas. CDN ou WAF limita por IP e corta volume bruto. API gateway limita por API key e plano. A aplicação, com um filtro, limita por usuário e por custo da rota. O banco e os serviços são protegidos por paginação máxima, timeouts e limite de conexões.</desc>
+  <defs><marker id="mk-camadas" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="168" height="150" rx="10" class="d-info"/>
+  <text x="94" y="70" text-anchor="middle" class="d-title">CDN / WAF</text>
+  <text x="94" y="100" text-anchor="middle" class="d-label">por IP</text>
+  <text x="94" y="122" text-anchor="middle" class="d-label">volume bruto</text>
+  <text x="94" y="144" text-anchor="middle" class="d-label">robôs conhecidos</text>
+  <rect x="204" y="40" width="168" height="150" rx="10" class="d-violet"/>
+  <text x="288" y="70" text-anchor="middle" class="d-title">API gateway</text>
+  <text x="288" y="100" text-anchor="middle" class="d-label">por API key</text>
+  <text x="288" y="122" text-anchor="middle" class="d-label">planos comerciais</text>
+  <text x="288" y="144" text-anchor="middle" class="d-label">todas as réplicas</text>
+  <rect x="398" y="40" width="168" height="150" rx="10" class="d-accent"/>
+  <text x="482" y="70" text-anchor="middle" class="d-title">Aplicação</text>
+  <text x="482" y="100" text-anchor="middle" class="d-label">por usuário</text>
+  <text x="482" y="122" text-anchor="middle" class="d-label">custo por rota</text>
+  <text x="482" y="144" text-anchor="middle" class="d-label">regras de negócio</text>
+  <rect x="592" y="40" width="158" height="150" rx="10" class="d-ok"/>
+  <text x="671" y="70" text-anchor="middle" class="d-title">Banco e serviços</text>
+  <text x="671" y="100" text-anchor="middle" class="d-label">página máxima</text>
+  <text x="671" y="122" text-anchor="middle" class="d-label">timeouts</text>
+  <text x="671" y="144" text-anchor="middle" class="d-label">pool de conexões</text>
+  <path d="M178 115 L202 115" class="d-line" marker-end="url(#mk-camadas)"/>
+  <path d="M372 115 L396 115" class="d-line" marker-end="url(#mk-camadas)"/>
+  <path d="M566 115 L590 115" class="d-line" marker-end="url(#mk-camadas)"/>
+  <text x="380" y="226" text-anchor="middle" class="d-text">quanto mais à esquerda, mais barato recusar; quanto mais à direita, mais contexto</text>
+</svg>
+</Figura>
+
+Um **filtro na aplicação** conhece o usuário e o custo de cada rota, mas, com várias réplicas, cada uma tem os seus próprios baldes: quatro instâncias com "60 por minuto" em memória deixam passar até 240. Há duas saídas. A primeira é levar o **estado** para um armazenamento compartilhado, normalmente o Redis, com atualização atômica (um script Lua ou um comando único), porque "ler, calcular, gravar" em três idas ao Redis é uma condição de corrida. A biblioteca **Bucket4j** (8.x, artefatos `bucket4j_jdk17-*` para Java 17 ou mais recente) implementa token bucket em memória e em armazenamentos distribuídos, incluindo Redis. A segunda saída é subir o limite para o **gateway** (Spring Cloud Gateway, Kong, NGINX, o API Gateway da nuvem), que vê o tráfego de todas as réplicas.
+
+As camadas se somam, e a requisição recusada mais cedo é a mais barata: um 429 devolvido pelo filtro não abre transação, não consulta o banco, não roda BCrypt.
+
+### Limites de custo: página, payload e tempo
+
+O parceiro da segunda-feira não passou do limite de requisições: ele fez **poucas** requisições, cada uma caríssima. Rate limiting por contagem não pega isso. As defesas de custo são outras, e o API4 do OWASP lista várias:
+
+- **Tamanho máximo de página.** Toda listagem tem um teto validado na entrada (`@Max(100)`). Com Spring Data, `spring.data.web.pageable.default-page-size` (padrão 20) e `spring.data.web.pageable.max-page-size` (padrão **2000**, alto demais para uma API pública) controlam o `Pageable`. O Spring Data **reduz** em silêncio um valor acima do máximo; o `@Max` **recusa** com 400, o que é mais honesto com o cliente.
+- **Paginação por cursor** em vez de `offset` para listas grandes: `OFFSET 90000` obriga o banco a ler e descartar 90 mil linhas.
+- **Tamanho do corpo e dos headers.** O Spring Boot expõe `server.max-http-request-header-size` (padrão 8KB), `spring.servlet.multipart.max-file-size` (1MB) e `max-request-size` (10MB), e `server.tomcat.max-http-form-post-size` (2MB) para formulários. Para corpos JSON não há propriedade equivalente: o limite fica na borda (`client_max_body_size` no NGINX, o gateway) ou num filtro que confere o `Content-Length`. Limite também listas e strings dentro do JSON (`@Size(max = 500)`).
+- **Tempo.** Timeout em toda chamada de saída, `statement_timeout` no PostgreSQL e um teto para trabalho assíncrono (módulo 13, resiliência).
+- **Custo no limite.** O token bucket pode cobrar por peso: aqui, exportar custa 10 créditos. Em GraphQL, o equivalente é o limite de complexidade da consulta.
+
+## Headers de segurança
+
+O Spring Security 7 já envia, por padrão, um conjunto de headers em toda resposta. Conferido na documentação de referência da versão 7.1:
+
+| Header | Valor padrão | Para que serve |
+|---|---|---|
+| `Cache-Control`, `Pragma`, `Expires` | `no-cache, no-store, max-age=0, must-revalidate`; `no-cache`; `0` | respostas (possivelmente autenticadas) não ficam em caches |
+| `X-Content-Type-Options` | `nosniff` | o navegador não "adivinha" que um JSON é HTML ou script |
+| `Strict-Transport-Security` | `max-age=31536000 ; includeSubDomains` | HSTS: por um ano, o navegador só fala HTTPS com o domínio. **Só é enviado em requisições HTTPS** |
+| `X-Frame-Options` | `DENY` | a resposta não pode ser embutida num iframe (*clickjacking*) |
+| `X-XSS-Protection` | `0` | desliga o antigo filtro de XSS dos navegadores, que criava falhas; a recomendação atual da OWASP é exatamente `0` |
+
+O que **não** vem por padrão, também segundo a documentação: `Content-Security-Policy`, `Referrer-Policy` e `Permissions-Policy`, porque um valor razoável depende da aplicação. Para uma **API JSON** pura, a CSP mais útil é a mais restritiva possível, `default-src 'none'; frame-ancestors 'none'`: se, por algum bug, uma resposta for interpretada como página, nada é carregado nem executado, e ela não pode ser embutida. E `Referrer-Policy: no-referrer` evita que URLs (às vezes com identificadores) vazem para outros sites. Se a aplicação também serve HTML (um painel administrativo, páginas do Spring Authorization Server), a CSP vira um projeto à parte, com `script-src` e *nonces*.
+
+Duas observações de operação. HSTS é uma promessa difícil de desfazer: um `max-age` de um ano com `includeSubDomains` significa que nenhum subdomínio poderá servir HTTP por um ano, inclusive aquele sistema legado em `intranet.contadigital.dev`; e entrar na lista de *preload* dos navegadores é ainda mais definitivo. E, atrás de um proxy que termina o TLS, a aplicação recebe HTTP puro: sem `server.forward-headers-strategy`, o Spring acha que a requisição não é segura e **não** envia o HSTS.
+
+## CORS sem mitos
+
+O navegador aplica a **política de mesma origem**: o JavaScript carregado de `https://app.contadigital.dev` pode **enviar** requisições para `https://api.contadigital.dev`, mas não pode **ler** a resposta, a menos que a API autorize com os headers de **CORS** (*Cross-Origin Resource Sharing*). Para requisições "não simples" (um `POST` com `Content-Type: application/json`, qualquer requisição com `Authorization` ou com um header próprio), o navegador primeiro envia um **preflight**: um `OPTIONS` perguntando se pode.
+
+<Figura legenda="O preflight pergunta antes; a resposta de verdade ainda precisa dizer qual origem pode lê-la e quais headers o JavaScript pode ver">
+<svg viewBox="0 0 760 340" width="760" role="img" aria-labelledby="cors-titulo cors-desc">
+  <title id="cors-titulo">Sequência de uma requisição cross-origin com preflight</title>
+  <desc id="cors-desc">Duas colunas: o navegador, com o JavaScript de app.contadigital.dev, e a API. Primeiro o navegador envia OPTIONS com Origin, Access-Control-Request-Method POST e Access-Control-Request-Headers. A API responde 200 com Access-Control-Allow-Origin, Allow-Methods, Allow-Headers e Max-Age 3600, sem exigir token. Depois o navegador envia o POST de verdade, com Authorization e Idempotency-Key. A API responde 202 com Access-Control-Allow-Origin e Access-Control-Expose-Headers, e só então o JavaScript lê a resposta e os headers expostos.</desc>
+  <defs><marker id="mk-cors" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="10" width="220" height="50" rx="10" class="d-info"/>
+  <text x="130" y="32" text-anchor="middle" class="d-title">Navegador</text>
+  <text x="130" y="50" text-anchor="middle" class="d-label">JS de app.contadigital.dev</text>
+  <rect x="520" y="10" width="220" height="50" rx="10" class="d-accent"/>
+  <text x="630" y="32" text-anchor="middle" class="d-title">API</text>
+  <text x="630" y="50" text-anchor="middle" class="d-label">api.contadigital.dev</text>
+  <line x1="130" y1="60" x2="130" y2="330" class="d-line"/>
+  <line x1="630" y1="60" x2="630" y2="330" class="d-line"/>
+  <path d="M132 95 L626 95" class="d-line" marker-end="url(#mk-cors)"/>
+  <text x="380" y="88" text-anchor="middle" class="d-mono">1. OPTIONS + Origin + Request-Method</text>
+  <path d="M628 150 L134 150" class="d-line" marker-end="url(#mk-cors)"/>
+  <text x="380" y="143" text-anchor="middle" class="d-mono">2. 200 + Allow-Origin, Max-Age</text>
+  <text x="380" y="168" text-anchor="middle" class="d-label">sem token: o preflight não leva Authorization</text>
+  <path d="M132 220 L626 220" class="d-line" marker-end="url(#mk-cors)"/>
+  <text x="380" y="213" text-anchor="middle" class="d-mono">3. POST + Authorization</text>
+  <path d="M628 275 L134 275" class="d-line" marker-end="url(#mk-cors)"/>
+  <text x="380" y="268" text-anchor="middle" class="d-mono">4. 202 + Allow-Origin, Expose-Headers</text>
+  <text x="380" y="310" text-anchor="middle" class="d-text">só depois do passo 4 o JavaScript lê o corpo</text>
+</svg>
+</Figura>
+
+<Callout tipo="atencao" titulo="CORS não é controle de acesso">
+CORS é uma regra que o **navegador** aplica para proteger a **pessoa que usa o navegador**: impede que um site malicioso aberto numa aba leia dados de outra origem usando a sessão dela. `curl`, Postman, scripts e outros servidores ignoram CORS por completo. A sua API continua precisando de autenticação e autorização em todas as rotas.
+</Callout>
+
+Os mitos mais comuns, e o que é verdade:
+
+- **"O CORS bloqueou a minha requisição"**. Na maioria dos casos, o navegador **enviou** a requisição e só impediu o JavaScript de **ler** a resposta. Um `POST` simples (formulário) chega ao servidor e produz efeito mesmo sem CORS: é por isso que CSRF existe e é um problema diferente.
+- **"Libera `*` que resolve"**. `Access-Control-Allow-Origin: *` funciona para dados públicos sem credenciais (as cotações desta aula poderiam usá-lo). Com credenciais (cookies, autenticação HTTP), a especificação **proíbe** o curinga, e o Spring lança exceção se você tentar. Refletir de volta qualquer `Origin` recebido é equivalente a `*` com credenciais: o pior dos dois mundos.
+- **"Credenciais" incluem o token Bearer?** Não. `allowCredentials` trata de cookies, autenticação HTTP e certificados de cliente. Uma API que recebe o token no header `Authorization` não precisa de `allowCredentials(true)`; só precisa listar `Authorization` em `allowedHeaders`.
+- **"Os headers da resposta estão lá, mas o front não vê"**. Por padrão, o JavaScript só lê os headers "simples" (`Content-Type`, `Cache-Control` e poucos outros). `Retry-After`, `RateLimit` e `Location` precisam estar em `Access-Control-Expose-Headers`, senão o front nunca saberá quanto esperar.
+- **"O preflight precisa de token"**. O navegador não envia `Authorization` no preflight. O CORS precisa ser processado **antes** da autenticação; no Spring Security, isso é o `.cors(...)` na cadeia. A documentação do Spring Security 7 diz que o CORS é configurado automaticamente quando existe um bean `UrlBasedCorsConfigurationSource` (e só se houver um: com dois, você precisa dizer qual cada cadeia usa).
+
+## Segredos fora do código
+
+O segredo do JWT, a senha do banco e a chave da API de pagamentos **não** vão para o repositório. Um segredo commitado continua no histórico do git mesmo depois de apagado, aparece em forks, clones e caches de CI, e há robôs que varrem repositórios públicos em busca de chaves em minutos.
+
+- **De onde vem**: de um cofre (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, GCP Secret Manager), injetado como variável de ambiente ou arquivo na subida. A variável `CONTA_JWT_SEGREDO` preenche `conta.jwt.segredo` por *relaxed binding*, sem arquivo nenhum.
+- **Sem valor padrão**: `${CONTA_JWT_SEGREDO:dev-secret}` é um convite para produção subir com `dev-secret`. Sem o segredo, a aplicação **não sobe**.
+- **Valide na subida**: presença e tamanho mínimo, como faz o record `PropriedadesDoJwt` desta aula.
+- **Rotação**: com HS256 e um segredo só, trocar invalida todos os tokens de uma vez. Com chaves assimétricas e JWKS (aula 03), publica-se a chave nova antes, e a antiga sai quando os tokens dela expiram. Senhas de banco rotacionam melhor como credenciais dinâmicas de vida curta.
+- **O que nunca logar**: senhas, tokens (o header `Authorization`), segredos, números de cartão, corpos de login. Cuidado com `toString()` de records de configuração.
+- **Detecte vazamentos**: *secret scanning* com *push protection* do GitHub e gitleaks no pré-commit e no CI.
+- **Vazou?** **Revogue e troque primeiro**; limpe o histórico depois.
+
+## Dependências e pipeline (supply chain)
+
+Uma aplicação Spring Boot típica tem mais de cem dependências transitivas, e o seu código é uma fração pequena do que roda. O **A03:2025 (Software Supply Chain Failures)** cobre tanto bibliotecas com vulnerabilidades conhecidas quanto o risco de um artefato ou pipeline adulterado. Na prática:
+
+| Prática | Ferramenta |
+|---|---|
+| atualizações automáticas | **Dependabot** ou **Renovate**: PRs pequenos e frequentes, com o CI validando |
+| vulnerabilidades conhecidas | **OWASP Dependency-Check** (usa o NVD; configure uma chave da API do NVD), **OSV-Scanner**, GitHub Dependency Review, Trivy |
+| inventário | **SBOM CycloneDX**: o `spring-boot-starter-parent` já configura o `cyclonedx-maven-plugin`, basta declará-lo; o Actuator expõe o SBOM em `/actuator/sbom` |
+| versões coerentes | BOM do Spring Boot; sem `LATEST` nem intervalos de versão |
+| pipeline íntegro | actions fixadas por *hash*, branch protegida, `GITHUB_TOKEN` com permissões mínimas |
+| proveniência | assinatura de artefatos e imagens (**Sigstore**/cosign), atestados de build (SLSA) |
+| imagem | base mínima e atualizada, usuário não-root, varredura da imagem |
+
+Um ponto de maturidade: varredura que só **reporta** não protege. Defina uma política ("CVE crítica com correção disponível bloqueia o merge; alta tem 7 dias") e trate falsos positivos com supressões documentadas e com data de validade, em vez de desligar a ferramenta.
+
+<Callout tipo="dica" titulo="A pergunta que um SBOM responde">
+Quando sai uma CVE crítica numa biblioteca popular, a pergunta do dia é "quais serviços usam a versão afetada?". Com SBOMs publicados junto com cada artefato, a resposta sai de uma busca. Sem eles, é uma semana rodando `mvn dependency:tree` em cada repositório.
+</Callout>
+
+## Idempotency-Key: repetir sem duplicar
+
+O retry é uma defesa de resiliência, e o rate limit **provoca** retries: o cliente recebe 429, espera e tenta de novo. Para `GET`, `PUT` e `DELETE` isso é seguro, porque são idempotentes por definição. Para `POST` não: se a resposta da exportação se perdeu num timeout, o cliente não sabe se ela foi criada, e repetir pode criar duas. Em pagamentos, é cobrar duas vezes.
+
+A solução comum é o header **`Idempotency-Key`**: o cliente gera um identificador único (um UUID) **por operação**, e o servidor guarda o resultado associado a ele. O IETF tem um draft para isso (`draft-ietf-httpapi-idempotency-key-header`, versão 07, de outubro de 2025, hoje expirado), que serve de referência para os códigos de erro: **400** se a chave é obrigatória e não veio, **422** se a mesma chave chegou com um corpo diferente, **409** se a primeira requisição com aquela chave ainda está em processamento. Plataformas de pagamento usam o mesmo desenho há anos.
+
+As decisões de implementação que importam:
+
+- **Escopo**: por usuário (ou API key). Duas pessoas com a mesma chave por acaso não podem receber a resposta uma da outra.
+- **Comparar o corpo**: guarde o pedido (ou um hash) com a resposta; mesma chave com outro corpo é erro do cliente.
+- **Atomicidade**: "existe?" e "registre" são uma operação só: `computeIfAbsent` em memória, `UNIQUE (usuario, chave)` no banco, na transação que cria o recurso.
+- **Validade**: 24 horas é comum.
+- **Rate limit**: nesta aula a repetição também gasta créditos, porque o filtro roda antes do controller. É uma escolha, e pode ser revista.
+
+## O código que vamos construir
+
+Tudo o que aparece a seguir está em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.defesas`, e roda no CI. É uma API de extratos de uma conta digital com quatro rotas:
+
+| Rota | Quem | Custo | O que demonstra |
+|---|---|---|---|
+| `GET /api/cotacoes` | qualquer um | 1 | limite por IP, headers, CORS |
+| `GET /api/extratos?pagina&tamanho` | autenticado (JWT) | 1 | limite por usuário, tamanho máximo de página |
+| `POST /api/exportacoes` | autenticado, com `Idempotency-Key` | 10 | custo variável, idempotência |
+| `OPTIONS /api/**` | o navegador | 0 | preflight de CORS |
+
+As peças:
+
+- `PoliticaDeLimite`: a regra (nome, capacidade, janela), validada no construtor.
+- `LimitadorDeCreditos`: o token bucket por chave, na forma GCRA, com `Clock`.
+- `Consumo`: o resultado de uma tentativa (permitido, restantes, quanto esperar, quanto falta para encher).
+- `FiltroDeCota`: o `OncePerRequestFilter` que escolhe a chave, cobra o custo e escreve o 429.
+- `ConfiguracaoDeSeguranca`: a cadeia do Spring Security, com headers, CORS, JWT e o filtro.
+- `ExtratoController`, `ServicoDeExportacao` e `TratadorDeErros`: as rotas, a idempotência e os erros em Problem Details.
+- `JanelaFixa`, `RelogioAjustavel` e `SimulacaoDaVirada`: para comparar algoritmos e controlar o tempo.
+
+<Callout tipo="info" titulo="E o exercício 11.04?">
+No [exercício 11.04](../../../exercicios/11-seguranca/04-limite-de-requisicoes/), você implementa outro token bucket, com outra representação (tempo acumulado em nanossegundos), e um filtro que protege o **login por IP**, antes da autenticação. Aqui o domínio é outro de propósito: limite **por usuário**, depois da autenticação, com **custo variável** e estado de um instante só. Os dois se complementam; resolver um não resolve o outro.
+</Callout>
+
+## Mão na massa
+
+Os comandos abaixo rodam a partir da pasta do módulo:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test -Dtest=LimitadorDeCreditosTest      # uma classe
+mvn test                                      # o módulo inteiro
+```
+
+### Passo 1: a política e o resultado
+
+**O que vamos fazer e por quê.** Antes do algoritmo, os dois tipos que ele usa. A política valida as regras na construção: um limite com capacidade zero ou janela negativa é um erro de configuração, e deve impedir a aplicação de subir, não produzir um comportamento estranho às 3h da manhã.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/PoliticaDeLimite.java" />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/Consumo.java" />
+
+**O que acabou de acontecer.** `intervaloPorCredito()` é a taxa de reposição vista ao contrário: 60 créditos por minuto viram "1 crédito a cada segundo". `tempoParaEncher()` é `capacidade × intervalo`, calculado a partir do intervalo, para não sobrar resto de divisão (uma janela de 1 minuto com capacidade 7 daria 8,571... segundos por crédito). E `emSegundos` arredonda **para cima**: 1,2 s de espera vira `Retry-After: 2`, porque mandar o cliente voltar em 1 s é garantir mais um 429.
+
+### Passo 2: o token bucket com um instante por chave
+
+**O que vamos fazer e por quê.** O coração da aula. O limitador guarda, por chave, o instante em que o balde dela estará cheio de novo. O tempo vem só do `Clock` injetado: nenhuma thread de reposição, nenhum `System.currentTimeMillis()`, nenhum `Thread.sleep` nos testes.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/LimitadorDeCreditos.java" destacar="49-60, 80" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- `base`: se o "cheio em" ficou no passado (ou a chave é nova), o balde está cheio e a conta começa de `agora`; senão, de onde o balde parou.
+- `depois = base + custo × intervalo` é o novo "cheio em" se a requisição for aceita: uma exportação de custo 10 empurra o instante 10 s para a frente.
+- Se `depois - agora` passa de `tempoParaEncher()` (60 s), não havia saldo: a recusa devolve **quanto falta** e **não muda o estado** (`return anterior`). Uma recusa que gastasse créditos puniria quem respeita o `Retry-After`.
+- O saldo é derivado, `(janela - ocupado) / intervalo`, em nanossegundos inteiros: nada de `double`.
+- `ConcurrentHashMap.compute` é **atômico por chave**: duas requisições da mesma pessoa nunca leem o mesmo "cheio em", e chaves diferentes não se bloqueiam. A decisão sai do lambda por um vetor de uma posição, preenchido dentro do `compute`, sem corrida.
+- `removerOciosos` (linha 80) aproveita a representação: balde cheio e chave ausente são a **mesma coisa**, então apagar não perde informação. O `remove(chave, valor)` é condicional: se outra thread gastou créditos no meio, o valor mudou e nada sai.
+
+### Passo 3: testando o tempo sem esperar
+
+**O que vamos fazer e por quê.** Um limitador é cheio de bordas: o primeiro crédito depois da recusa, frações de tempo, o relógio que volta, a capacidade. Todas dependem do tempo, e nenhum teste deveria esperar de verdade. O `RelogioAjustavel` é um `Clock` que só anda quando o teste manda:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/RelogioAjustavel.java" />
+
+E os testes, com uma política de 6 créditos por minuto (1 a cada 10 s), para os números ficarem fáceis de conferir de cabeça:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/defesas/LimitadorDeCreditosTest.java" />
+
+```bash
+mvn test -Dtest=LimitadorDeCreditosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.defesas.LimitadorDeCreditosTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.184 s -- in dev.trilhajava.m11.aulas.defesas.LimitadorDeCreditosTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Onze testes, e o mais lento leva milissegundos.
+
+- `recusaNaoGastaEOTempoQueFaltaDiminui` prova a regra da recusa: aos 4 s, faltam 6; aos 10 s, passa. Se a recusa gastasse, o teste falharia.
+- `custoMaiorQueOSaldoERecusadoMesmoComSaldoPositivo` mostra o custo variável: com 2 créditos, uma operação de custo 3 é recusada, e a de custo 1 ainda cabe. É o comportamento que você quer: a exportação pesada espera; a consulta leve não.
+- `relogioQueVoltaNuncaCriaCreditos` documenta uma escolha. Quando o relógio da máquina volta 30 s (um ajuste de NTP), o "cheio em" parece mais distante e o saldo cai a zero temporariamente; quando o relógio volta ao normal, o saldo também volta. O relógio voltando **pune** por alguns segundos, mas **nunca** cria créditos. A alternativa do exercício 11.04 (ignorar o tempo negativo) também é válida; o importante é ter um teste dizendo qual das duas o seu código faz.
+- `cemThreadsDisputandoCinquentaCreditos` solta 100 *virtual threads* ao mesmo tempo, com um `CountDownLatch` como largada, contra um balde de 50. Exatamente 50 passam. Com um `HashMap` comum e `get` + `put` separados, o número variaria de execução para execução.
+
+### Passo 4: janela fixa contra token bucket
+
+**O que vamos fazer e por quê.** Ver, com números, o defeito da janela fixa. A `JanelaFixa` é o algoritmo mais simples possível:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/JanelaFixa.java" />
+
+A simulação manda a mesma rajada para os dois algoritmos, ambos com "10 por minuto": 10 requisições aos 59,5 s e outras 10 aos 60,5 s.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/SimulacaoDaVirada.java" />
+
+```bash
+mvn -q compile
+java -cp target/classes dev.trilhajava.m11.aulas.defesas.SimulacaoDaVirada
+```
+
+```text
+algoritmo        59,5 s   60,5 s    total
+janela fixa          10       10       20
+token bucket         10        0       10
+```
+
+**O que acabou de acontecer.** Na janela fixa, às 12:01:00 o contador zera, e o cliente passa 20 requisições num intervalo de um segundo: o dobro do limite. No token bucket, o balde começou cheio (10), foi esvaziado aos 59,5 s, e um segundo depois rendeu apenas 1/6 de crédito: nenhuma passa. O teste `JanelaFixaVersusBaldeTest` fixa esse resultado. Isso quer dizer que a janela fixa é inútil? Não: para um limite alto e grosseiro ("100 mil por dia por API key"), o dobro numa virada raramente importa, e o custo dela no Redis é um `INCR`. Para login e rotas caras, importa.
+
+### Passo 5: o filtro que devolve 429
+
+**O que vamos fazer e por quê.** Ligar o limitador às requisições HTTP. O filtro roda **dentro** da cadeia do Spring Security, logo depois da autenticação, porque precisa saber quem está chamando.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/FiltroDeCota.java" destacar="48, 51-54, 61-69, 75-82" />
+
+E a cadeia que o encaixa no lugar certo:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/ConfiguracaoDeSeguranca.java" destacar="36" />
+
+**O que acabou de acontecer.**
+
+- `addFilterAfter(..., AnonymousAuthenticationFilter.class)` põe o filtro depois da autenticação (inclusive a do Bearer token) e antes da autorização: o `SecurityContext` já tem um `JwtAuthenticationToken` ou um `AnonymousAuthenticationToken`.
+- `chaveDe` usa o `sub` do JWT quando há autenticação de verdade e o IP quando não há. O prefixo (`usuario:`, `ip:`) impede que um usuário chamado "10.0.0.1" divida balde com esse IP.
+- `RateLimit-Policy` e `RateLimit` vão em **toda** resposta da API; o `t` é quanto falta para o balde encher.
+- A recusa serializa um `ProblemDetail` com o `JsonMapper` do Jackson 3. O filtro roda antes do `DispatcherServlet`, então o `@RestControllerAdvice` não alcança esta resposta.
+- O filtro **não** é um `@Component` (veja "Quando dá errado").
+
+Agora, os testes do filtro, com a aplicação inteira e o relógio controlado. A anotação `@TestBean` (Spring Framework 6.2 em diante) troca o bean `relogio` pelo que o método estático de mesmo nome devolve:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/defesas/FiltroDeCotaTest.java" />
+
+```bash
+mvn test -Dtest=FiltroDeCotaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.defesas.FiltroDeCotaTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.800 s -- in dev.trilhajava.m11.aulas.defesas.FiltroDeCotaTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** `jwt().jwt(token -> token.subject("ana"))` (do `spring-security-test`) autentica a requisição com um JWT de mentira, sem assinar nada, e é assim que os testes criam "ana" e "bruno". Com o relógio parado, 60 extratos esgotam o balde da ana, e o 61º recebe 429 com `Retry-After: 1` (um crédito por segundo) e `RateLimit: "por-cliente";r=0;t=60`. O bruno, no mesmo instante, tem o balde cheio. Seis exportações de custo 10 também esgotam 60 créditos, e a sétima precisa esperar **10** segundos, enquanto um extrato de custo 1 precisaria só de 1. E `rotaPublicaUsaOIpComoChave` usa um `RequestPostProcessor` para trocar o `remoteAddr` e mostrar que dois IPs têm baldes separados.
+
+### Passo 6: vendo de verdade, com curl
+
+**O que vamos fazer e por quê.** Testes provam; ver a resposta crua ajuda a entender. Suba a aplicação com o segredo vindo de uma variável de ambiente (o próximo passo explica por que ela é obrigatória):
+
+<Tabs grupo="so">
+<Tab rotulo="Linux / macOS / Git Bash">
+```bash
+export CONTA_JWT_SEGREDO="segredo-local-de-desenvolvimento-com-32+bytes"
+mvn spring-boot:run -Dspring-boot.run.main-class=dev.trilhajava.m11.aulas.defesas.DefesasApplication
+```
+</Tab>
+<Tab rotulo="Windows (PowerShell)">
+```powershell
+$env:CONTA_JWT_SEGREDO = "segredo-local-de-desenvolvimento-com-32+bytes"
+mvn spring-boot:run "-Dspring-boot.run.main-class=dev.trilhajava.m11.aulas.defesas.DefesasApplication"
+```
+</Tab>
+</Tabs>
+
+Em outro terminal, uma chamada à rota pública:
+
+```bash
+curl -si http://127.0.0.1:8080/api/cotacoes
+```
+
+```http
+HTTP/1.1 200
+Vary: Origin
+Vary: Access-Control-Request-Method
+Vary: Access-Control-Request-Headers
+RateLimit-Policy: "por-cliente";q=60;w=60
+RateLimit: "por-cliente";r=59;t=1
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 0
+Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+Pragma: no-cache
+Expires: 0
+X-Frame-Options: DENY
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+Referrer-Policy: no-referrer
+Content-Type: application/json
+Content-Length: 27
+
+{"USD":5.4210,"EUR":6.3105}
+```
+
+Agora uma rajada de 70 requisições em paralelo, contando os status:
+
+```bash
+urls=""; for i in $(seq 1 70); do urls="$urls -o /dev/null http://127.0.0.1:8080/api/cotacoes"; done
+curl -s --parallel --parallel-max 70 -w "%{http_code}\n" $urls | sort | uniq -c
+```
+
+```text
+     60 200
+     10 429
+```
+
+E a resposta de uma requisição recusada:
+
+```http
+HTTP/1.1 429
+RateLimit-Policy: "por-cliente";q=60;w=60
+RateLimit: "por-cliente";r=0;t=60
+Retry-After: 1
+Content-Type: application/problem+json;charset=UTF-8
+Content-Length: 219
+
+{"detail":"Cota de 60 créditos por minuto esgotada. Tente de novo em 1 s.","instance":"/api/cotacoes","status":429,"title":"Cota de requisições excedida","type":"https://api.contadigital.dev/problemas/cota-excedida"}
+```
+
+(Os headers `Vary`, de segurança e `Date` foram omitidos nesta última.) **O que acabou de acontecer.** O balde do IP 127.0.0.1 começou cheio, aceitou a rajada de 60 e recusou as 10 seguintes. Se você repetir a rajada imediatamente, quase tudo vira 429, porque o balde se recupera a 1 crédito por segundo. Repare também que `localhost` pode resolver para `::1` (IPv6) e `127.0.0.1` (IPv4): para o limitador, são **dois IPs**, e portanto dois baldes. Um detalhe pequeno que, em produção, aparece como "o limite não funciona para alguns clientes".
+
+### Passo 7: headers de segurança e CORS, testados
+
+**O que vamos fazer e por quê.** Configuração de segurança que não tem teste se perde no primeiro refactor ("tirei o `.headers(...)` porque parecia duplicado"). O `MockMvcTester` testa a cadeia inteira, inclusive o preflight.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/defesas/HeadersECorsTest.java" />
+
+```bash
+mvn test -Dtest=HeadersECorsTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.defesas.HeadersECorsTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.298 s -- in dev.trilhajava.m11.aulas.defesas.HeadersECorsTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O primeiro teste confere os padrões do Spring Security 7, os dois acrescentados (CSP e `Referrer-Policy`) e a **ausência** do HSTS numa requisição HTTP; `.secure(true)` simula HTTPS, e aí o HSTS aparece.
+- O preflight (`mvc.options()`) passa **sem token** e **sem** o header `RateLimit`: o `CorsFilter` responde e encerra a cadeia antes do filtro de cota. Preflights não gastam créditos.
+- A origem não autorizada recebe **403** com `Invalid CORS request`.
+- Numa resposta de verdade, `Access-Control-Expose-Headers` permite ao front ler `Retry-After` e `RateLimit`.
+
+Com a aplicação do passo 6 no ar, o mesmo preflight com `curl`:
+
+```bash
+curl -si -X OPTIONS http://127.0.0.1:8080/api/exportacoes \
+  -H "Origin: https://app.contadigital.dev" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization, content-type, idempotency-key"
+```
+
+```http
+HTTP/1.1 200
+Access-Control-Allow-Origin: https://app.contadigital.dev
+Access-Control-Allow-Methods: GET,POST
+Access-Control-Allow-Headers: authorization, content-type, idempotency-key
+Access-Control-Expose-Headers: Retry-After, RateLimit, RateLimit-Policy, Location
+Access-Control-Max-Age: 3600
+```
+
+E a prova de que CORS não é controle de acesso: o mesmo `curl`, sem o header `Origin`, simplesmente lê os dados.
+
+```bash
+curl -s -w " -> %{http_code}\n" -H "Origin: https://promocao-imperdivel.example" http://127.0.0.1:8080/api/cotacoes
+curl -s -w " -> %{http_code}\n" http://127.0.0.1:8080/api/cotacoes
+```
+
+```text
+Invalid CORS request -> 403
+{"USD":5.4210,"EUR":6.3105} -> 200
+```
+
+O Spring recusa a requisição que **declara** vir de uma origem não autorizada, mas qualquer cliente fora do navegador escolhe não declarar nada. Quem protege `/api/extratos` é o JWT, não o CORS.
+
+### Passo 8: página máxima e Idempotency-Key
+
+**O que vamos fazer e por quê.** As duas defesas de custo e repetição. O controller recusa páginas acima de 100 com validação de parâmetros (no Spring Framework 7, `@Min` e `@Max` direto no `@RequestParam` disparam a validação de método, sem `@Validated` na classe), e a exportação exige `Idempotency-Key`:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/ExtratoController.java" />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/ServicoDeExportacao.java" />
+
+O `TratadorDeErros` herda de `ResponseEntityExceptionHandler`, que transforma em Problem Details os erros do próprio Spring MVC (header ausente, validação de parâmetro), e acrescenta o 422 da chave reutilizada:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/TratadorDeErros.java" />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/defesas/PaginacaoEIdempotenciaTest.java" />
+
+```bash
+mvn test -Dtest=PaginacaoEIdempotenciaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.defesas.PaginacaoEIdempotenciaTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.964 s -- in dev.trilhajava.m11.aulas.defesas.PaginacaoEIdempotenciaTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `tamanho=100` devolve 50 lançamentos na página 2 (os últimos dos 250); `tamanho=5000` devolve **400** com `"detail": "Validation failure"`, sem tocar nos dados. Em produção, vale sobrescrever `handleHandlerMethodValidationException` para dizer **qual** parâmetro falhou e qual é o máximo.
+- Sem o header, `@RequestHeader("Idempotency-Key")` faz o Spring lançar `MissingRequestHeaderException`, e o tratador devolve 400 com `"Required header 'Idempotency-Key' is not present."`. É o 400 do draft, de graça.
+- A repetição com a mesma chave e o mesmo corpo devolve `202` com o **mesmo** `Location` e `Idempotent-Replayed: true`. Esse header não é padronizado; é uma convenção usada por plataformas de pagamento para o cliente saber que recebeu uma resposta repetida. A mesma chave com outro período devolve **422**.
+- A mesma chave usada por outra pessoa cria **outra** exportação: o escopo é `usuario:chave`.
+
+Para fechar, a suíte completa do pacote:
+
+```bash
+mvn test -Dtest='dev.trilhajava.m11.aulas.defesas.*Test'
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.CheckpointCotaTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.FiltroDeCotaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.HeadersECorsTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.JanelaFixaVersusBaldeTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.LimitadorDeCreditosTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.defesas.PaginacaoEIdempotenciaTest
+[INFO] Tests run: 29, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+(`CheckpointCotaTest` é a solução do checkpoint mais abaixo; deixe para abrir depois.)
+
+## Quando dá errado
+
+As mensagens abaixo são reais: foram geradas quebrando o código (ou a configuração) de propósito.
+
+### A aplicação não sobe sem o segredo
+
+Subindo a aplicação sem a variável `CONTA_JWT_SEGREDO`:
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Failed to bind properties under 'conta.jwt' to dev.trilhajava.m11.aulas.defesas.PropriedadesDoJwt:
+
+    Reason: java.lang.IllegalStateException: conta.jwt.segredo não configurado: defina a variável de ambiente CONTA_JWT_SEGREDO
+
+Action:
+
+Update your application's configuration
+```
+
+**Como ler:** é exatamente o que você quer. O *failure analyzer* do Spring Boot mostra a mensagem do construtor do record, que diz o que fazer. Falhar na subida é muito melhor do que subir com um segredo vazio e falhar na primeira requisição, ou pior, aceitar tokens assinados com uma chave trivial. Repare que a mensagem diz **qual** variável falta e **nunca** mostra o valor. O record é este:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/defesas/PropriedadesDoJwt.java" />
+
+### O filtro que roda duas vezes
+
+Anotando `FiltroDeCota` com `@Component` (e mantendo o `addFilterAfter`), os testes do filtro quebram assim:
+
+```text
+[ERROR] FiltroDeCotaTest.cadaUsuarioTemOSeuBalde -- Time elapsed: 0.201 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+[check primary value for HTTP header 'RateLimit']
+expected: ""por-cliente";r=59;t=1"
+ but was: ""por-cliente";r=58;t=2"
+```
+
+**Como ler:** a primeira requisição do bruno gastou **dois** créditos. O Spring Boot registra automaticamente no contêiner de servlets todo bean que implementa `Filter`; então o filtro rodou uma vez como filtro de servlet e outra dentro da cadeia do Spring Security. **Como corrigir:** não faça do filtro um bean (como nesta aula), ou, se ele precisar ser bean, registre um `FilterRegistrationBean` com `setEnabled(false)` para desligar o registro automático. O sintoma em produção é traiçoeiro: "o limite está pela metade" e ninguém sabe por quê.
+
+### Curinga com credenciais
+
+Uma configuração de CORS com `setAllowedOrigins(List.of("*"))` e `setAllowCredentials(true)`, na primeira requisição com `Origin`:
+
+```text
+java.lang.IllegalArgumentException: When allowCredentials is true, allowedOrigins cannot contain the special value "*" since that cannot be set on the "Access-Control-Allow-Origin" response header. To allow credentials to a set of origins, list them explicitly or consider using "allowedOriginPatterns" instead.
+```
+
+**Como ler:** o Spring impede a configuração que a especificação de CORS proíbe. A saída sugerida, `allowedOriginPatterns`, aceita padrões como `https://*.contadigital.dev`; use-a com cuidado, porque um padrão largo demais reabre o problema (qualquer subdomínio, inclusive um tomado por terceiros, passa a ler respostas com a sessão da pessoa).
+
+### O teste que esqueceu o charset
+
+Uma falha do próprio teste, no primeiro rascunho desta aula:
+
+```text
+org.opentest4j.AssertionFailedError:
+[Media type]
+expected: application/problem+json
+ but was: application/problem+json;charset=UTF-8
+```
+
+**Como ler:** o filtro chama `setCharacterEncoding("UTF-8")` (necessário para os acentos do `detail`), e o contêiner acrescenta `;charset=UTF-8` ao `Content-Type`. `hasContentType` compara o tipo exato; `hasContentTypeCompatibleWith` ignora os parâmetros. Clientes também devem comparar o tipo sem os parâmetros.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Limite que não protege" depois="Limite que protege">
+```java
+// mapa comum, sem atomicidade, sem limpeza
+Map<String, Integer> contagem = new HashMap<>();
+
+String chave = request.getHeader("X-Forwarded-For");
+int n = contagem.getOrDefault(chave, 0) + 1;
+contagem.put(chave, n);
+if (n > 60) {
+    response.setStatus(503);   // status errado, sem Retry-After
+    return;
+}
+```
+
+```java
+// estado atômico por chave, limpeza periódica,
+// chave confiável e resposta que o cliente entende
+Consumo consumo = limitador.consumir(chaveDe(requisicao), custo);
+if (!consumo.permitido()) {
+    resposta.setStatus(429);
+    resposta.setHeader("Retry-After",
+            String.valueOf(Consumo.emSegundos(consumo.tentarDepoisDe())));
+    // + Problem Details e headers RateLimit
+}
+```
+</Comparar>
+
+O código da esquerda tem cinco problemas: confia num header que o cliente forja (cada requisição com um `X-Forwarded-For` diferente ganha um contador novo), perde contagens sob concorrência (`get` e `put` separados num `HashMap`), cresce para sempre, nunca zera (é um limite vitalício, não por minuto) e responde 503 sem dizer quando voltar.
+
+Outras armadilhas que aparecem em revisão de código:
+
+- **Limite só em memória com várias réplicas**: o limite efetivo é `limite × réplicas` e muda com o autoscaling.
+- **Limitar depois do trabalho caro**: um limite num método de serviço, chamado depois do BCrypt e da transação, protege pouco. Recuse o mais cedo possível.
+- **Limite como única defesa do login**: um limite por IP não segura uma botnet. Combine com bloqueio por conta (exercício 11.01), MFA e monitoramento.
+- **Esquecer os clientes legítimos**: um limite apertado derruba o seu próprio app no quinto dia útil, quando o salário cai. Meça antes de impor.
+- **Liberar o CORS "para resolver o erro do front"** com `allowedOriginPatterns("*")` e credenciais: o erro some, e a proteção também.
+- **Desligar os headers padrão** porque "uma página não carregou num iframe". Libere a origem específica com `frame-ancestors` na CSP.
+- **Logar o header `Authorization`**: o token vale como senha enquanto não expira.
+
+Quando **não** escrever o seu próprio limitador: quase sempre, em produção. Implementar é ótimo para entender (por isso esta aula e o exercício 11.04 fazem isso), mas, no dia a dia, use o limite do gateway ou uma biblioteca madura (Bucket4j, ou o `RedisRateLimiter` do Spring Cloud Gateway), que já resolveram armazenamento distribuído, expiração e métricas. Escreva o seu quando a regra é de negócio e nenhuma ferramenta a expressa bem (custo por rota calculado a partir do corpo, por exemplo), e mesmo assim sobre um armazenamento compartilhado.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Comece pelo objetivo, não pelo algoritmo.** "Proteger o banco", "garantir justiça entre parceiros" e "conter força bruta" levam a políticas diferentes. A primeira é um limite global de concorrência (quantas consultas pesadas ao mesmo tempo, não por minuto), que o Spring Framework 7 oferece com `@ConcurrencyLimit` e que um *bulkhead* do Resilience4j também resolve. A segunda é uma cota por API key, que mora no gateway e entra no contrato comercial. A terceira é um limite apertado por IP e por conta-alvo, antes da autenticação. Um time que começa com "vamos usar token bucket de 100 por minuto em tudo" geralmente termina com um limite que não protege nenhuma das três coisas.
+
+**Escolher os números.** Capacidade e taxa saem de dados, não de intuição. O roteiro que funciona: instrumente uma métrica de requisições por cliente (com cuidado com a cardinalidade, aula de observabilidade do módulo 14), olhe o percentil 99 dos clientes legítimos, defina o limite com folga acima dele e implante em **modo sombra** (só registra quem seria limitado). Depois de uma ou duas semanas sem falsos positivos relevantes, ative. E publique os limites na documentação da API: limite secreto vira ticket de suporte.
+
+**Falhar aberto ou fechado.** Com o estado no Redis, a pergunta inevitável é: e se o Redis cair? Falhar **fechado** (recusar tudo) transforma uma falha do Redis numa indisponibilidade total da API. Falhar **aberto** (deixar passar) mantém a API no ar e remove a proteção por alguns minutos. Para cotas comerciais e proteção de capacidade, aberto costuma ser a resposta, com um limite local em memória como rede de segurança e um alerta. Para o login, muitos times preferem um modo degradado mais restritivo. O que não pode é a decisão ser acidental, descoberta durante o incidente.
+
+**Custo do estado distribuído.** Cada requisição passa a fazer uma ida ao Redis, que vira dependência crítica do caminho de toda requisição. A representação GCRA ajuda: um valor por chave, uma operação atômica, TTL igual ao tempo para encher. Para volumes muito altos, cada instância pode reservar um lote de créditos e consumir localmente, trocando precisão por menos idas à rede. Diga isso explicitamente ao time: "o limite pode passar até X% em troca de não depender do Redis a cada requisição".
+
+**Gateway ou aplicação.** No gateway: limites por API key e por IP, cotas comerciais, política central entre serviços. Na aplicação: o que depende de regra de negócio (custo de uma exportação, limite por usuário, idempotência). Em plataformas maduras, o gateway tem limites grossos e iguais para todos, e a aplicação, os finos que só ela entende.
+
+**Headers e CORS como contrato.** Testes (como os do passo 7), revisão de segurança nas mudanças e uma lista **explícita** de origens por ambiente, vinda de configuração, nunca um padrão largo. "Libera tudo em homologação" se resolve listando a origem de homologação.
+
+**Segredos: ensaie a rotação.** Um segredo que nunca foi rotacionado é um segredo que ninguém sabe rotacionar. Automatize a troca em homologação, prefira identidades da plataforma (um papel do IAM em vez de senha) e tenha um plano para vazamentos: quem é avisado, em quanto tempo se revoga, como se descobre o que foi acessado.
+
+**Supply chain é processo, não ferramenta.** Os PRs do Dependabot só ajudam se alguém os aceita: com uma boa suíte de testes (módulo 10), atualizar o patch do Spring Boot toda semana é rotina; sem ela, vira um medo que acumula meses de atraso, até a CVE crítica obrigar uma atualização grande às pressas. Publique o SBOM com cada versão, assine as imagens no CI e verifique a assinatura no deploy. Ao justificar para o time, fale em tempo: "com SBOM, responder a uma CVE leva minutos; sem, leva dias".
+
+**Idempotência como parte do contrato.** Em APIs que movimentam dinheiro ou criam recursos caros, torne a `Idempotency-Key` **obrigatória** no `POST`, documente a validade e os códigos de erro (400, 409, 422), e guarde a resposta na mesma transação que cria o recurso. Sem isso, os retries que o seu próprio rate limit provoca podem duplicar operações.
+
+<Callout tipo="entrevista">
+**"Como você implementaria rate limiting numa API com várias instâncias?"** Uma boa resposta separa algoritmo, chave e lugar. Algoritmo: token bucket (rajada controlada, custo variável), citando o defeito da janela fixa na virada. Chave: usuário ou API key nas rotas autenticadas, IP nas públicas, com o cuidado do `X-Forwarded-For` atrás de proxy. Lugar: estado compartilhado num Redis com operação atômica (script Lua, ou Bucket4j com backend Redis), ou o limite no gateway; e a decisão de falhar aberto ou fechado se o Redis cair. Resposta: 429 com `Retry-After` e Problem Details, e os headers `RateLimit` do draft IETF.
+
+**"CORS protege a minha API?"** Não: é uma regra do navegador sobre quem pode **ler** respostas. O que protege é autenticação e autorização. Bônus: explicar o preflight, por que `*` não combina com credenciais e por que `Retry-After` precisa estar em `Access-Control-Expose-Headers`.
+
+**"Um cliente repetiu um POST de pagamento depois de um timeout e cobrou duas vezes. Como evitar?"** `Idempotency-Key` gerada pelo cliente por operação, guardada com escopo por cliente, junto com o hash do corpo e a resposta, numa restrição única na mesma transação; repetição devolve a mesma resposta, corpo diferente devolve 422, requisição ainda em andamento devolve 409.
+
+**"Um segredo foi commitado num repositório público. O que você faz?"** Revoga e troca primeiro, avalia o que foi acessado com ele, e só depois limpa o histórico; e então ataca a causa: *secret scanning* com bloqueio no push e segredos vindos de um cofre.
+</Callout>
+
+## Checkpoint
+
+A política da API é de 60 créditos por minuto por cliente, e o relógio está **parado** durante as primeiras requisições. A usuária "fernanda", com o balde cheio, faz nesta ordem:
+
+1. uma exportação (`POST /api/exportacoes`, custo 10);
+2. 45 consultas de extrato (`GET /api/extratos`, custo 1 cada);
+3. outra exportação, com outra `Idempotency-Key`.
+
+Responda sem rodar nada: (a) qual o header `RateLimit` da primeira exportação? (b) qual o status, o `Retry-After` e o `RateLimit` da segunda exportação? (c) se o relógio andar exatamente o tempo do `Retry-After` e ela repetir a segunda exportação, o que acontece, e qual o novo `RateLimit`? Depois, escreva um teste de integração com `@TestBean` para o relógio que confirme as três respostas.
+
+<details>
+<summary>Solução</summary>
+
+**(a)** A exportação empurra o "cheio em" 10 s para a frente: sobram 50 créditos, e faltam 10 s para encher. `RateLimit: "por-cliente";r=50;t=10`.
+
+**(b)** Depois dos 45 extratos, o "cheio em" está 55 s à frente: saldo 5. A exportação custaria 10, o que levaria o "cheio em" a 65 s, 5 s além do limite de 60. Resultado: **429**, `Retry-After: 5`, e `RateLimit: "por-cliente";r=5;t=55` (a recusa não gasta nada, então o estado é o de antes dela).
+
+**(c)** Cinco segundos depois, o "cheio em" está 50 s à frente; somar 10 dá exatamente 60, que **cabe** (o limite é "maior que 60", não "maior ou igual"). A exportação é aceita com **202**, e o balde fica vazio: `RateLimit: "por-cliente";r=0;t=60`.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/defesas/CheckpointCotaTest.java" />
+
+**Por que assim.** O relógio parado torna cada número uma conta exata, e o `@TestBean` troca só o `Clock`, mantendo o resto da aplicação real (filtro, segurança, controller). O item (c) é o teste de borda: se alguém trocar `compareTo(limite) > 0` por `>= 0`, a exportação no instante exato do `Retry-After` seria recusada, e um cliente que obedece ao header tomaria um 429 injusto. Esse teste pega o erro.
+
+</details>
+
+<Quiz
+  id="11-defesas"
+  questoes={[
+    {
+      pergunta: 'A API tem 4 instâncias atrás de um load balancer, cada uma com um limitador em memória de 60 req/min por usuário. Qual o limite real de um usuário?',
+      opcoes: ['60 req/min', 'Até 240 req/min, e muda com o autoscaling', '15 req/min', 'Ilimitado'],
+      correta: 1,
+      explicacao: 'Estado em memória não é compartilhado: cada instância tem o seu balde. Para uma cota real, o estado vai para um armazenamento compartilhado (Redis) ou o limite sobe para o gateway.',
+    },
+    {
+      pergunta: 'Com uma janela fixa de 10 requisições por minuto, quantas requisições um cliente consegue fazer entre 12:00:59 e 12:01:01?',
+      opcoes: ['10', '20', '11', '5'],
+      correta: 1,
+      explicacao: 'O contador zera na virada do minuto: 10 no fim de uma janela e 10 no começo da seguinte. O token bucket não tem esse defeito, porque o saldo só volta à taxa de reposição.',
+    },
+    {
+      pergunta: 'O front em https://app.contadigital.dev recebe 429, mas o JavaScript lê `Retry-After` como null. A resposta tem o header. Qual a causa mais provável?',
+      opcoes: ['O Retry-After precisa estar em segundos', 'Faltou listar Retry-After em Access-Control-Expose-Headers', 'O navegador bloqueia respostas 429', 'Faltou allowCredentials(true)'],
+      correta: 1,
+      explicacao: 'Por padrão, o navegador só expõe ao JavaScript alguns headers "simples". Os demais, como Retry-After e RateLimit, precisam estar em `setExposedHeaders`.',
+    },
+    {
+      pergunta: 'Um cliente repete um POST /api/exportacoes com a mesma Idempotency-Key, mas com outro período no corpo. O que a API deve responder?',
+      opcoes: ['202 com a exportação original', '202 com uma exportação nova', '422: a chave já foi usada com outro pedido', '429: repetição conta como abuso'],
+      correta: 2,
+      explicacao: 'Mesma chave com corpo diferente é erro do cliente, não repetição. Devolver a resposta antiga esconderia o erro; criar outra quebraria a promessa da chave. O draft IETF sugere 422.',
+    },
+    {
+      pergunta: 'Por que o FiltroDeCota desta aula não é anotado com @Component?',
+      opcoes: ['Porque filtros não podem ser beans', 'Porque o Spring Boot registraria o bean também como filtro de servlet, e ele rodaria duas vezes, gastando o dobro de créditos', 'Por desempenho na inicialização', 'Porque o Spring Security proíbe filtros com dependências'],
+      correta: 1,
+      explicacao: 'Todo bean que implementa Filter é registrado no contêiner. Com o addFilterAfter na cadeia, o filtro rodaria duas vezes. Ou não é bean, ou desliga-se o registro com um FilterRegistrationBean.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Rate limiting** protege capacidade, justiça e segurança. Janela fixa é barata mas deixa passar o dobro na virada; janela deslizante é mais precisa; **token bucket** tolera rajadas, controla a média e aceita **custo variável**; leaky bucket suaviza enfileirando.
+- O **GCRA** representa o token bucket com um único instante por chave ("cheio em"): atualização atômica, sem `double`, e fácil de levar para o Redis.
+- A **chave** importa tanto quanto o algoritmo: usuário ou API key nas rotas autenticadas, IP nas públicas (com cuidado com proxies e `X-Forwarded-For`), conta-alvo contra força bruta distribuída.
+- Recuse com **429**, `Retry-After` arredondado para cima e **Problem Details**; os headers `RateLimit` e `RateLimit-Policy` (draft IETF, versão 11) avisam antes.
+- Com várias réplicas, o estado vai para o **Redis** (Bucket4j) ou o limite sobe para o **gateway**; decida se o limitador falha aberto ou fechado.
+- Limite também o **custo**: página máxima, tamanho de payload, timeouts.
+- O Spring Security 7 já envia `nosniff`, `X-Frame-Options: DENY`, `Cache-Control`, `X-XSS-Protection: 0` e HSTS (só em HTTPS); para APIs, acrescente CSP `default-src 'none'` e `Referrer-Policy`.
+- **CORS** é regra do navegador, não controle de acesso: origens exatas, nada de `*` com credenciais, e `Expose-Headers` para o front ler `Retry-After`.
+- **Segredos** num cofre, sem valor padrão, validados na subida, nunca logados, com rotação ensaiada.
+- **Supply chain**: Dependabot/Renovate, varredura (Dependency-Check, OSV), SBOM CycloneDX, assinatura de artefatos e pipeline protegido.
+- **Idempotency-Key** torna o POST seguro para repetir: escopo por cliente, corpo comparado, registro atômico, validade.
+
+## Próximo passo
+
+Até aqui, a API emitiu e validou os próprios tokens. Em produção, quase sempre quem emite é um servidor de autorização (Keycloak, Auth0, Entra ID, Cognito) e quem faz login é uma pessoa num navegador ou num app. Na aula [OAuth 2 e OpenID Connect](../../11-seguranca/07-oauth2-e-openid-connect/), você vai ver os fluxos (authorization code com PKCE, client credentials), a diferença entre access token e ID token, e como o Spring Security conecta a API a um provedor de identidade. E, para praticar o que viu aqui, faça o [exercício 11.04, Limite de requisições com token bucket](../../../exercicios/11-seguranca/04-limite-de-requisicoes/).
+
+## Referências
+
+- [OWASP API Security Top 10 (2023) — API4: Unrestricted Resource Consumption](https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/)
+- [OWASP Top 10:2025 — A03 Software Supply Chain Failures](https://owasp.org/Top10/2025/)
+- [IETF — RateLimit header fields for HTTP (draft-ietf-httpapi-ratelimit-headers)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
+- [IETF — The Idempotency-Key HTTP Header Field (draft-ietf-httpapi-idempotency-key-header)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+- [RFC 6585 — Additional HTTP Status Codes (429)](https://www.rfc-editor.org/rfc/rfc6585) e [RFC 9110 — HTTP Semantics (Retry-After)](https://www.rfc-editor.org/rfc/rfc9110#section-10.2.3)
+- [RFC 9457 — Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
+- [Spring Security — Security HTTP Response Headers](https://docs.spring.io/spring-security/reference/features/exploits/headers.html)
+- [Spring Security — CORS](https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html)
+- [Spring Boot — Generate a CycloneDX SBOM](https://docs.spring.io/spring-boot/how-to/build.html)
+- [Bucket4j — documentação](https://bucket4j.com/)
+- [OWASP — Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+- [CycloneDX Maven Plugin](https://cyclonedx.github.io/cyclonedx-maven-plugin/)
+- [OWASP Dependency-Check](https://owasp.org/www-project-dependency-check/)
+- [Sigstore](https://www.sigstore.dev/)

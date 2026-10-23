@@ -1,0 +1,333 @@
+---
+titulo: "RAG e embeddings: respostas com base nos documentos do banco"
+descricao: Embeddings e similaridade de cosseno, chunking com tamanho e sobreposição, pgvector no PostgreSQL, o pipeline de ingestão do Spring AI, consultas com topK, limiar e filtro por metadados, QuestionAnswerAdvisor × RetrievalAugmentationAdvisor e como avaliar um RAG antes de colocá-lo na frente do cliente.
+modulo: 16-ia-backend
+ordem: 3
+duracao: 65
+objetivos:
+  - Explicar o que é um embedding e calcular a similaridade de cosseno entre dois vetores em Java puro
+  - Escolher tamanho e sobreposição de chunks para documentos de políticas e FAQ
+  - Montar o pipeline de ingestão (leitura, divisão, gravação) num vector store pgvector
+  - Configurar a consulta com topK, similarityThreshold e filtro por metadados para isolar clientes
+  - Avaliar um RAG com perguntas de teste, inclusive as que devem receber "não sei"
+tags: [RAG, embeddings, similaridade de cosseno, chunking, pgvector, vector store, Spring AI, advisors]
+flashcards:
+  - frente: O que é RAG?
+    verso: Retrieval-Augmented Generation. Antes de chamar o modelo, a aplicação busca trechos relevantes nos seus próprios documentos e os coloca no prompt como contexto. O modelo responde com base neles, e não só no que aprendeu no treino.
+  - frente: O que é um embedding?
+    verso: Um vetor de números (centenas ou milhares de dimensões) que representa o significado de um texto. Textos com significado parecido geram vetores próximos, mesmo sem palavras em comum.
+  - frente: Como se calcula a similaridade de cosseno?
+    verso: Produto escalar dos dois vetores dividido pelo produto das suas normas. Vai de -1 a 1; quanto mais perto de 1, mais parecidos os textos. Com vetores já normalizados, é só o produto escalar.
+  - frente: Por que dividir os documentos em chunks?
+    verso: O embedding de um documento inteiro dilui o significado, e o contexto do modelo é limitado e cobrado por token. Trechos menores tornam a busca precisa e o prompt enxuto. Sobreposição evita cortar uma regra no meio.
+  - frente: Para que servem topK e similarityThreshold?
+    verso: topK limita quantos trechos voltam da busca; similarityThreshold descarta os trechos pouco parecidos com a pergunta. Juntos controlam o custo do prompt e o ruído no contexto.
+  - frente: Como isolar os documentos de cada cliente num vector store compartilhado?
+    verso: Gravando o id do cliente (tenant) nos metadados de cada documento e aplicando SEMPRE um filtro por esse metadado na consulta, com o valor vindo da autenticação, nunca do texto da pergunta.
+  - frente: O que o RAG deve fazer quando a busca não encontra contexto?
+    verso: Responder que não sabe (ou encaminhar para um humano), em vez de deixar o modelo inventar. No Spring AI, o ContextualQueryAugmenter com allowEmptyContext(false), o padrão, instrui o modelo a não responder sem contexto.
+---
+
+O time de atendimento da Fintech Core recebe as mesmas perguntas todos os dias: "qual o limite do Pix noturno?", "quanto custa a TED?", "em quanto tempo cai o estorno?". As respostas estão nas **políticas e no FAQ** do banco, documentos que mudam todo mês. Um modelo de linguagem genérico não conhece esses documentos e, pior, responde com confiança mesmo assim.
+
+**RAG** (*Retrieval-Augmented Generation*) resolve isso sem treinar modelo nenhum: a cada pergunta, a aplicação **busca** os trechos relevantes dos documentos do banco e os entrega ao modelo junto com a pergunta. O modelo vira um redator que lê o material certo antes de responder. Esta aula mostra cada peça desse caminho, e onde ele costuma quebrar.
+
+## A intuição: busca por significado
+
+Uma busca por palavra-chave (`LIKE '%pix%'`) não acha "transferência instantânea à noite" quando a política diz "limite noturno do Pix". Precisamos comparar **significados**. É para isso que servem os **embeddings**: um modelo de embedding transforma um texto num vetor de números, e textos parecidos viram vetores que apontam para direções parecidas.
+
+```text
+"limite do Pix à noite"          → [0.12, -0.40, 0.88, ...]   (1536 números, por exemplo)
+"valor máximo de Pix noturno"    → [0.10, -0.38, 0.91, ...]   ← quase a mesma direção
+"como emitir segunda via do boleto" → [-0.55, 0.20, 0.03, ...] ← direção bem diferente
+```
+
+Cada modelo de embedding tem a sua **dimensão** (quantos números por vetor) e o seu "espaço": vetores de modelos diferentes não se comparam. Se trocar o modelo, reprocesse todos os documentos.
+
+## Similaridade de cosseno em Java puro
+
+A medida mais usada para comparar embeddings é a **similaridade de cosseno**: o cosseno do ângulo entre os dois vetores. Vale 1 quando apontam para o mesmo lado, 0 quando não têm relação, -1 quando são opostos.
+
+```java
+public final class Similaridade {
+
+    private Similaridade() { }
+
+    /** cos(a, b) = (a · b) / (|a| × |b|) */
+    public static double cosseno(float[] a, float[] b) {
+        if (a.length != b.length) {
+            throw new IllegalArgumentException("Dimensões diferentes: " + a.length + " × " + b.length);
+        }
+        double produtoEscalar = 0, normaA = 0, normaB = 0;
+        for (int i = 0; i < a.length; i++) {
+            produtoEscalar += a[i] * b[i];
+            normaA += a[i] * a[i];
+            normaB += b[i] * b[i];
+        }
+        if (normaA == 0 || normaB == 0) {
+            throw new IllegalArgumentException("Vetor nulo não tem direção");
+        }
+        return produtoEscalar / (Math.sqrt(normaA) * Math.sqrt(normaB));
+    }
+
+    public static void main(String[] args) {
+        float[] pergunta   = {0.9f, 0.1f, 0.3f};
+        float[] pixNoturno = {0.8f, 0.2f, 0.4f};
+        float[] boleto     = {-0.2f, 0.9f, 0.1f};
+        System.out.printf("pix noturno: %.3f%n", cosseno(pergunta, pixNoturno)); // ≈ 0,983
+        System.out.printf("boleto:      %.3f%n", cosseno(pergunta, boleto));     // ≈ -0,062
+    }
+}
+```
+
+Vetores de três dimensões são só para caber na tela; o cálculo é o mesmo com 1536. Muitos provedores já devolvem vetores **normalizados** (norma 1), e aí o cosseno é só o produto escalar. Um vector store faz exatamente essa conta, só que com índice (HNSW, por exemplo) para não comparar a pergunta com milhões de vetores um a um.
+
+<Callout tipo="info" titulo="Distância × similaridade">
+O pgvector trabalha com **distância de cosseno**, que é `1 - similaridade`. Quando o Spring AI fala em `similarityThreshold(0.8)`, ele já converteu para similaridade: 0,8 significa "bem parecido", não "longe".
+</Callout>
+
+## O caminho completo
+
+RAG tem dois fluxos independentes: a **ingestão**, que roda quando os documentos mudam, e a **consulta**, que roda a cada pergunta.
+
+<Figura legenda="Ingestão (acima) prepara os vetores; a consulta (abaixo) busca os trechos e aumenta o prompt">
+<svg viewBox="0 0 680 290" width="680" role="img" aria-label="Fluxo de ingestão: documentos, leitor, divisor em chunks, modelo de embedding e pgvector. Fluxo de consulta: pergunta, embedding, busca no pgvector com topK e filtro, prompt aumentado e modelo de chat">
+  <defs><marker id="m1631" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="22" class="d-title">Ingestão (quando os documentos mudam)</text>
+  <rect x="10" y="36" width="110" height="54" rx="8" class="d-box"/><text x="65" y="60" text-anchor="middle" class="d-title">Políticas</text><text x="65" y="78" text-anchor="middle" class="d-label">PDF, Markdown</text>
+  <rect x="145" y="36" width="110" height="54" rx="8" class="d-info"/><text x="200" y="60" text-anchor="middle" class="d-title">Reader</text><text x="200" y="78" text-anchor="middle" class="d-mono">Document</text>
+  <rect x="280" y="36" width="110" height="54" rx="8" class="d-info"/><text x="335" y="60" text-anchor="middle" class="d-title">Splitter</text><text x="335" y="78" text-anchor="middle" class="d-label">chunks</text>
+  <rect x="415" y="36" width="110" height="54" rx="8" class="d-violet"/><text x="470" y="60" text-anchor="middle" class="d-title">Embedding</text><text x="470" y="78" text-anchor="middle" class="d-label">texto → vetor</text>
+  <rect x="550" y="36" width="120" height="200" rx="8" class="d-ok"/><text x="610" y="130" text-anchor="middle" class="d-title">pgvector</text><text x="610" y="150" text-anchor="middle" class="d-mono">vector_store</text>
+  <path d="M120 63 H141" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M255 63 H276" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M390 63 H411" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M525 63 H546" class="d-line" marker-end="url(#m1631)"/>
+  <text x="10" y="142" class="d-title">Consulta (a cada pergunta)</text>
+  <rect x="10" y="182" width="110" height="54" rx="8" class="d-box"/><text x="65" y="206" text-anchor="middle" class="d-title">Pergunta</text><text x="65" y="224" text-anchor="middle" class="d-label">do cliente</text>
+  <rect x="145" y="182" width="110" height="54" rx="8" class="d-violet"/><text x="200" y="206" text-anchor="middle" class="d-title">Embedding</text><text x="200" y="224" text-anchor="middle" class="d-label">mesmo modelo</text>
+  <rect x="280" y="182" width="245" height="54" rx="8" class="d-accent"/><text x="402" y="206" text-anchor="middle" class="d-title">Busca: topK, limiar, filtro</text><text x="402" y="224" text-anchor="middle" class="d-mono">tenant == 'acme'</text>
+  <path d="M120 209 H141" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M255 209 H276" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M525 209 H546" class="d-line" marker-end="url(#m1631)"/>
+  <path d="M402 236 V262 H200" class="d-line" marker-end="url(#m1631)"/>
+  <text x="10" y="266" class="d-label">prompt aumentado:</text><text x="10" y="284" class="d-label">pergunta + trechos → modelo de chat → resposta</text>
+</svg>
+</Figura>
+
+## Chunking: o detalhe que decide a qualidade
+
+Gerar um embedding de um PDF de 40 páginas produz um vetor que "fala de tudo" e não se parece com pergunta nenhuma. Por isso os documentos são divididos em **chunks** (trechos), e cada chunk vira um vetor.
+
+| Decisão | Pequeno demais | Grande demais | Ponto de partida |
+|---|---|---|---|
+| **Tamanho** | o trecho perde o contexto ("o limite é R$ 1.000", de quê?) | o vetor dilui o assunto e o prompt fica caro | algumas centenas de tokens; para FAQ, uma pergunta com a resposta |
+| **Sobreposição** | uma regra cortada no meio aparece pela metade em dois chunks | trechos repetidos ocupam o contexto | 10% a 20% do tamanho |
+| **Fronteira** | cortar no meio de uma frase ou tabela | juntar seções sem relação | respeitar títulos, parágrafos e itens do FAQ |
+
+O `TokenTextSplitter` do Spring AI divide por **tokens** e tenta terminar cada chunk numa pontuação, mas **não tem sobreposição** configurável. Se ela for importante para os seus documentos, escreva um `TextSplitter` próprio, ou divida o FAQ você mesmo, uma entrada por `Document`. Para documentos com estrutura clara, dividir pela estrutura quase sempre vence o corte por tamanho.
+
+<Callout tipo="dica" titulo="Metadados são metade do chunk">
+Cada `Document` carrega um mapa de metadados: fonte, seção, versão da política, data de vigência e, num sistema com vários clientes, o **tenant**. É por eles que você filtra, cita a fonte na resposta e apaga os trechos de uma política revogada.
+</Callout>
+
+## Vector store: pgvector
+
+A trilha já usa PostgreSQL, então o caminho natural é a extensão **pgvector**: vetores numa coluna, índice HNSW, e o mesmo banco com backup e monitoramento que você já opera. No Spring AI, o starter é `spring-ai-starter-vectorstore-pgvector`, e as propriedades ficam em `spring.ai.vectorstore.pgvector.*`:
+
+```yaml
+spring:
+  ai:
+    vectorstore:
+      pgvector:
+        index-type: HNSW              # padrão
+        distance-type: COSINE_DISTANCE # padrão
+        dimensions: 1536              # precisa bater com o modelo de embedding
+        initialize-schema: true       # só em desenvolvimento; em produção, crie a tabela via Flyway
+```
+
+A imagem Docker `pgvector/pgvector` já traz a extensão, e o Testcontainers a sobe nos testes. Para um protótipo ou teste rápido sem banco, o `SimpleVectorStore` guarda tudo em memória (e pode salvar em arquivo): ótimo para experimentar, inadequado para produção, porque compara com todos os vetores e não é compartilhado entre instâncias.
+
+## Pipeline de ingestão
+
+A ingestão é um ETL: um `DocumentReader` lê, um `DocumentTransformer` (o splitter) divide, e o `VectorStore` grava, chamando o modelo de embedding para cada chunk.
+
+```java
+@Component
+public class IngestaoDePoliticas {
+
+    private final VectorStore vectorStore;
+
+    public IngestaoDePoliticas(VectorStore vectorStore) {
+        this.vectorStore = vectorStore;
+    }
+
+    public void ingerir(Resource arquivo, String tenantId, String versao) {
+        TextReader leitor = new TextReader(arquivo);                 // PDF: spring-ai-pdf-document-reader
+        leitor.getCustomMetadata().putAll(Map.of(
+                "tenant", tenantId,
+                "fonte", arquivo.getFilename(),
+                "versao", versao));
+
+        TokenTextSplitter divisor = TokenTextSplitter.builder()
+                .withChunkSize(500)                                   // em tokens
+                .withMinChunkSizeChars(200)
+                .build();
+
+        List<Document> chunks = divisor.apply(leitor.read());       // metadados são copiados para cada chunk
+        vectorStore.add(chunks);                                      // gera embeddings e grava
+    }
+}
+```
+
+Na vida real, a ingestão roda fora do caminho da requisição (um job agendado ou um consumidor de eventos, módulo 12) e precisa ser **idempotente**: ao publicar a versão nova de uma política, apague os chunks da versão antiga (`vectorStore.delete` aceita uma expressão de filtro) antes de gravar os novos, ou o modelo vai receber as duas regras.
+
+## A consulta: topK, limiar e filtro
+
+```java
+List<Document> trechos = vectorStore.similaritySearch(SearchRequest.builder()
+        .query("qual o limite do Pix à noite?")
+        .topK(5)                                  // no máximo 5 trechos
+        .similarityThreshold(0.7)                 // descarta o que for pouco parecido
+        .filterExpression("tenant == 'acme' && versao == '2026-09'")
+        .build());
+```
+
+- **topK** controla custo e ruído: mais trechos = prompt maior e mais chance de contexto irrelevante.
+- **similarityThreshold** evita que, sem nada relevante, os "5 menos piores" entrem no prompt. O valor bom depende do modelo de embedding: calibre com as perguntas de teste.
+- **Filtros por metadados** restringem a busca antes do ranking. A expressão em texto é portável entre vector stores; o `FilterExpressionBuilder` monta a mesma coisa com tipos.
+
+<Callout tipo="erro" titulo="Vazamento entre clientes">
+Se o vector store guarda documentos de vários clientes (um contrato específico, as tarifas negociadas de uma empresa), a busca **sem filtro** pode colocar o contrato da empresa A no prompt da empresa B, e o modelo vai citá-lo sem cerimônia. O filtro por `tenant` é obrigatório em **toda** consulta, e o valor vem do usuário autenticado (o `SecurityContext` do módulo 11), nunca de algo que o cliente digitou. Teste isso como você testa autorização.
+</Callout>
+
+## Os advisors do Spring AI
+
+Você pode montar o prompt à mão com os trechos, mas o Spring AI já oferece isso como **advisors** do `ChatClient`, que interceptam a chamada, fazem a busca e aumentam o prompt.
+
+**QuestionAnswerAdvisor** (artefato `spring-ai-vector-store-advisor`): o caminho direto, bom para começar.
+
+```java
+ChatClient atendimento = ChatClient.builder(chatModel)
+        .defaultAdvisors(QuestionAnswerAdvisor.builder(vectorStore)
+                .searchRequest(SearchRequest.builder().similarityThreshold(0.75).topK(5).build())
+                .build())
+        .build();
+
+String resposta = atendimento.prompt()
+        .user("Qual o limite do Pix entre 20h e 6h?")
+        .advisors(a -> a.param(QuestionAnswerAdvisor.FILTER_EXPRESSION, "tenant == '" + tenantAutenticado + "'"))
+        .call()
+        .content();
+```
+
+O `tenantAutenticado` vem do seu código, mas mesmo assim valide o formato (por exemplo, só letras, números e hífen) antes de concatenar na expressão: é o mesmo cuidado de não montar SQL com texto livre.
+
+**RetrievalAugmentationAdvisor** (artefato `spring-ai-rag`): a versão modular. Cada etapa é uma peça que você troca: transformar a pergunta (`RewriteQueryTransformer` reescreve perguntas vagas antes da busca), recuperar (`VectorStoreDocumentRetriever`) e aumentar o prompt (`ContextualQueryAugmenter`).
+
+```java
+Advisor rag = RetrievalAugmentationAdvisor.builder()
+        .queryTransformers(RewriteQueryTransformer.builder()
+                .chatClientBuilder(chatClientBuilder.build().mutate())
+                .build())
+        .documentRetriever(VectorStoreDocumentRetriever.builder()
+                .vectorStore(vectorStore)
+                .similarityThreshold(0.70)
+                .topK(5)
+                .filterExpression(new FilterExpressionBuilder().eq("tenant", tenantAutenticado).build())
+                .build())
+        .queryAugmenter(ContextualQueryAugmenter.builder()
+                .allowEmptyContext(false)          // padrão: sem contexto, o modelo é instruído a não responder
+                .build())
+        .build();
+```
+
+| | QuestionAnswerAdvisor | RetrievalAugmentationAdvisor |
+|---|---|---|
+| Montagem | uma peça, poucos parâmetros | pipeline de etapas plugáveis |
+| Reescrever/expandir a pergunta | não | sim (`RewriteQueryTransformer` e outros) |
+| Contexto vazio | responde com o que tiver | `allowEmptyContext` decide |
+| Quando usar | protótipo, FAQ simples | produção, perguntas vagas ou conversas longas |
+
+## Avaliando um RAG
+
+"Parece bom quando eu testo" não é critério. Monte um **conjunto de avaliação** antes de ir para produção, e rode-o a cada mudança de chunking, modelo, limiar ou prompt:
+
+```java
+record CasoDeAvaliacao(String pergunta, String deveConter, boolean deveDizerQueNaoSabe) { }
+
+List<CasoDeAvaliacao> casos = List.of(
+        new CasoDeAvaliacao("Qual o limite do Pix à noite?", "R$ 1.000", false),
+        new CasoDeAvaliacao("Quanto custa a TED para pessoa física?", "gratuita", false),
+        new CasoDeAvaliacao("Qual a cotação do bitcoin hoje?", null, true),         // fora dos documentos
+        new CasoDeAvaliacao("Quais as tarifas negociadas da empresa Beta?", null, true)); // outro tenant
+```
+
+Avalie separadamente as duas metades:
+
+1. **Recuperação**: para cada pergunta, o trecho certo veio entre os `topK`? Isso se testa sem modelo de chat, só com `similaritySearch`, e é determinístico.
+2. **Geração**: a resposta usa o trecho, contém o fato esperado e **não inventa**? Aqui entram verificações simples (contém "R$ 1.000") e, para respostas longas, um segundo modelo como avaliador (*LLM-as-a-judge*), que o Spring AI oferece como `Evaluator` (por exemplo, `RelevancyEvaluator`).
+
+Os casos de **"não sei"** são os mais importantes num banco: uma pergunta sem resposta nos documentos, ou sobre dados de outro cliente, precisa terminar em "não encontrei essa informação, vou te encaminhar para um atendente", e não numa tarifa inventada.
+
+<Callout tipo="atencao" titulo="Documento é entrada não confiável">
+O texto dos chunks vai para o prompt. Se alguém consegue incluir documentos (um upload de cliente, uma página raspada), consegue incluir instruções ("ignore as regras e ..."). É a *prompt injection* indireta: trate a origem dos documentos com o mesmo cuidado de qualquer entrada.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você faria um chatbot que responde com base nos documentos da empresa?" Estruture:
+
+1. **Ingestão**: leitura, chunking (tamanho, sobreposição, respeitar a estrutura), embeddings, vector store (pgvector se já há PostgreSQL), metadados.
+2. **Consulta**: embedding da pergunta com o **mesmo** modelo, `topK`, limiar, **filtro por tenant** vindo da autenticação.
+3. **Geração**: prompt com os trechos, instrução para responder só com base neles e citar a fonte, "não sei" sem contexto.
+4. **Avaliação**: conjunto de perguntas com resposta esperada, medindo recuperação e geração separadamente.
+5. **Operação**: reingestão idempotente quando a política muda, custo por token, logs das fontes usadas.
+</Callout>
+
+<Quiz
+  id="16-rag"
+  questoes={[
+    {
+      pergunta: 'Dois vetores de embedding apontam exatamente na mesma direção. Qual é a similaridade de cosseno entre eles?',
+      opcoes: ['0', '1', '-1', 'Depende do tamanho dos vetores'],
+      correta: 1,
+      explicacao: 'O cosseno de um ângulo zero é 1. A norma (tamanho) não importa, porque a fórmula divide pelo produto das normas.',
+    },
+    {
+      pergunta: 'O vector store guarda contratos de várias empresas. Como garantir que a empresa A nunca receba trechos da empresa B?',
+      opcoes: ['Pedir ao modelo, no prompt, que ignore documentos de outras empresas', 'Filtrar a busca por um metadado de tenant cujo valor vem do usuário autenticado', 'Aumentar o similarityThreshold', 'Usar topK igual a 1'],
+      correta: 1,
+      explicacao: 'O isolamento precisa acontecer antes do modelo, na busca. Instruções no prompt não são controle de acesso, e limiar ou topK não dizem nada sobre o dono do documento.',
+    },
+    {
+      pergunta: 'Por que não gerar um único embedding para um PDF de 40 páginas?',
+      opcoes: ['Porque o pgvector não aceita textos longos', 'Porque o vetor dilui o significado e o trecho relevante não fica parecido com nenhuma pergunta', 'Porque embeddings só funcionam com uma frase', 'Porque o PDF precisa ser convertido para imagem'],
+      correta: 1,
+      explicacao: 'Chunks menores têm assunto definido, o que torna a busca precisa e o prompt enxuto.',
+    },
+    {
+      pergunta: 'O cliente pergunta a cotação do bitcoin e nenhum documento das políticas fala disso. Qual o comportamento desejado?',
+      opcoes: ['Responder com o conhecimento geral do modelo', 'Dizer que não encontrou a informação e oferecer um atendente', 'Devolver os 5 trechos mais parecidos mesmo assim', 'Repetir a pergunta'],
+      correta: 1,
+      explicacao: 'Num banco, uma resposta inventada é pior que nenhuma. O limiar de similaridade e um augmenter que não aceita contexto vazio levam a esse comportamento, e o conjunto de avaliação deve cobrá-lo.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **RAG** = buscar trechos dos seus documentos e colocá-los no prompt; o modelo responde com base neles.
+- **Embeddings** representam significado; compare com **similaridade de cosseno** e use sempre o mesmo modelo na ingestão e na consulta.
+- **Chunking**: tamanho de algumas centenas de tokens, sobreposição quando cortar regras for um risco, respeito à estrutura; o `TokenTextSplitter` não sobrepõe.
+- **pgvector** no PostgreSQL que você já tem; `SimpleVectorStore` só para protótipo.
+- Ingestão: reader → splitter → `vectorStore.add`, idempotente e fora do caminho da requisição.
+- Consulta: `topK`, `similarityThreshold` e **filtro por tenant** vindo da autenticação.
+- `QuestionAnswerAdvisor` para começar; `RetrievalAugmentationAdvisor` para um pipeline modular.
+- Avalie recuperação e geração com perguntas de teste, incluindo as que devem receber "não sei".
+
+## Referências
+
+- Documentação do Spring AI — *Retrieval Augmented Generation*, *ETL Pipeline*, *Vector Databases* (*PGvector*), *Evaluation Testing*
+- Repositório do pgvector — README (tipos, operadores e índices HNSW/IVFFlat)
+- Lewis et al. — *Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks* (2020)
+- OWASP — *Top 10 for LLM Applications* (prompt injection)

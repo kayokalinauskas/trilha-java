@@ -1,0 +1,310 @@
+---
+titulo: "Maven e Gradle: ciclo de vida, dependências e o jar executável"
+descricao: O ciclo de vida do Maven e os plugins por trás de cada fase, BOM e dependencyManagement, escopos, projetos multi-módulo, wrapper, Surefire × Failsafe, o comando certo para o CI, o equivalente em Gradle (Kotlin DSL) e o spring-boot-maven-plugin gerando o jar executável.
+modulo: 14-devops
+ordem: 2
+duracao: 55
+objetivos:
+  - Explicar as fases do ciclo de vida do Maven e o que cada uma executa
+  - Controlar versões com BOM e dependencyManagement e escolher o escopo certo
+  - Separar testes unitários (Surefire) e de integração (Failsafe) e rodar tudo no CI com mvn -B verify
+  - Gerar o jar executável do Spring Boot com Maven ou Gradle
+tags: [maven, gradle, build, BOM, dependencyManagement, surefire, failsafe, wrapper, spring-boot-maven-plugin]
+flashcards:
+  - frente: Quais as principais fases do ciclo de vida padrão do Maven, em ordem?
+    verso: validate, compile, test, package, verify, install e deploy (há fases intermediárias, como integration-test). Rodar uma fase executa todas as anteriores - mvn verify compila, testa e empacota.
+  - frente: O que é um BOM?
+    verso: Um pom (packaging pom) que só tem dependencyManagement com versões testadas juntas, como o spring-boot-dependencies. Importado com scope import, ele fixa as versões e você declara as dependências sem versão.
+  - frente: Diferença entre dependencies e dependencyManagement
+    verso: dependencies ADICIONA a biblioteca ao projeto. dependencyManagement só DECIDE a versão (e o escopo) caso algum módulo a declare; sozinho, não adiciona nada ao classpath.
+  - frente: Surefire × Failsafe
+    verso: O Surefire roda os testes unitários (*Test, *Tests) na fase test e, se algum falhar, reprova o build ao fim dela. O Failsafe roda os de integração (*IT) na fase integration-test e só reprova o build na fase verify, depois de post-integration-test derrubar o ambiente.
+  - frente: Por que usar o Maven Wrapper (mvnw)?
+    verso: Ele baixa e usa a versão do Maven fixada em .mvn/wrapper/maven-wrapper.properties. Todo mundo, e o CI, compila com a mesma versão, sem precisar instalar o Maven.
+  - frente: Por que mvn -B verify no CI, e não mvn install?
+    verso: verify roda tudo o que importa (compilar, todos os testes, empacotar, checagens). install ainda copia o artefato para o ~/.m2 da máquina, o que não serve para nada numa máquina de CI descartável. O -B (batch) tira cores e barras de progresso do log.
+---
+
+Desde o módulo 0 você roda `mvn test`. Agora é hora de entender o que acontece por trás desse comando, porque é exatamente ele que o pipeline de CI (aula 4) e o `Dockerfile` (aula 3) vão executar. Um build confiável é o primeiro degrau da entrega contínua: **o mesmo comando, com as mesmas versões, na sua máquina e no servidor**.
+
+**Pré-requisitos:** ter rodado os testes dos módulos anteriores com Maven e conhecer os starters do Spring Boot (módulo 8).
+
+## Intuição: uma linha de montagem
+
+O Maven é uma linha de montagem com estações fixas, sempre na mesma ordem. Você não diz *como* compilar; diz **até qual estação** quer chegar, e ele passa por todas as anteriores. Os **plugins** são as ferramentas presas a cada estação.
+
+<Figura legenda="O ciclo de vida padrão do Maven (resumido). Pedir uma fase executa todas as anteriores; embaixo, o plugin que faz o trabalho em cada uma">
+<svg viewBox="0 0 680 200" width="680" role="img" aria-label="Fases validate, compile, test, package, verify e install em sequência, com os plugins compiler, surefire, jar, failsafe e install">
+  <defs><marker id="m1402" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="5" y="30" width="95" height="40" rx="8" class="d-box"/><text x="52" y="55" text-anchor="middle" class="d-mono">validate</text>
+  <rect x="118" y="30" width="95" height="40" rx="8" class="d-info"/><text x="165" y="55" text-anchor="middle" class="d-mono">compile</text>
+  <rect x="231" y="30" width="95" height="40" rx="8" class="d-info"/><text x="278" y="55" text-anchor="middle" class="d-mono">test</text>
+  <rect x="344" y="30" width="95" height="40" rx="8" class="d-info"/><text x="391" y="55" text-anchor="middle" class="d-mono">package</text>
+  <rect x="457" y="30" width="95" height="40" rx="8" class="d-accent"/><text x="504" y="55" text-anchor="middle" class="d-mono">verify</text>
+  <rect x="570" y="30" width="95" height="40" rx="8" class="d-box"/><text x="617" y="55" text-anchor="middle" class="d-mono">install</text>
+  <path d="M100 50 H114" class="d-line" marker-end="url(#m1402)"/>
+  <path d="M213 50 H227" class="d-line" marker-end="url(#m1402)"/>
+  <path d="M326 50 H340" class="d-line" marker-end="url(#m1402)"/>
+  <path d="M439 50 H453" class="d-line" marker-end="url(#m1402)"/>
+  <path d="M552 50 H566" class="d-line" marker-end="url(#m1402)"/>
+  <text x="52" y="95" text-anchor="middle" class="d-label">pom válido?</text>
+  <text x="165" y="95" text-anchor="middle" class="d-label">compiler</text>
+  <text x="278" y="95" text-anchor="middle" class="d-label">surefire</text>
+  <text x="278" y="113" text-anchor="middle" class="d-label">(*Test)</text>
+  <text x="391" y="95" text-anchor="middle" class="d-label">jar +</text>
+  <text x="391" y="113" text-anchor="middle" class="d-label">repackage</text>
+  <text x="504" y="95" text-anchor="middle" class="d-label">failsafe</text>
+  <text x="504" y="113" text-anchor="middle" class="d-label">(*IT)</text>
+  <text x="617" y="95" text-anchor="middle" class="d-label">copia para</text>
+  <text x="617" y="113" text-anchor="middle" class="d-mono">~/.m2</text>
+  <text x="10" y="155" class="d-label">No CI, pare em verify: tudo foi compilado, testado e empacotado.</text>
+  <text x="10" y="178" class="d-label">(integration-test roda logo antes de verify; deploy vem depois de install)</text>
+</svg>
+</Figura>
+
+```bash
+mvn compile            # validate + compile
+mvn test               # ... + testes unitários
+mvn package            # ... + gera o jar em target/
+mvn verify             # ... + testes de integração e checagens
+mvn clean verify       # apaga target/ antes (o clean é outro ciclo de vida)
+
+mvn -B verify          # no CI: modo batch, log limpo
+mvn -pl m14-devops/solucao -am verify   # só um módulo (e o que ele precisa)
+mvn dependency:tree    # de onde veio cada biblioteca
+```
+
+Fuja do `-DskipTests` como hábito: um jar que ninguém testou é o jeito mais rápido de levar um bug para produção.
+
+## Dependências: escopos, BOM e dependencyManagement
+
+| Escopo | Compila? | Testes? | Vai no jar final? | Exemplo |
+|---|---|---|---|---|
+| `compile` (padrão) | sim | sim | sim | `spring-boot-starter-webmvc` |
+| `provided` | sim | sim | não (o ambiente fornece) | API de servlet num WAR |
+| `runtime` | não | sim | sim | driver JDBC do PostgreSQL |
+| `test` | só os testes | sim | não | JUnit, AssertJ, Testcontainers |
+
+Escolher versões à mão para 60 bibliotecas que precisam funcionar juntas é receita de conflito. Um **BOM** (*bill of materials*) resolve: é um pom que só contém `dependencyManagement` com versões testadas em conjunto. O `trilha-spring-parent` deste curso importa o do Spring Boot:
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>${spring-boot.version}</version>   <!-- 4.1.1 -->
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+E o módulo declara as dependências **sem versão**, como no `pom.xml` do módulo 14:
+
+```xml
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>   <!-- versão vem do BOM -->
+</dependency>
+<dependency>
+  <groupId>org.yaml</groupId>
+  <artifactId>snakeyaml</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+A diferença que cai em entrevista: `dependencies` **adiciona** a biblioteca; `dependencyManagement` só **decide a versão** caso alguém a declare. Quando duas bibliotecas trazem versões diferentes de uma mesma dependência transitiva, o Maven escolhe a mais **próxima** da raiz na árvore (*nearest wins*), não a mais nova; o BOM evita a surpresa.
+
+## Multi-módulo e parent
+
+O diretório `java/` deste repositório é um projeto **multi-módulo**: um `pom.xml` agregador lista os módulos, e um *parent* concentra configurações comuns (versão do Java, BOM, plugins).
+
+```xml
+<!-- pom agregador: packaging pom -->
+<packaging>pom</packaging>
+<modules>
+  <module>spring-parent</module>
+  <module>m14-devops/solucao</module>
+  <!-- ... -->
+</modules>
+```
+
+**Agregação** (`<modules>`) diz o que construir junto; **herança** (`<parent>`) diz de onde vêm as configurações. Muitas vezes o mesmo pom faz as duas coisas, mas são conceitos separados. Na Fintech Core real, um multi-módulo típico separa `dominio`, `aplicacao` e `api`, e o Maven os constrói na ordem das dependências.
+
+## Maven Wrapper
+
+```bash
+mvn wrapper:wrapper        # gera mvnw, mvnw.cmd e .mvn/wrapper/maven-wrapper.properties
+./mvnw -B verify           # Linux/macOS (no Windows: mvnw.cmd)
+```
+
+Commite os três. Quem clona o projeto (e o CI) usa a **mesma versão do Maven**, baixada automaticamente, sem instalar nada. O projeto gerado pelo start.spring.io já vem com o wrapper.
+
+## Surefire × Failsafe
+
+| | Surefire | Failsafe |
+|---|---|---|
+| Para | testes unitários | testes de integração |
+| Nomes (padrão) | `*Test`, `Test*`, `*Tests`, `*TestCase` | `IT*`, `*IT`, `*ITCase` |
+| Fase | `test` | `integration-test`, e reprova em `verify` |
+| Numa falha | reprova ao fim da fase `test`; nada depois roda | deixa `post-integration-test` derrubar o ambiente, depois reprova |
+
+O Surefire vem ativo por padrão; o Failsafe precisa ser declarado com os goals `integration-test` e `verify`. Com essa separação, `mvn test` fica rápido para o dia a dia e `mvn verify` roda tudo. Muitos projetos Spring Boot com Testcontainers (módulo 10) rodam tudo no Surefire mesmo, e funciona: a separação vale quando os testes de integração ficam lentos.
+
+## O jar executável: spring-boot-maven-plugin
+
+O `maven-jar-plugin` gera um jar só com as **suas** classes. Para rodar com `java -jar`, o Spring Boot precisa de um jar com as dependências dentro e um lançador. Quem faz isso é o goal `repackage`:
+
+```xml
+<build>
+  <plugins>
+    <plugin>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-maven-plugin</artifactId>
+      <executions>
+        <execution>
+          <goals><goal>repackage</goal></goals>   <!-- ligado à fase package -->
+        </execution>
+      </executions>
+    </plugin>
+  </plugins>
+</build>
+```
+
+Com o `spring-boot-starter-parent` como parent, essa execução já vem configurada; com um parent próprio (como o deste curso), declare-a. Se o módulo tiver mais de uma classe com `main` (o módulo 14 tem três aplicações de exercício), informe qual usar em `<configuration><mainClass>…</mainClass></configuration>`. O resultado, `target/app.jar`, é o que o `Dockerfile` da próxima aula copia. O mesmo plugin tem o goal `build-image`, que gera uma imagem OCI sem `Dockerfile`.
+
+## O mesmo projeto em Gradle
+
+O Gradle usa um script (Kotlin DSL ou Groovy) em vez de XML, tem build incremental e cache de tarefas, e é o padrão no Android. Nos projetos Spring de backend, os dois são comuns; saiba ler ambos.
+
+<Tabs grupo="build">
+<Tab rotulo="Maven">
+
+```xml
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>4.1.1</version>
+</parent>
+<properties><java.version>25</java.version></properties>
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+<build><plugins><plugin>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-maven-plugin</artifactId>
+</plugin></plugins></build>
+```
+
+```bash
+./mvnw -B verify          # testes + target/*.jar executável
+```
+
+</Tab>
+<Tab rotulo="Gradle (Kotlin DSL)">
+
+```kotlin
+// build.gradle.kts
+plugins {
+    java
+    id("org.springframework.boot") version "4.1.1"
+}
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
+
+repositories { mavenCentral() }
+
+dependencies {
+    implementation(platform(org.springframework.boot.gradle.plugin.SpringBootPlugin.BOM_COORDINATES))
+    implementation("org.springframework.boot:spring-boot-starter-webmvc")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.test { useJUnitPlatform() }
+```
+
+```bash
+./gradlew build           # testes + build/libs/*.jar (bootJar executável)
+```
+
+</Tab>
+</Tabs>
+
+| Maven | Gradle |
+|---|---|
+| `compile` / `test` (fases) | `compileJava` / `test` (tarefas) |
+| `package` | `assemble` (`jar` e `bootJar`) |
+| `verify` | `check` / `build` |
+| `install` | `publishToMavenLocal` (plugin `maven-publish`) |
+| escopo `compile` / `runtime` / `test` | `implementation` / `runtimeOnly` / `testImplementation` |
+| BOM com `scope import` | `platform(...)` |
+| `mvnw` | `gradlew` |
+
+## Armadilhas comuns
+
+- **Versão fixada à mão por cima do BOM**: um `<version>` no módulo sobrescreve a versão testada pelo Spring Boot e pode quebrar em tempo de execução (`NoSuchMethodError`).
+- **Driver JDBC com escopo `compile`**: funciona, mas deixa o código depender da implementação; `runtime` é o escopo certo.
+- **`mvn install` no CI**: gasta tempo copiando para um `~/.m2` descartável. Use `verify`.
+- **Jar sem `repackage`**: `java -jar` responde "no main manifest attribute" (não há `Main-Class` no manifesto).
+- **Commitar sem o wrapper**: o CI usa uma versão do Maven, você outra, e o build "funciona na minha máquina".
+
+<Callout tipo="entrevista">
+"Explique o ciclo de vida do Maven" e "qual a diferença entre `dependencies` e `dependencyManagement`?" são clássicas. Cite as fases em ordem, que **rodar uma fase executa as anteriores**, o papel do **BOM** e a distinção entre **Surefire e Failsafe**. Se o time usa Gradle, mostre que você reconhece o mapeamento (tarefas no lugar de fases, `implementation` no lugar de `compile`).
+</Callout>
+
+<Quiz
+  id="14-maven-e-gradle"
+  questoes={[
+    {
+      pergunta: 'Você roda mvn package. Quais fases executam?',
+      opcoes: ['Só package', 'validate, compile, test e package', 'package, verify e install', 'compile e package, sem testes'],
+      correta: 1,
+      explicacao: 'Pedir uma fase executa todas as anteriores do ciclo de vida, inclusive os testes unitários.',
+    },
+    {
+      pergunta: 'O que acontece se você declarar o spring-boot-dependencies apenas em dependencyManagement, com scope import, e nenhuma dependência?',
+      opcoes: ['Todas as bibliotecas do Spring entram no classpath', 'Nada entra no classpath: só as versões ficam definidas', 'O build falha', 'O Maven baixa só os starters'],
+      correta: 1,
+      explicacao: 'dependencyManagement só decide versões. Para uma biblioteca entrar, ela precisa estar em dependencies.',
+    },
+    {
+      pergunta: 'Qual o escopo adequado para o driver JDBC do PostgreSQL?',
+      opcoes: ['compile', 'provided', 'runtime', 'test'],
+      correta: 2,
+      explicacao: 'O código usa a API JDBC; a implementação do driver só é necessária para executar.',
+    },
+    {
+      pergunta: 'java -jar target/app.jar responde "no main manifest attribute". Qual a causa mais provável?',
+      opcoes: ['Falta o Java 25', 'O jar não passou pelo goal repackage do spring-boot-maven-plugin', 'O Surefire falhou', 'Falta o mvnw'],
+      correta: 1,
+      explicacao: 'Sem o repackage, o jar tem só as classes do projeto, sem dependências nem lançador no manifesto.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O Maven é um **ciclo de vida** de fases (validate → compile → test → package → verify → install); cada fase roda as anteriores.
+- **BOM** + `dependencyManagement` fixam versões compatíveis; declare dependências sem versão e com o **escopo** certo.
+- **Multi-módulo**: agregação (`<modules>`) e herança (`<parent>`) são coisas diferentes.
+- **Wrapper** (`mvnw`) fixa a versão do Maven; **`mvn -B verify`** é o comando do CI.
+- **Surefire** roda `*Test`; **Failsafe** roda `*IT` e reprova em `verify`.
+- O **spring-boot-maven-plugin** (`repackage`) gera o jar executável; no Gradle, `bootJar`.
+
+## Referências
+
+- Apache Maven — *Introduction to the Build Lifecycle*, *Introduction to the Dependency Mechanism* e *Maven Wrapper* (maven.apache.org)
+- Apache Maven — *Maven Surefire Plugin* e *Maven Failsafe Plugin* (maven.apache.org)
+- Documentação do Spring Boot — *Maven Plugin* e *Gradle Plugin* (docs.spring.io)
+- Documentação do Gradle — *Building Java Applications* e *Toolchains for JVM projects* (docs.gradle.org)

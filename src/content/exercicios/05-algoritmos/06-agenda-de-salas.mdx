@@ -1,0 +1,85 @@
+---
+titulo: Agenda de salas de reunião (intervalos)
+codigo: "05.06"
+resumo: Mescle horários ocupados, verifique conflitos, calcule o mínimo de salas com uma PriorityQueue e encontre as janelas livres do expediente.
+modulo: 05-algoritmos
+ordem: 6
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [intervalos, ordenação, PriorityQueue, varredura]
+aulas: [05-algoritmos/06-grafos-e-intervalos]
+java:
+  modulo: m05-algoritmos
+  teste: AgendaDeSalasTest
+---
+
+## Contexto
+
+Um SaaS de agendamento para coworkings precisa de quatro funções no motor de agenda: juntar os horários ocupados de uma pessoa, dizer se ela consegue ir a todas as reuniões, calcular **quantas salas** o coworking precisa para comportar as reuniões do dia e mostrar os **horários livres** para marcar uma nova reunião.
+
+## O modelo (pronto)
+
+`record Intervalo(int inicio, int fim)` — em minutos desde a meia-noite, **semiaberto** `[inicio, fim)`: uma reunião que termina às 10h00 não conflita com outra que começa às 10h00. O construtor rejeita `inicio >= fim`.
+
+## Requisitos
+
+| Método | Retorna |
+|---|---|
+| `mesclar(intervalos)` | Intervalos que se sobrepõem **ou se encostam** unidos, ordenados; **não altera** a entrada |
+| `semConflitos(reunioes)` | `true` se nenhum par se sobrepõe (encostar é permitido) |
+| `minimoDeSalas(reunioes)` | Menor número de salas para acomodar todas |
+| `horariosLivres(ocupados, inicioDia, fimDia)` | Lacunas livres dentro do expediente |
+
+## Exemplos
+
+```text
+mesclar([9:00–10:00, 9:30–10:30, 11:40–12:00, 10:30–11:00]) → [9:00–11:00, 11:40–12:00]
+minimoDeSalas([9:00–10:00, 9:10–11:40, 10:10–10:50, 11:40–12:00]) → 2
+horariosLivres([10:00–11:00, 9:00–9:30, 10:40–11:40], 8:00, 18:00)
+    → [8:00–9:00, 9:30–10:00, 11:40–18:00]
+```
+
+(Nos testes, os horários estão em minutos: 9:00 = 540.)
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `AgendaDeSalasTest` passam.
+- [ ] Tudo em O(n log n).
+- [ ] `horariosLivres` reaproveita `mesclar`.
+
+## Desafios opcionais
+
+- `primeiroHorarioComum(agendas, duracao)`: o primeiro horário em que **todas** as pessoas estão livres por pelo menos `duracao` minutos.
+- `alocar(reunioes)`: devolva **qual sala** cada reunião usa, não só quantas.
+
+<Dicas>
+<Dica nivel={1}>
+Todos os quatro começam igual: ordenar pelo início (sem alterar a lista recebida — use uma cópia ou `stream().sorted()`). Depois, uma passada linear comparando cada intervalo com o anterior.
+</Dica>
+<Dica nivel={2}>
+Mesclar: se `atual.inicio() <= ultimo.fim()`, substitua o último por `[ultimo.inicio, max(ultimo.fim, atual.fim)]`. Salas: uma `PriorityQueue<Integer>` com os términos das salas ocupadas; se o menor término ≤ início da reunião atual, a sala foi liberada.
+</Dica>
+<Dica nivel={3}>
+Livres: percorra `mesclar(ocupados)` com um cursor começando em `inicioDia`. Se o ocupado começa depois do cursor, há uma lacuna `[cursor, min(inicio, fimDia))`. Avance o cursor para `max(cursor, fim)`. No final, se `cursor < fimDia`, a lacuna final vai até `fimDia`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/AgendaDeSalas.java" />
+
+### Pontos-chave
+
+- **Ordenar primeiro** transforma problemas de "todos contra todos" (O(n²)) em uma varredura linear.
+- **`stream().sorted().toList()`** cria uma cópia ordenada: a lista do chamador fica intacta (o teste `naoAltera` confere).
+- **O heap de términos** representa as salas ocupadas: o menor término é a sala que libera primeiro. O tamanho final do heap é o pico de salas simultâneas.
+- **Intervalos semiabertos** eliminam a ambiguidade de "termina às 10h, começa às 10h" — é a convenção de `java.time` e da maioria das APIs de agenda.
+
+### Avalie sua solução
+
+- `semConflitos([9:00–10:00, 10:00–11:00])` devolve `true`?
+- Três reuniões idênticas exigem 3 salas na sua versão?
+
+</Solucao>

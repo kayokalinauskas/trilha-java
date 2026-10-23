@@ -1,0 +1,137 @@
+---
+titulo: Orçamento de adesivos da gráfica
+codigo: "02.02"
+resumo: Calcule orçamentos com formas geométricas polimórficas (incluindo polígonos pela fórmula do shoelace) e regras de preço combináveis com decorator.
+modulo: 02-poo
+ordem: 2
+dificuldade: medio
+tempo: 2–3h
+conceitos: [interfaces, polimorfismo, decorator, aberto/fechado, cópia defensiva]
+aulas: [02-poo/04-interfaces-e-polimorfismo, 02-poo/03-heranca-e-composicao]
+java:
+  modulo: m02-poo
+  teste: OrcamentoTest
+---
+
+## Contexto
+
+Uma gráfica rápida cobra a impressão de adesivos por **metro quadrado de material**. Cada formato tem uma fórmula de área diferente, e hoje o orçamento é feito numa planilha que gera erros. Além disso, o comercial muda as regras de preço com frequência: hoje é desconto acima de 10 m²; mês que vem pode ser taxa de urgência ou preço especial para ONGs.
+
+Você vai construir o **núcleo de domínio** do orçamento: só as classes de negócio, sem banco nem API.
+
+## Requisitos
+
+### Formas
+
+A interface `Forma` (pronta) define `area()` e `descricao()`. Implemente:
+
+| Classe | Construtor | Área |
+|---|---|---|
+| `Circulo` | `(raio)` | π · r² |
+| `Retangulo` | `(largura, altura)` | l · a |
+| `Triangulo` | `(base, altura)` | b · a / 2 |
+| `Poligono` | `(List<Ponto> vertices)` | fórmula do shoelace |
+
+**Fórmula do shoelace (Gauss):** para vértices (x₁,y₁), …, (xₙ,yₙ) em ordem ao redor da figura:
+
+```text
+área = | Σ (xᵢ · yᵢ₊₁ − xᵢ₊₁ · yᵢ) | / 2      (com xₙ₊₁ = x₁ e yₙ₊₁ = y₁)
+```
+
+### Orçamento
+
+- `adicionar(forma, quantidade)`, `itens()`, `areaTotal()` e `valorTotal(Precificacao)`.
+- `ItemOrcamento` associa uma forma a uma quantidade e sabe sua `areaTotal()`.
+
+### Precificação
+
+A interface `Precificacao` (pronta) define `precoPara(double areaTotalM2)`. Implemente:
+
+- `PrecoPorMetroQuadrado(BigDecimal precoPorM2)`.
+- `DescontoProgressivo(Precificacao base, double areaMinimaM2, BigDecimal percentual)` — aplica o desconto sobre o preço calculado **por outra precificação** quando a área passa do limite.
+
+```java
+Precificacao regra = new DescontoProgressivo(new PrecoPorMetroQuadrado(new BigDecimal("45.00")), 10.0, new BigDecimal("0.10"));
+regra.precoPara(12.0);  // 486.00  (540,00 - 10%)
+regra.precoPara(10.0);  // 450.00  (no limite, sem desconto)
+```
+
+## Regras de negócio
+
+1. Dimensões **menores ou iguais a zero** são rejeitadas **na criação** da forma (`IllegalArgumentException`), nunca no cálculo.
+2. Polígono precisa de pelo menos 3 vértices e área positiva (pontos colineares são inválidos).
+3. Quantidade de um item deve ser pelo menos 1.
+4. Orçamento vazio custa `0.00`.
+5. Preços com 2 casas decimais, `HALF_EVEN`.
+
+## Exemplo do enunciado
+
+2 retângulos de 2 m × 1,5 m + 3 círculos de raio 0,5 m, a R$ 45,00/m²:
+
+```text
+retângulos: 3,00 m² × 2 = 6,0000 m²
+círculos:   0,7854 m² × 3 = 2,3562 m²
+total:      8,3562 m²  →  R$ 376,03
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `OrcamentoTest` passam — inclusive `formaNova`, que usa uma forma criada **dentro do teste**.
+- [ ] **Nenhum** `instanceof` ou `getClass()` no cálculo de área ou de preço.
+- [ ] `Orcamento` não conhece nenhuma forma concreta nem nenhuma regra de preço concreta.
+- [ ] `Poligono` não é afetado se a lista original de vértices for alterada depois da criação.
+
+## Desafios opcionais
+
+- **Acabamento** (fosco, brilho, laminado) que multiplica o preço por um fator. Implemente como outro decorator e empilhe: `new Acabamento(new DescontoProgressivo(...), LAMINADO)`.
+- **Relatório de orçamento** para o cliente, com a descrição e a área de cada item.
+
+<Dicas>
+<Dica nivel={1}>
+Três responsabilidades separadas: **forma** (sabe sua área), **orçamento** (soma itens) e **precificação** (transforma área em preço). Se uma classe está fazendo duas dessas coisas, separe.
+</Dica>
+<Dica nivel={2}>
+Para validar dimensões sem repetir código em quatro classes, crie um método utilitário de pacote, como `Dimensoes.positiva(valor, "Raio")`, que lança a exceção ou devolve o valor. Para o shoelace, percorra os vértices com `(i + 1) % n` para "fechar" o polígono no primeiro ponto.
+</Dica>
+<Dica nivel={3}>
+`DescontoProgressivo` **guarda** uma `Precificacao` base e a chama: `BigDecimal preco = base.precoPara(area);` e só então aplica o fator `(1 - percentual)` se `area > areaMinima`. Isso é o padrão **decorator**. No `Poligono`, use `List.copyOf(vertices)` no construtor.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### Formas
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/Poligono.java" />
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/Circulo.java" semImports />
+
+`Retangulo` e `Triangulo` seguem o mesmo modelo do `Circulo`. A validação compartilhada fica em uma classe de pacote:
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/Dimensoes.java" />
+
+### Orçamento
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/Orcamento.java" />
+
+### Precificação (decorator)
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/PrecoPorMetroQuadrado.java" />
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/grafica/DescontoProgressivo.java" />
+
+### Por que este design funciona
+
+- **Aberto/Fechado de verdade.** O teste `formaNova` cria um hexágono com uma classe anônima. O `Orcamento` o aceita sem mudar uma linha, porque só depende da interface `Forma`.
+- **Decorator para regras que se combinam.** `DescontoProgressivo` não sabe (nem precisa saber) como o preço base é calculado. Regras novas viram novas classes que se empilham, em vez de `if`s crescendo dentro de uma classe `CalculadoraDePreco` gigante.
+- **`!(valor > 0)` em vez de `valor <= 0`.** Parece estranho, mas rejeita também `NaN`: toda comparação com `NaN` é falsa, então `NaN <= 0` é `false` e passaria pela validação.
+- **Área do polígono calculada uma vez.** Como o objeto é imutável, a área pode ser calculada no construtor — o que também permite validar "área positiva" na criação.
+- **`BigDecimal.valueOf(double)`** em vez de `new BigDecimal(double)`: usa a representação decimal curta do `double` e evita carregar o erro binário para o preço.
+
+### Avalie sua solução
+
+- O seu `Orcamento` tem algum `if` sobre o tipo da forma?
+- Onde está a regra "quantidade ≥ 1"? Ela deveria estar no `ItemOrcamento`, que é quem conhece a quantidade.
+- Você validou as dimensões no construtor ou dentro de `area()`? O enunciado pede o primeiro.
+
+</Solucao>

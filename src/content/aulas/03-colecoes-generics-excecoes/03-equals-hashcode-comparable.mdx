@@ -1,0 +1,189 @@
+---
+titulo: equals, hashCode, Comparable e Comparator
+descricao: O contrato entre equals e hashCode e o que quebra quando ele é violado, igualdade de negócio, ordenação natural com Comparable e ordenações flexíveis com Comparator.
+modulo: 03-colecoes-generics-excecoes
+ordem: 3
+duracao: 50
+objetivos:
+  - Implementar equals e hashCode que respeitam o contrato
+  - Definir igualdade de acordo com a regra de negócio
+  - Ordenar coleções com Comparable e com Comparator encadeado
+tags: [equals, hashCode, Comparable, Comparator]
+flashcards:
+  - frente: Qual o contrato entre equals e hashCode?
+    verso: Se a.equals(b), então a.hashCode() == b.hashCode(). O inverso não precisa valer (colisões são permitidas).
+  - frente: O que acontece se você sobrescrever equals mas não hashCode?
+    verso: HashSet/HashMap passam a aceitar "duplicados" e não encontram chaves iguais, porque objetos iguais caem em buckets diferentes.
+  - frente: Por que não usar um campo mutável no hashCode de uma chave de HashMap?
+    verso: Se o campo mudar depois da inserção, o hash muda e o objeto fica "perdido" no bucket antigo — get e remove não o encontram mais.
+  - frente: Qual a diferença entre Comparable e Comparator?
+    verso: Comparable define a ordem natural dentro da própria classe (compareTo). Comparator é um objeto externo que define ordens alternativas, combináveis com thenComparing.
+  - frente: Como ordenar por preço decrescente e, em empate, por nome?
+    verso: Comparator.comparing(Produto::preco).reversed().thenComparing(Produto::nome).
+---
+
+Você já usou `equals` para comparar Strings e já viu, no exercício 02.03, que um record gera `equals` e `hashCode` sozinho. Agora é hora de entender o **contrato** por trás deles. É um dos temas mais cobrados em entrevistas Java e a causa de bugs bem silenciosos em produção.
+
+## O que `equals` deve garantir
+
+`Object.equals` compara **referências** por padrão. Para comparar por **conteúdo**, você o sobrescreve, respeitando cinco propriedades:
+
+| Propriedade | Significa |
+|---|---|
+| Reflexiva | `a.equals(a)` é `true` |
+| Simétrica | `a.equals(b)` ⇔ `b.equals(a)` |
+| Transitiva | se `a = b` e `b = c`, então `a = c` |
+| Consistente | chamadas repetidas dão o mesmo resultado (se nada mudou) |
+| Não nula | `a.equals(null)` é `false` (e nunca lança exceção) |
+
+Uma implementação típica, com *pattern matching* no `instanceof`:
+
+```java
+@Override
+public boolean equals(Object o) {
+    if (this == o) return true;
+    return o instanceof Peca outra && codigo.equals(outra.codigo);
+}
+```
+
+## O contrato com `hashCode`
+
+A regra de ouro:
+
+> **Se dois objetos são `equals`, eles precisam ter o mesmo `hashCode`.**
+
+Lembre como o `HashMap` funciona (aula anterior): o `hashCode` escolhe o bucket e o `equals` confirma dentro dele. Se dois objetos iguais tiverem hashes diferentes, eles vão para **buckets diferentes**, e o `equals` nunca é consultado.
+
+```java
+class Peca {                       // equals sobrescrito, hashCode NÃO
+    private final String codigo;
+    @Override public boolean equals(Object o) { ... compara codigo ... }
+}
+
+Set<Peca> set = new HashSet<>();
+set.add(new Peca("AB-1"));
+set.add(new Peca("AB-1"));
+set.size();                        // 2 — "duplicado" aceito!
+set.contains(new Peca("AB-1"));    // false — não encontra!
+```
+
+A correção é usar **os mesmos campos** nos dois métodos:
+
+```java
+@Override
+public int hashCode() {
+    return codigo.hashCode();                // ou Objects.hash(campo1, campo2, ...)
+}
+```
+
+<Callout tipo="erro" titulo="Campos mutáveis no hashCode">
+Se o `hashCode` depende de um campo que **muda** depois de o objeto entrar em um `HashSet` ou virar chave de `HashMap`, o objeto fica "perdido" no bucket antigo: `contains` e `remove` deixam de encontrá-lo. Use campos **imutáveis** (o que é natural em value objects e records).
+</Callout>
+
+## Igualdade é decisão de negócio
+
+Quando duas peças são "a mesma peça"? Não é uma pergunta técnica. No exercício 03.01, a regra é: **mesmo código de fabricante, sem diferenciar maiúsculas nem espaços**; nome e preço **não importam**.
+
+Para que isso funcione de forma consistente, **normalize no construtor** e compare o campo já normalizado:
+
+```java
+public Peca(String codigo, ...) {
+    this.codigo = codigo.strip().toUpperCase(Locale.ROOT);   // "ab-123 " → "AB-123"
+}
+```
+
+Se você normalizasse **dentro** do `equals` (`equalsIgnoreCase`), precisaria repetir a mesma normalização no `hashCode`. Um descuido e o contrato quebra. Normalizar na entrada resolve de uma vez.
+
+<Callout tipo="dica" titulo="Records e o contrato">
+Records geram `equals` e `hashCode` com **todos** os componentes, respeitando o contrato automaticamente. Se a igualdade de negócio usa só **parte** dos campos (como a `Peca`), uma classe comum com os dois métodos escritos à mão é a escolha certa.
+</Callout>
+
+## `Comparable`: a ordem natural
+
+Algumas classes têm uma **ordem natural**: números, datas, Strings. Para dar uma ordem natural à sua classe, implemente `Comparable`:
+
+```java
+public record Versao(int maior, int menor, int patch) implements Comparable<Versao> {
+
+    @Override
+    public int compareTo(Versao outra) {
+        int c = Integer.compare(maior, outra.maior);
+        if (c != 0) return c;
+        c = Integer.compare(menor, outra.menor);
+        if (c != 0) return c;
+        return Integer.compare(patch, outra.patch);
+    }
+}
+
+List<Versao> versoes = new ArrayList<>(List.of(new Versao(2, 10, 0), new Versao(2, 9, 3)));
+Collections.sort(versoes);    // [2.9.3, 2.10.0] — e não a ordem de texto!
+```
+
+`compareTo` devolve **negativo** (este vem antes), **zero** (empate) ou **positivo** (este vem depois).
+
+<Callout tipo="erro" titulo="Nunca compare subtraindo">
+`return this.idade - outra.idade;` parece esperto, mas estoura com valores grandes (lembra do overflow?). Use sempre `Integer.compare`, `Long.compare` e similares.
+</Callout>
+
+## `Comparator`: ordens sob medida
+
+Na maioria das vezes, você precisa de **várias** ordens para o mesmo objeto: por preço, por nome, por data. Um `Comparator` é um objeto externo que define uma ordem, e ele se **compõe**:
+
+```java
+record Produto(String nome, BigDecimal preco, int vendidos) { }
+
+Comparator<Produto> porPreco = Comparator.comparing(Produto::preco);
+Comparator<Produto> maisVendidosPrimeiro = Comparator
+        .comparingInt(Produto::vendidos).reversed()     // mais vendidos primeiro
+        .thenComparing(Produto::preco)                  // empate: mais barato
+        .thenComparing(Produto::nome);                  // empate: ordem alfabética
+
+produtos.sort(maisVendidosPrimeiro);
+```
+
+- `Comparator.comparing(extrator)` cria a ordem a partir de uma propriedade.
+- `.reversed()` inverte **tudo o que foi definido até ali**.
+- `.thenComparing(...)` define o critério de desempate.
+- `Comparator.nullsFirst(...)`/`nullsLast(...)` tratam valores nulos.
+
+O exercício 03.02 (ranking de vendas) é exatamente isso: quantidade decrescente, faturamento decrescente e nome em ordem alfabética.
+
+<Callout tipo="atencao" titulo="TreeSet e TreeMap usam compareTo, não equals">
+Estruturas ordenadas consideram iguais os elementos cujo `compareTo` dá zero. Se o seu `Comparator` compara só o preço, dois produtos diferentes com o mesmo preço viram **um só** dentro de um `TreeSet`. Mantenha a ordem **consistente com o equals** (desempate até diferenciar).
+</Callout>
+
+<Quiz
+  id="03-equals"
+  questoes={[
+    {
+      pergunta: 'Duas instâncias com `equals` true e `hashCode` diferentes são inseridas em um HashSet. O que acontece?',
+      opcoes: ['Só uma fica no set', 'As duas ficam no set', 'Lança exceção', 'O segundo add substitui o primeiro'],
+      correta: 1,
+      explicacao: 'Com hashes diferentes, elas caem em buckets diferentes e o equals nunca é consultado.',
+    },
+    {
+      pergunta: 'Qual regra do contrato é obrigatória?',
+      opcoes: ['Objetos com o mesmo hashCode devem ser equals', 'Objetos equals devem ter o mesmo hashCode', 'hashCode deve ser único por objeto', 'hashCode deve ser positivo'],
+      correta: 1,
+      explicacao: 'Hashes iguais para objetos diferentes (colisões) são permitidos; o inverso não.',
+    },
+    {
+      pergunta: 'Como ordenar funcionários por salário decrescente e, em empate, por nome?',
+      opcoes: [
+        '`comparing(Funcionario::nome).thenComparing(Funcionario::salario).reversed()`',
+        '`comparing(Funcionario::salario).reversed().thenComparing(Funcionario::nome)`',
+        '`comparing(Funcionario::salario).thenComparing(Funcionario::nome).reversed()`',
+        '`comparing(Funcionario::salario - Funcionario::nome)`',
+      ],
+      correta: 1,
+      explicacao: 'reversed() inverte só o que foi definido até ali (o salário). O desempate por nome vem depois, em ordem crescente.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `equals` e `hashCode` andam **juntos** e usam os **mesmos campos** — de preferência imutáveis.
+- Igualdade é regra de negócio: **normalize na entrada** e compare o campo normalizado.
+- `Comparable` define a ordem natural; `Comparator` define ordens alternativas com `comparing`, `reversed` e `thenComparing`.
+- Nunca compare subtraindo; em `TreeSet`/`TreeMap`, a ordem precisa diferenciar o que o `equals` diferencia.

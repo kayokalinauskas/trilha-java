@@ -1,0 +1,311 @@
+---
+import Icon from '../Icon.astro';
+
+export interface Questao {
+  pergunta: string;
+  opcoes: string[];
+  /** índice da opção correta (0-based) */
+  correta: number;
+  explicacao: string;
+}
+
+interface Props {
+  id: string;
+  questoes: Questao[];
+  titulo?: string;
+}
+
+const { id, questoes: originais, titulo = 'Verifique seu entendimento' } = Astro.props;
+
+// Embaralha as opções de forma determinística (mesma ordem a cada build), para que a posição
+// da resposta certa não vire um padrão previsível. Semente: id do quiz + texto da pergunta.
+function semente(texto: string) {
+  let h = 2166136261;
+  for (let i = 0; i < texto.length; i++) h = Math.imul(h ^ texto.charCodeAt(i), 16777619);
+  return () => {
+    h = Math.imul(h ^ (h >>> 15), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return ((h ^= h >>> 16) >>> 0) / 4294967296;
+  };
+}
+const questoes = originais.map((q) => {
+  const aleatorio = semente(`${id}|${q.pergunta}`);
+  const ordem = q.opcoes.map((_, i) => i);
+  for (let i = ordem.length - 1; i > 0; i--) {
+    const j = Math.floor(aleatorio() * (i + 1));
+    [ordem[i], ordem[j]] = [ordem[j], ordem[i]];
+  }
+  return { ...q, opcoes: ordem.map((i) => q.opcoes[i]), correta: ordem.indexOf(q.correta) };
+});
+
+// Converte `código` inline em <code> sem aceitar HTML arbitrário.
+const fmt = (s: string) =>
+  s
+    .replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+---
+
+<section class="quiz" data-quiz={id} aria-labelledby={`quiz-${id}`} data-pagefind-ignore>
+  <header class="quiz-head">
+    <span class="quiz-icon"><Icon name="target" size={18} /></span>
+    <div>
+      <h2 id={`quiz-${id}`} class="quiz-title">{titulo}</h2>
+      <p class="quiz-sub">{questoes.length} perguntas · responda antes de continuar</p>
+    </div>
+  </header>
+
+  <ol class="quiz-list">
+    {
+      questoes.map((q, qi) => (
+        <li class="quiz-q" data-correta={q.correta}>
+          <fieldset>
+            <legend set:html={fmt(q.pergunta)} />
+            <div class="quiz-opts">
+              {q.opcoes.map((o, oi) => (
+                <label class="quiz-opt">
+                  <input type="radio" name={`${id}-${qi}`} value={oi} />
+                  <span class="letra">{String.fromCharCode(65 + oi)}</span>
+                  <span set:html={fmt(o)} />
+                </label>
+              ))}
+            </div>
+            <div class="quiz-exp" hidden>
+              <p class="quiz-verdict" />
+              <p set:html={fmt(q.explicacao)} />
+            </div>
+          </fieldset>
+        </li>
+      ))
+    }
+  </ol>
+
+  <footer class="quiz-foot">
+    <button type="button" class="btn btn-primary btn-sm" data-verificar>Verificar respostas</button>
+    <button type="button" class="btn btn-ghost btn-sm" data-refazer hidden><Icon name="rotate" size={15} /> Refazer</button>
+    <p class="quiz-score" aria-live="polite"></p>
+  </footer>
+</section>
+
+<script>
+  import { registrarQuiz, toast } from '../../lib/progresso';
+
+  document.querySelectorAll<HTMLElement>('[data-quiz]').forEach((quiz) => {
+    const id = quiz.dataset.quiz!;
+    const questoes = [...quiz.querySelectorAll<HTMLElement>('.quiz-q')];
+    const verificar = quiz.querySelector<HTMLButtonElement>('[data-verificar]')!;
+    const refazer = quiz.querySelector<HTMLButtonElement>('[data-refazer]')!;
+    const placar = quiz.querySelector<HTMLElement>('.quiz-score')!;
+
+    verificar.addEventListener('click', () => {
+      const semResposta = questoes.filter((q) => !q.querySelector('input:checked'));
+      if (semResposta.length) {
+        toast(`Faltam ${semResposta.length} pergunta(s). Arrisque um palpite — errar aqui ensina.`);
+        semResposta[0].querySelector('input')?.focus();
+        return;
+      }
+      let acertos = 0;
+      for (const q of questoes) {
+        const correta = Number(q.dataset.correta);
+        const marcada = Number((q.querySelector('input:checked') as HTMLInputElement).value);
+        const ok = marcada === correta;
+        if (ok) acertos++;
+        q.classList.add(ok ? 'is-ok' : 'is-erro');
+        q.querySelectorAll<HTMLInputElement>('input').forEach((i) => {
+          i.disabled = true;
+          if (Number(i.value) === correta) i.closest('label')!.classList.add('correta');
+        });
+        const exp = q.querySelector<HTMLElement>('.quiz-exp')!;
+        exp.hidden = false;
+        exp.querySelector('.quiz-verdict')!.textContent = ok ? 'Correto!' : 'Não exatamente.';
+      }
+      placar.textContent = `${acertos} de ${questoes.length} corretas${acertos === questoes.length ? ' — excelente!' : ''}`;
+      verificar.hidden = true;
+      refazer.hidden = false;
+      registrarQuiz(id, acertos, questoes.length);
+    });
+
+    refazer.addEventListener('click', () => {
+      for (const q of questoes) {
+        q.classList.remove('is-ok', 'is-erro');
+        q.querySelectorAll<HTMLInputElement>('input').forEach((i) => {
+          i.disabled = false;
+          i.checked = false;
+          i.closest('label')!.classList.remove('correta');
+        });
+        q.querySelector<HTMLElement>('.quiz-exp')!.hidden = true;
+      }
+      placar.textContent = '';
+      verificar.hidden = false;
+      refazer.hidden = true;
+      questoes[0].querySelector('input')?.focus();
+    });
+  });
+</script>
+
+<style>
+  .quiz {
+    margin-block: 2.4em;
+    padding: clamp(18px, 3vw, 28px);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+  }
+  .quiz-head {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    margin-bottom: 18px;
+  }
+  .quiz-icon {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+  .quiz-title {
+    font-size: 1.15rem !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .quiz-sub {
+    margin: 0 !important;
+    font-size: 0.85rem;
+    color: var(--text-3);
+  }
+  .quiz-list {
+    list-style: none;
+    padding: 0 !important;
+    display: grid;
+    gap: 22px;
+    counter-reset: q;
+  }
+  .quiz-q {
+    counter-increment: q;
+    margin: 0 !important;
+    min-width: 0;
+    /* identificadores longos (`.requestMatchers(...)`) não podem alargar a questão no celular */
+    overflow-wrap: anywhere;
+  }
+  fieldset {
+    border: 0;
+    padding: 0;
+    min-width: 0;
+  }
+  legend {
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 10px;
+    line-height: 1.5;
+  }
+  legend::before {
+    content: counter(q) '. ';
+    color: var(--accent);
+    font-family: var(--font-mono);
+  }
+  .quiz-opts {
+    display: grid;
+    gap: 8px;
+  }
+  .quiz-opt {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-soft);
+    cursor: pointer;
+    line-height: 1.5;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .quiz-opt:hover {
+    border-color: var(--border-strong);
+  }
+  .quiz-opt input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .letra {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .quiz-opt:has(input:checked) {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .quiz-opt:has(input:checked) .letra {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  .quiz-opt:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .is-erro .quiz-opt:has(input:checked) {
+    border-color: var(--danger);
+    background: var(--danger-soft);
+  }
+  .is-erro .quiz-opt:has(input:checked) .letra {
+    background: var(--danger);
+    border-color: var(--danger);
+  }
+  .quiz-opt.correta {
+    border-color: var(--ok) !important;
+    background: var(--ok-soft) !important;
+  }
+  .quiz-opt.correta .letra {
+    background: var(--ok) !important;
+    border-color: var(--ok) !important;
+    color: var(--accent-ink);
+  }
+  .quiz-opt:has(input:disabled) {
+    cursor: default;
+  }
+  .quiz-exp {
+    margin-top: 10px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: var(--surface-2);
+    font-size: 0.93rem;
+  }
+  .quiz-exp p {
+    margin: 0;
+  }
+  .quiz-verdict {
+    font-weight: 700;
+  }
+  .is-ok .quiz-verdict {
+    color: var(--ok);
+  }
+  .is-erro .quiz-verdict {
+    color: var(--danger);
+  }
+  .quiz-foot {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 22px;
+  }
+  .quiz-score {
+    margin: 0 !important;
+    font-weight: 600;
+    color: var(--text);
+  }
+</style>

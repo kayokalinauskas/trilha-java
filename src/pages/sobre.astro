@@ -1,0 +1,107 @@
+---
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import '../styles/prose.css';
+import { getModulos } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const modulos = await getModulos();
+const disponiveis = modulos.filter((m) => m.data.status === 'disponivel').length;
+---
+
+<Base title="Sobre e metodologia" description="Como a Trilha Java Backend foi pensada: princípios de aprendizagem, versões adotadas e fontes.">
+  <div class="container-narrow sobre">
+    <p class="eyebrow">Sobre</p>
+    <h1>Como esta trilha foi pensada</h1>
+
+    <div class="prose">
+      <p class="lead">
+        A maior parte do material para quem quer virar backend Java cai em um de dois extremos: tutoriais que fazem tudo por você, ou listas
+        de tópicos sem nenhuma prática guiada. Esta trilha tenta ficar no meio: <strong>explicar muito bem e depois fazer você trabalhar de
+        verdade</strong>.
+      </p>
+
+      <h2>Princípios</h2>
+      <ul>
+        <li>
+          <strong>Recuperação ativa antes de releitura.</strong> Quiz no fim de cada aula, dicas antes da solução, simulador que pede a sua
+          resposta antes da resposta-modelo.
+        </li>
+        <li><strong>Prática espaçada.</strong> Flashcards com algoritmo SM-2: cada conceito volta no momento certo.</li>
+        <li>
+          <strong>Feedback objetivo.</strong> Todo exercício tem testes automatizados. Não existe "acho que está certo" — ou está verde, ou não
+          está.
+        </li>
+        <li>
+          <strong>Soluções que funcionam de verdade.</strong> O código exibido nas soluções é lido diretamente do projeto Maven em
+          <code>java/</code>, que compila e passa em todos os testes no CI. Não há como a solução do site estar desatualizada em relação ao
+          código.
+        </li>
+        <li>
+          <strong>Contexto de negócio sempre.</strong> Nenhum exercício é "crie a classe X com o método Y": todos partem de uma demanda
+          realista, com regras, casos de erro e critérios de aceite.
+        </li>
+        <li>
+          <strong>Honestidade.</strong> O diagnóstico de prontidão conta módulos ainda não publicados como zero. Os números sobre o mercado
+          vêm com fonte e data.
+        </li>
+      </ul>
+
+      <h2>Versões adotadas (setembro de 2026)</h2>
+      <table>
+        <thead><tr><th>Tecnologia</th><th>Versão da trilha</th><th>Observação</th></tr></thead>
+        <tbody>
+          <tr><td>Java</td><td>25 (LTS)</td><td>Compatível com 21 nos módulos 00–03</td></tr>
+          <tr><td>Spring Boot</td><td>4.1</td><td>Spring Framework 7, Jakarta EE 11, Jackson 3</td></tr>
+          <tr><td>Spring Security</td><td>7</td><td>—</td></tr>
+          <tr><td>Hibernate</td><td>7</td><td>—</td></tr>
+          <tr><td>JUnit</td><td>6</td><td>AssertJ 3.27</td></tr>
+          <tr><td>Testcontainers</td><td>2</td><td>—</td></tr>
+          <tr><td>Kafka</td><td>4</td><td>Somente KRaft (sem ZooKeeper)</td></tr>
+          <tr><td>Maven</td><td>3.9</td><td>—</td></tr>
+        </tbody>
+      </table>
+      <p>O conteúdo é revisado a cada lançamento semestral do Java e a cada versão minor do Spring Boot.</p>
+
+      <h2>Estado atual</h2>
+      <p>
+        {
+          disponiveis === modulos.length
+            ? `Todos os ${modulos.length} módulos estão publicados, do básico à preparação para entrevistas. A trilha segue em revisão contínua, conforme a política acima.`
+            : `${disponiveis} de ${modulos.length} módulos estão publicados. Os demais aparecem no mapa como "em breve", com o programa já definido. A ordem de publicação segue as dependências do mapa.`
+        }
+      </p>
+
+      <h2>Inspirações</h2>
+      <p>
+        A trilha se inspira no formato de exercícios com testes do <strong>Exercism</strong>, nos mapas de estudo do
+        <strong>roadmap.sh</strong>, na prática guiada da <strong>JetBrains Academy (Hyperskill)</strong> e do <strong>Boot.dev</strong>, e
+        no livro <em>Effective Java</em>, de Joshua Bloch, para as boas práticas da linguagem.
+      </p>
+
+      <h2>Privacidade</h2>
+      <p>
+        Não há login, cookies de rastreamento nem servidor. Todo o seu progresso fica no <code>localStorage</code> do navegador e só sai dele
+        se você exportar um backup no <a href={url('painel')}>painel</a>.
+      </p>
+    </div>
+
+    <a class="btn btn-primary voltar" href={url('')}><Icon name="map" size={16} /> Voltar ao mapa</a>
+  </div>
+</Base>
+
+<style>
+  .sobre {
+    padding-block: 48px 24px;
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 24px;
+  }
+  .prose {
+    max-width: none;
+  }
+  .voltar {
+    margin-top: 40px;
+  }
+</style>

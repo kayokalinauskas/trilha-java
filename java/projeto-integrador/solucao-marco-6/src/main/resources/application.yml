@@ -1,0 +1,74 @@
+spring:
+  application:
+    name: fintech-core
+  datasource:
+    url: jdbc:postgresql://localhost:5432/fintech
+    username: fintech
+    password: fintech
+  jpa:
+    open-in-view: false          # sem consultas escondidas na camada web
+    hibernate:
+      ddl-auto: validate         # quem cria o schema é o Flyway; o Hibernate só confere
+  docker:
+    compose:
+      lifecycle-management: start-only   # mvn spring-boot:run sobe o PostgreSQL e o Kafka do compose.yaml
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all                          # o líder só confirma depois que as réplicas gravaram
+      properties:
+        enable.idempotence: true         # repetir um envio não duplica a mensagem no tópico
+        max.block.ms: 5000               # com o broker fora, o relay falha em 5 s em vez de 60 s
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+    consumer:
+      auto-offset-reset: earliest
+
+springdoc:
+  swagger-ui:
+    path: /docs
+
+fintech:
+  jwt:
+    # Em produção o segredo vem de uma variável de ambiente alimentada por um cofre (Vault, AWS Secrets
+    # Manager...). O valor padrão abaixo só serve para desenvolvimento local — nunca versione o real.
+    segredo: ${FINTECH_JWT_SEGREDO:segredo-de-desenvolvimento-troque-em-producao!!}
+    emissor: fintech-core
+    validade: 15m
+  admin:
+    # Sem estas variáveis, nenhum administrador é criado.
+    email: ${FINTECH_ADMIN_EMAIL:}
+    senha: ${FINTECH_ADMIN_SENHA:}
+  eventos:
+    # false: os eventos são gravados na outbox, mas não são publicados nem consumidos (sem broker).
+    habilitados: ${FINTECH_EVENTOS_HABILITADOS:true}
+    relay:
+      intervalo-ms: 500
+  # Marco 6: acima disso, o evento pendente mais antigo derruba o componente "outbox" do health.
+  observabilidade:
+    outbox-atraso-maximo: 10m
+
+# Marco 6 — produção: logs em JSON, health checks e métricas.
+logging:
+  structured:
+    format:
+      console: ecs                  # um objeto JSON por linha (Elastic Common Schema), com o MDC (requestId)
+    ecs:
+      service:
+        name: fintech-core
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus  # nada de env, beans, heapdump... expostos na web
+  endpoint:
+    health:
+      show-details: when-authorized # anônimo vê só {"status":"UP"}; ADMIN vê db, outbox...
+      roles: ADMIN
+      group:
+        readiness:
+          include: readinessState,db  # sem banco a API não atende; sem Kafka, sim (a outbox segura)
+  metrics:
+    tags:
+      aplicacao: fintech-core

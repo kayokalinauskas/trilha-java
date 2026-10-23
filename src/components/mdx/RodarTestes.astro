@@ -1,0 +1,200 @@
+---
+/**
+ * O quadro "Seu ambiente de prática" no topo de cada exercício com código Java.
+ *
+ * - Sem `teste` (formato atual, módulos 10+): onde está o starter, como abrir no IntelliJ e em quais
+ *   arquivos implementar. Não há testes para rodar: o enunciado é a especificação.
+ * - Com `teste` (formato antigo, módulos 00–09): o comando que roda os testes do exercício.
+ */
+import Icon from '../Icon.astro';
+
+interface Props {
+  modulo: string;
+  teste?: string;
+  arquivos?: string[];
+}
+const { modulo, teste, arquivos = [] } = Astro.props;
+const pasta = `java/${modulo}/starter`;
+// O "*" inclui as classes @Nested do teste (sem ele, o Surefire roda só a classe externa, que fica vazia).
+// As aspas protegem o argumento no PowerShell (que quebraria no ".") e no Bash (que tentaria expandir o "*").
+const cmdTestes = teste ? `cd ${pasta}
+mvn test "-Dtest=${teste}*"` : undefined;
+const cmdCompilar = `cd ${pasta}
+mvn -q compile`;
+---
+
+{
+  teste ? (
+    <div class="rodar" data-pagefind-ignore>
+      <div class="rodar-head">
+        <span class="rodar-icon" aria-hidden="true">
+          <Icon name="terminal" size={18} />
+        </span>
+        <div>
+          <p class="rodar-title">Seu ambiente de prática</p>
+          <p class="rodar-sub">
+            O código inicial está em <code>{pasta}</code>. Implemente até todos os testes de <code>{teste}</code>{' '}
+            ficarem verdes.
+          </p>
+        </div>
+      </div>
+      <div class="rodar-cmd">
+        <pre tabindex="0" aria-label="Comandos para rodar os testes"><code>{cmdTestes}</code></pre>
+        <button type="button" class="icon-btn" data-copiar={cmdTestes} aria-label="Copiar comandos">
+          <Icon name="copy" size={16} />
+        </button>
+      </div>
+      <p class="rodar-foot">
+        No IntelliJ: <strong>File → Open</strong>, selecione <code>{pasta}/pom.xml</code> e escolha <strong>Open as
+        Project</strong>. Depois localize <code>{teste}</code> (na pasta <code>testes</code>) e clique no ▶ verde ao lado
+        da classe.
+      </p>
+    </div>
+  ) : (
+    <section class="rodar" aria-label="Seu ambiente de prática" data-pagefind-ignore>
+      <div class="rodar-head">
+        <span class="rodar-icon" aria-hidden="true">
+          <Icon name="terminal" size={18} />
+        </span>
+        <div>
+          <p class="rodar-title">Seu ambiente de prática</p>
+          <p class="rodar-sub">
+            O projeto está em <code>{pasta}</code>. No IntelliJ: <strong>File → Open</strong>, selecione{' '}
+            <code>{pasta}/pom.xml</code> e escolha <strong>Open as Project</strong> (SDK: JDK 25).
+          </p>
+        </div>
+      </div>
+      {
+        arquivos.length > 0 && (
+          <div class="onde">
+            <p class="onde-titulo">
+              Implemente {arquivos.length === 1 ? 'no arquivo' : 'nos arquivos'} (procure o comentário{' '}
+              <code>// Implemente aqui o exercício</code>):
+            </p>
+            <ul class="onde-lista">
+              {arquivos.map((a) => (
+                <li>
+                  <code>{a}</code>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      }
+      <p class="rodar-foot">
+        Não há testes prontos para rodar: o enunciado abaixo é a especificação. Experimente seu código do jeito que
+        preferir (um <code>main</code>, um teste seu, a aplicação rodando) e compare com os exemplos. Para só compilar:
+      </p>
+      <div class="rodar-cmd">
+        <pre tabindex="0" aria-label="Comandos para compilar"><code>{cmdCompilar}</code></pre>
+        <button type="button" class="icon-btn" data-copiar={cmdCompilar} aria-label="Copiar comandos para compilar">
+          <Icon name="copy" size={16} />
+        </button>
+      </div>
+    </section>
+  )
+}
+
+<script>
+  import { toast } from '../../lib/progresso';
+  document.querySelectorAll<HTMLButtonElement>('[data-copiar]').forEach((b) =>
+    b.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(b.dataset.copiar!);
+        toast('Comandos copiados!');
+      } catch {
+        toast('Não foi possível copiar. Selecione o texto manualmente.');
+      }
+    }),
+  );
+</script>
+
+<style>
+  .rodar {
+    margin-block: 1.8em;
+    padding: 18px;
+    border-radius: var(--radius-l);
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .rodar-head {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+  }
+  .rodar-head > div {
+    min-width: 0;
+  }
+  .rodar-icon {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: var(--info-soft);
+    color: var(--info);
+  }
+  .rodar-title {
+    margin: 0 !important;
+    font-size: 1rem !important;
+    font-weight: 700;
+    line-height: 1.4;
+    color: var(--text);
+    border: 0 !important;
+    padding: 0 !important;
+  }
+  .rodar-sub,
+  .rodar-foot {
+    margin: 2px 0 0 !important;
+    font-size: 0.9rem;
+    color: var(--text-3);
+    overflow-wrap: anywhere;
+  }
+  .onde {
+    margin: 14px 0 4px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+  }
+  .onde-titulo {
+    margin: 0 0 6px !important;
+    font-size: 0.9rem;
+    color: var(--text-2);
+  }
+  .onde-lista {
+    margin: 0 !important;
+    padding-left: 1.2em !important;
+    font-size: 0.88rem;
+    overflow-wrap: anywhere;
+  }
+  .onde-lista li {
+    margin: 2px 0 !important;
+  }
+  .rodar-cmd {
+    position: relative;
+    margin: 10px 0 4px;
+  }
+  .rodar-cmd pre {
+    margin: 0;
+    padding: 14px 52px 14px 16px;
+    border-radius: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    overflow-x: auto;
+    font-size: 0.86rem;
+    line-height: 1.6;
+  }
+  .rodar-cmd code {
+    background: none !important;
+    border: 0 !important;
+    padding: 0 !important;
+    color: var(--text) !important;
+  }
+  .rodar-cmd .icon-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+  }
+</style>

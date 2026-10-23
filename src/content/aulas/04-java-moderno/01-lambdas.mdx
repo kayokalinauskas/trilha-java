@@ -1,0 +1,200 @@
+---
+titulo: Lambdas e interfaces funcionais
+descricao: Comportamento como valor — lambdas, method references, as interfaces funcionais da JDK, closures e composição de funções.
+modulo: 04-java-moderno
+ordem: 1
+duracao: 50
+objetivos:
+  - Escrever lambdas e method references com segurança
+  - Escolher a interface funcional certa (Function, Predicate, Supplier, Consumer…)
+  - Entender closures e a regra do "effectively final"
+  - Compor comportamentos com andThen, and, or e negate
+tags: [lambda, Function, Predicate, method reference]
+flashcards:
+  - frente: O que é uma interface funcional?
+    verso: Uma interface com exatamente um método abstrato. Pode ser implementada com uma lambda ou method reference.
+  - frente: Qual a diferença entre Function, Predicate, Supplier e Consumer?
+    verso: "Function<T,R>: recebe T e devolve R. Predicate<T>: recebe T e devolve boolean. Supplier<T>: não recebe nada e devolve T. Consumer<T>: recebe T e não devolve nada."
+  - frente: Por que uma lambda só pode usar variáveis locais effectively final?
+    verso: Porque ela captura o VALOR da variável; se a variável pudesse mudar depois, a lambda veria um valor desatualizado e surgiriam bugs (principalmente entre threads).
+  - frente: Quais os 4 tipos de method reference?
+    verso: "Estático (Integer::parseInt), de instância de um objeto específico (System.out::println), de instância de um tipo arbitrário (String::length) e de construtor (ArrayList::new)."
+  - frente: Como combinar dois Predicates?
+    verso: "p1.and(p2), p1.or(p2), p1.negate() ou Predicate.not(p)."
+---
+
+Até agora, você passou **dados** para métodos: números, textos, objetos. Nesta aula, você vai passar **comportamento**: "filtre usando *esta* regra", "ordene por *este* critério", "faça *isto* quando terminar". É a base de Streams, do `Comparator.comparing` que você já usou e de metade das APIs do Spring.
+
+## De classe anônima a lambda
+
+No módulo 02, o teste do exercício 02.02 criou uma forma nova assim:
+
+```java
+Forma hexagono = new Forma() {
+    @Override public double area() { return 2.598; }
+    @Override public String descricao() { return "Hexágono"; }
+};
+```
+
+É uma **classe anônima**: implementa uma interface ali mesmo, sem nome. Quando a interface tem **um único método abstrato**, o Java permite uma forma muito mais curta, a **lambda**:
+
+```java
+Comparator<Pedido> porValor = new Comparator<>() {             // antes do Java 8
+    @Override
+    public int compare(Pedido a, Pedido b) {
+        return a.valor().compareTo(b.valor());
+    }
+};
+
+Comparator<Pedido> porValor = (a, b) -> a.valor().compareTo(b.valor());   // lambda
+```
+
+A sintaxe:
+
+```java
+x -> x * 2                          // um parâmetro: parênteses opcionais
+(a, b) -> a + b                     // vários parâmetros
+() -> LocalDate.now()               // nenhum parâmetro
+(Pedido p) -> p.pago()              // tipo explícito (raramente necessário)
+p -> {                              // corpo com várias instruções: chaves e return
+    BigDecimal taxa = calcularTaxa(p);
+    return p.valor().add(taxa);
+}
+```
+
+## Interfaces funcionais
+
+Uma interface com exatamente um método abstrato é uma **interface funcional**. A anotação `@FunctionalInterface` é opcional, mas faz o compilador reclamar se alguém adicionar um segundo método abstrato.
+
+O pacote `java.util.function` traz as mais usadas:
+
+| Interface | Método | Assinatura | Exemplo |
+|---|---|---|---|
+| `Function<T, R>` | `apply` | T → R | `Pedido::valor` |
+| `BiFunction<T, U, R>` | `apply` | (T, U) → R | `BigDecimal::add` |
+| `Predicate<T>` | `test` | T → boolean | `p -> p.valor() > 100` |
+| `Supplier<T>` | `get` | () → T | `ArrayList::new` |
+| `Consumer<T>` | `accept` | T → (nada) | `System.out::println` |
+| `UnaryOperator<T>` | `apply` | T → T | `String::strip` |
+| `BinaryOperator<T>` | `apply` | (T, T) → T | `Integer::sum` |
+
+Existem também versões para primitivos, que evitam o custo de *boxing*: `IntPredicate`, `ToIntFunction<T>`, `IntUnaryOperator`, `LongSupplier`…
+
+<Callout tipo="dica" titulo="Não decore a tabela">
+Pergunte-se: "recebe o quê e devolve o quê?". Recebe um e devolve outro → `Function`. Devolve `boolean` → `Predicate`. Não recebe nada → `Supplier`. Não devolve nada → `Consumer`.
+</Callout>
+
+## Method references
+
+Quando a lambda só chama um método existente, dá para referenciá-lo diretamente com `::`:
+
+| Tipo | Lambda equivalente | Method reference |
+|---|---|---|
+| Método estático | `s -> Integer.parseInt(s)` | `Integer::parseInt` |
+| Método de um objeto específico | `x -> System.out.println(x)` | `System.out::println` |
+| Método de instância do próprio parâmetro | `p -> p.valor()` | `Pedido::valor` |
+| Construtor | `() -> new ArrayList<>()` | `ArrayList::new` |
+
+O terceiro caso é o mais comum e o que mais confunde: `Pedido::valor` significa "dado um pedido, chame `valor()` nele". É por isso que `Comparator.comparing(Pedido::valor)` funciona.
+
+## Closures e "effectively final"
+
+Uma lambda pode usar variáveis do método onde foi criada — ela as **captura**:
+
+```java
+BigDecimal limite = new BigDecimal("500");
+Predicate<Pedido> acimaDoLimite = p -> p.valor().compareTo(limite) > 0;   // captura "limite"
+```
+
+Mas há uma regra: a variável capturada precisa ser **final** ou **effectively final** (nunca reatribuída):
+
+```java
+int contador = 0;
+pedidos.forEach(p -> contador++);   // não compila: contador é reatribuída
+```
+
+O motivo: a lambda guarda uma **cópia do valor**, e ela pode rodar depois, em outro momento ou em outra thread. Se a variável pudesse mudar, a lambda enxergaria um valor desatualizado. A solução não é "driblar" a regra com um array de um elemento; é usar a ferramenta certa, como `count()` de uma Stream (próxima aula).
+
+<Callout tipo="erro" titulo="Lambdas com efeito colateral">
+Lambdas passadas para `filter`, `map` e `Comparator` devem ser **puras**: calculam e devolvem, sem alterar nada fora delas. Um `map` que grava no banco ou incrementa um contador externo é um bug esperando para acontecer, especialmente com streams paralelas.
+</Callout>
+
+## Fábricas de comportamento
+
+Métodos que **devolvem** lambdas são uma técnica poderosa para montar regras configuráveis:
+
+```java
+static Predicate<Proposta> scoreMinimo(int minimo) {
+    return p -> p.score() >= minimo;
+}
+
+static Predicate<Proposta> rendaMinima(BigDecimal minimo) {
+    return p -> p.rendaMensal().compareTo(minimo) >= 0;
+}
+
+Predicate<Proposta> politica = scoreMinimo(600).and(rendaMinima(new BigDecimal("1500")));
+```
+
+É exatamente o que você vai construir no exercício 04.03: um motor de regras de crédito em que cada regra é um `Predicate`, e regras novas entram sem mudar o motor.
+
+## Compondo funções
+
+As interfaces funcionais trazem métodos `default` para combinação:
+
+```java
+Predicate<Pedido> pago = Pedido::pago;
+Predicate<Pedido> grande = p -> p.valor().compareTo(MIL) >= 0;
+
+pago.and(grande);          // os dois
+pago.or(grande);           // qualquer um
+grande.negate();           // o contrário
+Predicate.not(Pedido::pago); // útil com method references
+
+Function<String, String> limpar = String::strip;
+Function<String, String> normalizar = limpar.andThen(String::toLowerCase);   // strip, depois lower
+normalizar.apply("  PIX ");   // "pix"
+
+Comparator<Pedido> ordem = Comparator.comparing(Pedido::cliente).thenComparing(Pedido::data).reversed();
+```
+
+<Callout tipo="entrevista">
+"O que é uma interface funcional?" e "o que é um method reference?" são perguntas diretas de triagem Júnior. Para se destacar, explique a regra do **effectively final** com o motivo (captura de valor, segurança entre threads) e mostre um exemplo de **fábrica de predicados** — é o tipo de código que aparece em regras de negócio reais.
+</Callout>
+
+<Quiz
+  id="04-lambdas"
+  questoes={[
+    {
+      pergunta: 'Qual interface funcional representa "recebe um Pedido e devolve true/false"?',
+      opcoes: ['`Function<Pedido, Boolean>`', '`Predicate<Pedido>`', '`Supplier<Pedido>`', '`Consumer<Pedido>`'],
+      correta: 1,
+      explicacao: 'Predicate<T> é o tipo idiomático para condições; tem and/or/negate e evita o boxing de Boolean.',
+    },
+    {
+      pergunta: 'O que `Pedido::valor` significa quando usado como `Function<Pedido, BigDecimal>`?',
+      opcoes: ['Chama um método estático valor()', 'Dado um pedido, chama valor() nele', 'Cria um novo Pedido', 'Não compila'],
+      correta: 1,
+      explicacao: 'É a referência a um método de instância de um tipo arbitrário: o parâmetro vira o objeto em que o método é chamado.',
+    },
+    {
+      pergunta: 'Por que `int total = 0; lista.forEach(x -> total += x);` não compila?',
+      opcoes: ['forEach não aceita lambdas', 'total não é effectively final', 'Falta o tipo do parâmetro', 'int não pode ser usado em lambdas'],
+      correta: 1,
+      explicacao: 'Lambdas capturam o valor de variáveis locais e exigem que elas não sejam reatribuídas.',
+    },
+    {
+      pergunta: 'Qual o resultado de `Function<Integer,Integer> f = x -> x + 1; f.andThen(x -> x * 2).apply(3)`?',
+      opcoes: ['7', '8', '6', '9'],
+      correta: 1,
+      explicacao: 'andThen aplica f primeiro (3 + 1 = 4) e depois a segunda função (4 * 2 = 8).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Uma **lambda** implementa uma **interface funcional** (um único método abstrato) de forma concisa.
+- `Function`, `Predicate`, `Supplier`, `Consumer` e seus parentes cobrem quase todos os casos.
+- **Method references** (`Classe::metodo`) deixam lambdas simples ainda mais legíveis.
+- Variáveis capturadas precisam ser **effectively final**; lambdas devem ser **puras**.
+- Funções se **compõem** (`and`, `or`, `negate`, `andThen`, `thenComparing`) e podem ser **fabricadas** por métodos.

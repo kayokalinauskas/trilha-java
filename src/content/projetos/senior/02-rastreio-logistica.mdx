@@ -1,0 +1,1294 @@
+---
+titulo: "Rota Viva — despacho e rastreamento de entregas em tempo real"
+resumo: "Plataforma distribuída de uma transportadora de última milha: recebe pedidos de lojistas, despacha para milhares de entregadores com saga e compensação, ingere mil posições GPS por segundo tratando duplicidade, ordem e atraso, e mostra o rastreio ao vivo ao cliente final, com SLOs medidos sob carga e sob falha."
+nivel: senior
+ordem: 2
+dominio: "Logística · last mile"
+horas: 204
+stack: [Java 25, Spring Boot 4, Spring Security 7, PostgreSQL 18, PostGIS (opcional), Kafka 4 (KRaft), Redis, Resilience4j, OpenTelemetry, Prometheus, Grafana, Tempo, Loki, Keycloak, Testcontainers 2, k6, Toxiproxy, Docker Compose, Kubernetes (kind), Helm, GitHub Actions]
+competencias:
+  - Fronteiras de serviço justificadas em ADRs, incluindo o que deliberadamente não foi separado
+  - Fluxo de alto volume (1.000 posições/s sustentadas, picos de 3x) com duplicidade, ordem e atraso tratados e demonstrados em teste
+  - Saga orquestrada com prazos persistidos, compensação e idempotência de ponta a ponta (API, outbox, consumidores, DLQ)
+  - Tempo real para o cliente final com SSE, fan-out entre réplicas, reconexão sem perda e link público de uso limitado
+  - Confiabilidade medida, não prometida — SLOs por jornada, alertas de burn rate, teste de carga no volume-alvo e teste de caos com comportamento degradado definido
+  - Operação madura — tracing atravessando o Kafka, runbooks, postmortem, deploy sem downtime em Kubernetes e estimativa de custo com premissas explícitas
+  - Segurança e privacidade de dados de localização — audiências JWT distintas, autenticação entre serviços e LGPD (minimização e retenção)
+modulos: [06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 12-mensageria, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - { id: fundacao, titulo: "Fundação: monorepo, ADRs, Compose e CI", resumo: "Repositório com os serviços vazios, ADRs de fronteira, infraestrutura local subindo com um comando e CI verde." }
+  - { id: pedidos, titulo: "Pedidos de entrega: idempotência e outbox", resumo: "Lojista autenticado cria, consulta e cancela pedidos com Idempotency-Key; eventos saem pela outbox para o Kafka." }
+  - { id: despacho, titulo: "Despacho: atribuição e saga com compensação", resumo: "Pedido criado vira oferta a um entregador próximo, com recusa, expiração, compensação e escalonamento ao operador." }
+  - { id: telemetria, titulo: "Telemetria: ingestão em alto volume", resumo: "Posições GPS em lote entram pela API, seguem para o Kafka particionado por entregador e são gravadas sem duplicar." }
+  - { id: rastreamento, titulo: "Rastreamento ao vivo: read model e SSE", resumo: "Read model com a última posição e o status; cliente final acompanha por SSE com fan-out e reconexão sem perda." }
+  - { id: anomalias, titulo: "ETA, anomalias e notificações", resumo: "ETA recalculado com roteirizador simulado, detecção de parado, sem sinal, desvio e atraso, e SMS/e-mail simulados." }
+  - { id: seguranca, titulo: "Segurança ponta a ponta e LGPD", resumo: "Audiências por tipo de cliente, autenticação entre serviços, link público de uso limitado, rate limit e retenção de dados de localização." }
+  - { id: operacao, titulo: "Observabilidade, SLOs e alertas", resumo: "Tracing atravessando o Kafka, dashboards por jornada, SLOs medidos e alertas multi-janela de burn rate." }
+  - { id: entrega, titulo: "Kubernetes, carga, caos e release v1.0.0", resumo: "Ambiente reproduzível em Kubernetes local, carga no volume-alvo, caos com Toxiproxy, runbooks, postmortem e release." }
+---
+
+## Visão geral
+
+Uma transportadora de última milha vive de três promessas: **o pedido do lojista nunca se perde**, **alguém vai buscar o pacote logo** e **o cliente final sabe onde a encomenda está**. A primeira é um problema de consistência entre serviços; a segunda, de coordenação com gente que recusa, esquece o celular e perde sinal no túnel; a terceira, de dados em alto volume que chegam duplicados, fora de ordem e atrasados, e precisam aparecer na tela do cliente em segundos.
+
+Você vai construir a **Rota Viva**, a plataforma que cumpre essas promessas, como um conjunto pequeno de serviços que conversam por eventos. Não é um sistema de microsserviços por moda: cada fronteira existe porque a carga, o ritmo de mudança ou o modo de falha daquele pedaço é diferente dos outros, e você vai registrar isso em ADRs, inclusive o que decidiu **não** separar.
+
+O que será construído:
+
+- **Pedidos de Entrega**: API para lojistas criarem, consultarem e cancelarem pedidos, com `Idempotency-Key`, validação de janela de entrega e área de cobertura, e publicação de eventos pela outbox transacional.
+- **Despacho**: escolhe o entregador pela proximidade, capacidade e janela; oferta a entrega, trata recusa, expiração e "sumiço" com uma saga orquestrada e compensação; escala ao operador quando ninguém aceita.
+- **Telemetria**: recebe posições GPS em lote (1.000 posições/s sustentadas, 3.000/s em pico), valida, publica no Kafka particionado por entregador e grava o histórico sem duplicar.
+- **Rastreamento**: read model CQRS com a última posição, o status e o ETA de cada entrega; transmite ao cliente final por SSE, com fan-out entre réplicas e reconexão sem perda; detecta anomalias (parado, sem sinal, desvio, atraso previsto).
+- **Notificações**: SMS e e-mail simulados, com deduplicação, retentativas e limite de envio por destinatário.
+- **Gateway/BFF**: porta única de entrada, validação de JWT por audiência, rate limit e a página pública de rastreio.
+- **Simulador de frota**: uma ferramenta sua que gera trajetos realistas para 5.000 entregadores, aceita e recusa ofertas e mede, de fora, o frescor do rastreio (a sonda sintética dos SLOs).
+- **Operação**: tracing distribuído atravessando o Kafka, dashboards por jornada, SLOs com alertas de burn rate, teste de carga com k6, teste de caos com Toxiproxy, deploy em Kubernetes local sem downtime, runbooks e um postmortem.
+
+**Pitch de uma frase:** "Construí uma plataforma de despacho e rastreamento de entregas que processa mil posições GPS por segundo, mostra o entregador ao vivo para o cliente em até 3 segundos em 99,5% dos casos e continua funcionando, de forma degradada e definida, quando o Kafka fica lento ou o serviço de despacho cai — e tenho os gráficos de carga e de caos para provar."
+
+**Por que chama atenção num portfólio Sênior.** Projetos de portfólio costumam parar no caminho feliz. Um gestor procurando alguém Sênior quer ver o que acontece **quando dá errado**: mensagens duplicadas, eventos fora de ordem, um serviço fora do ar, um pico de três vezes o tráfego. Aqui cada uma dessas situações tem regra escrita, teste automatizado e um gráfico medido. E quer ver julgamento: por que seis serviços e não doze, por que SSE e não WebSocket, quanto custaria rodar isso na nuvem e o que você cortaria com metade do prazo. O repositório pronto responde a essas perguntas antes da entrevista.
+
+<Callout tipo="atencao" titulo="Este é o projeto mais longo da trilha">
+São cerca de 200 horas: algo como três meses a 15 horas por semana. O plano foi desenhado para que você tenha algo demonstrável ao fim de cada marco (fatias verticais que atravessam os serviços), então vale publicar o progresso no GitHub desde o primeiro dia. Se o prazo apertar, a seção [Escopo](#escopo) diz o que é essencial e a pergunta "o que você cortaria?" da entrevista tem a resposta preparada.
+</Callout>
+
+## Contexto de negócio
+
+A **Rota Viva Logística** é uma transportadora fictícia de última milha que opera na Grande São Paulo. Ela atende cerca de 400 lojistas (e-commerces, farmácias, restaurantes de marmita congelada, lojas de autopeças) e trabalha com uma frota de entregadores parceiros de moto, bicicleta e carro. Hoje o despacho é feito por operadores num grupo de mensagens, com uma planilha, e o cliente final só descobre que a entrega atrasou quando ela não chega.
+
+Os números que orientam o projeto (use-os nos testes de carga e na estimativa de custo):
+
+| Grandeza | Valor de referência |
+|---|---|
+| Entregadores com turno ativo no pico | 5.000 |
+| Frequência de posição por entregador | 1 a cada 5 s → **1.000 posições/s sustentadas**; picos de 3x (3.000/s) na volta de áreas sem sinal e em horários de rush |
+| Pedidos por dia | 60.000 (pico de 10.000 por hora; rajadas de 20 pedidos/s quando um lojista importa um lote) |
+| Entregas ativas simultâneas no pico | ~12.500 (em média 2,5 por entregador) |
+| Clientes finais com a página de rastreio aberta | ~30% das entregas ativas → ~3.750 conexões; projete para **10.000** |
+| Janela de operação | 7h às 23h (16 h por dia) |
+
+### Atores
+
+| Ator | O que faz no sistema |
+|---|---|
+| **Lojista** (sistema integrador) | Cria pedidos de entrega pela API, consulta status, cancela antes da coleta, recebe o link de rastreio para repassar ao cliente. Autentica-se com *client credentials*. |
+| **Entregador** (app móvel, simulado) | Abre e fecha turno, informa o modal, envia posições GPS, recebe ofertas, aceita ou recusa, registra coleta, entrega (com código) ou falha. |
+| **Cliente final** (destinatário) | Recebe SMS com o link de rastreio e acompanha o entregador ao vivo numa página pública, sem login. |
+| **Operador** (central da Rota Viva) | Acompanha anomalias, redespacha manualmente, resolve escalonamentos, reprocessa mensagens da DLQ. |
+| **Supervisor** | Tudo o que o operador faz, mais revogar links de rastreio, bloquear entregadores e exportar dados de um titular (LGPD). |
+| **Serviços externos** (simulados) | Roteirizador (distância e tempo entre pontos), provedor de SMS e servidor de e-mail. |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **Pedido de entrega** | Solicitação do lojista: coletar volumes num endereço e entregá-los em outro, dentro de uma janela. É o agregado do serviço de Pedidos. |
+| **Janela** | Intervalo prometido (`inicio`, `fim`). Serviço `EXPRESSA`: a coleta começa na criação e a entrega termina em até 90 min. Serviço `AGENDADA`: janela de entrega de 1 a 4 h escolhida pelo lojista, com pelo menos 3 h de antecedência. |
+| **Atribuição** | O processo (a saga) de encontrar um entregador para um pedido: começa em `PROCURANDO` e termina em `ACEITA`, `ESCALADA` ou `CANCELADA`. |
+| **Oferta** | Proposta de uma entrega a um entregador específico, com prazo de resposta de 45 s. Uma atribuição gera uma ou mais ofertas. |
+| **Posição** | Uma leitura de GPS: coordenadas, precisão, velocidade, **momento da captura** (no aparelho) e **número de sequência** por dispositivo. |
+| **Event time × processing time** | O momento em que a posição foi capturada (event time) e o momento em que o sistema a processa (processing time). Podem diferir em minutos quando o aparelho fica sem sinal. |
+| **Posição atrasada** | Chega mais de 2 min depois da captura. Vai para o histórico, mas não substitui uma posição mais nova no read model. |
+| **Link de rastreio** | URL pública com um token opaco, de uso limitado e com expiração, que dá acesso somente ao rastreio de uma entrega. |
+| **Frescor** | Tempo entre o recebimento de uma posição pela API e o momento em que ela está visível no rastreio. É o SLI principal. |
+
+## Escopo
+
+### Dentro
+
+- Os seis serviços descritos na visão geral, cada um com seu próprio banco de dados, mais o simulador de frota e os dois serviços externos simulados (roteirizador e SMS; o e-mail usa um servidor SMTP de teste local).
+- Autenticação com um provedor OIDC local (Keycloak) e três tipos de cliente com audiências distintas.
+- Contratos versionados: OpenAPI para as APIs HTTP e AsyncAPI com JSON Schema para os eventos, verificados no CI.
+- Uma página pública de rastreio simples (HTML e JavaScript sem framework, usando `EventSource`), servida pelo gateway.
+- Um console mínimo do operador **via API** (a interface pode ser a coleção `.http` ou o Swagger UI).
+- Infraestrutura local com Docker Compose e ambiente de Kubernetes local (kind ou k3d) com Helm ou Kustomize.
+- Observabilidade completa, SLOs, alertas, carga, caos, runbooks, um postmortem e a estimativa de custo.
+
+### Fora
+
+- Aplicativos móveis reais (o simulador faz o papel do app; a página de rastreio é o único front-end).
+- Roteirização ótima de múltiplas paradas (o problema de roteamento de veículos). A ordem das paradas de um entregador é a ordem de aceite; o roteirizador simulado só calcula distância e tempo entre dois pontos.
+- Geocodificação: o lojista envia as coordenadas junto com o endereço.
+- Pagamento de entregadores, precificação dinâmica do frete, faturamento de lojistas.
+- Foto como prova de entrega, assinatura digital e devolução ao remetente (o fluxo de falha termina em `FALHA_NA_ENTREGA` e o tratamento é manual).
+- Webhooks para lojistas (fica em [Para ir além](#para-ir-além)).
+- Multirregião e deploy em nuvem pública (a estimativa de custo é feita no papel).
+
+<Callout tipo="dica" titulo="O núcleo que não se corta">
+Se precisar reduzir, preserve a fatia que conta a história inteira: pedido com idempotência → despacho com uma oferta e expiração → posições deduplicadas → rastreio por SSE → um SLO medido com um teste de carga. Anomalias de desvio, o gateway como serviço separado e o Kubernetes são os primeiros candidatos a virar "próximos passos" no README, com a justificativa.
+</Callout>
+
+## Requisitos funcionais
+
+As regras são numeradas de forma contínua (RN-01 a RN-64) para que testes, ADRs e commits possam citá-las (`fix(despacho): RN-30 aceite concorrente`). Horários são sempre em UTC na API e no banco; o fuso `America/Sao_Paulo` só aparece nas regras de horário de operação e nas mensagens ao cliente.
+
+### RF-01 · Criação de pedido de entrega
+
+O lojista cria um pedido com os dados de coleta, entrega, volumes e tipo de serviço. A resposta traz o identificador, o status e o link de rastreio para ele repassar ao cliente.
+
+- **RN-01 — `Idempotency-Key` obrigatória.** Cabeçalho com 8 a 64 caracteres (`A–Z`, `a–z`, `0–9`, `-`, `_`). O escopo da chave é o lojista: a chave `pedido-8812` do lojista A não colide com a mesma chave do lojista B. Sem o cabeçalho → `400 idempotency-key-ausente`. Com `pedido 8812` (espaço) → `400 requisicao-invalida`.
+- **RN-02 — Repetição devolve a mesma resposta.** Mesma chave e mesmo conteúdo dentro de 24 h → mesmo status (`201`) e mesmo corpo da primeira resposta, com o cabeçalho `Idempotency-Replayed: true`. Nenhum pedido novo, nenhum evento novo. "Mesmo conteúdo" é comparado pelo SHA-256 da requisição já validada e serializada com as propriedades em ordem alfabética: reordenar campos do JSON não muda o hash, mas mudar `pesoGramas` de 1200 para 1201 muda.
+- **RN-03 — Mesma chave, conteúdo diferente.** → `422 idempotency-key-reutilizada`, com o `id` do pedido original na extensão `pedidoOriginal` do Problem Details.
+- **RN-04 — Primeira requisição ainda em andamento.** Uma segunda chamada com a mesma chave enquanto a primeira não terminou → `409 idempotency-key-em-processamento` com `Retry-After: 1`. Nunca dois pedidos.
+- **RN-05 — O que fica guardado.** Só respostas `201` são guardadas. Um `400`/`422` de validação não consome a chave (o lojista corrige e reenvia com a mesma chave); um `5xx` libera a chave. A chave expira 24 h após a primeira requisição; depois disso, reutilizá-la cria um pedido novo (e isso está documentado no OpenAPI).
+- **RN-06 — Referência externa única por lojista.** `referenciaExterna` (1 a 40 caracteres) é única por lojista. Chave diferente com a mesma referência → `409 referencia-duplicada` com a extensão `pedidoExistente`. Isso protege contra o integrador que gera uma chave nova a cada tentativa.
+- **RN-07 — Janela de entrega.** `EXPRESSA`: o lojista não envia janela; a coleta começa na criação e a entrega termina em `criadoEm + 90 min`. `AGENDADA`: janela de entrega de 1 a 4 h, com início pelo menos 3 h depois da criação e no máximo 7 dias à frente, inteiramente entre 7h e 23h de São Paulo. Exemplos: criado às 10h00 com janela 12h00–14h00 → `422 janela-invalida` (antecedência de 2 h); criado às 10h00 com janela 21h30–23h30 → `422 janela-invalida` (passa das 23h); criado às 10h00 com janela 13h00–15h00 → aceito. `EXPRESSA` criado às 22h40 → `422 janela-invalida` (o fim, 00h10, passa das 23h).
+- **RN-08 — Área de cobertura e distância.** Coleta e entrega dentro da área de cobertura (configurável; para começar, o retângulo de latitude −23,80 a −23,35 e longitude −46,90 a −46,35). Distância em linha reta entre coleta e entrega de até 40 km (`AGENDADA`) ou 15 km (`EXPRESSA`). Entrega em Campinas (−22,90; −47,06) → `422 fora-da-area-de-cobertura`. Coleta e entrega com as mesmas coordenadas → `422 requisicao-invalida` (distância zero).
+- **RN-09 — Volumes e modal exigido.** De 1 a 10 volumes; peso total de até 30 kg; cada dimensão de até 100 cm. O modal mínimo é derivado: peso total acima de 20 kg ou qualquer dimensão acima de 60 cm exige `CARRO`; acima de 8 kg exclui `BICICLETA`. Exemplo: 2 volumes de 5 kg (10 kg) → `MOTO` ou `CARRO`; 1 volume de 70 cm → só `CARRO`; 11 volumes → `400`.
+- **RN-10 — Formatos.** Telefone em E.164 (`+5511987654321`); coordenadas com até 6 casas decimais; `valorDeclarado` como texto decimal com 2 casas (`"189.90"`) e moeda `BRL`, até `"10000.00"` — nunca número de ponto flutuante.
+- **RN-11 — Efeitos da criação.** Na mesma transação: o pedido é gravado com status `RECEBIDO`, a chave de idempotência é gravada com a resposta, um token de rastreio aleatório de 128 bits é gerado (só o SHA-256 dele é persistido), um código de entrega de 4 dígitos é gerado (também só o hash), e o evento `PedidoCriado` vai para a outbox. Se qualquer passo falhar, nada disso existe.
+
+**Critérios de aceite**
+
+- **Dado** um lojista autenticado, **quando** ele envia o mesmo pedido com a mesma `Idempotency-Key` em 10 requisições simultâneas, **então** existe exatamente 1 pedido, exatamente 1 evento `PedidoCriado` no tópico, e todas as respostas bem-sucedidas têm o mesmo `id` (as demais são `409` com `Retry-After`).
+- **Dado** um pedido criado com a chave `k1`, **quando** o lojista reenvia com `k1` e `pesoGramas` diferente, **então** recebe `422` com `type` terminando em `idempotency-key-reutilizada` e `pedidoOriginal` preenchido.
+- **Dado** que o banco falha depois de gravar o pedido e antes do commit, **quando** a transação é desfeita, **então** não há pedido, não há evento na outbox e a mesma chave pode ser reutilizada com sucesso.
+- **Dado** um pedido `AGENDADA` com início da janela a 2h59 da criação, **quando** ele é enviado, **então** a resposta é `422 janela-invalida` e o `detail` diz a antecedência mínima.
+
+### RF-02 · Consulta, listagem e cancelamento de pedidos
+
+- **RN-12 — Cada lojista só enxerga os seus pedidos.** Buscar, listar ou cancelar um pedido de outro lojista → `404 recurso-nao-encontrado`, idêntico ao de um id inexistente (não `403`, para não confirmar que o id existe).
+- **RN-13 — Listagem por cursor.** `GET /v1/pedidos` ordena por `criadoEm` decrescente e `id` decrescente, pagina por cursor opaco (keyset, sem `OFFSET`), tamanho padrão 20 e máximo 100 (`tamanho=101` → `400`). Filtros: `status` (lista), `criadoDe`, `criadoAte` (intervalo máximo de 31 dias). Um pedido criado entre duas páginas não aparece duplicado nem some da página seguinte.
+- **RN-14 — Cancelamento é um pedido de cancelamento.** A verdade sobre o que aconteceu fisicamente (o pacote já foi coletado?) está no Despacho. Por isso `POST /v1/pedidos/{id}/cancelamento` responde `202` com status `CANCELAMENTO_SOLICITADO` para pedidos em `RECEBIDO`, `PROCURANDO_ENTREGADOR` ou `ENTREGADOR_ATRIBUIDO`, e o estado final chega por evento: `AtribuicaoCancelada` → `CANCELADO`; `CancelamentoRecusado` (motivo `JA_COLETADO`) → volta ao status anterior e o lojista é avisado por e-mail. Em 99% dos casos o estado final é conhecido em até 5 s.
+- **RN-15 — Cancelamento idempotente e transições inválidas.** Cancelar um pedido `CANCELADO` ou `CANCELAMENTO_SOLICITADO` → `202` com o mesmo corpo (sem novo evento). Cancelar um pedido `COLETADO`, `EM_ROTA`, `ENTREGUE` ou `FALHA_NA_ENTREGA` → `409 transicao-invalida` com o status atual na extensão `statusAtual`.
+
+**Critérios de aceite**
+
+- **Dado** o pedido `P1` do lojista A, **quando** o lojista B faz `GET /v1/pedidos/P1`, **então** recebe `404` com o mesmo corpo de um id aleatório.
+- **Dado** um pedido `ENTREGADOR_ATRIBUIDO` cujo entregador registrou a coleta 200 ms antes do cancelamento, **quando** o lojista cancela, **então** a API responde `202`, o Despacho publica `CancelamentoRecusado`, o pedido termina em `COLETADO` e o lojista recebe um e-mail explicando.
+
+### RF-03 · Turno e capacidade do entregador
+
+- **RN-16 — Abrir turno.** O entregador informa o modal; a capacidade vem dele: `MOTO` 3 entregas simultâneas e 20 kg; `BICICLETA` 2 e 8 kg; `CARRO` 8 e 200 kg. Velocidades médias usadas nas estimativas: 25, 12 e 20 km/h. Abrir turno com outro aberto → `409 turno-ja-aberto`. Turno com mais de 12 h é encerrado automaticamente (e o entregador é avisado 30 min antes).
+- **RN-17 — Pausar e encerrar.** `PAUSADO` não recebe ofertas, mas continua enviando posições se tiver entregas ativas. Encerrar turno com entregas `ACEITA` ou `COLETADA` → `409 entregas-pendentes`. Um entregador com 3 recusas ou expirações seguidas em 30 min é pausado automaticamente por 10 min (e avisado do motivo).
+- **RN-18 — Turno é publicado como estado.** Abrir, pausar, retomar e encerrar publicam o estado atual do entregador num tópico compactado (`despacho.turnos.v1`, chave `entregadorId`). É por ele que a Telemetria sabe quem pode enviar posições sem chamar o Despacho de forma síncrona.
+
+**Critérios de aceite**
+
+- **Dado** um entregador de bicicleta com 2 entregas aceitas, **quando** o Despacho procura candidatos para um terceiro pedido de 1 kg, **então** ele não aparece entre os candidatos.
+
+### RF-04 · Seleção de candidatos
+
+O Despacho escolhe a quem ofertar cada pedido. A regra é determinística, para ser testável e explicável ao operador.
+
+- **RN-19 — Quem é candidato.** Turno ativo; status `DISPONIVEL` ou `EM_ENTREGA` com vaga (entregas ativas abaixo da capacidade); modal compatível com a RN-09 e com o peso restante; última posição válida com no máximo 60 s de idade; distância em linha reta até a coleta de até 5 km (a partir da 4ª oferta: 8 km); ainda não recebeu oferta nesta atribuição.
+- **RN-20 — A janela precisa caber.** Tempo estimado de entrega = 10 min por entrega ativa que o entregador já tem + deslocamento até a coleta + 4 min de coleta + deslocamento da coleta à entrega (deslocamentos pelo roteirizador ou, no fallback, pela RN-50). O candidato só entra se `agora + tempo estimado ≤ janela.fim − 5 min`. Exemplo: agora 14h00, janela até 15h30, entregador com 1 entrega ativa (10 min), 12 min até a coleta, 4 min de coleta, 28 min até o destino → chega 14h54, cabe. Um carro com 3 entregas ativas (30 min) → chega 15h14, ainda cabe; com 5 → 15h34, não cabe.
+- **RN-21 — Ordenação.** Custo = minutos estimados até a coleta + 3 × entregas ativas. Menor custo primeiro; empate → menor distância em metros; empate → menor `entregadorId` (lexicográfico). Exemplo:
+
+| Entregador | Minutos até a coleta | Distância | Entregas ativas | Custo | Posição |
+|---|---|---|---|---|---|
+| E-07 | 6 | 1,6 km | 2 | 12 | 3º |
+| E-12 | 9 | 2,1 km | 0 | 9 | 2º |
+| E-31 | 3 | 0,9 km | 2 | 9 | 1º |
+
+  E-12 e E-31 empatam no custo; vence a menor distância, então a ordem final é E-31, E-12, E-07. Esse é o tipo de exemplo que vira teste parametrizado.
+- **RN-22 — Sem candidatos.** Lista vazia não é erro: a atribuição fica `PROCURANDO` e tenta de novo a cada 20 s, até o limite da RN-26.
+
+**Critérios de aceite**
+
+- **Dado** os três entregadores da tabela, **quando** a seleção roda, **então** a ordem é E-31, E-12, E-07, sempre (repetir 100 vezes dá o mesmo resultado).
+
+### RF-05 · Oferta, aceite, recusa, expiração e compensação (a saga)
+
+A atribuição é uma saga **orquestrada** pelo Despacho: o estado vive numa tabela, cada passo é uma transação local, e cada efeito externo (evento, aviso ao app) sai pela outbox.
+
+- **RN-23 — Uma oferta por vez.** Cada atribuição tem no máximo uma oferta pendente; cada entregador tem no máximo uma oferta pendente (nunca duas entregas ofertadas ao mesmo tempo para a mesma pessoa). Prazo de resposta: 45 s, contado no relógio do servidor.
+- **RN-24 — Aceite.** Só a oferta `PENDENTE`, não expirada e do próprio entregador (o id vem do token). Aceite 1 s depois do prazo → `409 oferta-expirada`, mesmo que o job de expiração ainda não tenha rodado. Aceite repetido da mesma oferta (retry do app) → `200` com o mesmo corpo. Aceitar oferta de outro entregador → `404`.
+- **RN-25 — Recusa e expiração.** Levam ao próximo candidato da lista (recalculada, porque as posições mudam). O entregador que recusou ou deixou expirar não recebe outra oferta desta atribuição.
+- **RN-26 — Escalonamento.** `EXPRESSA`: 5 ofertas sem aceite ou 10 min desde o início → atribuição `ESCALADA`, evento `DespachoEscalado`, pedido `SEM_ENTREGADOR`, alerta no console e e-mail ao lojista. `AGENDADA`: a atribuição só começa 60 min antes do início da janela e escala após 20 min sem aceite.
+- **RN-27 — Prazos persistidos.** Expiração de oferta, nova tentativa e escalonamento são linhas numa tabela de prazos, lidas a cada 1 s com `FOR UPDATE SKIP LOCKED` (várias réplicas, cada prazo processado uma vez). Nada de `Thread.sleep` ou agendamento em memória: se todas as réplicas reiniciarem, prazos vencidos durante a queda são processados em até 5 s depois da volta.
+- **RN-28 — Compensação: o entregador sumiu.** Com a atribuição `ACEITA` e o pacote **ainda não coletado**, se chegar `AnomaliaDetectada` do tipo `SEM_SINAL` (5 min sem posição) ou se o entregador não chegar à coleta até `ETA de coleta + 15 min`, o Despacho **revoga** a atribuição (`AtribuicaoRevogada`, com motivo), avisa o entregador e volta a `PROCURANDO` com prioridade (os prazos desta atribuição passam à frente dos demais). **Depois da coleta** não há revogação automática (o pacote está com a pessoa): abre-se um incidente para o operador.
+- **RN-29 — Compensação: o lojista cancelou.** Oferta pendente → cancelada (some do app); atribuição aceita e não coletada → revogada e o entregador avisado; já coletada → `CancelamentoRecusado`.
+- **RN-30 — Corridas.** Aceite, expiração, cancelamento e revogação podem acontecer no mesmo segundo. Cada transição usa bloqueio otimista (`versao` na atribuição): exatamente uma vence; quem perde recebe `409` (API) ou descarta a transição (job). Exemplo: aceite às 14:00:44,900 e job de expiração às 14:00:45,000 → se o aceite fizer commit primeiro, a oferta fica `ACEITA` e o job não faz nada; se o job fizer commit primeiro, o aceite recebe `409 oferta-expirada`. Nunca os dois.
+
+**Critérios de aceite**
+
+- **Dado** uma oferta com prazo às 14:00:45, **quando** o aceite chega às 14:00:46 e o job de expiração está parado, **então** a resposta é `409 oferta-expirada` e a próxima oferta sai para o segundo candidato assim que o job voltar.
+- **Dado** 50 execuções em que aceite e cancelamento são disparados ao mesmo tempo, **quando** todas terminam, **então** em todas o pedido termina `CANCELADO` e nenhuma atribuição fica `ACEITA`; quando o aceite venceu a corrida, o entregador recebeu o aviso de revogação, e quando perdeu, recebeu `409`.
+- **Dado** uma atribuição aceita e não coletada, **quando** o Rastreamento publica `SEM_SINAL` para aquele entregador, **então** em até 5 s a atribuição é revogada, o entregador recebe o aviso e outra oferta sai para o próximo candidato.
+- **Dado** que todas as réplicas do Despacho ficam paradas por 2 min com 30 ofertas pendentes, **quando** voltam, **então** todas as ofertas vencidas são expiradas e reofertadas em até 5 s.
+
+### RF-06 · Ciclo de vida da entrega
+
+- **RN-31 — Transições.** `ACEITA → COLETADA → EM_ROTA → ENTREGUE | FALHOU`. `COLETADA` exige a última posição válida a até 200 m da coleta; `EM_ROTA` é automático quando a entrega vira a próxima parada do entregador (paradas na ordem de aceite); `FALHOU` exige um motivo entre `DESTINATARIO_AUSENTE`, `ENDERECO_NAO_ENCONTRADO`, `RECUSADO_PELO_DESTINATARIO` e `AVARIA`. Registrar coleta a 350 m do endereço → `409 fora-do-local`, com a distância na extensão `distanciaMetros`.
+- **RN-32 — Prova de entrega.** `ENTREGUE` exige o código de 4 dígitos que o destinatário recebeu por SMS e a última posição a até 150 m do destino. Código errado → `422 codigo-invalido` com `tentativasRestantes`; na 3ª tentativa errada, a conclusão por código fica bloqueada (`409 codigo-bloqueado`) e só o operador libera.
+- **RN-33 — Status visível ao lojista.** Os eventos do Despacho atualizam o pedido: `ENTREGADOR_ATRIBUIDO`, `COLETADO`, `EM_ROTA`, `ENTREGUE`, `FALHA_NA_ENTREGA`, `SEM_ENTREGADOR`. Um evento mais antigo que chega depois de um mais novo (pela `versao` da atribuição) é ignorado: o pedido nunca volta de `ENTREGUE` para `EM_ROTA`.
+
+**Critérios de aceite**
+
+- **Dado** uma entrega `EM_ROTA`, **quando** o entregador envia o código certo a 120 m do destino, **então** o pedido fica `ENTREGUE` para o lojista em até 5 s e o rastreio público recebe o evento `encerrado`.
+- **Dado** os eventos `EM_ROTA` (versão 5) e `ENTREGUE` (versão 6) entregues ao serviço de Pedidos na ordem inversa, **quando** ambos são processados, **então** o pedido termina `ENTREGUE`.
+
+### RF-07 · Ingestão de posições GPS
+
+O app coleta uma posição a cada 5 s e envia em lote. Sem sinal, acumula localmente e envia tudo ao reconectar, em lotes de até 100.
+
+- **RN-34 — Tamanho do lote.** De 1 a 100 posições e corpo de até 64 KB. 101 posições → `413 lote-muito-grande`.
+- **RN-35 — Identidade vem do token.** O `entregadorId` é o do token; o corpo não tem esse campo (se tiver, é ignorado e um evento de segurança é registrado).
+- **RN-36 — Só com turno ativo.** Entregador sem turno ativo ou `BLOQUEADO` → `409 turno-inativo` para o lote inteiro. A Telemetria decide pelo estado local alimentado pelo tópico compactado da RN-18; quem acabou de abrir o turno pode ter as primeiras posições recusadas por até 2 s (documentado; o app reenvia).
+- **RN-37 — Validação por item.** Latitude em [−90, 90], longitude em [−180, 180], precisão de 0 a 5.000 m, `seq` ≥ 0. `capturadaEm` mais de 30 s no futuro em relação ao recebimento → rejeitada com `RELOGIO_ADIANTADO`; mais de 24 h no passado → `ANTIGA`. O lote é aceito parcialmente: `202` com a contagem de aceitas e a lista de rejeitadas (índice e motivo). JSON malformado → `400`.
+- **RN-38 — `202` só depois da gravação no Kafka.** A resposta sai quando o broker confirmou (`acks=all`) todas as posições aceitas. Se a confirmação não vier em 2 s → `503 servico-indisponivel` com `Retry-After: 5`, e o app reenvia o lote inteiro. As duplicatas criadas por esse reenvio são absorvidas pela RN-39.
+- **RN-39 — Identidade de uma posição e deduplicação.** Uma posição é identificada por `(entregadorId, dispositivoId, seq)`. No histórico, a segunda gravação da mesma posição não faz nada. No read model, uma posição só substitui a atual se `(capturadaEm, seq)` for maior: duplicatas e posições velhas não têm efeito, e aplicar a mesma posição duas vezes dá o mesmo estado (idempotência por comparação monotônica). Trocar de celular gera um `dispositivoId` novo com `seq` recomeçando em 0; a comparação por `capturadaEm` resolve.
+- **RN-40 — Fora de ordem e atraso.** A "última posição" é a de maior `capturadaEm`, não a que chegou por último. Posição com `recebidaEm − capturadaEm` acima de 2 min é **atrasada**: vai para o histórico e para a linha do tempo, não é enviada ao rastreio como posição atual, não alimenta anomalias de "parado" e fica fora do SLI de frescor.
+- **RN-41 — Qualidade do sinal.** Precisão acima de 100 m, ou salto que implique velocidade acima de 150 km/h em relação à posição válida anterior → gravada com a marca `outlier`, ignorada no ETA, nas anomalias, no índice geográfico do Despacho e no rastreio.
+
+Exemplo de um lote de 5 posições do dispositivo `D1`, recebido às 14:10:00:
+
+| `seq` | `capturadaEm` | Precisão | O que acontece |
+|---|---|---|---|
+| 40 | 14:09:40 | 8 m | aceita; vira a última posição |
+| 41 | 14:09:45 | 8 m | aceita; vira a última posição |
+| 39 | 14:09:35 | 9 m | aceita (histórico); não substitui a 41 |
+| 41 | 14:09:45 | 8 m | duplicata no mesmo lote: aceita na API, sem efeito no histórico e no read model |
+| 42 | 14:10:50 | 6 m | rejeitada: `RELOGIO_ADIANTADO` (50 s no futuro) |
+
+**Critérios de aceite**
+
+- **Dado** o lote da tabela, **quando** ele é enviado, **então** a resposta é `202` com `aceitas: 4` e uma rejeição (`indice: 4`, `motivo: RELOGIO_ADIANTADO`), o histórico tem 3 linhas novas e a última posição é a `seq` 41.
+- **Dado** que o Kafka não confirma em 2 s, **quando** o app envia um lote, **então** recebe `503` com `Retry-After: 5`; ao reenviar depois da volta do Kafka, o histórico não tem nenhuma posição duplicada.
+- **Dado** um entregador que ficou 20 min sem sinal e envia 240 posições em 3 lotes, **quando** elas chegam, **então** todas vão para o histórico, nenhuma é transmitida ao cliente como posição atual exceto a mais recente (se tiver menos de 2 min), e nenhuma anomalia `PARADO` é aberta retroativamente.
+
+### RF-08 · Rastreamento ao vivo para o cliente final
+
+- **RN-42 — O que o cliente vê.** Status, janela prometida, ETA, primeiro nome e modal do entregador, e a posição **somente quando a entrega é a próxima parada** (`EM_ROTA`). Nunca telefone, sobrenome, `entregadorId`, nem as outras paradas. Antes disso, `posicao` é `null` e `paradasAntes` diz quantas entregas vêm antes ("o entregador está em outras 2 entregas antes da sua").
+- **RN-43 — Precisão reduzida.** Coordenadas enviadas ao cliente com 4 casas decimais (~11 m).
+- **RN-44 — Stream SSE.** `GET /v1/rastreio/{token}/stream` com `Content-Type: text/event-stream`. Eventos `snapshot`, `status`, `posicao`, `eta` e `encerrado`; cada evento tem `id` crescente por entrega. Comentário de heartbeat a cada 15 s; `retry: 3000`. Depois de `encerrado`, o servidor fecha a conexão.
+- **RN-45 — Reconexão sem perda.** Com `Last-Event-ID`, o servidor reenvia os eventos de `status` e `eta` perdidos dos últimos 10 min e apenas a posição mais recente (posições intermediárias não interessam a quem estava desconectado). Lacuna maior que 10 min ou id desconhecido → um `snapshot` completo.
+- **RN-46 — Limites do link.** No máximo 5 conexões SSE simultâneas por token (a 6ª → `429`) e 300 requisições por hora por token. O link expira 24 h depois do estado terminal. Token inexistente ou revogado → `404`; expirado → `410 link-expirado`. O token nunca aparece em logs (só os 6 primeiros caracteres do hash).
+
+**Critérios de aceite**
+
+- **Dado** um cliente conectado ao stream, **quando** o entregador envia uma posição, **então** o evento `posicao` chega ao cliente em até 3 s (medido pela sonda do simulador).
+- **Dado** um cliente que perdeu a conexão por 40 s, durante os quais houve 1 mudança de status e 8 posições, **quando** ele reconecta com `Last-Event-ID`, **então** recebe o evento de status e 1 evento de posição (o mais recente), nessa ordem.
+
+### RF-09 · ETA
+
+- **RN-47 — Cálculo.** ETA = agora + (tempo de cada parada anterior pelo roteirizador + 4 min por parada) + tempo da posição atual até o destino. Recalculado a cada nova posição válida, **no máximo uma vez a cada 30 s por entrega** (para não sobrecarregar o roteirizador), ou imediatamente em mudança de status ou desvio.
+- **RN-48 — Quando publicar.** Para o cliente (SSE), quando o ETA muda 1 min ou mais; para o Kafka (`EtaAlterado`), só quando muda 5 min ou mais em relação ao último publicado. Isso reduz o volume de eventos em uma ordem de grandeza.
+- **RN-49 — Arredondamento.** O cliente vê o ETA arredondado para o minuto e, se faltar mais de 30 min, como faixa de 10 min ("entre 15h20 e 15h30").
+- **RN-50 — Fallback.** Roteirizador fora, lento (acima de 800 ms) ou com o circuit breaker aberto → distância em linha reta (haversine) × 1,4 ÷ velocidade média do modal, com `"fonte": "ESTIMATIVA"`. Exemplo: 7 km de moto → 7 × 1,4 ÷ 25 × 60 ≈ 23,5 min.
+
+**Critérios de aceite**
+
+- **Dado** o roteirizador simulado configurado para responder em 2 s, **quando** uma posição chega, **então** o ETA é calculado pelo fallback em até 1 s, com `fonte: ESTIMATIVA`, e o circuit breaker abre depois do limite configurado.
+- **Dado** 12 posições em 60 s da mesma entrega, **quando** são processadas, **então** o roteirizador é chamado no máximo 2 vezes.
+
+### RF-10 · Detecção de anomalias
+
+Todas as anomalias são avaliadas no Rastreamento, sobre posições válidas e não atrasadas, e publicadas como `AnomaliaDetectada`/`AnomaliaEncerrada`. Há no máximo uma anomalia aberta por `(pedido, tipo)`.
+
+- **RN-51 — `PARADO`.** Deslocamento de menos de 50 m durante 8 min ou mais (pelo event time), com entrega `ACEITA`, `COLETADA` ou `EM_ROTA`, fora de um raio de 150 m da coleta e do destino. Encerra quando o entregador se afasta mais de 100 m. Exemplo: parado 9 min num posto de gasolina → abre; parado 12 min na porta do destino esperando o cliente → não abre.
+- **RN-52 — `SEM_SINAL`.** Nenhuma posição recebida há 5 min ou mais (pelo processing time) com entrega ativa. Encerra na próxima posição recebida. Esta regra usa o relógio do servidor de propósito: é justamente a ausência de eventos que ela detecta.
+- **RN-53 — `DESVIO`.** Com a entrega `EM_ROTA`, distância à rota planejada (polilinha devolvida pelo roteirizador) acima de 1 km em 3 posições válidas consecutivas. Sem polilinha (fallback), distância ao destino crescendo continuamente por 5 min.
+- **RN-54 — `ATRASO_PREVISTO`.** ETA depois de `janela.fim + 10 min` → abre; encerra só quando o ETA volta para antes de `janela.fim` (histerese, para não abrir e fechar a cada posição). O cliente recebe no máximo 1 SMS de atraso por entrega; o operador vê todas.
+
+**Critérios de aceite**
+
+- **Dado** um trajeto simulado com o entregador parado 9 min a 2 km do destino, **quando** as posições são processadas, **então** exatamente uma `AnomaliaDetectada` do tipo `PARADO` é publicada, com `desde` igual à `capturadaEm` do início da parada.
+- **Dado** um ETA que oscila entre `janela.fim + 11 min` e `janela.fim + 4 min` por 10 min, **quando** as posições são processadas, **então** há uma única anomalia `ATRASO_PREVISTO` aberta e um único SMS de atraso.
+
+### RF-11 · Notificações
+
+- **RN-55 — Gatilhos e modelos.**
+
+| Evento | Canal | Destinatário | Modelo |
+|---|---|---|---|
+| `PedidoCriado` | SMS | destinatário | link de rastreio e código de entrega |
+| `EntregaEmRota` | SMS | destinatário | "saiu para entrega", com ETA |
+| `AnomaliaDetectada` (`ATRASO_PREVISTO`) | SMS | destinatário | novo ETA e pedido de desculpas (1 por entrega) |
+| `EntregaConcluida` | SMS | destinatário | confirmação |
+| `EntregaFalhou`, `DespachoEscalado`, `CancelamentoRecusado` | e-mail | lojista | motivo e próximo passo |
+
+- **RN-56 — No máximo uma vez por evento.** A notificação é identificada pelo `eventId` de origem e pelo modelo (única no banco): o mesmo evento entregue 3 vezes gera 1 envio. Além disso, no máximo 5 SMS por destinatário por entrega.
+- **RN-57 — Falhas do provedor.** `429` ou `5xx` → nova tentativa com backoff exponencial com jitter (1, 2, 4, 8, 16 s; 5 tentativas), respeitando `Retry-After`; esgotadas, a mensagem vai para a DLQ. `4xx` de número inválido → falha permanente, sem nova tentativa, registrada.
+- **RN-58 — Dados mascarados.** Telefone gravado e logado como `+55 11 9****-4321`; o número completo só existe em memória durante o envio (vem do evento).
+
+**Critérios de aceite**
+
+- **Dado** o SMS fake configurado para devolver `503` nas 2 primeiras chamadas, **quando** chega `PedidoCriado`, **então** o SMS é enviado na 3ª tentativa e há exatamente 1 registro `ENVIADA`.
+- **Dado** o mesmo `PedidoCriado` reentregue 3 vezes pelo Kafka, **quando** processado, **então** o SMS fake recebeu exatamente 1 chamada bem-sucedida.
+
+### RF-12 · Console do operador
+
+- **RN-59 — Fila de atenção.** Lista anomalias abertas e atribuições escaladas, ordenadas por severidade (`SEM_ENTREGADOR` > `SEM_SINAL` com pacote coletado > `ATRASO_PREVISTO` > `PARADO` > `DESVIO`) e depois por antiguidade.
+- **RN-60 — Redespacho manual.** O operador escolhe um entregador; sai uma oferta direta com prazo de 60 s pela mesma saga (origem `MANUAL`). Não é possível redespachar depois da coleta (`409 transicao-invalida`).
+- **RN-61 — DLQ.** Listar mensagens de cada tópico de DLQ com os cabeçalhos da exceção, reprocessar (republica no tópico original com a mesma chave e o mesmo `eventId`; a deduplicação garante efeito único) ou descartar com justificativa obrigatória.
+- **RN-62 — Auditoria.** Toda ação de operador e supervisor é registrada (quem, quando, o quê, alvo, motivo) e mantida por 1 ano. A auditoria não pode ser alterada pela API.
+
+**Critérios de aceite**
+
+- **Dado** uma mensagem envenenada (JSON inválido) em `pedidos.eventos.v1`, **quando** o consumidor do Rastreamento a recebe, **então** ela vai para a DLQ sem retentativas (erro não transitório), a partição não trava e as mensagens seguintes são processadas.
+- **Dado** uma mensagem na DLQ cujo defeito foi corrigido no consumidor, **quando** o operador a reprocessa duas vezes seguidas, **então** o efeito acontece uma vez só e as duas ações ficam na auditoria.
+
+### RF-13 · Privacidade e retenção (LGPD)
+
+Localização contínua de uma pessoa é dado pessoal, e endereço e telefone do destinatário também. A base legal e a política de privacidade são responsabilidade da empresa fictícia; o sistema garante **minimização** e **retenção**.
+
+- **RN-63 — Retenção.** Posições brutas: 30 dias (a partição diária mais antiga é removida inteira, sem `DELETE` linha a linha); agregados por turno (km rodados, tempo em movimento): 12 meses. Dados do destinatário (nome, telefone, endereço completo e complemento): anonimizados 90 dias depois do estado terminal, mantendo só o prefixo do CEP (5 dígitos) e o bairro para estatística. Kafka: `telemetria.posicoes.v1` com retenção de 72 h.
+- **RN-64 — Minimização e acesso.** Posições só com turno ativo (RN-36); cliente final só vê a posição na última etapa (RN-42) e com precisão reduzida (RN-43); nenhum log em nível `INFO` contém coordenadas, telefone ou token. O supervisor pode exportar, em JSON, os dados de um entregador (turnos e posições dos últimos 30 dias) para atender a uma solicitação do titular; a exportação é auditada.
+
+**Critérios de aceite**
+
+- **Dado** a data simulada de 31 dias depois de uma posição, **quando** o job de retenção roda, **então** a partição daquele dia não existe mais e a execução levou menos de 1 s (é um `DROP`, não um `DELETE`).
+- **Dado** os logs de uma execução do teste de carga, **quando** procurados por um padrão de coordenada (`-23.`) ou de telefone (`+5511`), **então** não há ocorrências em nível `INFO` ou acima.
+
+## Requisitos não funcionais
+
+Os SLOs são medidos numa janela móvel de 30 dias; no projeto, você os mede nas execuções de carga e de caos e no ambiente local ligado por algumas horas com o simulador.
+
+| RNF | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Frescor do rastreio (SLO) | 99,5% das posições aceitas e não atrasadas visíveis no stream SSE em até 3 s do recebimento | Sonda do simulador: diferença entre o `recebidaEm` e a chegada no cliente SSE; histograma no Prometheus |
+| RNF-02 | Criação de pedido (SLO) | 99,9% das requisições sem `5xx`; p99 ≤ 400 ms no gateway | Métricas `http.server.requests` do gateway; k6 com `thresholds` |
+| RNF-03 | Ingestão de posições (SLO) | 99,9% das requisições `2xx`/`4xx`; p99 ≤ 250 ms a 1.000 req/s | k6 `constant-arrival-rate`, 30 min |
+| RNF-04 | Despacho (SLO) | 95% dos pedidos `EXPRESSA` com aceite em até 3 min, havendo candidato | Histograma de `criadoEm → aceitaEm` publicado pelo Despacho |
+| RNF-05 | Notificação | 99% dos SMS de "saiu para entrega" enviados ao provedor em até 60 s do evento | Métrica de atraso evento → envio |
+| RNF-06 | Capacidade | 3.000 posições/s por 5 min sem perda; lag do consumo do Rastreamento volta abaixo de 2 s em até 2 min depois do pico | k6 + métrica de lag por grupo de consumidores |
+| RNF-07 | Conexões simultâneas | 10.000 conexões SSE em 3 réplicas, com heap estável e p99 de frescor mantido | Simulador com virtual threads abrindo as conexões |
+| RNF-08 | Durabilidade | Nenhum pedido ou evento de domínio perdido com a queda de qualquer réplica ou de 1 broker | Teste de caos com contagem fim a fim (pedidos criados = eventos consumidos) |
+| RNF-09 | Deploy sem downtime | Rollout de qualquer serviço durante a carga sem `5xx` em pedidos e com reconexão SSE em até 5 s | k6 rodando durante `helm upgrade`/`kubectl rollout` |
+| RNF-10 | Segurança | Todas as rotas exigem JWT com a audiência certa, exceto o rastreio público e o health; matriz de autorização coberta por teste | Testes de fatia da matriz (papel × rota × dono) |
+| RNF-11 | Privacidade | Zero coordenadas, telefones ou tokens em logs `INFO`+; retenção da RN-63 automatizada | Teste de log e job de retenção com relógio simulado |
+| RNF-12 | Observabilidade | 100% das requisições com `traceId` nos logs; trace atravessando gateway → serviço → Kafka → consumidor | Captura de tela de um trace no Tempo com spans de produtor e consumidor |
+| RNF-13 | Qualidade | Cobertura de linhas ≥ 80% no domínio; contratos (OpenAPI e schemas de eventos) verificados no CI; zero vulnerabilidade crítica conhecida nas dependências | Relatório do JaCoCo, job de contrato, varredura de dependências no CI |
+| RNF-14 | Reprodutibilidade | Do clone ao ambiente rodando com dados de demonstração com 1 comando em até 10 min (Compose) | Cronometrar num computador limpo; README |
+| RNF-15 | Recursos | Cada serviço com `requests`/`limits` definidos; ambiente completo cabe em 16 GB de RAM | `kubectl top`; README com a medição |
+
+## Modelo de dados
+
+Cada serviço tem o próprio banco (um banco lógico por serviço no mesmo PostgreSQL local é suficiente, desde que nenhum serviço leia o banco de outro). Identificadores são UUID v7 (ordenáveis no tempo; o PostgreSQL 18 gera com `uuidv7()`), datas em `timestamptz`.
+
+<Figura legenda="Modelo de dados por serviço: tabelas transacionais no PostgreSQL e o read model do Rastreamento no Redis">
+<svg viewBox="0 0 860 560" width="860" role="img" aria-labelledby="rv-er-t rv-er-d">
+  <title id="rv-er-t">Tabelas e chaves de cada serviço da Rota Viva</title>
+  <desc id="rv-er-d">Seis painéis. Pedidos: lojista, pedido, chave_idempotencia e outbox. Despacho: entregador, turno, atribuicao, oferta, prazo e outbox. Telemetria: posicao particionada por dia. Rastreamento no PostgreSQL: link_rastreio, linha_do_tempo, anomalia e evento_processado. Rastreamento no Redis: hashes da última posição e da entrega, buffer de eventos e canal pub/sub. Notificações: notificacao e evento_processado.</desc>
+  <rect x="8" y="8" width="276" height="262" rx="10" class="d-box"/>
+  <text x="20" y="32" class="d-title">Pedidos (PostgreSQL)</text>
+  <text x="20" y="58" class="d-mono">pedido</text>
+  <text x="20" y="76" class="d-label">id PK · lojista_id · referencia_externa</text>
+  <text x="20" y="92" class="d-label">status · servico · janela_inicio/fim</text>
+  <text x="20" y="108" class="d-label">coleta/entrega (lat, lon, endereço)</text>
+  <text x="20" y="124" class="d-label">versao_despacho · criado_em</text>
+  <text x="20" y="150" class="d-mono">chave_idempotencia</text>
+  <text x="20" y="168" class="d-label">PK (lojista_id, chave) · hash · estado</text>
+  <text x="20" y="184" class="d-label">resposta jsonb · expira_em</text>
+  <text x="20" y="210" class="d-mono">outbox</text>
+  <text x="20" y="228" class="d-label">id · agregado_id · tipo · payload</text>
+  <text x="20" y="244" class="d-label">criado_em · publicado_em</text>
+  <rect x="292" y="8" width="276" height="262" rx="10" class="d-accent"/>
+  <text x="304" y="32" class="d-title">Despacho (PostgreSQL)</text>
+  <text x="304" y="58" class="d-mono">entregador · turno</text>
+  <text x="304" y="76" class="d-label">modal · capacidade · status · versao</text>
+  <text x="304" y="102" class="d-mono">atribuicao</text>
+  <text x="304" y="120" class="d-label">id · pedido_id UNIQUE · estado</text>
+  <text x="304" y="136" class="d-label">entregador_id · tentativas · versao</text>
+  <text x="304" y="162" class="d-mono">oferta</text>
+  <text x="304" y="180" class="d-label">atribuicao_id · entregador_id · estado</text>
+  <text x="304" y="196" class="d-label">expira_em · respondida_em</text>
+  <text x="304" y="222" textLength="258" lengthAdjust="spacingAndGlyphs" class="d-mono">prazo · outbox · evento_processado</text>
+  <text x="304" y="240" class="d-label">prazo: tipo · alvo_id · vence_em</text>
+  <text x="304" y="256" class="d-label">(índice parcial em vence_em)</text>
+  <rect x="576" y="8" width="276" height="262" rx="10" class="d-ok"/>
+  <text x="588" y="32" class="d-title">Telemetria (PostgreSQL)</text>
+  <text x="588" y="58" class="d-mono">posicao</text>
+  <text x="588" y="76" class="d-label">PARTITION BY RANGE (capturada_em)</text>
+  <text x="588" y="92" class="d-label">uma partição por dia, 30 dias</text>
+  <text x="588" y="112" class="d-label">entregador_id · dispositivo_id · seq</text>
+  <text x="588" y="128" class="d-label">capturada_em · recebida_em</text>
+  <text x="588" y="144" class="d-label">lat · lon · precisao_m · outlier</text>
+  <text x="588" y="170" class="d-label">UNIQUE (entregador_id, dispositivo_id,</text>
+  <text x="588" y="186" class="d-label">seq, capturada_em) — inclui a chave</text>
+  <text x="588" y="202" class="d-label">de partição, como o PostgreSQL exige</text>
+  <text x="588" y="228" class="d-mono">agregado_turno</text>
+  <text x="588" y="246" class="d-label">km · minutos_em_movimento (12 meses)</text>
+  <rect x="8" y="286" width="276" height="262" rx="10" class="d-info"/>
+  <text x="20" y="310" class="d-title">Rastreamento (PostgreSQL)</text>
+  <text x="20" y="336" class="d-mono">link_rastreio</text>
+  <text x="20" y="354" class="d-label">token_hash PK · pedido_id</text>
+  <text x="20" y="370" class="d-label">expira_em · revogado_em</text>
+  <text x="20" y="396" class="d-mono">entrega_view</text>
+  <text x="20" y="414" class="d-label">pedido_id PK · status · eta · janela</text>
+  <text x="20" y="430" class="d-label">entregador · paradas · versao</text>
+  <text x="20" y="456" class="d-mono">linha_do_tempo · anomalia</text>
+  <text x="20" y="474" class="d-label">anomalia: UNIQUE parcial</text>
+  <text x="20" y="490" class="d-label">(pedido_id, tipo) WHERE aberta</text>
+  <text x="20" y="516" class="d-mono">evento_processado</text>
+  <text x="20" y="534" class="d-label">PK (grupo, event_id)</text>
+  <rect x="292" y="286" width="276" height="262" rx="10" class="d-violet"/>
+  <text x="304" y="310" class="d-title">Rastreamento (Redis)</text>
+  <text x="304" y="336" class="d-mono">rv:ultima:[entregadorId]</text>
+  <text x="304" y="354" class="d-label">hash: lat, lon, capturadaEm, seq</text>
+  <text x="304" y="380" class="d-mono">rv:entrega:[pedidoId]</text>
+  <text x="304" y="398" class="d-label">hash: status, eta, proximaParada</text>
+  <text x="304" y="424" class="d-mono">rv:eventos:[pedidoId]</text>
+  <text x="304" y="442" class="d-label">stream com os eventos de 10 min</text>
+  <text x="304" y="458" class="d-label">(replay do Last-Event-ID)</text>
+  <text x="304" y="484" class="d-mono">canal rv:canal:[pedidoId]</text>
+  <text x="304" y="502" class="d-label">pub/sub: fan-out entre réplicas</text>
+  <text x="304" y="528" class="d-label">Tudo reconstruível a partir do Kafka</text>
+  <rect x="576" y="286" width="276" height="262" rx="10" class="d-box"/>
+  <text x="588" y="310" class="d-title">Notificações (PostgreSQL)</text>
+  <text x="588" y="336" class="d-mono">notificacao</text>
+  <text x="588" y="354" class="d-label">id · UNIQUE (event_id, modelo)</text>
+  <text x="588" y="370" class="d-label">pedido_id · canal · destino_mascarado</text>
+  <text x="588" y="386" class="d-label">estado · tentativas · enviada_em</text>
+  <text x="588" y="412" class="d-mono">limite_destinatario</text>
+  <text x="588" y="430" class="d-label">(pedido_id, destino_hash) · contagem</text>
+  <text x="588" y="456" class="d-mono">Auditoria (no Despacho)</text>
+  <text x="588" y="474" class="d-label">acao_operador: quem · o quê · alvo</text>
+  <text x="588" y="490" class="d-label">motivo · em (somente INSERT)</text>
+</svg>
+</Figura>
+
+Restrições que importam (cada uma corresponde a uma regra):
+
+- `chave_idempotencia`: chave primária `(lojista_id, chave)`; a disputa entre duas requisições simultâneas é resolvida pelo `INSERT` que vence (a outra recebe a violação e responde `409`, RN-04). Índice em `expira_em` para a limpeza.
+- `pedido`: `UNIQUE (lojista_id, referencia_externa)` (RN-06); índice `(lojista_id, criado_em DESC, id DESC)` para a paginação por cursor (RN-13); `CHECK (janela_fim > janela_inicio)`.
+- `atribuicao`: `UNIQUE (pedido_id)` (uma saga por pedido); `oferta` com índice único parcial `(entregador_id) WHERE estado = 'PENDENTE'` (RN-23: o banco garante uma oferta pendente por entregador).
+- `prazo`: índice parcial em `vence_em WHERE processado_em IS NULL`, lido com `FOR UPDATE SKIP LOCKED` (RN-27).
+- `posicao`: particionada por dia; a unicidade inclui `capturada_em` porque em tabela particionada a restrição única precisa conter a chave de partição. A gravação usa `INSERT … ON CONFLICT DO NOTHING` em lote (RN-39). Partições criadas com 3 dias de antecedência por um job; a retenção é `DROP` da partição (RN-63).
+- `anomalia`: índice único parcial `(pedido_id, tipo) WHERE encerrada_em IS NULL` (uma anomalia aberta por tipo, RF-10).
+- `evento_processado`: chave `(grupo, event_id)`, gravada **na mesma transação** do efeito do consumidor (deduplicação de consumidores idempotentes).
+
+Migrations (Flyway, uma pasta por serviço): `V1` cria as tabelas do agregado e a outbox; `V2` a idempotência ou os prazos; `V3` os índices parciais; na Telemetria, `V1` cria a tabela particionada e a função que cria partições futuras. Nenhuma migration altera o banco de outro serviço.
+
+<Callout tipo="erro" titulo="Uma tabela de posições sem partição">
+Com 1.000 posições/s em 16 h de operação, são cerca de 57 milhões de linhas por dia. Sem particionar, a retenção vira um `DELETE` gigantesco que gera inchaço (bloat) e disputa com as inserções; com partição diária, é um `DROP TABLE` instantâneo. E lembre: chave única e chave primária em tabela particionada precisam incluir a coluna da partição.
+</Callout>
+
+## Contrato da API
+
+Todas as rotas passam pelo gateway em `/v1`. Formato JSON (`application/json`), exceto o stream (`text/event-stream`) e os erros (`application/problem+json`). O OpenAPI de cada serviço fica em `contracts/openapi/` e é a fonte da verdade.
+
+| Método | Caminho | Quem pode (audiência / papel) | O que faz | Respostas |
+|---|---|---|---|---|
+| POST | `/v1/pedidos` | `api-lojista` / LOJISTA | Cria pedido (RF-01) | 201, 200 (repetição), 400, 401, 409, 422, 429 |
+| GET | `/v1/pedidos/{id}` | `api-lojista` / dono | Consulta | 200, 404 |
+| GET | `/v1/pedidos` | `api-lojista` / LOJISTA | Lista por cursor | 200, 400 |
+| POST | `/v1/pedidos/{id}/cancelamento` | `api-lojista` / dono | Solicita cancelamento | 202, 404, 409 |
+| POST | `/v1/entregadores/me/turno` | `api-entregador` | Abre turno | 201, 409 |
+| PATCH | `/v1/entregadores/me/turno` | `api-entregador` | Pausa, retoma, encerra | 200, 409 |
+| POST | `/v1/entregadores/me/posicoes` | `api-entregador` | Lote de posições (RF-07) | 202, 400, 409, 413, 429, 503 |
+| GET | `/v1/entregadores/me/eventos` | `api-entregador` | SSE com ofertas e avisos | 200 (stream) |
+| POST | `/v1/ofertas/{id}/aceite` | `api-entregador` / destinatário da oferta | Aceita | 200, 404, 409 |
+| POST | `/v1/ofertas/{id}/recusa` | `api-entregador` / destinatário da oferta | Recusa | 200, 404, 409 |
+| POST | `/v1/entregas/{pedidoId}/coleta` | `api-entregador` / atribuído | Registra coleta | 200, 404, 409 |
+| POST | `/v1/entregas/{pedidoId}/conclusao` | `api-entregador` / atribuído | Entrega (código) ou falha | 200, 409, 422 |
+| GET | `/v1/rastreio/{token}` | público | Snapshot do rastreio | 200, 404, 410, 429 |
+| GET | `/v1/rastreio/{token}/stream` | público | Stream SSE | 200, 404, 410, 429 |
+| GET | `/v1/operacao/atencao` | `api-operador` / OPERADOR | Fila de atenção | 200 |
+| POST | `/v1/operacao/atribuicoes/{id}/oferta-manual` | `api-operador` / OPERADOR | Redespacho manual | 202, 409 |
+| GET, POST | `/v1/operacao/dlq/...` | `api-operador` / OPERADOR | Lista, reprocessa, descarta | 200, 202 |
+| DELETE | `/v1/operacao/links/{pedidoId}` | `api-operador` / SUPERVISOR | Revoga link de rastreio | 204 |
+
+### Criar pedido
+
+```http
+POST /v1/pedidos
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Idempotency-Key: loja8812-000451-a
+Content-Type: application/json
+```
+
+```json
+{
+  "referenciaExterna": "LOJA-8812-000451",
+  "servico": "EXPRESSA",
+  "coleta": {
+    "endereco": "Rua Augusta, 1500 - Consolação, São Paulo - SP, 01304-001",
+    "coordenadas": { "lat": -23.556314, "lon": -46.660432 },
+    "contato": { "nome": "Expedição Loja Ateliê", "telefone": "+5511930001234" }
+  },
+  "entrega": {
+    "endereco": "Rua Harmonia, 200, apto 52 - Vila Madalena, São Paulo - SP, 05435-000",
+    "coordenadas": { "lat": -23.553112, "lon": -46.690118 },
+    "destinatario": { "nome": "Marina Souza", "telefone": "+5511987654321" },
+    "instrucoes": "Portaria 24h"
+  },
+  "volumes": [
+    { "pesoGramas": 1200, "dimensoesCm": { "altura": 20, "largura": 30, "comprimento": 15 } }
+  ],
+  "valorDeclarado": { "valor": "189.90", "moeda": "BRL" }
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /v1/pedidos/0199a3c4-6f1e-7b52-9d3a-2f6c1e8b4a10
+```
+
+```json
+{
+  "id": "0199a3c4-6f1e-7b52-9d3a-2f6c1e8b4a10",
+  "referenciaExterna": "LOJA-8812-000451",
+  "status": "RECEBIDO",
+  "servico": "EXPRESSA",
+  "janelaEntrega": { "inicio": "2026-10-05T17:02:11Z", "fim": "2026-10-05T18:32:11Z" },
+  "modalMinimo": "MOTO",
+  "linkRastreio": "https://rastreio.rotaviva.example/r/q7T2vX9kLmB3nR8sW1yZ4A",
+  "criadoEm": "2026-10-05T17:02:11Z"
+}
+```
+
+### Enviar posições
+
+```http
+POST /v1/entregadores/me/posicoes
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Content-Type: application/json
+```
+
+```json
+{
+  "dispositivoId": "a1f3c9e2-android",
+  "posicoes": [
+    { "seq": 40, "capturadaEm": "2026-10-05T17:09:40Z", "lat": -23.555901, "lon": -46.671220, "precisaoM": 8, "velocidadeKmh": 22.5 },
+    { "seq": 41, "capturadaEm": "2026-10-05T17:09:45Z", "lat": -23.555512, "lon": -46.671934, "precisaoM": 8, "velocidadeKmh": 24.1 },
+    { "seq": 42, "capturadaEm": "2026-10-05T17:10:50Z", "lat": -23.555100, "lon": -46.672600, "precisaoM": 6, "velocidadeKmh": 20.0 }
+  ]
+}
+```
+
+```json
+{
+  "recebidaEm": "2026-10-05T17:10:00.412Z",
+  "aceitas": 2,
+  "rejeitadas": [ { "indice": 2, "seq": 42, "motivo": "RELOGIO_ADIANTADO" } ]
+}
+```
+
+### Aceitar oferta
+
+```http
+POST /v1/ofertas/0199a3c5-0a7d-7c11-8e2f-6b0d9f3a2c77/aceite
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+```
+
+```json
+{
+  "ofertaId": "0199a3c5-0a7d-7c11-8e2f-6b0d9f3a2c77",
+  "pedidoId": "0199a3c4-6f1e-7b52-9d3a-2f6c1e8b4a10",
+  "estado": "ACEITA",
+  "coleta": { "endereco": "Rua Augusta, 1500 - Consolação", "coordenadas": { "lat": -23.556314, "lon": -46.660432 } },
+  "etaColeta": "2026-10-05T17:14:30Z",
+  "ordemNaRota": 2
+}
+```
+
+### Rastreio público: snapshot e stream
+
+```json
+{
+  "status": "EM_ROTA",
+  "janelaEntrega": { "inicio": "2026-10-05T17:02:11Z", "fim": "2026-10-05T18:32:11Z" },
+  "eta": { "previsto": "2026-10-05T17:41:00Z", "fonte": "ROTEIRIZADOR" },
+  "entregador": { "primeiroNome": "Carlos", "modal": "MOTO" },
+  "posicao": { "lat": -23.5549, "lon": -46.6801, "capturadaEm": "2026-10-05T17:31:05Z" },
+  "paradasAntes": 0
+}
+```
+
+```text
+retry: 3000
+
+id: 118
+event: posicao
+data: {"lat":-23.5547,"lon":-46.6809,"capturadaEm":"2026-10-05T17:31:10Z"}
+
+id: 119
+event: eta
+data: {"previsto":"2026-10-05T17:43:00Z","fonte":"ROTEIRIZADOR"}
+
+: heartbeat
+```
+
+### Erros (Problem Details, RFC 9457)
+
+```json
+{
+  "type": "https://rotaviva.example/problemas/idempotency-key-reutilizada",
+  "title": "Idempotency-Key reutilizada com outro conteúdo",
+  "status": 422,
+  "detail": "A chave loja8812-000451-a já foi usada em 2026-10-05T17:02:11Z para um pedido diferente.",
+  "instance": "/v1/pedidos",
+  "pedidoOriginal": "0199a3c4-6f1e-7b52-9d3a-2f6c1e8b4a10",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+| Status | `type` (sufixo) | Quando |
+|---|---|---|
+| 400 | `requisicao-invalida` | Validação de campos; extensão `erros` com `campo` e `mensagem` |
+| 400 | `idempotency-key-ausente` | RN-01 |
+| 401 | `nao-autenticado` | Token ausente, expirado ou com audiência errada |
+| 403 | `acesso-negado` | Papel sem permissão para a rota (ex.: entregador chamando `/operacao`) |
+| 404 | `recurso-nao-encontrado` | Inexistente **ou de outro dono** (RN-12, RN-24) e link revogado |
+| 409 | `idempotency-key-em-processamento` | RN-04, com `Retry-After` |
+| 409 | `referencia-duplicada` | RN-06 |
+| 409 | `transicao-invalida` | RN-15, RN-60; extensão `statusAtual` |
+| 409 | `oferta-expirada` | RN-24, RN-30 |
+| 409 | `turno-inativo`, `turno-ja-aberto`, `entregas-pendentes` | RN-16, RN-17, RN-36 |
+| 409 | `fora-do-local`, `codigo-bloqueado` | RN-31, RN-32 |
+| 410 | `link-expirado` | RN-46 |
+| 413 | `lote-muito-grande` | RN-34 |
+| 422 | `idempotency-key-reutilizada` | RN-03 |
+| 422 | `janela-invalida`, `fora-da-area-de-cobertura` | RN-07, RN-08 |
+| 422 | `codigo-invalido` | RN-32; extensão `tentativasRestantes` |
+| 429 | `limite-excedido` | Rate limit, com `Retry-After` |
+| 503 | `servico-indisponivel` | Dependência fora ou Kafka sem confirmação (RN-38), com `Retry-After` |
+
+### Catálogo de eventos
+
+Todo evento tem um envelope comum nos **cabeçalhos** do Kafka: `eventId` (UUID v7), `eventType`, `schemaVersion`, `occurredAt`, `producer` e `traceparent` (W3C Trace Context). O corpo é JSON validado por JSON Schema em `contracts/asyncapi/`. A garantia de entrega de todos é **pelo menos uma vez**; o efeito único vem dos consumidores idempotentes.
+
+| Tópico | Produtor | Consumidores (grupo) | Chave | Eventos | Partições / retenção |
+|---|---|---|---|---|---|
+| `pedidos.eventos.v1` | Pedidos (outbox) | despacho, rastreamento, notificacoes | `pedidoId` | `PedidoCriado`, `CancelamentoSolicitado` | 6 / 7 dias |
+| `despacho.eventos.v1` | Despacho (outbox) | pedidos, rastreamento, notificacoes | `pedidoId` | `AtribuicaoIniciada`, `EntregaAtribuida`, `AtribuicaoRevogada`, `PacoteColetado`, `EntregaEmRota`, `EntregaConcluida`, `EntregaFalhou`, `DespachoEscalado`, `AtribuicaoCancelada`, `CancelamentoRecusado` | 6 / 7 dias |
+| `despacho.turnos.v1` | Despacho (outbox) | telemetria | `entregadorId` | `EstadoDoEntregador` (estado atual) | 3 / compactado |
+| `telemetria.posicoes.v1` | Telemetria (direto, `acks=all`) | rastreamento, despacho, telemetria-gravacao | `entregadorId` | `PosicaoRecebida` | 12 / 72 h |
+| `rastreamento.eventos.v1` | Rastreamento (outbox) | despacho, notificacoes | `pedidoId` | `AnomaliaDetectada`, `AnomaliaEncerrada`, `EtaAlterado` | 6 / 7 dias |
+| `<topico>.<grupo>.dlt` | DeadLetter de cada consumidor | console do operador | a original | a mensagem original + cabeçalhos da exceção | 1 / 14 dias |
+
+Por que a chave importa: com `pedidoId`, todos os eventos de uma entrega caem na mesma partição e chegam **em ordem** ao consumidor; com `entregadorId`, as posições de uma pessoa são processadas em sequência por uma única instância, o que permite manter o estado do detector de anomalias em memória local daquela partição.
+
+Exemplo de `EntregaAtribuida` (corpo):
+
+```json
+{
+  "pedidoId": "0199a3c4-6f1e-7b52-9d3a-2f6c1e8b4a10",
+  "atribuicaoId": "0199a3c4-7d02-7e8a-b1c4-91f0aa2c3d55",
+  "versao": 4,
+  "entregador": { "id": "0198ff10-2b3c-7a40-9e11-4c5d6e7f8a90", "primeiroNome": "Carlos", "modal": "MOTO" },
+  "ordemNaRota": 2,
+  "etaColeta": "2026-10-05T17:14:30Z",
+  "aceitaEm": "2026-10-05T17:03:02Z"
+}
+```
+
+**Regra de compatibilidade dos schemas.** Dentro de uma versão de tópico (`.v1`), só mudanças **compatíveis para trás e para frente**: acrescentar campo opcional, acrescentar valor de enum que os consumidores tratam como "desconhecido". Proibido: remover ou renomear campo, mudar tipo, tornar obrigatório um campo opcional. Os consumidores ignoram campos desconhecidos (configure o desserializador para isso e não confie no padrão da versão do Jackson). Mudança incompatível → tópico `.v2`, com o produtor publicando nos dois durante a migração e o `.v1` desligado só depois que todos os grupos migraram. O CI compara cada schema alterado com a versão da `main` e falha se a mudança for incompatível; `schemaVersion` sobe o menor (`1.3` → `1.4`) a cada mudança compatível.
+
+## Arquitetura
+
+<Figura legenda="Serviços, dados e tópicos da Rota Viva. Clientes externos entram só pelo gateway; os serviços não chamam uns aos outros de forma síncrona no caminho crítico, e sim por eventos no Kafka">
+<svg viewBox="0 0 860 510" width="860" role="img" aria-labelledby="rv-arq-t rv-arq-d">
+  <title id="rv-arq-t">Arquitetura de serviços e fluxo de dados</title>
+  <desc id="rv-arq-d">Lojista, app do entregador, cliente final e operador chamam o gateway, que valida o JWT e encaminha para cinco serviços: Pedidos, Despacho, Telemetria, Rastreamento e Notificações. Cada serviço tem seu banco. Todos publicam ou consomem no Kafka, cujos tópicos aparecem à direita. Abaixo, Keycloak, roteirizador simulado, SMS simulado com Mailpit e a pilha de observabilidade.</desc>
+  <defs><marker id="rv-arq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="120" height="44" rx="8" class="d-box"/>
+  <text x="70" y="67" text-anchor="middle" class="d-text">Lojista</text>
+  <rect x="10" y="140" width="120" height="44" rx="8" class="d-box"/>
+  <text x="70" y="167" text-anchor="middle" class="d-text">App entregador</text>
+  <rect x="10" y="240" width="120" height="44" rx="8" class="d-box"/>
+  <text x="70" y="267" text-anchor="middle" class="d-text">Cliente final</text>
+  <rect x="10" y="340" width="120" height="44" rx="8" class="d-box"/>
+  <text x="70" y="367" text-anchor="middle" class="d-text">Operador</text>
+  <text x="70" y="102" text-anchor="middle" class="d-label">client credentials</text>
+  <text x="70" y="202" text-anchor="middle" class="d-label">posições · ofertas</text>
+  <text x="70" y="302" text-anchor="middle" class="d-label">link público · SSE</text>
+  <text x="70" y="402" text-anchor="middle" class="d-label">console (API)</text>
+  <path d="M130 62 L158 62" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M130 162 L158 162" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M130 262 L158 262" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M130 362 L158 362" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <rect x="160" y="30" width="110" height="380" rx="10" class="d-accent"/>
+  <text x="215" y="196" text-anchor="middle" class="d-title">Gateway</text>
+  <text x="215" y="216" text-anchor="middle" class="d-title">BFF</text>
+  <text x="215" y="240" text-anchor="middle" class="d-label">JWT · audiência</text>
+  <text x="215" y="256" text-anchor="middle" class="d-label">rate limit</text>
+  <text x="215" y="272" text-anchor="middle" class="d-label">página de rastreio</text>
+  <path d="M270 60 L298 60" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M270 140 L298 140" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M270 220 L298 220" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M270 300 L298 300" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <path d="M270 380 L298 380" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <rect x="300" y="30" width="210" height="60" rx="8" class="d-box"/>
+  <text x="312" y="54" class="d-title">Pedidos</text>
+  <text x="312" y="76" textLength="192" lengthAdjust="spacingAndGlyphs" class="d-label">PostgreSQL · idempotência · outbox</text>
+  <rect x="300" y="110" width="210" height="60" rx="8" class="d-box"/>
+  <text x="312" y="134" class="d-title">Despacho</text>
+  <text x="312" y="156" class="d-label">PostgreSQL · saga · prazos · GEO</text>
+  <rect x="300" y="190" width="210" height="60" rx="8" class="d-ok"/>
+  <text x="312" y="214" class="d-title">Telemetria</text>
+  <text x="312" y="236" textLength="192" lengthAdjust="spacingAndGlyphs" class="d-label">ingestão sem estado · gravação PG</text>
+  <rect x="300" y="270" width="210" height="60" rx="8" class="d-ok"/>
+  <text x="312" y="294" class="d-title">Rastreamento</text>
+  <text x="312" y="316" class="d-label">Redis + PG · SSE · ETA · anomalias</text>
+  <rect x="300" y="350" width="210" height="60" rx="8" class="d-box"/>
+  <text x="312" y="374" class="d-title">Notificações</text>
+  <text x="312" y="396" class="d-label">PostgreSQL · retentativas</text>
+  <path d="M512 60 L538 60" class="d-line" marker-start="url(#rv-arq-seta)" marker-end="url(#rv-arq-seta)"/>
+  <path d="M512 140 L538 140" class="d-line" marker-start="url(#rv-arq-seta)" marker-end="url(#rv-arq-seta)"/>
+  <path d="M512 220 L538 220" class="d-line" marker-start="url(#rv-arq-seta)" marker-end="url(#rv-arq-seta)"/>
+  <path d="M512 300 L538 300" class="d-line" marker-start="url(#rv-arq-seta)" marker-end="url(#rv-arq-seta)"/>
+  <path d="M538 380 L512 380" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <rect x="540" y="30" width="54" height="380" rx="10" class="d-violet"/>
+  <text x="567" y="220" text-anchor="middle" class="d-title" transform="rotate(-90 567 220)">Kafka 4 (KRaft)</text>
+  <text x="610" y="52" class="d-mono">pedidos.eventos.v1</text>
+  <text x="610" y="70" class="d-label">chave pedidoId</text>
+  <text x="610" y="86" class="d-label">→ despacho, rastreio, notificações</text>
+  <text x="610" y="132" class="d-mono">despacho.eventos.v1</text>
+  <text x="610" y="150" class="d-label">chave pedidoId (+ turnos.v1)</text>
+  <text x="610" y="166" class="d-label">→ pedidos, rastreio, notificações</text>
+  <text x="610" y="212" class="d-mono">telemetria.posicoes.v1</text>
+  <text x="610" y="230" class="d-label">chave entregadorId · 12 partições</text>
+  <text x="610" y="246" class="d-label">→ rastreio, despacho, gravação</text>
+  <text x="610" y="292" class="d-mono">rastreamento.eventos.v1</text>
+  <text x="610" y="310" class="d-label">chave pedidoId</text>
+  <text x="610" y="326" class="d-label">→ notificações, despacho</text>
+  <text x="610" y="372" class="d-mono">*.dlt (uma por grupo)</text>
+  <text x="610" y="390" class="d-label">reprocessadas pelo console</text>
+  <rect x="160" y="440" width="110" height="56" rx="8" class="d-info"/>
+  <text x="215" y="464" text-anchor="middle" class="d-text">Keycloak</text>
+  <text x="215" y="483" text-anchor="middle" class="d-label">OIDC · JWT</text>
+  <rect x="300" y="440" width="140" height="56" rx="8" class="d-info"/>
+  <text x="370" y="464" text-anchor="middle" class="d-text">Roteirizador fake</text>
+  <text x="370" y="483" text-anchor="middle" class="d-label">HTTP · ETA e rota</text>
+  <rect x="455" y="440" width="140" height="56" rx="8" class="d-info"/>
+  <text x="525" y="464" text-anchor="middle" class="d-text">SMS fake · Mailpit</text>
+  <text x="525" y="483" text-anchor="middle" class="d-label">HTTP · SMTP</text>
+  <path d="M480 410 L480 438" class="d-line" marker-end="url(#rv-arq-seta)"/>
+  <rect x="610" y="440" width="240" height="56" rx="8" class="d-info"/>
+  <text x="730" y="464" text-anchor="middle" class="d-text">Observabilidade</text>
+  <text x="730" y="483" textLength="228" lengthAdjust="spacingAndGlyphs" text-anchor="middle" class="d-label">OTel · Prometheus · Tempo · Loki · Grafana</text>
+</svg>
+</Figura>
+
+### Os serviços e por que cada fronteira existe
+
+| Serviço | Responsabilidade | Por que é separado |
+|---|---|---|
+| **Gateway/BFF** | Roteamento, validação de JWT e audiência, rate limit, CORS, página de rastreio | Ponto único para políticas de borda; escala com conexões, não com regra de negócio. Não tem regra de negócio nem banco. |
+| **Pedidos** | Lojistas, pedidos, idempotência, status para o lojista | Contrato externo estável com 400 integradores; ritmo de mudança baixo; SLO de 99,9% que não pode depender do resto. |
+| **Despacho** | Frota, turnos, atribuição (saga), ofertas, prazos, ciclo da entrega, auditoria | Regras que mudam toda semana (algoritmo de seleção); é o dono do estado físico da entrega; pode cair sem impedir a criação de pedidos. |
+| **Telemetria** | Ingestão de posições e histórico | Perfil de carga 50 vezes maior que o resto; precisa escalar horizontalmente sem estado; falha dela não pode derrubar pedidos. Uma imagem, dois papéis (`ingestao` e `gravacao`), implantados como Deployments separados. |
+| **Rastreamento** | Read model, SSE, ETA, anomalias | Leitura pública de alto volume e conexões longas; dados reconstruíveis a partir do Kafka; isolar o tráfego público protege as APIs autenticadas. |
+| **Notificações** | SMS e e-mail | Efeitos externos com provedores lentos, limites e retentativas longas; o atraso de um provedor não pode segurar o consumo de outros serviços. |
+
+**O que não separar (e registrar no ADR-001):** ETA e anomalias ficam **dentro** do Rastreamento, porque usam o mesmo fluxo de posições e o mesmo estado por entrega (separar dobraria o consumo e criaria um read model duplicado). Cadastro de entregadores e turnos ficam no Despacho (só ele decide quem trabalha). Lojistas ficam em Pedidos. Usuários e senhas ficam no Keycloak, sem "serviço de usuários". Histórico de posições não é um serviço: é o segundo papel da Telemetria. E não há biblioteca compartilhada de domínio: só uma biblioteca pequena com o envelope de eventos e as convenções de observabilidade.
+
+### O caminho das posições
+
+<Figura legenda="Do celular ao cliente: a API só aceita depois do ack do Kafka; cada grupo de consumidores trata duplicidade e atraso do seu jeito">
+<svg viewBox="0 0 860 340" width="860" role="img" aria-labelledby="rv-tel-t rv-tel-d">
+  <title id="rv-tel-t">Pipeline de telemetria</title>
+  <desc id="rv-tel-d">O app envia lotes de posições à Telemetria, que valida e publica no Kafka particionado por entregador. Três grupos consomem: a gravação insere no PostgreSQL ignorando duplicatas; o Rastreamento só atualiza a última posição quando a nova é mais recente, grava no Redis e publica no canal para as réplicas de SSE; o Despacho atualiza o índice geográfico dos entregadores disponíveis.</desc>
+  <defs><marker id="rv-tel-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="130" width="110" height="70" rx="8" class="d-box"/>
+  <text x="65" y="158" text-anchor="middle" class="d-title">App</text>
+  <text x="65" y="178" text-anchor="middle" class="d-label">lote ≤ 100, seq</text>
+  <path d="M120 165 L148 165" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <rect x="150" y="110" width="150" height="110" rx="8" class="d-ok"/>
+  <text x="225" y="134" text-anchor="middle" class="d-title">Ingestão</text>
+  <text x="225" y="156" text-anchor="middle" class="d-label">id do token, turno ativo</text>
+  <text x="225" y="172" text-anchor="middle" class="d-label">futuro &gt; 30 s rejeita</text>
+  <text x="225" y="188" text-anchor="middle" class="d-label">202 após acks=all</text>
+  <text x="225" y="204" text-anchor="middle" class="d-label">2 s sem ack → 503</text>
+  <path d="M300 165 L328 165" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <rect x="330" y="70" width="110" height="190" rx="8" class="d-violet"/>
+  <text x="385" y="96" text-anchor="middle" class="d-title">Kafka</text>
+  <text x="385" y="116" text-anchor="middle" class="d-label">chave entregadorId</text>
+  <text x="385" y="146" text-anchor="middle" class="d-mono">p0</text>
+  <text x="385" y="168" text-anchor="middle" class="d-mono">p1</text>
+  <text x="385" y="190" text-anchor="middle" class="d-mono">…</text>
+  <text x="385" y="212" text-anchor="middle" class="d-mono">p11</text>
+  <text x="385" y="236" text-anchor="middle" class="d-label">ordem por</text>
+  <text x="385" y="252" text-anchor="middle" class="d-label">entregador</text>
+  <path d="M440 110 L478 50" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <path d="M440 165 L478 165" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <path d="M440 220 L478 280" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <rect x="480" y="16" width="190" height="72" rx="8" class="d-box"/>
+  <text x="492" y="38" class="d-title">Gravação</text>
+  <text x="492" y="58" class="d-label">INSERT em lote</text>
+  <text x="492" y="76" class="d-label">ON CONFLICT DO NOTHING</text>
+  <rect x="480" y="120" width="190" height="90" rx="8" class="d-ok"/>
+  <text x="492" y="142" class="d-title">Rastreamento</text>
+  <text x="492" y="162" textLength="172" lengthAdjust="spacingAndGlyphs" class="d-label">só aplica se (capturadaEm, seq)</text>
+  <text x="492" y="178" textLength="172" lengthAdjust="spacingAndGlyphs" class="d-label">for maior; atrasada → só histórico</text>
+  <text x="492" y="196" text-anchor="start" class="d-label">outlier → ignorada</text>
+  <rect x="480" y="244" width="190" height="72" rx="8" class="d-accent"/>
+  <text x="492" y="266" class="d-title">Despacho</text>
+  <text x="492" y="286" class="d-label">GEOADD de quem está</text>
+  <text x="492" y="304" class="d-label">disponível (posição ≤ 60 s)</text>
+  <path d="M670 52 L698 52" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <path d="M670 165 L698 165" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <path d="M670 280 L698 280" class="d-line" marker-end="url(#rv-tel-seta)"/>
+  <rect x="700" y="24" width="150" height="56" rx="8" class="d-info"/>
+  <text x="775" y="48" text-anchor="middle" class="d-text">PostgreSQL</text>
+  <text x="775" y="66" text-anchor="middle" class="d-label">partição diária</text>
+  <rect x="700" y="128" width="150" height="74" rx="8" class="d-info"/>
+  <text x="775" y="150" text-anchor="middle" class="d-text">Redis</text>
+  <text x="775" y="168" text-anchor="middle" class="d-label">HSET + PUBLISH</text>
+  <text x="775" y="186" text-anchor="middle" class="d-label">→ réplicas SSE</text>
+  <rect x="700" y="252" width="150" height="56" rx="8" class="d-info"/>
+  <text x="775" y="276" text-anchor="middle" class="d-text">Redis GEO</text>
+  <text x="775" y="294" text-anchor="middle" class="d-label">do Despacho</text>
+</svg>
+</Figura>
+
+O orçamento dos 3 s de frescor (RNF-01), que você deve medir e mostrar num painel: ingestão até o ack, ~50 ms; espera no Kafka até o consumo (lag), meta ≤ 500 ms; processamento e escrita no Redis, ~20 ms; publicação e entrega ao cliente SSE, ~50 ms. Sobra folga para o pico; quando o lag cresce, é ele que consome o orçamento, e por isso o alerta mais importante é o de lag do grupo `rastreamento`.
+
+### A saga de atribuição
+
+<Figura legenda="A saga orquestrada pelo Despacho: uma oferta de cada vez, prazos persistidos, compensação quando o entregador some antes da coleta">
+<svg viewBox="0 0 860 534" width="860" role="img" aria-labelledby="rv-saga-t rv-saga-d">
+  <title id="rv-saga-t">Sequência da atribuição com recusa e compensação</title>
+  <desc id="rv-saga-d">Pedidos publica PedidoCriado pela outbox. O Despacho consome, cria a atribuição e ranqueia candidatos. Oferta ao entregador A, que recusa ou deixa expirar em 45 segundos. O Despacho exclui A e oferta ao entregador B, que aceita. O Despacho publica EntregaAtribuida pela outbox; Pedidos e Rastreamento consomem. Abaixo, a compensação: se B ficar 5 minutos sem sinal antes da coleta, o Rastreamento publica a anomalia, o Despacho revoga a atribuição e volta a procurar com prioridade.</desc>
+  <defs><marker id="rv-saga-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="110" height="40" rx="8" class="d-box"/>
+  <text x="65" y="35" text-anchor="middle" class="d-text">Pedidos</text>
+  <rect x="145" y="10" width="110" height="40" rx="8" class="d-violet"/>
+  <text x="200" y="35" text-anchor="middle" class="d-text">Kafka</text>
+  <rect x="290" y="10" width="110" height="40" rx="8" class="d-accent"/>
+  <text x="345" y="35" text-anchor="middle" class="d-text">Despacho</text>
+  <rect x="435" y="10" width="110" height="40" rx="8" class="d-box"/>
+  <text x="490" y="35" text-anchor="middle" class="d-text">Entregador A</text>
+  <rect x="580" y="10" width="110" height="40" rx="8" class="d-box"/>
+  <text x="635" y="35" text-anchor="middle" class="d-text">Entregador B</text>
+  <rect x="730" y="10" width="110" height="40" rx="8" class="d-ok"/>
+  <text x="785" y="35" text-anchor="middle" class="d-text">Rastreamento</text>
+  <path d="M65 50 L65 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M200 50 L200 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M345 50 L345 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M490 50 L490 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M635 50 L635 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M785 50 L785 420" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M65 82 L198 82" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="72" y="74" class="d-label">PedidoCriado (outbox)</text>
+  <path d="M200 112 L343 112" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="208" y="104" class="d-label">consome (grupo despacho)</text>
+  <text x="353" y="140" class="d-label">PROCURANDO · ranqueia (RN-21)</text>
+  <path d="M345 170 L488 170" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="353" y="162" class="d-label">oferta · prazo 45 s</text>
+  <path d="M490 205 L347 205" class="d-line" stroke-dasharray="5 4" marker-end="url(#rv-saga-seta)"/>
+  <text x="353" y="197" class="d-label">recusa ou expira (prazo)</text>
+  <text x="353" y="232" class="d-label">exclui A · próximo candidato</text>
+  <path d="M345 262 L633 262" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="353" y="254" class="d-label">oferta · prazo 45 s</text>
+  <path d="M635 297 L347 297" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="440" y="289" class="d-label">aceite (bloqueio otimista, RN-30)</text>
+  <path d="M345 332 L202 332" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="208" y="324" class="d-label">EntregaAtribuida (outbox)</text>
+  <path d="M200 367 L67 367" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="72" y="359" class="d-label">ENTREGADOR_ATRIBUIDO</text>
+  <path d="M200 400 L783 400" class="d-line" marker-end="url(#rv-saga-seta)"/>
+  <text x="560" y="392" class="d-label">status e paradas no read model</text>
+  <rect x="120" y="432" width="720" height="92" rx="10" class="d-violet"/>
+  <text x="136" y="456" class="d-title">Compensação (RN-28)</text>
+  <text x="136" y="478" class="d-label">B fica 5 min sem sinal antes da coleta → Rastreamento publica AnomaliaDetectada(SEM_SINAL)</text>
+  <text x="136" y="496" class="d-label">→ Despacho revoga, avisa B, publica AtribuicaoRevogada e volta a PROCURANDO com prioridade.</text>
+  <text x="136" y="514" class="d-label">Depois da coleta: sem revogação automática; abre-se um incidente para o operador.</text>
+</svg>
+</Figura>
+
+### Organização do repositório
+
+Monorepo com Maven multi-módulo (ou Gradle), cada serviço com arquitetura hexagonal leve (domínio sem Spring, adaptadores de entrada HTTP e Kafka, adaptadores de saída para banco, Redis e HTTP):
+
+```text
+rota-viva/
+├── services/{gateway,pedidos,despacho,telemetria,rastreamento,notificacoes}/
+├── fakes/{roteirizador,sms}/              # contratos descritos no README de cada um
+├── tools/simulador-frota/                 # trajetos, ofertas, sonda de frescor, clientes SSE
+├── libs/eventos/                          # só envelope de eventos e convenções; nada de domínio
+├── contracts/{openapi,asyncapi}/          # fonte da verdade, verificada no CI
+├── deploy/{compose,helm,k6,caos,grafana,prometheus}/
+└── docs/{adr,runbooks,postmortems,slo,custo}/
+```
+
+**Contratos dos serviços simulados.** O roteirizador responde `POST /rotas` com `origem`, `destino` e `modal`, devolvendo `distanciaMetros`, `duracaoSegundos` (haversine × 1,3 ÷ velocidade do modal, com ruído determinístico de ±10% pela semente) e `polilinha` (lista de pontos interpolados a cada 200 m). Ele aceita cabeçalhos de controle para teste (`X-Fake-Latencia-Ms`, `X-Fake-Falha: 503`). O SMS responde `POST /mensagens` com `202` e um id, falha com `429` em mais de 50 mensagens/s e expõe `GET /mensagens` para os testes conferirem o que foi enviado. O e-mail vai para o Mailpit (servidor SMTP de teste com interface web) via SMTP.
+
+### Decisões para registrar em ADRs
+
+Cada ADR tem contexto, opções, decisão, consequências e "como saberemos que erramos". As recomendações abaixo são uma base; você pode decidir diferente, desde que justifique.
+
+| ADR | Pergunta | Opções e trade-offs | Recomendação de base |
+|---|---|---|---|
+| 001 | Quais fronteiras de serviço? | Monólito modular (simples, uma implantação; mas telemetria e rastreio público disputariam recursos com pedidos) × 6 serviços (isolamento de carga e falha; custo de operação) × mais granular (custo sem benefício) | 6 serviços, com a lista do que não separar; monólito modular como alternativa considerada e explicada |
+| 002 | Síncrono ou assíncrono entre serviços? | REST entre serviços (simples; acopla disponibilidade) × eventos (desacopla; consistência eventual) | Eventos no caminho crítico; HTTP síncrono só para os fakes externos |
+| 003 | Como publicar eventos com consistência? | Escrita dupla (perde eventos) × outbox com polling (simples; latência de ~1 s) × CDC com Debezium (baixa latência; mais infraestrutura) | Outbox com polling a cada 200 ms e `SKIP LOCKED`; CDC como evolução |
+| 004 | Saga orquestrada ou coreografada? | Coreografia (sem coordenador; fluxo espalhado e difícil de depurar) × orquestração (estado explícito numa tabela; um ponto central) | Orquestrada pelo Despacho |
+| 005 | Chaves e partições | Chave `pedidoId` × `lojistaId`; 6, 12 ou 24 partições (paralelismo máximo = partições; aumentar depois quebra a afinidade de chave) | `pedidoId` para eventos de entrega, `entregadorId` para posições; 12 partições em posições (3.000/s ÷ 12 = 250/s por partição) |
+| 006 | Protocolo de ingestão | HTTP em lote (simples, passa por qualquer proxy) × MQTT (feito para isso; mais um broker) × gRPC streaming | HTTP em lote |
+| 007 | SSE ou WebSocket para o cliente? | SSE (unidirecional, HTTP comum, reconexão e `Last-Event-ID` nativos) × WebSocket (bidirecional; mais complexo em proxy) × polling (simples; desperdício) | SSE; o cliente não precisa falar com o servidor |
+| 008 | Fan-out entre réplicas de SSE | Cada réplica consome o Kafka inteiro (simples; cada réplica processa 100% das posições) × Redis Pub/Sub por entrega (só recebe o que tem cliente; mais uma peça) | Redis Pub/Sub com canal por entrega, assinado só enquanto há cliente conectado naquela réplica |
+| 009 | Onde fica o read model? | Só Redis (rápido; precisa reconstruir) × só PostgreSQL (durável; mais lento no fan-out) × ambos | Redis para o quente, PostgreSQL para link, linha do tempo e anomalias; reconstrução pelo Kafka documentada |
+| 010 | Autenticação entre serviços | mTLS (forte; certificados e rotação) × JWT de client credentials com audiência por serviço (reaproveita o Keycloak) × rede confiável (não) | JWT client credentials nas chamadas HTTP internas; mTLS via service mesh em "Para ir além" |
+| 011 | Índice geográfico | PostGIS com índice GiST (consultas ricas; I/O no banco) × Redis `GEOSEARCH` (memória; consultas por raio) × geohash manual | Redis GEO no Despacho, alimentado pelo tópico de posições; PostGIS opcional no histórico |
+| 012 | Formato e registro de schemas | JSON Schema no repositório + verificação no CI × Avro/Protobuf com schema registry | JSON Schema + AsyncAPI no repositório; registry como evolução |
+| 013 | Empacotamento no Kubernetes | Helm (templates, valores por ambiente) × Kustomize (patches, sem templates) | Qualquer um; justifique |
+
+<Callout tipo="erro" titulo="Microsserviços que compartilham o banco ou a biblioteca de domínio">
+Se o Rastreamento lê a tabela `pedido` do serviço de Pedidos "só para consultar", você tem um monólito distribuído: uma migration num serviço quebra o outro. O mesmo vale para uma biblioteca `common-domain` com as entidades: muda uma classe, todos os serviços precisam ser reimplantados juntos. Cada serviço mantém a própria cópia dos dados de que precisa, alimentada por eventos.
+</Callout>
+
+## Plano de execução
+
+**Começo** (marco 1): o esqueleto inteiro existe e está verde antes de qualquer regra de negócio — repositório, ADRs de fronteira, infraestrutura local com um comando, CI e observabilidade básica. **Meio** (marcos 2 a 7): cada marco é uma fatia vertical que atravessa serviços e termina com algo demonstrável pelo simulador. **Fim** (marcos 8 e 9): você prova que funciona sob carga e sob falha, implanta em Kubernetes e publica a `v1.0.0`. Abra um PR por marco, com a descrição do que foi feito e de como testar.
+
+<Marco id="fundacao" numero={1} titulo="Fundação: monorepo, ADRs, Compose e CI" horas={16}>
+
+**Objetivo:** ter o esqueleto de ponta a ponta funcionando e as decisões estruturais registradas.
+
+**Tarefas**
+
+- Criar o monorepo com a estrutura da seção de arquitetura; os seis serviços gerados com Spring Boot 4 e Java 25, cada um com `/actuator/health` e um endpoint de exemplo; `spring.threads.virtual.enabled=true`.
+- Escrever os ADRs 001 a 004 (fronteiras, comunicação, outbox, saga) e o README inicial com o problema, o diagrama e "como rodar".
+- `deploy/compose/compose.yaml` com PostgreSQL 18 (um banco lógico por serviço), Kafka 4 em modo KRaft (um broker local), Redis, Keycloak com o realm importado de um arquivo, Mailpit e a pilha de observabilidade (por exemplo, a imagem `grafana/otel-lgtm`, que reúne coletor OpenTelemetry, Prometheus, Tempo, Loki e Grafana).
+- Os fakes `roteirizador` e `sms` respondendo o contrato descrito.
+- GitHub Actions: build e testes de todos os módulos em paralelo, cache do Maven, verificação de formatação, varredura de dependências e publicação dos relatórios de teste.
+- Logs estruturados em JSON com `traceId`; tracing exportado por OTLP.
+
+**Entregáveis:** repositório público, 4 ADRs, `compose.yaml`, workflow de CI, README inicial.
+
+**Definição de pronto:** `docker compose up -d` sobe tudo em até 3 min e todos os health checks ficam `UP`; uma requisição ao gateway aparece como trace no Grafana com spans do gateway e do serviço; o CI está verde na `main` com proteção de branch exigindo o CI.
+
+**Aulas de apoio:** [Microsserviços](../../../aulas/13-arquitetura/05-microsservicos/), [Docker e Compose](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Maven e Gradle](../../../aulas/14-devops/02-maven-e-gradle/), [Git no time](../../../aulas/14-devops/01-git-no-time/), [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), [Domain-Driven Design](../../../aulas/13-arquitetura/07-domain-driven-design/).
+
+<Callout tipo="erro" titulo="Começar pelo serviço mais interessante">
+É tentador abrir direto a Telemetria. Sem o Compose, o CI e o tracing prontos, cada marco seguinte custa o dobro para depurar. Fundação primeiro, mesmo que pareça burocracia.
+</Callout>
+
+</Marco>
+
+<Marco id="pedidos" numero={2} titulo="Pedidos de entrega: idempotência e outbox" horas={22}>
+
+**Objetivo:** o lojista autenticado cria, consulta, lista e cancela pedidos, e os eventos chegam ao Kafka sem perda nem duplicação na origem.
+
+**Tarefas**
+
+- Realm do Keycloak com o cliente `lojista-demo` (client credentials) e a audiência `api-lojista`; serviço de Pedidos como resource server validando emissor, assinatura, expiração e audiência.
+- RF-01 e RF-02 completos (RN-01 a RN-15), com Problem Details e o OpenAPI em `contracts/openapi/pedidos.yaml`.
+- Tabela de idempotência com a disputa resolvida pela chave primária; o hash canônico da requisição.
+- Outbox na mesma transação e um relay com polling a cada 200 ms (`FOR UPDATE SKIP LOCKED`, lote de 100, `acks=all`, produtor idempotente); métrica da idade do evento mais antigo não publicado.
+- Consumidor de `despacho.eventos.v1` (pode chegar no marco 3) com deduplicação por `eventId` e descarte de versão antiga (RN-33).
+
+**Entregáveis:** API de pedidos, OpenAPI, AsyncAPI de `pedidos.eventos.v1`, testes de integração com Testcontainers, coleção `.http`.
+
+**Definição de pronto:** os critérios de aceite do RF-01 e do RF-02 passam como testes automatizados, inclusive as 10 requisições simultâneas com a mesma chave; derrubar o Kafka por 1 min durante a criação de 100 pedidos resulta, depois da volta, em exatamente 100 eventos no tópico.
+
+**Aulas de apoio:** [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/), [Kafka](../../../aulas/12-mensageria/03-kafka/), [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/), [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/), [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/), [Testcontainers](../../../aulas/10-testes/05-testcontainers/), [Evolução de esquemas de eventos](../../../aulas/12-mensageria/07-evolucao-de-esquemas-de-eventos/), [Testes de contrato](../../../aulas/10-testes/07-testes-de-contrato/).
+
+<Callout tipo="erro" titulo="Idempotência com SELECT antes do INSERT">
+"Se a chave não existe, crie o pedido" falha com duas requisições simultâneas: as duas leem "não existe". Deixe o banco decidir com a chave primária e trate a violação como "em processamento" ou "repetição".
+</Callout>
+
+</Marco>
+
+<Marco id="despacho" numero={3} titulo="Despacho: atribuição e saga com compensação" horas={30}>
+
+**Objetivo:** cada pedido criado vira ofertas a entregadores, até alguém aceitar, com todos os caminhos de falha cobertos.
+
+**Tarefas**
+
+- Turnos e capacidade (RF-03), com o estado publicado em `despacho.turnos.v1` (compactado).
+- Seleção de candidatos (RF-04) como função pura do domínio, testada com a tabela da RN-21; índice geográfico em Redis alimentado pelas posições (no início, posições fixas do simulador).
+- Saga (RF-05): tabelas `atribuicao`, `oferta` e `prazo`; job de prazos com `SKIP LOCKED`; bloqueio otimista; compensações da RN-28 e da RN-29; `Clock` injetado.
+- Stream SSE autenticado do entregador para receber ofertas; aceite, recusa, coleta e conclusão (RF-06).
+- Primeira versão do simulador de frota: N entregadores que abrem turno, aceitam com probabilidade configurável e respondem com atraso aleatório.
+
+**Entregáveis:** serviço de Despacho, ADR-004 e ADR-005, diagrama de estados da atribuição no README, simulador v1.
+
+**Definição de pronto:** com 50 entregadores simulados (aceite de 60%), 500 pedidos são todos atribuídos ou escalados, nenhum com dois entregadores; os quatro critérios de aceite do RF-05 passam, incluindo as 50 execuções da corrida aceite × cancelamento e o reinício de todas as réplicas com prazos vencidos.
+
+**Aulas de apoio:** [Sagas](../../../aulas/15-system-design/05-escala-e-consistencia/#sagas), [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/), [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/), [Hexagonal](../../../aulas/13-arquitetura/03-hexagonal/), [Redis](../../../aulas/15-system-design/02-redis/), [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+
+<Callout tipo="erro" titulo="Timers em memória">
+Um `ScheduledExecutorService` por oferta funciona até a primeira reimplantação: as ofertas pendentes nunca expiram. Prazo é dado, e dado mora no banco.
+</Callout>
+
+</Marco>
+
+<Marco id="telemetria" numero={4} titulo="Telemetria: ingestão em alto volume" horas={26}>
+
+**Objetivo:** aceitar 1.000 posições/s sustentadas com a semântica do RF-07, sem duplicar no histórico.
+
+**Tarefas**
+
+- Endpoint de lote com validação por item, identidade do token e estado de turno vindo do tópico compactado.
+- Produtor com `acks=all`, idempotência habilitada, compressão e `linger.ms` ajustado; espera do ack com timeout de 2 s → `503`.
+- Papel `gravacao`: consumo em lote, `INSERT … ON CONFLICT DO NOTHING` com JDBC em lote, commit de offset só depois do commit no banco; tabela particionada por dia com criação antecipada de partições e job de retenção.
+- Simulador v2: trajetos realistas (interpolação entre pontos de uma rota do roteirizador, ruído de GPS, túneis sem sinal que geram rajadas atrasadas, relógios adiantados, reenvios duplicados).
+- Primeiro script k6 (`constant-arrival-rate`, 1.000 req/s por 10 min) contra o ambiente Compose.
+
+**Entregáveis:** serviço de Telemetria com dois papéis, ADR-006, simulador v2, script k6, primeiro relatório de carga no `docs/`.
+
+**Definição de pronto:** os três critérios de aceite do RF-07 passam como testes de integração; no k6 a 1.000 req/s por 10 min, p99 ≤ 250 ms, zero `5xx` e contagem de linhas no histórico igual ao número de posições únicas enviadas (o simulador registra quantas gerou).
+
+**Aulas de apoio:** [Kafka](../../../aulas/12-mensageria/03-kafka/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/), [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/), [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/), [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/), [Kafka em produção](../../../aulas/12-mensageria/08-kafka-em-producao/), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/).
+
+<Callout tipo="erro" titulo="Commit de offset antes da gravação">
+Com auto-commit, o offset pode ser confirmado antes de o lote chegar ao banco; uma queda nesse intervalo perde posições. Confirme o offset depois do commit no banco e aceite as duplicatas — é para isso que existe o `ON CONFLICT`.
+</Callout>
+
+</Marco>
+
+<Marco id="rastreamento" numero={5} titulo="Rastreamento ao vivo: read model e SSE" horas={24}>
+
+**Objetivo:** o cliente final abre o link e vê o entregador se mover, com reconexão sem perda.
+
+**Tarefas**
+
+- Consumidores de pedidos, despacho e posições construindo o read model (Redis + PostgreSQL) com a comparação monotônica da RN-39 e o tratamento de atrasadas da RN-40.
+- Endpoints do RF-08: snapshot e stream SSE (`SseEmitter` no Spring MVC com virtual threads), heartbeat, `Last-Event-ID` com o buffer de 10 min em Redis Stream, encerramento.
+- Fan-out entre réplicas por Redis Pub/Sub (ADR-008): a réplica assina o canal da entrega só enquanto tem cliente.
+- Página pública mínima com `EventSource` e um mapa simples (por exemplo, Leaflet com tiles do OpenStreetMap respeitando a política de uso) ou só as coordenadas e o ETA em texto.
+- Sonda do simulador: clientes SSE que medem o frescor (RNF-01) e exportam um histograma.
+- Comando de reconstrução do read model a partir do Kafka (reset de offsets de um grupo novo).
+
+**Entregáveis:** serviço de Rastreamento, página de rastreio, ADR-007, ADR-008, ADR-009, gráfico de frescor.
+
+**Definição de pronto:** com 3 réplicas e 2.000 clientes SSE, o p99 de frescor medido pela sonda é ≤ 3 s a 1.000 posições/s; matar uma réplica faz os clientes dela reconectarem em até 5 s, sem perder eventos de status; apagar o Redis e reconstruir devolve o mesmo estado.
+
+**Aulas de apoio:** [Cache](../../../aulas/15-system-design/01-cache/), [Redis](../../../aulas/15-system-design/02-redis/), [HTTP na prática](../../../aulas/08-spring-boot/01-http-na-pratica/), [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/), [Por que mensageria](../../../aulas/12-mensageria/01-por-que-mensageria/).
+
+<Callout tipo="erro" titulo="SSE atrás de proxy com buffer">
+Proxies e alguns servidores acumulam a resposta antes de enviar, e o cliente só recebe os eventos em blocos. Desligue o buffer na rota do stream, envie heartbeat e confira com `curl -N` que os eventos chegam um a um. Ajuste também o timeout de inatividade do gateway para mais que o intervalo do heartbeat.
+</Callout>
+
+</Marco>
+
+<Marco id="anomalias" numero={6} titulo="ETA, anomalias e notificações" horas={20}>
+
+**Objetivo:** o sistema avisa antes de o problema virar reclamação.
+
+**Tarefas**
+
+- ETA (RF-09) com o roteirizador por HTTP (`RestClient`), timeout de 800 ms, circuit breaker do Resilience4j e fallback por haversine; limitador de 1 recálculo a cada 30 s por entrega.
+- Detector de anomalias (RF-10) mantido por partição: estado por entregador em memória, reconstruído no rebalanceamento a partir do Redis; `SEM_SINAL` por varredura periódica em processing time; histerese do atraso.
+- Despacho reagindo a `SEM_SINAL` (RN-28) — fecha o ciclo da compensação.
+- Serviço de Notificações (RF-11): modelos, deduplicação, limite por destinatário, retentativas com backoff e DLQ.
+
+**Entregáveis:** ETA e anomalias no Rastreamento, serviço de Notificações, testes de cenários do simulador (parada, túnel, desvio, atraso).
+
+**Definição de pronto:** os critérios de aceite do RF-09, do RF-10 e do RF-11 passam; um trajeto roteirizado em que o entregador some antes da coleta termina, sem intervenção, com a entrega reatribuída e o SMS de atraso enviado uma única vez.
+
+**Aulas de apoio:** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/), [RestClient e OpenAPI](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/), [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/), [Mockito](../../../aulas/10-testes/03-mockito/).
+
+<Callout tipo="erro" titulo="Retentativa bloqueante segurando a partição">
+Cinco tentativas com backoff de até 16 s dentro do consumidor travam todas as outras mensagens da partição. Use tópicos de retentativa (não bloqueantes) para o SMS, ou um registro de envio pendente no banco processado por um job.
+</Callout>
+
+</Marco>
+
+<Marco id="seguranca" numero={7} titulo="Segurança ponta a ponta e LGPD" horas={18}>
+
+**Objetivo:** cada ator só faz o que pode, o link público não vira porta dos fundos, e os dados de localização seguem a política.
+
+**Tarefas**
+
+- Três clientes no Keycloak (`api-lojista`, `api-entregador`, `api-operador`) com mapeadores de audiência e papéis; claims `lojista_id` e `entregador_id`.
+- Matriz de autorização (papel × rota × dono) testada por testes de fatia; `404` para recursos de outro dono.
+- Chamadas internas com JWT de client credentials e audiência por serviço (ADR-010).
+- Link de rastreio: token de 128 bits, hash no banco, limites da RN-46 com Redis, revogação pelo supervisor.
+- Rate limit no gateway por cliente e por IP; cabeçalhos de segurança; CORS só para a origem da página de rastreio.
+- LGPD: retenção (RN-63), anonimização agendada, exportação auditada (RN-64), revisão dos logs; um modelo de ameaças curto (STRIDE) em `docs/`.
+
+**Entregáveis:** realm versionado, ADR-010, matriz de autorização, modelo de ameaças, política de retenção documentada.
+
+**Definição de pronto:** um token do app do entregador chamando `/v1/pedidos` recebe `401` (audiência errada); a matriz de autorização tem um teste por célula; o critério de logs do RF-13 passa sobre os logs do último teste de carga.
+
+**Aulas de apoio:** [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/), [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/), [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/), [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/), [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/), [OAuth 2 e OpenID Connect](../../../aulas/11-seguranca/07-oauth2-e-openid-connect/), [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/).
+
+<Callout tipo="erro" titulo="Audiência que ninguém confere">
+Por padrão, o token emitido pelo Keycloak pode não trazer a audiência que você espera, e o resource server do Spring só valida `aud` se você configurar. Sem isso, um token do app do entregador abre a API do operador. Escreva o teste negativo antes de configurar.
+</Callout>
+
+</Marco>
+
+<Marco id="operacao" numero={8} titulo="Observabilidade, SLOs e alertas" horas={20}>
+
+**Objetivo:** saber, por números, se o sistema cumpre o que promete, e ser acordado só quando importa.
+
+**Tarefas**
+
+- Tracing atravessando o Kafka (observação habilitada no produtor e no consumidor do Spring Kafka, propagando `traceparent` nos cabeçalhos) e nos relays da outbox (o `traceparent` gravado na linha da outbox).
+- Métricas de negócio: pedidos por status, tempo até o aceite, frescor, lag por grupo, idade da outbox, tamanho das DLQs, conexões SSE.
+- `docs/slo/` com um documento por SLO: SLI exato (numerador, denominador, onde se mede), meta, janela de 30 dias e orçamento de erro.
+- Regras de gravação e alertas multi-janela de burn rate: página quando a taxa é 14,4× em 1 h **e** em 5 min, ou 6× em 6 h e em 30 min; ticket quando é 1× em 3 dias e em 6 h. Alertas de causa (lag acima de 30 s, outbox mais velha que 60 s, DLQ crescendo) linkados ao runbook.
+- Dashboards: um por jornada (lojista, entregador, cliente) e um de plataforma (JVM, Kafka, banco).
+
+**Entregáveis:** dashboards exportados em JSON, regras de alerta versionadas, documentos de SLO, um trace de ponta a ponta no README.
+
+**Definição de pronto:** um trace de um pedido mostra gateway → Pedidos → outbox → Kafka → Despacho → Kafka → Rastreamento; injetar 5% de erros no Pedidos dispara o alerta de página em menos de 10 min; cada alerta tem link para um runbook existente.
+
+**Aulas de apoio:** [Observabilidade](../../../aulas/14-devops/05-observabilidade/), [SLI, SLO, RED e alertas](../../../aulas/14-devops/05-observabilidade/#sli-slo-red-e-alertas), [Testes de fatia](../../../aulas/10-testes/04-testes-de-fatia-no-spring/).
+
+<Callout tipo="erro" titulo="Alerta em média e em limiar fixo">
+"Latência média acima de 300 ms" dispara à toa de madrugada e não dispara quando 2% dos clientes sofrem. Alerte sobre o consumo do orçamento de erro, com duas janelas para não demorar a perceber nem continuar alertando depois que passou.
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Kubernetes, carga, caos e release v1.0.0" horas={28}>
+
+**Objetivo:** provar que o sistema aguenta o volume-alvo e falha do jeito combinado, num ambiente que qualquer pessoa recria.
+
+**Tarefas**
+
+- Cluster kind (ou k3d) com charts Helm (ou Kustomize) para cada serviço: probes de liveness e readiness (`/actuator/health/liveness` e `/readiness`), `requests`/`limits`, `PodDisruptionBudget`, rolling update com `maxUnavailable: 0`, encerramento gracioso e `preStop`; HPA por CPU na ingestão (2 a 6 réplicas; exige o metrics-server no kind). Infraestrutura no cluster por manifests simples ou um operador de Kafka (por exemplo, Strimzi).
+- Carga com k6: 1.000 req/s de posições por 30 min, pico de 3.000 req/s por 5 min, 20 pedidos/s, e os clientes SSE do simulador; rodar também durante um rollout.
+- Caos com Toxiproxy entre os serviços e o Kafka, o Redis e o roteirizador, com o comportamento esperado escrito **antes** de rodar:
+
+| Cenário | Comportamento degradado esperado |
+|---|---|
+| Kafka com +500 ms de latência na ingestão | p99 da ingestão sobe, mas abaixo de 2 s; acima disso, `503` com `Retry-After`; nenhuma posição perdida; alerta de frescor dispara |
+| Despacho fora por 10 min | Pedidos seguem com `201` dentro do SLO; rastreio mostra "procurando entregador"; na volta, o backlog é drenado em até 10 min sem atribuição dupla |
+| Redis fora | Snapshot do rastreio vem do PostgreSQL; stream degrada para snapshot a cada 10 s; rate limit do link passa a ser local por réplica |
+| Roteirizador com 2 s de latência | Circuit breaker abre, ETA por estimativa (`fonte: ESTIMATIVA`), sem impacto no frescor |
+| Relay da outbox sem acesso ao Kafka por 5 min | Pedidos continuam sendo aceitos; alerta de idade da outbox; na volta, eventos publicados em ordem por pedido |
+
+- Runbooks em `docs/runbooks/` (lag alto, outbox parada, DLQ crescendo, SSE caindo, Kafka lento) e um postmortem sem culpados de um dos cenários (linha do tempo, impacto em orçamento de erro, causas, ações).
+- Estimativa de custo em `docs/custo/` (veja a seção de entregáveis); README final, vídeo, `CHANGELOG` e tag `v1.0.0` com release no GitHub.
+
+**Entregáveis:** charts, `make cluster` (ou script) que cria tudo do zero, relatórios de carga e de caos com gráficos, runbooks, postmortem, estimativa de custo, release.
+
+**Definição de pronto:** do clone ao cluster com dados de demonstração em um comando; relatório com os SLOs cumpridos na carga-alvo (ou, se a máquina não comportar, o teto medido, o gargalo identificado e a extrapolação explicada); cada cenário de caos com o comportamento observado comparado ao esperado; rollout durante a carga sem `5xx` em pedidos.
+
+**Aulas de apoio:** [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/), [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/), [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/), [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/).
+
+<Callout tipo="erro" titulo="Teste de carga contra o próprio gargalo do notebook">
+Gerar 3.000 req/s, rodar 6 serviços, Kafka e 10.000 conexões SSE na mesma máquina mede a máquina, não o sistema. Rode o k6 com limites de CPU próprios, observe a saturação do gerador e registre no relatório onde o limite estava. Um teto honesto bem explicado vale mais que um número bonito impossível de reproduzir.
+</Callout>
+
+</Marco>
+
+## Estratégia de testes
+
+| Nível | O que cobre | Ferramentas |
+|---|---|---|
+| Unidade (domínio) | Seleção de candidatos, transições da saga, regras de janela e de cobertura, deduplicação monotônica, detectores de anomalia, ETA | JUnit 6, AssertJ, testes parametrizados, `Clock` fixo |
+| Fatia | Controllers (validação, Problem Details, matriz de autorização), repositórios | `@WebMvcTest` com segurança, `@DataJpaTest` ou JDBC com Testcontainers |
+| Integração | Outbox → Kafka, consumidores idempotentes, DLQ, SSE de ponta a ponta num serviço | Testcontainers 2 (PostgreSQL, Kafka, Redis), Awaitility |
+| Contrato | OpenAPI e JSON Schema: o que o produtor publica valida contra o schema; mudança incompatível falha | Validador de JSON Schema no teste do produtor; diff de schema no CI |
+| Arquitetura | Domínio sem Spring; nenhum serviço importa pacote de outro | ArchUnit |
+| Sistema | Cenários do simulador contra o Compose | Simulador + asserções nas métricas |
+| Carga e caos | RNF-01 a RNF-09 | k6, Toxiproxy (também via Testcontainers para cenários pequenos no CI) |
+
+**Cenários obrigatórios.** Todos os critérios de aceite dos RF-01 a RF-13 viram testes automatizados com o número da regra no nome (`deveRecusarAceiteDepoisDoPrazo_RN24`). Os que mais pesam numa conversa técnica, e que precisam estar no CI: as 10 criações simultâneas com a mesma chave; o Kafka fora durante a criação sem perda de eventos; as 50 corridas aceite × cancelamento; o reinício das réplicas do Despacho com prazos vencidos; o lote com duplicata, fora de ordem e relógio adiantado; o reenvio após `503` sem duplicar o histórico; a rajada de posições atrasadas sem `PARADO` retroativo; a reconexão SSE com `Last-Event-ID`; a mensagem envenenada indo para a DLQ sem travar a partição; e o token com audiência errada recebendo `401`.
+
+## Entregáveis do portfólio
+
+**README** (o gestor lê os primeiros 30 segundos; capriche no topo):
+
+```markdown
+# Rota Viva — despacho e rastreamento de entregas em tempo real
+
+Plataforma distribuída de última milha: pedidos com idempotência, despacho por saga com
+compensação, 1.000 posições GPS/s com deduplicação e eventos fora de ordem, e rastreio ao vivo por SSE.
+
+![CI](badge) ![Release](badge)
+
+## Resultados medidos
+| SLO | Meta | Medido (carga-alvo) |
+|---|---|---|
+| Frescor do rastreio | 99,5% ≤ 3 s | 99,8% (p99 1,9 s) |
+| Criação de pedido | 99,9%, p99 ≤ 400 ms | ... |
+
+## Arquitetura          (diagrama + 1 parágrafo + link para os ADRs)
+## Rodando em 1 comando (Compose e kind)
+## Demonstração         (vídeo de 3 min + roteiro do simulador)
+## Decisões e trade-offs (os 5 ADRs mais importantes, uma linha cada)
+## Carga e caos         (gráficos e o que aprendi)
+## Operação             (SLOs, alertas, runbooks, postmortem)
+## Custo estimado       (premissas e resultado)
+## O que eu faria diferente / próximos passos
+```
+
+**Diagramas:** os três desta especificação, refeitos por você, mais o diagrama de estados da atribuição.
+
+**Coleção `.http`:** um arquivo por ator, com variáveis de ambiente e a obtenção do token.
+
+**Estimativa de custo** (`docs/custo/`): sem preços inventados. Descreva o método e preencha com os preços da calculadora oficial do provedor escolhido, com a data da consulta. Fatores mínimos:
+
+| Componente | Como estimar | Ordem de grandeza com os números de referência |
+|---|---|---|
+| Computação | vCPU e memória medidas no teste de carga por serviço × réplicas × 1,5 de folga × horas por mês | a partir dos seus gráficos de `kubectl top` |
+| Kafka (armazenamento) | mensagens/s × tamanho médio × segundos de operação por dia × dias de retenção × fator de replicação | 1.000/s × ~250 B × 57.600 s ≈ 14 GB/dia; × 3 dias × 3 réplicas ≈ 130 GB |
+| PostgreSQL (histórico) | linhas/dia × bytes por linha com índice × 30 dias | ~57 milhões de linhas/dia × ~150 B ≈ 8,6 GB/dia → ~260 GB |
+| Redis | entregadores ativos e entregas ativas × tamanho dos hashes + buffers de eventos | da ordem de centenas de MB |
+| Tráfego de saída | conexões SSE × eventos/s por conexão × bytes por evento | 10.000 × 0,2/s × ~200 B ≈ 400 KB/s |
+| SMS | mensagens por pedido × pedidos/mês × preço unitário | ~3 SMS × 60.000/dia |
+
+Feche com o custo por mil entregas e com a lista do que mais pesa (geralmente SMS e retenção) e de duas alavancas para reduzir (por exemplo, enviar posições a cada 10 s fora da etapa final e reduzir a retenção bruta para 7 dias com agregados).
+
+**Vídeo de até 3 minutos:** (1) 20 s — o problema e o diagrama; (2) 60 s — o simulador rodando: um pedido criado, oferta recusada, aceita, o cliente vendo o entregador se mover; (3) 40 s — derrubar o Despacho ao vivo e mostrar pedidos ainda aceitos e o backlog drenando na volta; (4) 40 s — painel de SLO durante o pico de 3x e o alerta de burn rate; (5) 20 s — o que você aprendeu.
+
+**Post para o LinkedIn:** o problema em uma frase, um gráfico (frescor sob carga ou o teste de caos), três decisões com o trade-off de cada uma e o link do repositório. Sem "projeto de estudo": é uma especificação profissional implementada por você.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível | Acima do nível |
+|---|---|---|---|
+| Fronteiras de serviço | Serviços por entidade, sem justificativa | ADR com motivos de carga, mudança e falha, e o que não separar | Compara com monólito modular com números (custo, latência, esforço) |
+| Idempotência | Só no caminho feliz | API, outbox e consumidores idempotentes, com testes de concorrência | Demonstra efeito único fim a fim sob caos, com contagens |
+| Saga | Transições sem controle de concorrência | Estado persistido, prazos com `SKIP LOCKED`, bloqueio otimista, compensações testadas | Visualização do estado da saga no console e métricas por etapa |
+| Alto volume | Processa posições uma a uma sem medir | 1.000/s com dedup, ordem e atraso tratados e medidos | Mede o teto, identifica o gargalo e mostra a curva de escala por partições |
+| Tempo real | Polling ou SSE sem reconexão | SSE com `Last-Event-ID`, fan-out e frescor medido | 10.000 conexões com heap estável e análise de memória por conexão |
+| Contratos | Sem documentação ou só o Swagger gerado | OpenAPI e AsyncAPI versionados, compatibilidade verificada no CI | Migração `.v1` → `.v2` demonstrada |
+| Segurança | Um papel para tudo | Audiências por cliente, matriz testada, link público limitado | Modelo de ameaças com mitigações rastreáveis a testes |
+| Privacidade | Coordenadas em logs | Retenção e minimização automatizadas | Exportação do titular e relatório de impacto resumido |
+| Observabilidade | Logs soltos | Traces atravessando o Kafka, dashboards por jornada | Exemplars ligando métrica a trace; correlação com o lag |
+| SLOs e alertas | Sem metas | SLOs escritos, burn rate multi-janela, runbooks | Postmortem com consumo do orçamento e ações concluídas |
+| Carga e caos | Não feitos | Carga no alvo e 5 cenários com comportamento esperado × observado | Caos automatizado no CI para cenários pequenos |
+| Comunicação | README com "como rodar" apenas | README com resultados, decisões e custo | Vídeo e post que um não técnico entende |
+
+## Como apresentar na entrevista
+
+**Pitch (60–90 s):** "A Rota Viva é uma plataforma de despacho e rastreamento para uma transportadora de última milha com 5.000 entregadores. Separei em seis serviços porque a telemetria tem 50 vezes mais tráfego que o resto e o rastreio é público, e eu não queria que nenhum dos dois derrubasse a criação de pedidos; detalhei isso num ADR, inclusive o que não separei. Os pedidos entram com idempotência e saem para o Kafka por outbox. O despacho é uma saga orquestrada com prazos no banco, porque entregadores recusam, deixam expirar e somem. As posições chegam duplicadas, fora de ordem e atrasadas, e eu trato cada caso com uma regra explícita. O cliente acompanha por SSE com reconexão sem perda. E medi: 99,8% das posições aparecem em menos de 3 s a mil por segundo, testei pico de 3x e cinco cenários de caos com o comportamento degradado definido antes. Tenho runbooks, um postmortem e uma estimativa de custo com premissas."
+
+**Perguntas prováveis**
+
+1. **Por que seis serviços e não um monólito modular?** Carga diferente (telemetria), exposição diferente (rastreio público), modo de falha diferente (provedores de SMS); o que você ganhou e o que pagou (operação, consistência eventual); quando um monólito modular seria melhor (time pequeno, volume menor).
+2. **Como garante que um pedido não é criado duas vezes?** Chave de idempotência com chave primária no banco, hash do conteúdo, `409` em processamento, referência externa única como segunda barreira; e do lado do Kafka, outbox + consumidores com `evento_processado` na mesma transação.
+3. **E se o Kafka cair?** Pedidos continuam (outbox acumula, alerta de idade); ingestão responde `503` e o app guarda as posições; nada se perde; mostre o teste de caos.
+4. **Como lida com posições fora de ordem e duplicadas?** Identidade `(entregador, dispositivo, seq)`; comparação monotônica por `capturadaEm`; atrasadas só no histórico; event time × processing time e por que `SEM_SINAL` usa processing time.
+5. **Por que SSE e não WebSocket?** Comunicação unidirecional, HTTP comum, `Last-Event-ID`; o custo é uma conexão por cliente; como escala (virtual threads, fan-out por Redis, limite por token).
+6. **Como escala para 10x?** Partições (12 → 48, e o cuidado com a afinidade de chave), consumidores, Redis em cluster, réplicas SSE; qual é o primeiro gargalo segundo o seu teste de carga.
+7. **Como são os SLOs e os alertas?** SLI de frescor medido de fora pela sonda; janela de 30 dias; burn rate 14,4× em 1 h e 5 min para página; por que não alerta em média.
+8. **Conte um incidente.** Use o postmortem: o que aconteceu, como foi detectado, impacto no orçamento de erro, causa, ações.
+9. **Como dividiria isso entre times?** Um time de plataforma de dados em tempo real (Telemetria e Rastreamento), um de operações de entrega (Despacho e console), um de integrações (Pedidos e Notificações); contratos de eventos como interface entre times, dono por tópico e por schema.
+10. **Quanto custa rodar?** O método da estimativa, os dois maiores custos e as alavancas; custo por mil entregas.
+11. **Com metade do prazo, o que você cortaria?** O núcleo da seção de escopo; gateway como configuração em vez de serviço, anomalias de desvio, Kubernetes; nunca idempotência e medição de SLO.
+12. **O que faria diferente?** Uma resposta honesta: por exemplo, CDC em vez de polling, schema registry desde o começo, ou começar como monólito modular e extrair a telemetria.
+
+**Trade-offs para mencionar sem esperar a pergunta:** consistência eventual no status do pedido (até 5 s); o cancelamento como pedido assíncrono; a oferta para um entregador por vez (mais lenta, porém justa e sem disputa); SSE ocupando uma conexão por cliente; JSON em vez de Avro (legível, maior); posições aceitas com `acks=all` (latência maior, sem perda).
+
+## Para ir além
+
+- Webhooks para lojistas com assinatura HMAC, retentativas e painel de entregas.
+- CDC com Debezium no lugar do polling da outbox.
+- Schema registry com Avro ou Protobuf e verificação de compatibilidade no registry.
+- mTLS entre serviços com um service mesh (por exemplo, Linkerd) e ACLs no Kafka.
+- Roteirização com várias paradas e reordenação dinâmica.
+- Previsão de ETA com histórico (média por faixa horária e região) comparada ao roteirizador.
+- Assistente para o operador com Spring AI: resumir as anomalias da última hora e sugerir redespachos, sempre com aprovação humana (veja o módulo 16).
+- Multirregião com o Kafka replicado e o rastreio servido da região mais próxima.
+
+## O que estudar além da trilha
+
+A trilha vai do básico ao Pleno, e as aulas avançadas (módulos 10 a 13) já trazem a visão sênior de decisões e trade-offs. Os tópicos abaixo vão além delas. Estes tópicos aparecem neste projeto e nas entrevistas Sênior; cada um tem o mínimo para começar e onde aprofundar.
+
+**Stream processing: janelas, event time e watermarks.** Em fluxos contínuos, agregações são feitas em janelas (fixas, deslizantes, de sessão). Como os eventos chegam atrasados, o sistema precisa decidir quando uma janela está "completa": a watermark é a estimativa de "não devem chegar mais eventos anteriores a T", e o *allowed lateness* define o que fazer com os retardatários. Neste projeto você fez isso à mão (posição atrasada, detector de parada); frameworks como Kafka Streams e Apache Flink fazem isso de forma geral. Referências: livro *Streaming Systems* (Akidau, Chernyak e Lax, O'Reilly); [documentação do Kafka Streams](https://kafka.apache.org/documentation/streams/); [Timely Stream Processing, no Apache Flink](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/).
+
+**Consistência em sistemas distribuídos e sagas.** Sem transação distribuída, cada serviço confirma localmente e compensa quando algo dá errado; isso exige pensar em estados intermediários visíveis, idempotência e ordem. Entenda os modelos de consistência (linearizável, causal, eventual) para saber o que o usuário pode observar. Referências: artigo *Sagas* (Garcia-Molina e Salem, 1987); [padrão Saga no microservices.io](https://microservices.io/patterns/data/saga.html); [modelos de consistência no Jepsen](https://jepsen.io/consistency).
+
+**Dados geoespaciais.** Distância na esfera (haversine), índices espaciais (R-tree/GiST), geohash e grades hexagonais para agrupar regiões, e a diferença entre geometria e geografia. Referências: [documentação do PostGIS](https://postgis.net/documentation/); [tipos geoespaciais do Redis](https://redis.io/docs/latest/develop/data-types/geospatial/); [H3, índice hexagonal](https://h3geo.org/).
+
+**SSE e WebSocket em escala.** Conexões longas mudam o dimensionamento: memória por conexão, limites de descritores, balanceamento (conexões não se redistribuem sozinhas depois de escalar), timeouts de proxies e reconexão em massa depois de um deploy (adicione jitter no `retry`). Referências: [especificação de Server-Sent Events (WHATWG)](https://html.spec.whatwg.org/multipage/server-sent-events.html); [RFC 6455 — WebSocket](https://www.rfc-editor.org/rfc/rfc6455).
+
+**SRE: SLOs, orçamento de erro e burn rate.** SLO é um acordo sobre quanto de falha é aceitável; o orçamento de erro transforma isso em decisão (congelar mudanças quando acaba). Burn rate é a velocidade de consumo do orçamento, e alertas multi-janela equilibram precisão e tempo de detecção. Referências: [Site Reliability Engineering (livro do Google)](https://sre.google/sre-book/table-of-contents/); [Alerting on SLOs, no SRE Workbook](https://sre.google/workbook/alerting-on-slos/).
+
+**Engenharia do caos.** Formular hipóteses sobre o estado estável, injetar falhas reais em escopo controlado e comparar; começar pequeno e automatizar. Referências: [Principles of Chaos Engineering](https://principlesofchaos.org/); [Toxiproxy](https://github.com/Shopify/toxiproxy).
+
+**Kubernetes para quem desenvolve.** Probes (e por que a liveness não deve depender do banco), requests e limits (e o throttling de CPU), HPA, PDB, rolling update e encerramento gracioso. Referências: [documentação do Kubernetes](https://kubernetes.io/docs/home/); [probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/); [HPA](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/); [kind](https://kind.sigs.k8s.io/); [Helm](https://helm.sh/docs/).
+
+**Evolução de schemas e contratos assíncronos.** Compatibilidade para trás e para frente, leitores tolerantes, versionamento de tópicos, e como Avro e Protobuf tratam campos novos. Ponto de partida na trilha: [Evolução de esquemas de eventos](../../../aulas/12-mensageria/07-evolucao-de-esquemas-de-eventos/). Referências: capítulo *Encoding and Evolution* de *Designing Data-Intensive Applications* (Martin Kleppmann, O'Reilly); [documentação do AsyncAPI](https://www.asyncapi.com/docs).
+
+**Tracing distribuído com mensageria.** Como o contexto atravessa o broker (cabeçalhos `traceparent`), spans de produtor e consumidor, e links entre traces quando um consumidor processa um lote. Referências: [W3C Trace Context](https://www.w3.org/TR/trace-context/); [convenções semânticas de mensageria do OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/messaging/).
+
+**Capacidade e custos (FinOps).** Planejar capacidade a partir de medições (lei de Little, utilização máxima saudável), relacionar custo a uma unidade de negócio (custo por entrega) e decidir entre reservar e escalar sob demanda. Referência: [FinOps Framework](https://www.finops.org/framework/).
+
+**Proteção de dados pessoais.** Localização é dado pessoal; os princípios da LGPD (finalidade, necessidade, retenção) viram requisitos técnicos. Referência: [Lei nº 13.709/2018 (LGPD)](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm).
+
+**Um livro para fechar:** *Designing Data-Intensive Applications*, de Martin Kleppmann (O'Reilly), cobre replicação, particionamento, transações, processamento em lote e em fluxo — praticamente todo o fundamento por trás deste projeto.

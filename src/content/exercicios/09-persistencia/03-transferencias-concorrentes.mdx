@@ -1,0 +1,116 @@
+---
+titulo: Transferências concorrentes — otimista × pessimista
+codigo: "09.03"
+resumo: Implemente a mesma transferência de duas formas — lock otimista com @Version e retentativa, e lock pessimista sem deadlock — e veja cada uma aguentar dezenas de threads disputando a mesma conta.
+modulo: 09-persistencia
+ordem: 3
+dificuldade: dificil
+tempo: 3–4h
+conceitos: ["@Version", lock otimista, lock pessimista, deadlock, retentativa, auto-invocação]
+aulas: [09-persistencia/06-locking-e-flyway, 09-persistencia/05-transacoes-com-spring]
+java:
+  modulo: m09-persistencia
+  teste: TransferenciasTest
+---
+
+## Contexto
+
+Uma carteira digital descobriu, numa auditoria, que a soma dos saldos de todos os clientes não batia com o dinheiro em custódia: havia **R$ 1.340** a mais no sistema. A causa foi o *lost update*: duas transferências simultâneas liam o mesmo saldo, e a última a gravar apagava o débito da outra.
+
+Você vai reescrever a transferência de duas formas. As duas serão testadas com **dezenas de threads** disparadas ao mesmo tempo contra a mesma conta.
+
+## O schema (pronto)
+
+```sql
+conta (id IDENTITY, titular, saldo NUMERIC(12,2) CHECK (saldo >= 0), versao BIGINT DEFAULT 0)
+```
+
+Exceções prontas: `SaldoInsuficienteException`, `ContaNaoEncontradaException`, `TransferenciaConcorrenteException`.
+
+## Requisitos
+
+Crie a entidade `Conta`, o repositório e implemente:
+
+| Classe / método | Estratégia |
+|---|---|
+| `ServicoDeTransferencias.transferir(origem, destino, valor)` | **otimista**: `@Version`; em conflito, a exceção de concorrência do Spring sai do método |
+| `ServicoDeTransferencias.transferirComLockPessimista(origem, destino, valor)` | **pessimista**: `SELECT ... FOR UPDATE` nas duas contas, **sem deadlock** |
+| `TransferenciasComRetentativa.transferir(origem, destino, valor)` | chama a versão otimista e, em conflito (`OptimisticLockingFailureException`), **tenta de novo** — até 10 vezes, com uma pequena espera. Esgotou → `TransferenciaConcorrenteException` |
+
+Regras comuns: valor positivo e contas diferentes (`IllegalArgumentException`); conta inexistente → `ContaNaoEncontradaException` **sem** débito parcial; saldo insuficiente → `SaldoInsuficienteException`, e nada muda.
+
+## Os testes de concorrência
+
+| Cenário | Esperado |
+|---|---|
+| 16 threads, otimista **sem** retentativa | conflitos podem falhar, mas a soma dos saldos é preservada e cada transferência confirmada incrementa a versão uma vez |
+| 12 threads × R$ 10 numa conta com R$ 100, otimista **com** retentativa | exatamente 10 sucessos e 2 saldos insuficientes |
+| O mesmo, **pessimista** | 10 sucessos, 2 insuficientes, **nenhum** conflito, versão = 10 |
+| 20 threads, A→B e B→A alternados, pessimista | todas passam, em menos de 8 s (um deadlock esperaria o timeout de 10 s) |
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `TransferenciasTest` passam — rode umas três vezes seguidas.
+- [ ] A retentativa está numa **classe diferente** do serviço transacional (e você sabe explicar por quê).
+- [ ] Nenhum `synchronized`: quem garante a consistência é o banco.
+
+## Desafios opcionais
+
+- Troque o laço manual por `@Retryable` (Spring Retry) ou pelo `Retry` do Resilience4j.
+- Meça o tempo total de 200 transferências concorrentes com cada estratégia. Em qual cenário cada uma vence?
+- Implemente uma terceira versão sem lock nenhum: `UPDATE conta SET saldo = saldo - :valor WHERE id = :id AND saldo >= :valor` com `@Modifying`, verificando as linhas afetadas.
+
+<Dicas>
+<Dica nivel={1}>
+Otimista: basta um campo `@Version private long versao;` na entidade e um método `@Transactional` que busca as duas contas, debita e credita (sem `save`: dirty checking). O conflito aparece como `ObjectOptimisticLockingFailureException` no commit.
+</Dica>
+<Dica nivel={2}>
+A retentativa precisa de uma **transação nova a cada tentativa**. Se o laço estiver dentro do método `@Transactional`, todas as tentativas usam a mesma transação, já condenada. Se estiver em outro método da **mesma** classe, `this.transferir()` não passa pelo proxy. Por isso: outra classe (`TransferenciasComRetentativa`), que recebe o serviço por injeção.
+</Dica>
+<Dica nivel={3}>
+Pessimista sem deadlock:
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select c from Conta c where c.id = :id")
+Optional<Conta> buscarComLock(long id);
+```
+
+No serviço, trave **primeiro o menor id**, depois o maior, e só então decida quem é origem e quem é destino. Assim, A→B e B→A disputam a mesma primeira trava em vez de cada um segurar uma.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Serviço">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/transferencias/ServicoDeTransferencias.java" />
+</Tab>
+<Tab rotulo="Retentativa">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/transferencias/TransferenciasComRetentativa.java" />
+</Tab>
+<Tab rotulo="Conta e repositório">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/transferencias/Conta.java" />
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/transferencias/ContaRepository.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **`@Version` transforma sobrescrita silenciosa em erro explícito**: sem ele, a última gravação vence e o dinheiro "aparece". Com ele, a segunda gravação encontra `versao` diferente, afeta 0 linhas e a transação é desfeita.
+- **Retentativa com backoff e jitter**: esperas aleatórias e crescentes evitam que as threads que conflitaram tentem de novo exatamente juntas.
+- **Pessimista em ordem**: ninguém consegue segurar a conta B enquanto espera a A, porque todos pegam primeiro a de menor id.
+- **Rollback no destino inexistente**: o débito já tinha acontecido em memória; a exceção desfaz a transação, e nada chega ao banco.
+
+### Qual escolher?
+
+Otimista quando conflitos são raros (a maioria dos cadastros e das contas de pessoa física): não trava nada e escala bem. Pessimista para linhas "quentes", disputadas o tempo todo (a conta de uma grande loja recebendo PIX): evita tempestades de retentativa. Em qualquer caso, `CHECK (saldo >= 0)` fica como última defesa.
+
+### Avalie sua solução
+
+- O que acontece com a versão otimista se as transações demorarem mais (por exemplo, uma chamada HTTP no meio)?
+- Sua retentativa trata `SaldoInsuficienteException` como conflito? (Não deveria: repetir não vai criar saldo.)
+
+</Solucao>

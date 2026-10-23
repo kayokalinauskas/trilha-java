@@ -1,0 +1,809 @@
+---
+titulo: "Kafka em produção: partições, durabilidade, lag, rebalance e exactly-once"
+descricao: "O que muda quando o Kafka sai do notebook e passa a carregar pagamentos: quantas partições criar (e por que não dá para diminuir), fator de replicação, min.insync.replicas e acks, o lag como métrica principal, o protocolo de rebalanceamento novo do Kafka 4, retenção e compaction, transações e exactly-once com os seus limites, partições quentes, vazão e custo."
+modulo: 12-mensageria
+ordem: 8
+duracao: 130
+objetivos:
+  - Dimensionar o número de partições de um tópico a partir da vazão medida do consumidor e explicar por que esse número só pode crescer
+  - Escolher fator de replicação, min.insync.replicas e acks para um tópico de pagamentos e dizer quantos brokers podem cair sem perder escrita nem dado
+  - Calcular o lag de um consumer group por partição com a Admin API e escrever regras de alerta baseadas nele
+  - Configurar um consumidor com o protocolo de rebalanceamento novo (group.protocol=consumer) e membro estático, e dizer o que muda em relação ao protocolo clássico
+  - Implementar o padrão read-process-write com transações Kafka e demonstrar que um lote abortado não aparece para consumidores read_committed
+  - Diagnosticar uma partição quente pelo lag por partição e propor uma chave melhor sem perder a ordem que o negócio exige
+  - Estimar o disco e o tráfego de um cluster a partir de vazão, retenção e fator de replicação
+tags: [Kafka, produção, partições, replicação, lag, rebalance, KIP-848, transações, exactly-once, compaction]
+flashcards:
+  - frente: Por que não dá para diminuir o número de partições de um tópico?
+    verso: "O Kafka recusa (InvalidPartitionsException), porque os dados de uma partição não têm para onde ir sem quebrar a ordem e os offsets. E mesmo aumentar tem custo: a partição de uma chave é hash(chave) módulo N, então mudar N muda a partição da maioria das chaves (75% ao passar de 6 para 8)."
+  - frente: Com replication.factor=3, min.insync.replicas=2 e acks=all, quantos brokers podem cair?
+    verso: "Um, sem perder nada e sem parar as escritas. Com dois fora, as escritas com acks=all são recusadas (NotEnoughReplicas), mas nenhuma mensagem confirmada se perde. A leitura continua enquanto houver um líder."
+  - frente: Qual é a métrica número 1 de um consumidor Kafka e como ela é calculada?
+    verso: "O lag: log-end offset da partição menos o offset confirmado pelo grupo, por partição. Alerte pelo lag que cresce de forma sustentada ou pelo atraso em tempo, não por um número absoluto isolado."
+  - frente: O que muda com group.protocol=consumer (KIP-848)?
+    verso: "O coordenador no broker calcula as atribuições e reconcilia cada membro de forma incremental, sem a barreira global do protocolo clássico. session.timeout.ms, heartbeat.interval.ms e partition.assignment.strategy deixam de ser configurações do cliente e passam ao broker (group.consumer.*)."
+  - frente: Para que serve group.instance.id?
+    verso: "Torna o membro estático: se a instância reiniciar com o mesmo id dentro do tempo de sessão, ela recebe de volta as mesmas partições sem rebalanceamento. Bom para deploys e para consumidores com cache local."
+  - frente: O exactly-once do Kafka cobre gravar no PostgreSQL ou chamar uma API?
+    verso: "Não. Cobre o ciclo ler de um tópico, processar e escrever em outro tópico, com os offsets dentro da mesma transação. Efeitos fora do Kafka continuam precisando de outbox e de consumidores idempotentes."
+  - frente: cleanup.policy=compact garante o quê?
+    verso: "Que, para cada chave, pelo menos o último valor fica no log (versões antigas são removidas em segundo plano). Serve para estado (o saldo atual, o cadastro atual). Uma chave com valor nulo (tombstone) apaga a chave depois de delete.retention.ms."
+  - frente: O que linger.ms, batch.size e compression.type fazem pela vazão?
+    verso: "linger.ms espera um pouco para juntar mensagens (padrão 5 ms no Kafka 4), batch.size limita o lote por partição (padrão 16 KiB) e a compressão vale por lote: lotes maiores comprimem melhor e reduzem rede e disco, ao custo de alguns milissegundos de latência."
+---
+
+Sexta-feira de Black Friday, 21h. A fintech em que você trabalha processa os pagamentos de 4 mil lojas, e cada pagamento autorizado vira um evento no tópico `pagamentos.autorizados`. Às 21h07, o painel mostra o lag do serviço de liquidação subindo: 2 mil, 15 mil, 80 mil mensagens. Alguém reinicia os pods "para destravar", e o grupo entra numa sequência de rebalanceamentos em que ninguém processa nada por quase um minuto. O lag dobra. Na sala de guerra, surge a ideia óbvia: "vamos aumentar as partições de 12 para 24 e subir mais consumidores". Você aumenta, e na segunda-feira chega o chamado: algumas lojas viram eventos da mesma conta processados fora de ordem durante a madrugada. E o lag, olhando partição por partição, nunca esteve espalhado: 90% dele estava numa única partição, a de um marketplace gigante cujo identificador era a chave de todas as mensagens dele.
+
+Nada disso aparece nos tutoriais de Kafka, em que um broker roda num contêiner e um consumidor lê cinco mensagens. Em produção, as decisões que importam são outras: quantas partições criar sabendo que esse número quase não muda depois; quantas cópias de cada mensagem manter e quantas precisam confirmar uma escrita; o que medir para saber que o consumidor está atrasado antes do cliente reclamar; o que acontece com o grupo quando um pod reinicia; quando apagar dados por tempo e quando guardar só o valor mais recente de cada chave; o que o "exactly-once" do Kafka garante de fato. Nesta aula você vai tomar essas decisões com números, escrever o código que mede o lag e o que processa pagamentos dentro de uma transação Kafka, e rodar tudo num broker Kafka 4.2 embutido nos testes, sem Docker.
+
+## A intuição: o centro de distribuição
+
+Pense num centro de distribuição de uma transportadora. Os pacotes chegam e são colocados em **esteiras**; cada esteira leva a uma doca, onde um carregador põe os pacotes no caminhão, na ordem em que chegaram. Para que os pacotes de um mesmo cliente saiam na ordem certa, a regra é simples: **todos os pacotes de um cliente vão para a mesma esteira**, escolhida pelo número do cliente.
+
+Agora as decisões de operação:
+
+- **Quantas esteiras construir.** Cada esteira atende no máximo um carregador por vez. Se você tem 12 esteiras, contratar o 13º carregador não adianta nada. E construir esteiras novas no meio da operação muda a regra "cliente X vai para a esteira Y": os pacotes novos de um cliente podem ir para uma esteira diferente da dos antigos, e a ordem se perde no período de transição. Desmontar esteiras, então, nem pensar: os pacotes que estão nelas não têm para onde ir.
+- **Quantas cópias da nota fiscal.** Se a única nota de um pacote estiver no escritório que pegou fogo, o pacote "não existe". Por isso cada nota tem três vias, em três prédios, e a regra é: um pacote só é aceito quando pelo menos duas vias estão arquivadas.
+- **A fila de caminhões.** O indicador que o gerente olha não é "quantos pacotes chegaram", é **quantos pacotes estão esperando em cada esteira**. Se uma esteira tem 5 mil pacotes parados e as outras estão vazias, contratar carregadores não resolve: o problema é um cliente enorme concentrado numa só esteira.
+- **A troca de turno.** Quando um carregador sai para o almoço, alguém precisa assumir a esteira dele. Se, a cada saída, o gerente manda **todos** pararem para redistribuir as esteiras, a operação inteira congela várias vezes por dia. Melhor: só a esteira do carregador que saiu muda de mãos, e, se ele volta em 10 minutos, recebe de volta a mesma esteira.
+
+Esteira é **partição**, carregador é **consumidor**, via da nota fiscal é **réplica**, a fila parada é o **lag**, a troca de turno é o **rebalanceamento**. O resto da aula transforma cada uma dessas decisões em configuração, código e números.
+
+## Vocabulário
+
+Alguns termos já apareceram na [aula de Kafka](../../12-mensageria/03-kafka/); aqui eles ganham o sentido operacional.
+
+| Termo | O que é | Por que importa em produção |
+|---|---|---|
+| **Broker** | Um servidor Kafka. Um cluster tem vários. | Cada broker guarda uma parte das réplicas; é a unidade que falha. |
+| **Partição** | Um log ordenado e só de acréscimo; o tópico é a soma delas. | Teto de paralelismo do consumer group e unidade de ordem. |
+| **Réplica, líder e seguidora** | Cópias de uma partição em brokers diferentes. Uma é a **líder** (recebe escritas e, por padrão, as leituras); as outras são **seguidoras** e copiam a líder. | Sobrevivência a falhas de broker. |
+| **Fator de replicação** (`replication.factor`) | Quantas réplicas cada partição tem. | Multiplica o disco e o tráfego entre brokers. |
+| **ISR** (*in-sync replicas*) | As réplicas que estão em dia com a líder. | Só elas podem virar líder sem perder dado. |
+| **`min.insync.replicas`** | Quantas réplicas do ISR precisam ter gravado para uma escrita com `acks=all` ser aceita. | Define quantas falhas o tópico aguenta sem parar de aceitar escrita. |
+| **`acks`** | Quanta confirmação o produtor exige: `0`, `1` ou `all`. | Durabilidade contra latência. |
+| **Log-end offset** | O offset da próxima mensagem que será gravada na partição. | Um dos lados da conta do lag. |
+| **Offset confirmado** (*committed offset*) | A próxima posição que o grupo vai ler, salva no tópico interno `__consumer_offsets`. | O outro lado da conta do lag; onde o grupo recomeça depois de uma falha. |
+| **Lag** | Log-end offset menos offset confirmado, por partição. | A métrica principal de um consumidor. |
+| **Rebalanceamento** | Redistribuição das partições entre os membros de um grupo. | Enquanto acontece, partições ficam sem consumidor. |
+| **Membro estático** | Consumidor com `group.instance.id` fixo. | Reinícios rápidos não disparam rebalanceamento. |
+| **Retenção** | Por quanto tempo (ou quantos bytes) o log guarda mensagens. | Disco e capacidade de reprocessar. |
+| **Compaction** | Política que guarda pelo menos o último valor de cada chave. | Tópicos que representam estado. |
+| **`transactional.id`** | Identidade estável de um produtor transacional. | Permite ao Kafka cercar (*fence*) instâncias antigas, os "zumbis". |
+| **LSO** (*last stable offset*) | Até onde um consumidor `read_committed` pode ler: antes da primeira transação ainda aberta. | Uma transação longa atrasa todos os leitores `read_committed`. |
+| **Partição quente** (*hot partition*) | Uma partição que recebe muito mais tráfego que as outras. | Lag concentrado que mais consumidores não resolvem. |
+
+## Partições: quantas criar e por que esse número só cresce
+
+O número de partições é a decisão mais difícil de desfazer de um tópico. Ele define três coisas ao mesmo tempo:
+
+1. **O teto de paralelismo do consumo.** Num consumer group, cada partição é atribuída a no máximo um membro. Com 12 partições, o 13º consumidor fica ocioso. No Spring Kafka, o mesmo vale para o `concurrency` do container: threads além do número de partições não recebem nada.
+2. **A unidade de ordem.** A ordem só existe dentro de uma partição. Mensagens com a mesma chave vão para a mesma partição, e é isso que garante que os eventos de uma conta sejam processados na sequência em que aconteceram.
+3. **Uma parte do custo do cluster.** Cada partição é, em cada réplica, um diretório com arquivos de segmento e índices abertos no broker, e uma entrada nos metadados do cluster. Milhares de partições funcionam bem no Kafka 4 com KRaft, mas cada uma pesa no tempo de recuperação de um broker, na memória dos produtores (um lote em construção por partição) e na quantidade de requisições.
+
+### Por que não dá para diminuir
+
+Tente reduzir um tópico de 3 para 2 partições e o Kafka recusa na hora:
+
+```text
+org.apache.kafka.common.errors.InvalidPartitionsException: The topic pedidos currently has 3 partition(s); 2 would not be an increase.
+```
+
+O motivo é estrutural: as mensagens da partição 2 teriam de ser copiadas para as outras, o que destruiria os offsets (que são posições dentro de cada partição) e misturaria a ordem. O Kafka simplesmente não oferece essa operação. Para "diminuir", você cria um tópico novo com menos partições, migra produtores e consumidores e aposenta o antigo: um projeto, não um comando.
+
+### Por que aumentar também tem preço
+
+Aumentar é permitido, mas a regra que leva uma chave à sua partição é `hash(chave) módulo número de partições`. Quando o número muda, a conta muda. No passo 2 da mão na massa você vai medir isso com 10 mil chaves:
+
+- de 6 para 8 partições, **75,3%** das chaves mudam de partição;
+- de 6 para 12 (dobrando), **50,2%** mudam.
+
+O que isso quebra: depois do aumento, as mensagens novas da `conta-42` vão para a partição 0, mas as antigas, ainda não consumidas, estão na partição 2. Dois consumidores diferentes podem processar eventos da mesma conta ao mesmo tempo, fora de ordem, até a partição antiga esvaziar. Foi o chamado de segunda-feira do gancho. Também quebram os consumidores que guardam estado local por partição (caches, agregações do Kafka Streams), porque as chaves "mudaram de casa".
+
+<Figura legenda="A partição de uma chave é o hash dela módulo o número de partições. Mudar o número muda a casa da maioria das chaves">
+<svg viewBox="0 0 660 330" width="660" role="img" aria-labelledby="remap-titulo remap-desc">
+  <title id="remap-titulo">Remapeamento de chaves ao aumentar partições</title>
+  <desc id="remap-desc">À esquerda, um tópico com 6 partições, de p0 a p5; a chave conta-42 cai em p2. À direita, o mesmo tópico depois de aumentar para 8 partições, de p0 a p7; a mesma chave agora cai em p0. Embaixo, a conta: hash da chave módulo N, e o resultado medido: 75 por cento das chaves mudam de partição ao ir de 6 para 8, e 50 por cento ao dobrar de 6 para 12.</desc>
+  <defs><marker id="mk-remap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="150" y="24" text-anchor="middle" class="d-title">Antes: 6 partições</text>
+  <text x="500" y="24" text-anchor="middle" class="d-title">Depois: 8 partições</text>
+  <rect x="20" y="40" width="80" height="34" rx="6" class="d-box"/><text x="60" y="62" text-anchor="middle" class="d-mono">p0</text>
+  <rect x="110" y="40" width="80" height="34" rx="6" class="d-box"/><text x="150" y="62" text-anchor="middle" class="d-mono">p1</text>
+  <rect x="200" y="40" width="80" height="34" rx="6" class="d-accent"/><text x="240" y="62" text-anchor="middle" class="d-mono">p2</text>
+  <rect x="20" y="84" width="80" height="34" rx="6" class="d-box"/><text x="60" y="106" text-anchor="middle" class="d-mono">p3</text>
+  <rect x="110" y="84" width="80" height="34" rx="6" class="d-box"/><text x="150" y="106" text-anchor="middle" class="d-mono">p4</text>
+  <rect x="200" y="84" width="80" height="34" rx="6" class="d-box"/><text x="240" y="106" text-anchor="middle" class="d-mono">p5</text>
+  <rect x="370" y="40" width="64" height="34" rx="6" class="d-ok"/><text x="402" y="62" text-anchor="middle" class="d-mono">p0</text>
+  <rect x="442" y="40" width="64" height="34" rx="6" class="d-box"/><text x="474" y="62" text-anchor="middle" class="d-mono">p1</text>
+  <rect x="514" y="40" width="64" height="34" rx="6" class="d-box"/><text x="546" y="62" text-anchor="middle" class="d-mono">p2</text>
+  <rect x="586" y="40" width="64" height="34" rx="6" class="d-box"/><text x="618" y="62" text-anchor="middle" class="d-mono">p3</text>
+  <rect x="370" y="84" width="64" height="34" rx="6" class="d-box"/><text x="402" y="106" text-anchor="middle" class="d-mono">p4</text>
+  <rect x="442" y="84" width="64" height="34" rx="6" class="d-box"/><text x="474" y="106" text-anchor="middle" class="d-mono">p5</text>
+  <rect x="514" y="84" width="64" height="34" rx="6" class="d-box"/><text x="546" y="106" text-anchor="middle" class="d-mono">p6</text>
+  <rect x="586" y="84" width="64" height="34" rx="6" class="d-box"/><text x="618" y="106" text-anchor="middle" class="d-mono">p7</text>
+  <rect x="200" y="150" width="260" height="40" rx="8" class="d-violet"/>
+  <text x="330" y="175" text-anchor="middle" class="d-mono">chave "conta-42"</text>
+  <path d="M260 150 L245 78" class="d-line" marker-end="url(#mk-remap)"/>
+  <path d="M400 150 L402 78" class="d-line" marker-end="url(#mk-remap)"/>
+  <text x="120" y="140" class="d-label">murmur2 % 6 = 2</text>
+  <text x="430" y="140" class="d-label">murmur2 % 8 = 0</text>
+  <rect x="60" y="214" width="540" height="96" rx="10" class="d-info"/>
+  <text x="330" y="240" text-anchor="middle" class="d-text">partição = murmur2(bytes da chave) % N</text>
+  <text x="330" y="266" text-anchor="middle" class="d-text">6 → 8 partições: 75% das chaves mudam de casa</text>
+  <text x="330" y="292" text-anchor="middle" class="d-text">6 → 12 partições: 50% mudam (cada chave fica em p ou p + 6)</text>
+</svg>
+</Figura>
+
+### Como dimensionar
+
+A pergunta certa não é "quantas partições o Kafka aguenta", e sim "quantas instâncias do consumidor vou precisar no pior dia, com folga". A conta prática:
+
+1. **Meça** a vazão de uma instância do seu consumidor, com o processamento real (gravar no banco, chamar o antifraude), num teste de carga. Não estime: a vazão do consumidor quase sempre é o gargalo, muito antes do broker.
+2. **Estime o pico**: o maior volume por segundo que o negócio prevê (Black Friday, fechamento de mês), não a média.
+3. **Divida e acrescente folga**: partições = teto(pico × (1 + folga) ÷ vazão por instância). A folga cobre o crescimento do negócio nos próximos um ou dois anos e a capacidade de **zerar um atraso**: se o consumidor ficou parado 30 minutos, ele precisa consumir mais rápido do que a produção para alcançar.
+
+Com pico de 3.000 pagamentos por segundo, 400 por segundo por instância e folga de 100%, a conta dá 15 partições. Sem folga, 7,5 vira 8 (não existe meia partição). Muitos times arredondam para um número com muitos divisores (12, 24, 48), porque ele distribui bem entre 2, 3, 4 ou 6 instâncias.
+
+<Callout tipo="atencao" titulo="Mais partições não aceleram um consumidor lento">
+Se cada mensagem leva 50 ms porque o consumidor faz uma chamada HTTP síncrona, cada partição processa no máximo 20 mensagens por segundo, seja qual for o hardware do broker. Partições aumentam o paralelismo **entre** instâncias; o custo **por mensagem** se resolve no consumidor (lotes, chamadas em paralelo com controle de ordem por chave, cache).
+</Callout>
+
+## Durabilidade: fator de replicação, min.insync.replicas e acks
+
+Três configurações decidem se uma mensagem confirmada pode se perder. Elas só fazem sentido juntas.
+
+- **`replication.factor`** (no tópico): quantas cópias existem. O padrão de produção é **3**, em três brokers de zonas de disponibilidade diferentes.
+- **`min.insync.replicas`** (no tópico ou no broker): quantas cópias em dia precisam ter gravado para uma escrita `acks=all` ser aceita. Com fator 3, o valor usual é **2**.
+- **`acks`** (no produtor): `all` espera o ISR; `1` espera só a líder; `0` não espera nada. Desde o Kafka 3.0, `acks=all` e `enable.idempotence=true` são o padrão do produtor.
+
+A combinação 3 / 2 / `all` dá esta tabela de falhas:
+
+| Brokers fora (de 3) | Escritas `acks=all` | Leituras | Mensagens confirmadas |
+|---|---|---|---|
+| 0 | aceitas | normais | seguras em pelo menos 2 cópias |
+| 1 | aceitas (ISR = 2) | normais, após eleger nova líder se a líder caiu | seguras |
+| 2 | **recusadas** (`NotEnoughReplicasException`) | continuam na réplica restante | seguras |
+| 3 | impossíveis | impossíveis | seguras em disco, indisponíveis |
+
+<Figura legenda="Fator de replicação 3 com min.insync.replicas=2: um broker pode cair sem perder dado nem parar as escritas">
+<svg viewBox="0 0 660 340" width="660" role="img" aria-labelledby="isr-titulo isr-desc">
+  <title id="isr-titulo">Replicação de uma partição em três brokers</title>
+  <desc id="isr-desc">Um produtor com acks igual a all envia para a líder da partição pagamentos-0, no broker 1, na zona A. As seguidoras nos brokers 2 e 3, nas zonas B e C, copiam a líder. O ISR tem as três réplicas. A líder só confirma ao produtor depois que pelo menos duas réplicas do ISR gravaram, porque min.insync.replicas é 2. Se o broker 3 cair, o ISR fica com duas e as escritas continuam; se dois caírem, a escrita é recusada.</desc>
+  <defs><marker id="mk-isr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="230" y="10" width="200" height="50" rx="10" class="d-violet"/>
+  <text x="330" y="32" text-anchor="middle" class="d-title">Produtor</text>
+  <text x="330" y="50" text-anchor="middle" class="d-mono">acks=all</text>
+  <path d="M290 60 L140 116" class="d-line" marker-end="url(#mk-isr)"/>
+  <path d="M150 128 L290 72" class="d-line" marker-end="url(#mk-isr)"/>
+  <text x="96" y="86" class="d-label">1. envia</text>
+  <text x="236" y="112" class="d-label">4. confirma</text>
+  <rect x="20" y="120" width="190" height="90" rx="10" class="d-accent"/>
+  <text x="115" y="146" text-anchor="middle" class="d-title">Broker 1 · zona A</text>
+  <text x="115" y="170" text-anchor="middle" class="d-mono">pagamentos-0</text>
+  <text x="115" y="192" text-anchor="middle" class="d-label">líder</text>
+  <rect x="235" y="120" width="190" height="90" rx="10" class="d-box"/>
+  <text x="330" y="146" text-anchor="middle" class="d-title">Broker 2 · zona B</text>
+  <text x="330" y="170" text-anchor="middle" class="d-mono">pagamentos-0</text>
+  <text x="330" y="192" text-anchor="middle" class="d-label">seguidora (ISR)</text>
+  <rect x="450" y="120" width="190" height="90" rx="10" class="d-box"/>
+  <text x="545" y="146" text-anchor="middle" class="d-title">Broker 3 · zona C</text>
+  <text x="545" y="170" text-anchor="middle" class="d-mono">pagamentos-0</text>
+  <text x="545" y="192" text-anchor="middle" class="d-label">seguidora (ISR)</text>
+  <path d="M210 182 L233 182" class="d-line" marker-end="url(#mk-isr)"/>
+  <path d="M210 200 Q330 250 450 200" class="d-line" fill="none" marker-end="url(#mk-isr)"/>
+  <text x="330" y="246" text-anchor="middle" class="d-label">2. seguidoras copiam · 3. 2 de 3 gravaram</text>
+  <rect x="20" y="268" width="620" height="60" rx="10" class="d-info"/>
+  <text x="330" y="292" text-anchor="middle" class="d-text">min.insync.replicas=2: aguenta 1 broker fora com escrita</text>
+  <text x="330" y="314" text-anchor="middle" class="d-text">2 fora: escrita recusada (NotEnoughReplicas), nada se perde</text>
+</svg>
+</Figura>
+
+Repare no trade-off da última linha: com dois brokers fora, o Kafka prefere **parar de aceitar escrita** a aceitar uma escrita que existiria numa cópia só. Para pagamentos, é a escolha certa: o produtor recebe o erro, a aplicação pode guardar o evento no outbox ([aula 04](../../12-mensageria/04-transactional-outbox/)) e tentar depois. Para métricas de cliques, talvez você prefira `min.insync.replicas=1` e continuar aceitando.
+
+Mais duas configurações completam o quadro:
+
+- **`unclean.leader.election.enable=false`** (o padrão): uma réplica que saiu do ISR não pode virar líder, porque ela não tem as últimas mensagens. Ligar isso troca **perda de dado** por **disponibilidade**. Para tópicos de dinheiro, deixe desligado e documente a decisão.
+- **Racks/zonas** (`broker.rack`): diga ao Kafka em que zona está cada broker, para que as três réplicas de uma partição fiquem em zonas diferentes. Sem isso, as três podem acabar na mesma zona, e a queda de uma zona leva todas.
+
+<Callout tipo="erro" titulo="acks=all com min.insync.replicas=1 é quase acks=1">
+O padrão do broker para `min.insync.replicas` é **1**. Se o ISR encolher até sobrar só a líder (as seguidoras ficaram para trás por lentidão de disco, por exemplo), `acks=all` passa a confirmar com uma única cópia, sem nenhum aviso para o produtor. Se essa líder morrer em seguida, a mensagem confirmada se perde. Defina `min.insync.replicas=2` nos tópicos críticos, explicitamente, na criação do tópico.
+</Callout>
+
+## Consumer lag: a métrica principal
+
+O lag responde à pergunta que o negócio faz: "o que aconteceu há pouco já foi processado?". Ele é calculado **por partição**:
+
+```text
+lag = log-end offset da partição − offset confirmado pelo grupo
+```
+
+Somar tudo num número só esconde o problema mais comum. Um lag total de 80 mil pode ser 6.700 por partição em 12 partições (consumidores lentos de modo geral: escale) ou 72 mil numa partição e quase nada nas outras (partição quente ou consumidor travado numa mensagem: escalar não resolve). Por isso o `MonitorDeLag` desta aula devolve o lag partição por partição.
+
+### Mensagens ou tempo?
+
+Lag em mensagens não diz se está tudo bem: 10 mil mensagens de atraso num tópico que recebe 50 mil por segundo é um quinto de segundo; num tópico que recebe 2 por minuto são três dias e meio. Para alertas que o negócio entende, converta em **tempo**: "o pagamento mais antigo ainda não liquidado tem quantos segundos?". Duas formas comuns:
+
+- **Pela taxa**: lag ÷ taxa de consumo recente. Simples, mas engana quando o consumidor parou (taxa zero).
+- **Pelo carimbo de tempo**: o consumidor publica como métrica a diferença entre agora e o `timestamp` da última mensagem processada em cada partição. Mais fiel, mas só mede quem está consumindo; um consumidor morto para de publicar, e por isso o alerta precisa tratar "métrica ausente" como problema.
+
+### Regras de alerta que funcionam
+
+1. **Lag crescendo de forma sustentada**: a derivada do lag positiva por, digamos, 10 minutos. Pega consumidores mais lentos que a produção antes de o número ficar grande.
+2. **Atraso em tempo acima do acordo com o negócio**: "pagamento autorizado há mais de 2 minutos sem liquidar" é um SLO que o time de produto entende.
+3. **Lag parado e diferente de zero numa partição**: o offset confirmado não se mexe e há mensagens à frente. Quase sempre é uma mensagem envenenada sem DLT ([aula 06](../../12-mensageria/06-retry-e-dlq/)) ou um consumidor travado.
+4. **Grupo sem membros**: o grupo existe, tem lag e ninguém está consumindo.
+
+Evite o alerta "lag maior que 1.000". Ele dispara em todo pico normal, o time aprende a ignorá-lo e, no dia em que importa, ninguém olha.
+
+O próprio cliente expõe métricas (como `records-lag-max`), publicadas pelo Micrometer no Spring Boot, mas um consumidor morto para de reportar. Por isso o lag oficial costuma ser medido **de fora**, com a Admin API, como faz o `MonitorDeLag`.
+
+## Rebalanceamento: o protocolo clássico e o novo (KIP-848)
+
+Sempre que um membro entra, sai ou para de responder, as partições do grupo são redistribuídas. Durante esse intervalo, as partições afetadas ficam sem consumidor. Em grupos grandes e com deploys frequentes, rebalanceamentos mal resolvidos viram a principal causa de lag.
+
+### O protocolo clássico
+
+No protocolo clássico (`group.protocol=classic`, ainda o padrão do cliente), o rebalanceamento é coordenado **pelos próprios consumidores**: o broker escolhe um membro líder, que calcula a atribuição com o *assignor* configurado no cliente (`partition.assignment.strategy`) e a devolve ao coordenador. Na versão original (*eager*), todos os membros soltam **todas** as partições no início de cada rebalanceamento, e o grupo inteiro para. O `CooperativeStickyAssignor` (KIP-429) melhorou isso, movendo só as partições que precisam mudar, em duas rodadas. Mesmo assim, o protocolo depende de barreiras de sincronização entre todos os membros, e um membro lento atrasa os outros.
+
+### O protocolo novo: `group.protocol=consumer`
+
+O Kafka 4.0 tornou geralmente disponível (GA) o protocolo de rebalanceamento da próxima geração, o KIP-848. As mudanças principais:
+
+- **O broker calcula a atribuição.** O coordenador do grupo, no broker, usa um assignor do servidor (configurado no broker com `group.consumer.assignors`; o cliente pode escolher um pelo nome com `group.remote.assignor`).
+- **Reconciliação incremental, sem barreira global.** Cada membro recebe nos heartbeats a sua atribuição-alvo e converge para ela sozinho: solta só o que precisa soltar e pega o que lhe foi dado. Um membro lento não trava o grupo inteiro.
+- **Configurações que saem do cliente.** Com o protocolo novo, `session.timeout.ms`, `heartbeat.interval.ms` e `partition.assignment.strategy` **não podem** ser definidos no consumidor (o cliente lança `ConfigException`, como você verá em "Quando dá errado"). Os equivalentes ficam no broker: `group.consumer.session.timeout.ms` e `group.consumer.heartbeat.interval.ms`.
+- **Habilitação.** O protocolo está ligado no servidor por padrão desde o Kafka 4.0. No cliente, é opcional: `group.protocol=consumer`. Um grupo existente pode migrar sem parada, com um *rolling deploy* dos consumidores com a nova configuração.
+
+A documentação do Kafka lista limitações atuais: assignors do lado do cliente não são suportados, e estratégias de atribuição cientes de rack ainda não têm suporte completo. Se o seu consumidor depende de um assignor customizado, avalie antes de migrar.
+
+### Membros estáticos
+
+Num deploy com 12 pods, cada pod que reinicia sai do grupo e volta: no protocolo clássico, isso pode significar 24 rebalanceamentos. Com **`group.instance.id`** (KIP-345), o membro é **estático**: o coordenador guarda a atribuição dele pelo identificador, e, se ele voltar com o mesmo id antes de o tempo de sessão expirar, recebe as mesmas partições sem rebalanceamento. O preço: se a instância morrer de verdade, as partições dela ficam paradas até a sessão expirar, em vez de serem redistribuídas em segundos.
+
+Regras práticas:
+
+- O id precisa ser **estável e único**: o nome do pod de um StatefulSet (`liquidacao-0`, `liquidacao-1`) funciona; o hostname aleatório de um Deployment, não, porque muda a cada reinício.
+- O tempo de sessão precisa cobrir o tempo de reinício da instância, com margem, mas não tão longo que uma morte real deixe partições paradas por muito tempo. No protocolo novo, esse tempo é configurado no broker.
+- Duas instâncias com o mesmo `group.instance.id` ao mesmo tempo é um erro de configuração: o coordenador recusa a segunda (ou cerca a primeira). Isso costuma aparecer quando alguém escala um Deployment que usava um id fixo.
+
+### O que causa rebalanceamentos indesejados
+
+O motivo mais comum não é a rede: é o próprio código. Se o processamento de um lote demora mais que `max.poll.interval.ms` (padrão de 5 minutos), o consumidor é considerado travado e expulso do grupo; o lote volta a outra instância, que também demora, e o ciclo se repete. Reduza `max.poll.records`, torne o processamento por mensagem mais rápido ou mova o trabalho pesado para fora do laço de consumo. O `max.poll.interval.ms` continua sendo do cliente também no protocolo novo.
+
+## Retenção ou compaction: evento ou estado?
+
+Cada tópico tem uma política de limpeza (`cleanup.policy`):
+
+- **`delete`** (o padrão): segmentos inteiros são apagados quando ficam mais velhos que `retention.ms` (padrão de 7 dias) ou quando o tópico passa de `retention.bytes` (padrão sem limite). É o certo para **eventos**: "pagamento autorizado", "pedido criado". A retenção define a sua janela de reprocessamento: com 7 dias, um bug descoberto no oitavo dia não pode ser corrigido relendo o tópico.
+- **`compact`**: o Kafka guarda, para cada chave, pelo menos o **último valor**, e remove as versões anteriores em segundo plano. É o certo para **estado**: "saldo atual da conta", "cadastro atual do lojista", "configuração de taxa por loja". Um serviço novo pode reconstruir o estado inteiro lendo o tópico desde o início, sem replay de anos de eventos.
+- **`compact,delete`**: compacta e também apaga o que é mais velho que a retenção. Útil quando o estado de chaves inativas pode ser esquecido.
+
+Detalhes que pegam quem usa compaction pela primeira vez:
+
+- A compaction **não é imediata**. Ela roda nos segmentos fechados, quando a proporção de dados "sujos" passa de `min.cleanable.dirty.ratio`. Um consumidor pode ver várias versões da mesma chave; trate cada uma como "o valor mais recente até agora".
+- Para **apagar** uma chave, publique-a com valor `null` (um *tombstone*). O tombstone fica no log por `delete.retention.ms` (padrão de 1 dia), para que consumidores atrasados vejam a exclusão, e depois some.
+- Mensagens sem chave não podem ir para um tópico compactado: o broker recusa.
+- Compaction não substitui um banco de dados. Ela serve para distribuir e reconstruir estado; consulta por chave continua sendo trabalho de um banco ou de um *state store* do Kafka Streams.
+
+## Transações e exactly-once: o que garantem e o que não garantem
+
+As aulas de [outbox](../../12-mensageria/04-transactional-outbox/) e de [consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/) assumiram "pelo menos uma vez": uma mensagem pode ser entregue de novo, e o consumidor precisa aguentar. O Kafka oferece algo mais forte num cenário específico, o **read-process-write**: ler de um tópico, processar e escrever em outro tópico.
+
+O problema que ele resolve: o liquidador lê o pagamento, publica "liquidado" e, antes de confirmar o offset de entrada, cai. Outra instância relê o pagamento e publica "liquidado" de novo. Com uma transação, as mensagens de saída **e** o offset de entrada são confirmados juntos, atomicamente:
+
+1. `initTransactions()`: o produtor se registra no **coordenador de transações** com o seu `transactional.id`. Se existir uma instância antiga com o mesmo id (um "zumbi" que ficou pendurado numa pausa longa de GC, por exemplo), ela é **cercada**: a época (*epoch*) do id sobe, e qualquer escrita da antiga é recusada.
+2. `beginTransaction()`, depois os `send()` normais.
+3. `sendOffsetsToTransaction(offsets, consumidor.groupMetadata())`: o avanço do offset de entrada vira parte da transação, em vez de um `commitSync()` separado.
+4. `commitTransaction()`: o coordenador grava marcadores de *commit* em todas as partições envolvidas. Ou `abortTransaction()`, que grava marcadores de *abort*.
+
+Do lado de quem lê a saída, o que importa é o **`isolation.level`**:
+
+- **`read_committed`**: o consumidor só recebe mensagens de transações confirmadas, e não lê além do LSO (o início da primeira transação aberta).
+- **`read_uncommitted`** (o padrão do cliente): recebe tudo o que está no log, inclusive o que foi abortado.
+
+<Figura legenda="Read-process-write: as mensagens de saída e o offset de entrada entram na mesma transação">
+<svg viewBox="0 0 660 330" width="660" role="img" aria-labelledby="eos-titulo eos-desc">
+  <title id="eos-titulo">Transação Kafka no padrão read-process-write</title>
+  <desc id="eos-desc">O liquidador lê do tópico pagamentos.autorizados. Dentro de uma caixa tracejada chamada transação, ele escreve no tópico pagamentos.liquidados e grava o próximo offset de entrada no tópico interno de offsets do grupo. O coordenador de transações grava marcadores de commit ou abort nas duas partições. Um consumidor com read_committed, à direita, só vê as mensagens de transações confirmadas.</desc>
+  <defs><marker id="mk-eos" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="190" height="56" rx="10" class="d-box"/>
+  <text x="105" y="64" text-anchor="middle" class="d-mono" textLength="170" lengthAdjust="spacingAndGlyphs">pagamentos.autorizados</text>
+  <text x="105" y="84" text-anchor="middle" class="d-label">entrada</text>
+  <path d="M200 68 L250 68" class="d-line" marker-end="url(#mk-eos)"/>
+  <text x="225" y="58" text-anchor="middle" class="d-label">poll</text>
+  <rect x="252" y="36" width="150" height="64" rx="10" class="d-accent"/>
+  <text x="327" y="64" text-anchor="middle" class="d-title">Liquidador</text>
+  <text x="327" y="84" text-anchor="middle" class="d-label">regra de negócio</text>
+  <rect x="190" y="130" width="280" height="150" rx="12" class="d-box" stroke-dasharray="6 4" fill="none"/>
+  <text x="330" y="150" text-anchor="middle" class="d-label">uma transação</text>
+  <rect x="210" y="162" width="240" height="44" rx="8" class="d-ok"/>
+  <text x="330" y="189" text-anchor="middle" class="d-mono" textLength="200" lengthAdjust="spacingAndGlyphs">send → pagamentos.liquidados</text>
+  <rect x="210" y="220" width="240" height="44" rx="8" class="d-violet"/>
+  <text x="330" y="247" text-anchor="middle" class="d-mono" textLength="200" lengthAdjust="spacingAndGlyphs">offsets → __consumer_offsets</text>
+  <path d="M327 100 L327 160" class="d-line" marker-end="url(#mk-eos)"/>
+  <rect x="490" y="160" width="160" height="60" rx="10" class="d-info"/>
+  <text x="570" y="185" text-anchor="middle" class="d-title">read_committed</text>
+  <text x="570" y="205" text-anchor="middle" class="d-label">só vê o confirmado</text>
+  <path d="M450 184 L488 188" class="d-line" marker-end="url(#mk-eos)"/>
+  <text x="330" y="310" text-anchor="middle" class="d-text">commitTransaction: tudo vale · abortTransaction: nada vale</text>
+</svg>
+</Figura>
+
+### Os limites do exactly-once
+
+Aqui mora a confusão mais cara. O que o Kafka garante é: **o efeito, dentro do Kafka, de processar cada mensagem de entrada aparece exatamente uma vez** para leitores `read_committed`. A sua regra de negócio pode executar **mais de uma vez**: no teste da mão na massa, a regra roda para PAG-1 e PAG-2 duas vezes (antes e depois do abort). Portanto:
+
+- **Efeitos fora do Kafka não entram na transação.** Gravar no PostgreSQL, chamar a API do adquirente, mandar e-mail: se o lote for abortado e relido, esses efeitos acontecem de novo. A transação Kafka e a transação do banco são duas coisas diferentes, e não existe *commit* atômico entre elas. Para esses casos continuam valendo o outbox, a chave de idempotência e o consumidor idempotente.
+- **Só vale de Kafka para Kafka.** Se a saída for um banco, o exactly-once se constrói do lado do banco (gravar o offset na mesma transação do dado, ou deduplicar por identificador).
+- **Os leitores precisam usar `read_committed`.** Um consumidor esquecido no padrão `read_uncommitted` lê mensagens abortadas.
+- **Latência.** Um leitor `read_committed` só vê as mensagens quando a transação termina. Transações longas (lotes grandes, `commit` a cada minuto) atrasam todos os leitores. E uma transação aberta e esquecida segura o LSO até o `transaction.timeout.ms` (padrão de 60 segundos) expirar e o coordenador abortá-la.
+- **Custo.** Cada transação acrescenta requisições ao coordenador e marcadores nas partições. Transações por mensagem são caras; por lote, aceitáveis.
+
+No Spring Kafka, você não escreve esse laço à mão: definir `spring.kafka.producer.transaction-id-prefix` faz o Spring Boot configurar um `KafkaTransactionManager`, e o container do `@KafkaListener` passa a abrir a transação, enviar os offsets e confirmar ao fim de cada lote. O código desta aula usa a API do cliente diretamente para que você veja cada passo que o Spring faz por você.
+
+## Partições quentes e a escolha da chave
+
+A chave decide a partição. Uma chave ruim cria uma **partição quente**: uma partição que recebe muito mais tráfego que as outras e cujo consumidor vira o gargalo do grupo inteiro. No gancho, a chave era o identificador do lojista, e um marketplace concentrava 90% do volume.
+
+Como reconhecer: lag e bytes de entrada **por partição** muito desiguais. No passo 3 você vai ver exatamente isso: 5 de lag numa partição e 0 nas outras, porque 5 movimentos seguidos do `SKU-7` foram todos para a mesma partição.
+
+Como escolher a chave:
+
+1. **Comece pela ordem que o negócio exige.** "Os eventos de um pagamento precisam ser processados em ordem" é diferente de "os eventos de um lojista precisam ser processados em ordem". Quase sempre a ordem necessária é a da **entidade menor**: o pagamento, a conta, o pedido. Use essa entidade como chave.
+2. **Verifique a distribuição.** Conte, nos dados reais, quanto do volume vai para as maiores chaves. Se uma chave sozinha passa da capacidade de uma partição, nenhuma quantidade de partições resolve.
+3. **Se a ordem precisa mesmo ser por entidade grande**, divida a entidade: chave `lojista + "#" + (idDoPedido % 8)` espalha o lojista em até 8 partições e mantém a ordem por pedido. Você perde a ordem global do lojista, e precisa saber se o negócio aceita isso.
+4. **Isole quem é diferente.** Um tópico separado para os maiores clientes, com mais partições e consumidores dedicados, também é uma resposta legítima.
+
+E sem chave? O produtor distribui as mensagens entre as partições (com o particionador "pegajoso", que enche um lote por vez). A distribuição fica ótima, mas não há ordem nenhuma entre mensagens relacionadas. Só serve quando cada mensagem é independente.
+
+## Vazão: lotes, espera e compressão
+
+O produtor Kafka não envia mensagem por mensagem: ele acumula **lotes por partição** e envia vários lotes numa requisição. Três configurações controlam isso:
+
+- **`batch.size`** (padrão de 16 KiB): o tamanho máximo de um lote por partição. Um lote cheio é enviado na hora.
+- **`linger.ms`** (padrão de **5 ms** desde o Kafka 4.0; era 0): quanto o produtor espera para encher um lote antes de enviá-lo mesmo incompleto.
+- **`compression.type`** (`none`, `gzip`, `snappy`, `lz4`, `zstd`): a compressão é feita **por lote**. Lotes maiores comprimem melhor, porque eventos JSON da mesma partição se repetem muito (nomes de campo, valores parecidos).
+
+Aumentar `linger.ms` para 10 a 50 ms e `batch.size` para 64 a 256 KiB costuma multiplicar a vazão e reduzir o uso de CPU e rede dos brokers, ao custo de alguns milissegundos de latência no envio. Para eventos de pagamento, 20 ms a mais é imperceptível; para um sistema de lances em tempo real, talvez não.
+
+A escolha do algoritmo de compressão é uma troca de CPU por bytes. Como regra geral, `zstd` costuma comprimir mais, e `lz4` e `snappy` custam menos CPU. O que vale é medir com os seus dados. E a compressão economiza nos três lugares caros: rede do produtor ao broker, disco dos brokers (o lote fica comprimido no log) e replicação entre brokers.
+
+## Upgrades e vários ambientes
+
+Um cluster vive anos e passa por muitas versões. No Kafka 4:
+
+- **Só KRaft.** O ZooKeeper foi removido; um cluster antigo migra para KRaft numa 3.x (a 3.9 é a ponte) antes de ir para a 4.
+- **Java e clientes.** Brokers exigem Java 17+, clientes Java 11+, e clientes anteriores à versão 2.1 deixam de conectar. Faça o inventário dos clientes (inclusive conectores e ferramentas) **antes** do upgrade.
+- **Upgrade em etapas (*rolling*).** Um broker por vez, esperando o ISR voltar completo. Só com todos na versão nova finalize a versão dos metadados com `kafka-features.sh`; antes disso, ainda dá para voltar.
+- **Padrões mudam entre versões** (`linger.ms` foi de 0 para 5 no 4.0; `acks=all` e idempotência viraram padrão no 3.0). Configurações importantes explícitas, como na `ConfiguracaoDeProducao`, protegem contra isso.
+
+Entre ambientes: clusters separados (ou, no mínimo, prefixos e ACLs separados: um consumidor de homologação com o mesmo `group.id` apontado para produção "rouba" partições); `auto.create.topics.enable=false` e **tópicos como código**, criados por pipeline (Terraform, Strimzi, Admin API) com partições, replicação e retenção revisadas; e cotas por cliente, para que um produtor descontrolado não derrube o cluster de todos.
+
+## O código que vamos construir
+
+Tudo está em `java/m12-mensageria/aulas`, no pacote `dev.trilhajava.m12.aulas.producao`, e roda no CI com um broker Kafka 4.2 embutido (`@EmbeddedKafka`, do `spring-kafka-test`), sem Docker. São quatro classes:
+
+| Classe | Papel |
+|---|---|
+| `ConfiguracaoDeProducao` | As configurações de produtor e consumidor que um time fixa por escrito |
+| `Particionamento` | A conta da partição de uma chave, o remapeamento e o dimensionamento |
+| `MonitorDeLag` | O lag por partição de um consumer group, com a Admin API |
+| `LiquidadorDePagamentos` | Read-process-write com transação Kafka |
+
+Os testes ficam em `src/test/java/dev/trilhajava/m12/aulas/producao/`: `ParticionamentoTest` (sem broker) e `KafkaEmProducaoTest` (com o broker embutido).
+
+## Mão na massa
+
+Para rodar, entre no módulo e use o Maven:
+
+```bash
+cd java/m12-mensageria/aulas
+mvn test -Dtest=ParticionamentoTest      # sem broker, instantâneo
+mvn test -Dtest=KafkaEmProducaoTest      # sobe um broker Kafka embutido
+```
+
+### Passo 1: as configurações de produção, explícitas
+
+**O que vamos fazer e por quê.** Antes de qualquer código de negócio, o time decide e escreve as configurações dos clientes. Vários valores coincidem com os padrões do Kafka 4, mas escrevê-los tem dois efeitos: ninguém precisa adivinhar o comportamento lendo a documentação de uma versão específica, e uma mudança de padrão numa versão futura não altera o sistema em silêncio.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/producao/ConfiguracaoDeProducao.java" semImports />
+
+**O que acabou de acontecer.**
+
+- No produtor durável: `acks=all` e `enable.idempotence=true` são a dupla da durabilidade. A idempotência faz o broker descartar a cópia repetida quando o produtor reenvia um lote por timeout, usando um identificador de produtor e um número de sequência por partição. Sem ela, um reenvio pode duplicar a mensagem.
+- `linger.ms=20` e `batch.size=64 KiB` trocam até 20 ms de espera por lotes maiores; `compression.type=zstd` comprime cada lote.
+- `delivery.timeout.ms` é o limite total de um `send()`: dentro desse tempo o produtor tenta de novo sozinho; depois dele, o `Future` falha e a aplicação decide o que fazer (o outbox resolve isso de forma robusta).
+- O produtor transacional é o mesmo produtor com um `transactional.id`. Ele precisa ser **estável por instância** (`liquidacao-1` sempre na mesma instância) para o *fencing* funcionar: um id aleatório a cada início não cerca zumbi nenhum.
+- No consumidor: `group.protocol=consumer` liga o protocolo novo; `group.instance.id` torna o membro estático; `isolation.level=read_committed` ignora transações abortadas; `enable.auto.commit=false` faz o offset avançar só quando o código manda. E repare no que **não** está ali: `session.timeout.ms` e `heartbeat.interval.ms`, proibidos com o protocolo novo.
+
+Esses mapas podem ir para um `DefaultKafkaProducerFactory` do Spring, ou virar propriedades no `application.yml` (`spring.kafka.producer.properties.linger.ms: 20`, por exemplo). A forma importa menos que a regra: **toda configuração que muda durabilidade, ordem ou vazão está escrita e revisada**.
+
+### Passo 2: a partição de cada chave e o custo de aumentar
+
+**O que vamos fazer e por quê.** Vamos reproduzir a conta do particionador padrão e medir quantas chaves mudam de partição quando o tópico cresce. É o número que você leva para a reunião quando alguém propõe "só aumentar as partições".
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/producao/Particionamento.java" semImports />
+
+E o teste:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/producao/ParticionamentoTest.java" semImports />
+
+```bash
+mvn test -Dtest=ParticionamentoTest
+```
+
+Saída (as três linhas do `printf` e o resumo do Maven):
+
+```text
+conta-42 em 6 partições: p2; em 8: p0
+6 -> 8: 75,3% das chaves mudam de partição
+6 -> 12: 50,2% das chaves mudam de partição
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+(O separador decimal segue a localidade da sua JVM; em inglês, aparece `75.3%`.)
+
+**O que acabou de acontecer.**
+
+- `Utils.murmur2` e `Utils.toPositive` são as funções do próprio `kafka-clients` que o particionador padrão usa para mensagens com chave. Por isso a conta da classe coincide com o que o produtor faz.
+- Os 75% não são acaso. Uma chave fica na mesma partição quando `h % 6 == h % 8`. Olhando `h` módulo 24 (o mínimo múltiplo comum), isso só acontece para os restos de 0 a 5: 6 em 24, ou 25%. Os outros 75% mudam.
+- Ao **dobrar** (6 para 12), uma chave da partição `p` vai para `p` ou `p + 6`: metade fica. É por isso que, se for inevitável aumentar, dobrar é o "menos pior": metade das chaves continua onde estava, e cada partição antiga se divide em exatamente duas novas.
+- `particoesNecessarias` faz a divisão arredondada para cima com inteiros: `(a + b - 1) / b`. Com pico de 3.000/s, 400/s por instância e folga de 100%, dá 15.
+
+### Passo 3: o lag por partição
+
+**O que vamos fazer e por quê.** Agora com um broker de verdade. Um painel de estoque consome o tópico `estoque.movimentos` (3 partições), lê tudo e confirma os offsets. Em seguida, uma promoção do `SKU-7` gera 5 movimentos seguidos com a mesma chave. O `MonitorDeLag` precisa mostrar que o atraso está concentrado numa partição.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/producao/MonitorDeLag.java" semImports />
+
+O teste (o primeiro método de `KafkaEmProducaoTest`):
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/producao/KafkaEmProducaoTest.java" destacar="27-34, 46-57, 67-75" />
+
+```bash
+mvn test -Dtest=KafkaEmProducaoTest
+```
+
+Entre os logs do broker embutido, procure esta linha:
+
+```text
+lag por partição: {estoque.movimentos-0=5, estoque.movimentos-1=0, estoque.movimentos-2=0}
+```
+
+E, no fim:
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@EmbeddedKafka` sobe um broker Kafka 4.2 em modo KRaft dentro da JVM do teste e cria os tópicos com 3 partições. Sem contexto Spring, a extensão do JUnit injeta o `EmbeddedKafkaBroker` como parâmetro do método; `getBrokersAsString()` devolve o endereço para o `bootstrap.servers`. As duas propriedades de broker reduzem o fator de replicação do log interno de transações para 1, porque há um broker só.
+- O consumidor usa a `ConfiguracaoDeProducao.consumidor(...)`: protocolo novo, membro estático `painel-1`, *commit* manual. O laço de `poll` com prazo existe porque a primeira atribuição de partições leva alguns ciclos de heartbeat.
+- `commitSync()` grava no `__consumer_offsets` a próxima posição de cada partição atribuída. A partir daí, o lag do grupo é zero.
+- O `MonitorDeLag` faz duas consultas à Admin API: `listConsumerGroupOffsets` (os offsets confirmados do grupo) e `listOffsets` com `OffsetSpec.latest()` (o log-end offset de cada partição). A diferença é o lag.
+- As 5 mensagens do `SKU-7` foram todas para a partição 0, porque a chave é a mesma. O teste confere isso usando `Particionamento.particaoDa("SKU-7", 3)`: a mesma conta do produtor.
+
+<Callout tipo="atencao" titulo="O ponto cego do MonitorDeLag">
+Ele calcula o lag só das partições que **têm offset confirmado** pelo grupo. Uma partição nova (depois de um aumento) ou que o grupo nunca confirmou não aparece, e o lag dela fica invisível. Uma versão para produção também consulta as partições do tópico (`describeTopics`) e trata "sem offset confirmado" como lag igual ao tamanho da partição, ou como alerta separado.
+</Callout>
+
+Num cluster de verdade, a ferramenta de linha de comando faz a mesma conta. Com a imagem oficial `apache/kafka`, os scripts ficam em `/opt/kafka/bin`:
+
+```bash
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group painel-estoque
+```
+
+A saída é uma tabela com uma linha por partição e as colunas `GROUP`, `TOPIC`, `PARTITION`, `CURRENT-OFFSET`, `LOG-END-OFFSET`, `LAG`, `CONSUMER-ID`, `HOST` e `CLIENT-ID`. (Esta parte não roda no CI da trilha, que não usa Docker; os valores dependem do seu cluster.)
+
+### Passo 4: read-process-write com transação
+
+**O que vamos fazer e por quê.** O liquidador lê pagamentos autorizados, aplica a regra de liquidação e publica em `pagamentos.liquidados`. No meio do lote, o razão contábil dá timeout para o `PAG-3`, uma falha transitória. Queremos ver três coisas: o lote é abortado inteiro; quem lê a saída com `read_committed` nunca vê um pagamento duplicado ou pela metade; e o reprocessamento termina com exatamente três liquidações.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/producao/LiquidadorDePagamentos.java" destacar="47, 57-65, 67-71, 72-76" />
+
+O teste é o segundo método de `KafkaEmProducaoTest` (mostrado no passo 3). Na mesma execução, procure estas linhas:
+
+```text
+Lote de 3 pagamento(s) abortado; será reprocessado (causa: timeout no razão contábil)
+read_committed:   [PAG-1;150.00;LIQUIDADO, PAG-2;89.90;LIQUIDADO, PAG-3;1200.00;LIQUIDADO]
+read_uncommitted: [PAG-1;150.00;LIQUIDADO, PAG-2;89.90;LIQUIDADO, PAG-3;1200.00;LIQUIDADO]
+```
+
+**O que acabou de acontecer, passo a passo.**
+
+- No construtor, `initTransactions()` registra `liquidacao-1` no coordenador de transações. Se uma instância antiga com o mesmo id estivesse viva, ela seria cercada a partir daqui.
+- O primeiro `poll()` trouxe os três pagamentos (todos com a chave `conta-7`, logo na mesma partição e em ordem). A transação começou, PAG-1 e PAG-2 foram enviados, e a regra lançou exceção no PAG-3.
+- O `catch (RuntimeException falha)` abortou a transação e chamou `voltarAoUltimoCommit`. Esse passo é essencial e muita gente esquece: o abort desfaz as escritas, mas **não** volta a posição do consumidor em memória. Sem o `seek`, o próximo `poll()` continuaria depois do PAG-3, e os três pagamentos nunca seriam liquidados. Como o grupo ainda não tinha offset confirmado, o `seek` foi para o começo da partição.
+- No segundo `poll()`, os três voltaram. Desta vez a regra funcionou (a falha simulada acontece só uma vez), os três foram enviados, o offset de entrada foi junto com `sendOffsetsToTransaction` e a transação foi confirmada.
+- O leitor `read_committed` viu exatamente três mensagens. A regra de negócio, porém, executou **cinco** vezes (PAG-1 e PAG-2 duas vezes cada, PAG-3 uma, mais a tentativa que falhou). É o limite do exactly-once em ação: o efeito no Kafka é único; a execução do código, não.
+- E por que o `read_uncommitted` também viu só três? Porque, com `linger.ms=20`, as duas mensagens da tentativa abortada ainda estavam no buffer do produtor quando o abort aconteceu, e foram descartadas sem chegar ao broker. Sob carga, com lotes já enviados, elas estariam no log marcadas como abortadas, e só um leitor `read_uncommitted` as receberia. Por isso o teste aceita de 3 a 5 mensagens nesse leitor: o que é garantido é o que o `read_committed` vê.
+
+<Callout tipo="erro" titulo="Exceções fatais não se abortam">
+`ProducerFencedException` (outra instância assumiu o `transactional.id`), `OutOfOrderSequenceException` e `AuthorizationException` deixam o produtor num estado em que nem `abortTransaction()` funciona. O único caminho é fechar o produtor e deixar a instância cair (ou recriar o produtor). Por isso o `LiquidadorDePagamentos` trata esse grupo num `catch` separado, **antes** do genérico.
+</Callout>
+
+### Passo 5: compaction e retenção na linha de comando
+
+**O que vamos fazer e por quê.** Retenção e compaction são configurações de tópico, normalmente criadas por um pipeline de infraestrutura e não pelo código da aplicação. Os comandos abaixo mostram as duas formas, para você reconhecê-las num repositório de infraestrutura. Eles precisam de um cluster Kafka (por exemplo, a imagem `apache/kafka:4.2.0` no Docker) e não rodam no CI da trilha.
+
+Um tópico de eventos de pagamento, com retenção de 14 dias e durabilidade explícita:
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic pagamentos.autorizados --partitions 12 --replication-factor 3 \
+  --config min.insync.replicas=2 --config retention.ms=1209600000
+```
+
+Um tópico de estado (o saldo atual de cada conta), compactado:
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic contas.saldo-atual --partitions 12 --replication-factor 3 \
+  --config min.insync.replicas=2 --config cleanup.policy=compact \
+  --config delete.retention.ms=86400000
+```
+
+**O que observar.** `retention.ms=1209600000` são 14 dias em milissegundos (14 × 24 × 60 × 60 × 1000). Num cluster de desenvolvimento com um broker só, `--replication-factor 3` falha com `InvalidReplicationFactorException` (veja "Quando dá errado"); use 1 ali, e 3 nos ambientes que imitam produção.
+
+### Passo 6: a suíte inteira
+
+```bash
+cd java
+mvn -q -pl m12-mensageria/aulas -am verify
+```
+
+O comando termina sem erros (com `-q`, o Maven só imprime problemas e as linhas que os testes escrevem). Os quatro testes desta aula, dois em cada classe, rodam em cerca de 15 segundos, a maior parte para subir o broker embutido.
+
+## Quando dá errado
+
+As mensagens abaixo foram geradas contra o broker Kafka 4.2.1 embutido, num teste temporário que provocou cada erro de propósito.
+
+### Diminuir partições
+
+```text
+org.apache.kafka.common.errors.InvalidPartitionsException: The topic pedidos currently has 3 partition(s); 2 would not be an increase.
+```
+
+**Como ler:** a Admin API (`createPartitions` com `NewPartitions.increaseTo(2)`) só aceita aumentar. **Como resolver:** se você realmente precisa de menos partições, é migração: tópico novo, produtores escrevendo nos dois por um período ou um processo que copia, consumidores trocando de tópico, e o antigo aposentado depois de esvaziar.
+
+### Fator de replicação maior que o número de brokers
+
+```text
+org.apache.kafka.common.errors.InvalidReplicationFactorException: Unable to replicate the partition 3 time(s): The target replication factor of 3 cannot be reached because only 1 broker(s) are registered.
+```
+
+**Como ler:** pediu 3 réplicas num cluster de 1 broker. Acontece muito quando o script de criação de tópicos de produção roda no ambiente local. **Como resolver:** parametrize o fator de replicação por ambiente (1 no local, 3 em homologação e produção), e nunca o contrário.
+
+### Configuração do protocolo clássico com o protocolo novo
+
+```text
+org.apache.kafka.common.config.ConfigException: session.timeout.ms cannot be set when group.protocol=CONSUMER
+```
+
+**Como ler:** o consumidor nem chega a ser criado. Aconteceu porque a configuração antiga, com `session.timeout.ms=45000`, foi mantida ao ligar `group.protocol=consumer`. **Como resolver:** remova `session.timeout.ms`, `heartbeat.interval.ms` e `partition.assignment.strategy` da configuração do cliente, e ajuste os equivalentes no broker (`group.consumer.session.timeout.ms`, `group.consumer.heartbeat.interval.ms`) se os padrões não servirem. No Spring Boot, procure também em `spring.kafka.consumer.properties.*`.
+
+### Produtor zumbi cercado
+
+Duas instâncias abriram produtores com o mesmo `transactional.id` (`liquidacao-1`). A antiga tinha uma transação aberta e tentou continuar depois de a nova chamar `initTransactions()`:
+
+```text
+org.apache.kafka.common.errors.InvalidProducerEpochException: Producer attempted to produce with an old epoch.
+```
+
+E, no log do cliente antigo:
+
+```text
+Transiting to fatal error state due to org.apache.kafka.common.errors.ProducerFencedException: There is a newer producer with the same transactionalId which fences the current one.
+```
+
+**Como ler:** é o *fencing* funcionando: a época do id subiu quando a nova instância se registrou, e a antiga não consegue mais escrever. **O que fazer:** em produção, isso significa que duas instâncias acreditam ser a mesma, por exemplo durante um deploy em que o pod antigo ainda não terminou. Feche o produtor antigo e deixe a instância cair. Se acontece sempre, o `transactional.id` não é único por instância.
+
+### Aviso de acesso nativo do zstd no Java 25
+
+Ao usar `compression.type=zstd`, a primeira compressão carrega uma biblioteca nativa, e a JVM avisa:
+
+```text
+WARNING: java.lang.System::load has been called by com.github.luben.zstd.util.Native$2 in an unnamed module (file:/.../zstd-jni-1.5.6-10.jar)
+WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
+WARNING: Restricted methods will be blocked in a future release unless native access is enabled
+```
+
+**Como ler:** não é erro, e a compressão funciona. É o aviso de "métodos restritos" do Java recente: carregar código nativo vai exigir permissão explícita no futuro. **Como resolver:** acrescente `--enable-native-access=ALL-UNNAMED` às opções da JVM da aplicação (e do Surefire, se o aviso incomodar nos testes). Não ignore para sempre: quando o padrão mudar, a compressão `zstd` vai falhar na inicialização.
+
+### `NotEnoughReplicasException`
+
+Com fator 3, `min.insync.replicas=2` e dois brokers fora, o produtor com `acks=all` recebe `NotEnoughReplicasException` (ou `NotEnoughReplicasAfterAppendException`, se a líder gravou e as seguidoras saíram do ISR no meio). Esse erro precisa de um cluster com várias réplicas para aparecer: num broker embutido único, o teste temporário criou um tópico com `min.insync.replicas=2` e fator 1, e o broker 4.2 aceitou a escrita assim mesmo. É mais um motivo para testar durabilidade num ambiente com três brokers, e não confiar num broker único. **O que fazer quando aparecer em produção:** é uma exceção que o produtor tenta de novo sozinho até o `delivery.timeout.ms`; se o tempo acabar, o envio falha e a aplicação precisa ter onde guardar o evento (o outbox).
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Aumentar partições para resolver lag" depois="Olhar o lag por partição antes de escalar">
+```text
+Lag total: 80.000
+Ação: partições 12 → 24, consumidores 12 → 24
+
+Resultado:
+- 50% das chaves mudam de partição
+- eventos da mesma conta fora de ordem
+- o lag continua: 72.000 estavam numa
+  partição só (o marketplace)
+```
+
+```text
+Lag por partição:
+  p7 = 72.000   demais ≈ 700
+
+Diagnóstico: partição quente (chave = lojista)
+Ação: chave = idDoPagamento (a ordem
+      necessária é a do pagamento),
+      em tópico novo, com migração planejada
+```
+</Comparar>
+
+As armadilhas que mais aparecem:
+
+- **Tópicos criados automaticamente.** Nascem com 1 partição (ou o `num.partitions` do broker), fator de replicação do broker e `min.insync.replicas=1`. Desligue `auto.create.topics.enable` em produção.
+- **`acks=all` sem `min.insync.replicas=2`.** Visto na seção de durabilidade: parece seguro e não é.
+- **Lag só total.** Esconde partição quente e consumidor travado.
+- **`group.instance.id` num Deployment escalável.** O mesmo id em duas réplicas gera expulsões em sequência. Use o nome do pod de um StatefulSet ou um id derivado de algo único e estável.
+- **Esquecer o `seek` depois de abortar.** O lote abortado é pulado, e as mensagens se perdem para aquele grupo. O `KafkaTransactionManager` do Spring faz isso por você; código manual precisa fazer.
+- **Achar que exactly-once dispensa idempotência.** Efeitos fora do Kafka acontecem de novo a cada reprocessamento.
+- **Transações enormes.** Lotes de minutos seguram o LSO e atrasam todos os leitores `read_committed`.
+- **Retenção curta demais.** 1 dia de retenção num tópico cujo consumidor pode ficar parado num fim de semana é perda de dado anunciada.
+
+E quando **não** usar o que esta aula mostrou:
+
+- **Transações Kafka quando a saída é um banco ou uma API.** Não ajudam; use outbox e idempotência.
+- **Transações quando "pelo menos uma vez" com consumidor idempotente já resolve.** São mais simples de operar e não têm a latência do `read_committed`. Muitos sistemas de pagamento funcionam assim.
+- **Compaction para histórico.** Se você precisa saber o que aconteceu (auditoria, extrato), compaction apaga exatamente isso. Use retenção (ou armazenamento em camadas) num tópico de eventos, e compaction num tópico de estado derivado.
+- **Protocolo novo com assignor customizado no cliente.** Ainda não é suportado; mantenha o clássico até ter um substituto do lado do servidor.
+## Visão de pleno e sênior: decisões e trade-offs
+
+### Quanto custa um cluster
+
+A conta que todo Sênior faz antes de aprovar um tópico novo:
+
+```text
+disco = vazão de entrada × retenção × fator de replicação
+      = 5 MB/s × 7 dias × 3
+      = 5 × 604.800 s × 3 ≈ 9,07 TB   (já comprimido)
+```
+
+Some a isso uma margem para o disco nunca passar de 70% a 80% de uso (um broker com disco cheio para de aceitar escrita), e você tem o tamanho dos volumes. Na nuvem, há um segundo custo que surpreende: **tráfego entre zonas de disponibilidade**. Com três réplicas em três zonas, cada byte produzido atravessa zonas pelo menos duas vezes na replicação, e mais uma vez para cada consumidor que lê de uma líder em outra zona. Duas alavancas reduzem isso:
+
+- **Compressão** no produtor, que reduz tudo de uma vez: rede, disco e replicação.
+- **Leitura da réplica mais próxima** (KIP-392): com `broker.rack` nos brokers, um seletor de réplica configurado no broker e `client.rack` no consumidor, o consumidor lê da seguidora da própria zona.
+
+E o custo das pessoas: um cluster Kafka próprio exige alguém que saiba fazer upgrade, rebalancear partições entre brokers, trocar discos e responder a incidentes. Serviços gerenciados cobram mais por byte e tiram esse trabalho. Para a maioria dos times sem especialistas em Kafka, o gerenciado sai mais barato no total; times com volume muito alto e equipe de plataforma costumam compensar operando o próprio cluster.
+
+### Como justificar as escolhas para o time
+
+Registre num ADR (*Architecture Decision Record*, que o módulo 13 aprofunda) as decisões de cada tópico crítico, com números:
+
+| Decisão | Exemplo para `pagamentos.autorizados` | Por quê |
+|---|---|---|
+| Partições | 24 | Pico de 3.000/s, 400/s por instância, folga para 2 anos; 24 divide bem por 2, 3, 4, 6, 8 |
+| Chave | `idDoPagamento` | A ordem exigida é por pagamento; distribuição uniforme |
+| Replicação | 3, `min.insync.replicas=2`, `acks=all` | Aguenta 1 broker fora sem parar; 2 fora para escrita, sem perda |
+| Retenção | 14 dias | Janela para corrigir bug e reprocessar, inclusive feriado prolongado |
+| Garantia | Pelo menos uma vez + consumidor idempotente | Saída é o banco de liquidação; transação Kafka não ajudaria |
+| Alertas | Lag crescendo por 10 min; pagamento mais antigo acima de 2 min | Ligados ao SLO combinado com o produto |
+
+Esse quadro transforma "achismo" em decisão revisável: se o pico dobrar, todo mundo sabe qual número revisitar.
+
+### Falhas que você precisa ter ensaiado
+
+- **Um broker cai**: líderes migram em segundos, produtores e consumidores reconectam. Ensaie em homologação e meça quanto tempo o lag leva para voltar ao normal.
+- **Uma zona inteira cai**: com réplicas em três zonas e `min.insync.replicas=2`, tudo continua. Com réplicas em duas zonas, depende da sorte.
+- **Consumidor com bug publica lixo**: com retenção suficiente e eventos imutáveis, você corrige o código e reprocessa (redefinindo os offsets do grupo para um instante anterior com `kafka-consumer-groups.sh --reset-offsets --to-datetime`, com o grupo parado). Sem retenção, não há o que reprocessar.
+- **Mensagem envenenada**: DLT e alerta, da [aula 06](../../12-mensageria/06-retry-e-dlq/).
+- **Deploy com rebalanceamento em cascata**: membros estáticos, protocolo novo, deploy em ondas.
+
+### Segurança
+
+Em produção, o cluster não aceita conexão anônima: TLS na rede, autenticação dos clientes (SASL com SCRAM, OAuth ou certificados mTLS) e **ACLs** por tópico e grupo: o liquidador lê `pagamentos.autorizados`, escreve `pagamentos.liquidados` e usa o grupo `liquidacao`, e nada mais. Produtores transacionais também precisam de permissão sobre o próprio `transactional.id`. E eventos com dados pessoais (CPF, endereço) carregam as mesmas obrigações da LGPD que o banco: retenção mínima necessária, e cuidado com tópicos compactados, em que um dado pessoal pode ficar "para sempre" até alguém publicar o tombstone.
+
+### Quando trocar de abordagem
+
+Se o consumidor precisa de mais paralelismo do que as partições permitem (chamadas lentas e independentes), considere processamento paralelo por chave dentro da partição ou os *share groups* (KIP-932, introduzidos no Kafka 4.0 em acesso antecipado; confira o estado na sua versão). Se precisa de roteamento flexível e TTL por mensagem, RabbitMQ atende melhor. E se o volume e o time são pequenos, um serviço gerenciado, ou só uma tabela de outbox, pode ser a decisão mais madura.
+
+<Callout tipo="entrevista">
+Perguntas que aparecem para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Como você define o número de partições de um tópico?"** Pela vazão medida de uma instância do consumidor e o pico previsto, com folga para crescimento e para zerar atraso. Diz que diminuir é impossível e que aumentar remapeia as chaves (dobrar remapeia metade), quebrando a ordem durante a transição. Bônus: números com muitos divisores.
+- **"Que configurações garantem que um pagamento confirmado não se perde?"** Fator 3 em zonas diferentes, `min.insync.replicas=2`, `acks=all`, idempotência, eleição "suja" desligada. Explica a tabela de falhas: um broker fora segue normal; dois fora, escrita recusada sem perda.
+- **"O lag está subindo. O que você faz?"** Olha o lag por partição antes de agir: espalhado indica consumidor lento (escalar até o número de partições, otimizar o processamento); concentrado indica partição quente ou mensagem travada. Fala de alertas por tendência e por tempo, não por número absoluto.
+- **"O Kafka tem exactly-once?"** Sim, no read-process-write entre tópicos, com transações e `read_committed`. Não cobre efeitos em bancos ou APIs; a regra de negócio pode executar mais de uma vez; ainda precisa de idempotência e outbox fora desse caso.
+- **"Como evitar rebalanceamentos a cada deploy?"** Membros estáticos com `group.instance.id` estável, protocolo novo (KIP-848) com reconciliação incremental, processamento abaixo de `max.poll.interval.ms`. Sabe que o protocolo novo move os timeouts de sessão para o broker.
+- **"Retenção ou compaction?"** Evento é retenção; estado é compaction; tombstone para apagar; compaction não é auditoria.
+</Callout>
+
+## Checkpoint
+
+A fintech vai lançar o tópico `contas.saldo-atual`, que recebe o saldo mais recente de cada conta sempre que ele muda. São 2 milhões de contas, cada mensagem tem em média 400 bytes depois da compressão, o pico é de 1.200 atualizações por segundo e uma instância do consumidor (que atualiza um cache de saldos) processa 250 por segundo. Novos serviços precisam conseguir reconstruir o saldo de todas as contas lendo o tópico do começo.
+
+**O desafio:** defina a política de limpeza, a chave, o número de partições (folga de 100%), o fator de replicação e o `min.insync.replicas`, e estime o espaço em disco do tópico depois de compactado. Diga também qual alerta de lag você configuraria.
+
+<details>
+<summary>Ver uma solução</summary>
+
+**Política de limpeza:** `cleanup.policy=compact`. O tópico representa **estado** (o saldo atual), e o requisito "reconstruir o saldo de todas as contas lendo do começo" é exatamente o que a compaction oferece: para cada conta, pelo menos o último saldo fica no log. Com retenção por tempo, contas sem movimento há mais de 7 dias sumiriam do tópico.
+
+**Chave:** o identificador da conta. É obrigatório (tópico compactado recusa mensagem sem chave) e é a granularidade da ordem: duas atualizações da mesma conta precisam ser aplicadas na ordem em que aconteceram, ou o cache fica com um saldo velho.
+
+**Partições:** `Particionamento.particoesNecessarias(1200, 250, 100)` = teto(2.400 ÷ 250) = teto(9,6) = **10**. Um time arredondaria para **12**, que divide bem por 2, 3, 4 e 6 instâncias.
+
+**Durabilidade:** fator **3**, `min.insync.replicas=2`, produtor com `acks=all` e idempotência. Saldo é dado financeiro.
+
+**Disco depois de compactado:** 2 milhões de contas × 400 bytes ≈ 800 MB por cópia, ou cerca de **2,4 GB** com as três réplicas. Na prática, o log ocupa um pouco mais, porque a compaction não é imediata: o segmento ativo e a parte "suja" ainda guardam versões antigas. Um tópico de estado, mesmo com milhões de chaves, costuma ser pequeno; o que cresce sem limite é o tópico de **eventos**, e por isso os dois são separados.
+
+**Alerta:** lag crescendo de forma sustentada por 10 minutos em qualquer partição, e atraso em tempo (agora menos o timestamp da última mensagem aplicada) acima do que o produto aceita para um saldo desatualizado, por exemplo 30 segundos. Mais o alerta de grupo sem membros.
+
+</details>
+
+<Quiz
+  id="12-kafka-producao"
+  questoes={[
+    {
+      pergunta: 'O tópico pedidos tem 6 partições e chave igual ao id do cliente. Alguém propõe aumentar para 8 para escalar os consumidores. Qual o efeito colateral principal?',
+      opcoes: ['Nenhum: o Kafka redistribui as mensagens antigas', 'Cerca de 75% das chaves passam a ir para outra partição; durante a transição, eventos do mesmo cliente podem ser processados fora de ordem', 'As mensagens antigas são apagadas', 'O Kafka recusa o aumento'],
+      correta: 1,
+      explicacao: 'A partição é `murmur2(chave) % N`. Mudar N muda a casa da maioria das chaves, mas as mensagens já gravadas ficam onde estão. Mensagens novas e antigas da mesma chave ficam em partições diferentes até as antigas serem consumidas.',
+    },
+    {
+      pergunta: 'Fator de replicação 3, min.insync.replicas=2, acks=all. Dois brokers caem. O que acontece?',
+      opcoes: ['As escritas continuam normalmente', 'As escritas com acks=all são recusadas com NotEnoughReplicas, e nenhuma mensagem confirmada se perde', 'As mensagens confirmadas se perdem', 'O Kafka elege uma réplica fora do ISR automaticamente'],
+      correta: 1,
+      explicacao: 'Com só uma réplica em dia, não há como cumprir min.insync.replicas=2: o Kafka prefere recusar a escrita a aceitá-la numa cópia só. Com a eleição "suja" desligada (o padrão), nada confirmado se perde.',
+    },
+    {
+      pergunta: 'O lag total do grupo é 80 mil, sendo 72 mil numa única partição. Qual a ação mais adequada?',
+      opcoes: ['Dobrar o número de consumidores', 'Investigar a chave (partição quente) ou uma mensagem travada nessa partição', 'Aumentar a retenção', 'Trocar acks=all por acks=1'],
+      correta: 1,
+      explicacao: 'Cada partição é consumida por um único membro do grupo. Lag concentrado numa partição não melhora com mais consumidores: a causa é uma chave dominante ou um consumidor travado (mensagem envenenada sem DLT).',
+    },
+    {
+      pergunta: 'Ao ligar group.protocol=consumer, o consumidor falha com ConfigException mencionando session.timeout.ms. Por quê?',
+      opcoes: ['O protocolo novo exige session.timeout.ms maior', 'No protocolo novo (KIP-848), session.timeout.ms, heartbeat.interval.ms e partition.assignment.strategy não são configurados no cliente; os equivalentes ficam no broker', 'O broker não suporta o protocolo novo', 'Falta o group.instance.id'],
+      correta: 1,
+      explicacao: 'Com o protocolo novo, o broker controla sessão, heartbeat e atribuição (`group.consumer.session.timeout.ms`, `group.consumer.heartbeat.interval.ms`, `group.consumer.assignors`). Remova as configurações antigas do cliente.',
+    },
+    {
+      pergunta: 'Um serviço lê pagamentos de um tópico, grava a liquidação no PostgreSQL e confirma o offset, tudo dentro de uma transação Kafka. Ele tem exactly-once?',
+      opcoes: ['Sim, a transação Kafka cobre o banco', 'Não: a gravação no PostgreSQL fica fora da transação Kafka e pode acontecer de novo se o lote for abortado e relido; precisa de idempotência no banco', 'Sim, desde que use read_committed', 'Não, porque o Kafka não tem transações'],
+      correta: 1,
+      explicacao: 'O exactly-once do Kafka vale para read-process-write entre tópicos. Efeitos externos (banco, API, e-mail) podem se repetir; a deduplicação precisa acontecer do lado deles, por exemplo com uma chave única do pagamento.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Partições** definem o teto de paralelismo e a unidade de ordem. Dimensione pela vazão **medida** do consumidor e pelo pico, com folga. Não dá para diminuir; aumentar remapeia as chaves (75% de 6 para 8, 50% ao dobrar).
+- **Durabilidade** é a combinação fator 3 (zonas diferentes) + `min.insync.replicas=2` + `acks=all` + idempotência, com eleição "suja" desligada. Um broker fora: normal. Dois: escrita recusada, nada se perde.
+- **Lag** é log-end offset menos offset confirmado, **por partição**. Alerte por tendência e por tempo, e meça de fora do consumidor.
+- **Rebalanceamento:** o protocolo novo do Kafka 4 (`group.protocol=consumer`) calcula a atribuição no broker e reconcilia de forma incremental; timeouts de sessão e heartbeat vão para o broker. Membros estáticos (`group.instance.id`) evitam rebalanceamento em reinícios.
+- **Retenção** para eventos, **compaction** para estado, tombstone para apagar uma chave.
+- **Transações** dão exactly-once no read-process-write entre tópicos, com `sendOffsetsToTransaction` e leitores `read_committed`. A regra de negócio pode rodar mais de uma vez; efeitos fora do Kafka continuam precisando de outbox e idempotência. Depois de abortar, volte a posição do consumidor.
+- **Chave**: a menor entidade cuja ordem importa. Partição quente se vê no lag por partição.
+- **Vazão**: `linger.ms`, `batch.size` e compressão por lote; meça antes e depois.
+- **Custo**: disco = vazão × retenção × replicação; tráfego entre zonas; pessoas para operar.
+
+## Próximo passo
+
+Este foi o fim do módulo de mensageria. Antes de seguir, pratique: o [exercício 12.02, Estoque com Kafka](../../../exercicios/12-mensageria/02-estoque-kafka/), é um bom lugar para aplicar a escolha de chave e as configurações de produtor desta aula, e o [exercício 12.05, Fintech: marco 5](../../../exercicios/12-mensageria/05-fintech-marco-5/), junta outbox, idempotência, retry e DLQ num fluxo de pagamentos completo. Os outros exercícios do módulo ([roteamento no RabbitMQ](../../../exercicios/12-mensageria/01-roteamento-rabbitmq/), [relay do outbox](../../../exercicios/12-mensageria/03-relay-do-outbox/) e [consumidor idempotente](../../../exercicios/12-mensageria/04-consumidor-idempotente/)) cobrem as demais aulas.
+
+Depois, o módulo 13 muda de escala: das mensagens entre serviços para a forma do código e dos sistemas. Ele começa com [SOLID sem dogma](../../13-arquitetura/01-solid-sem-dogma/), em que cada princípio aparece com o problema que resolve e com o custo de aplicá-lo onde não precisa.
+
+## Referências
+
+- Apache Kafka 4.2 — documentação: [Design](https://kafka.apache.org/42/design/design/) (replicação, ISR, garantias de entrega, compaction) e [Operations](https://kafka.apache.org/42/operations/)
+- Apache Kafka — [Consumer Rebalance Protocol (KIP-848)](https://kafka.apache.org/42/operations/consumer-rebalance-protocol/)
+- Apache Kafka — referência de configuração: [Producer](https://kafka.apache.org/42/configuration/producer-configs/), [Consumer](https://kafka.apache.org/42/configuration/consumer-configs/) e [Topic](https://kafka.apache.org/42/configuration/topic-configs/)
+- Apache Kafka — Javadoc do [`KafkaProducer`](https://kafka.apache.org/42/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html) (exemplo de uso de transações) e da [`Admin`](https://kafka.apache.org/42/javadoc/org/apache/kafka/clients/admin/Admin.html)
+- Apache Kafka KIPs: [KIP-848](https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol), [KIP-345 (membros estáticos)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances), [KIP-447 (exactly-once escalável)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-447%3A+Producer+scalability+for+exactly+once+semantics), [KIP-392 (leitura da réplica mais próxima)](https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica)
+- Spring for Apache Kafka 4 — [Transactions](https://docs.spring.io/spring-kafka/reference/kafka/transactions.html) e [Testing with the Embedded Kafka Broker](https://docs.spring.io/spring-kafka/reference/testing.html)
+- Spring Boot 4 — [Apache Kafka Support](https://docs.spring.io/spring-boot/reference/messaging/kafka.html)

@@ -1,0 +1,172 @@
+---
+titulo: Java moderno na prática (Gatherers, pattern matching e dados imutáveis)
+descricao: Stream Gatherers do Java 24, pattern matching para modelar eventos, event sourcing como exemplo de programação funcional em Java e um guia de legibilidade.
+modulo: 04-java-moderno
+ordem: 5
+duracao: 45
+objetivos:
+  - Conhecer os Stream Gatherers (janelas, fold, scan) do Java 24+
+  - Combinar sealed, records e pattern matching para processar eventos
+  - Entender event sourcing como um "fold" de eventos sobre um estado
+  - Decidir entre estilo funcional e imperativo pela legibilidade
+tags: [Gatherers, Java 24, event sourcing, pattern matching]
+flashcards:
+  - frente: O que são Stream Gatherers?
+    verso: Operações intermediárias personalizáveis (Java 24, JEP 485), usadas com stream.gather(...) — por exemplo windowFixed, windowSliding, fold e scan.
+  - frente: O que Gatherers.windowSliding(3) faz?
+    verso: Agrupa os elementos em janelas deslizantes de 3 (ex. [1,2,3], [2,3,4], ...).
+  - frente: O que é event sourcing?
+    verso: Guardar a sequência de eventos (fatos) em vez do estado atual; o estado é reconstruído aplicando os eventos em ordem, como um fold.
+  - frente: Por que a função "aplicar evento" deve ser pura?
+    verso: Para que reconstruir o estado seja determinístico e testável — os mesmos eventos sempre produzem o mesmo estado.
+---
+
+Esta aula junta as peças do módulo — lambdas, Streams, Collectors, Optional — com os recursos de modelagem do módulo 02 (records, sealed, pattern matching) e apresenta a novidade mais recente da API de Streams: os **Gatherers**.
+
+## Stream Gatherers (Java 24)
+
+Até o Java 23, as operações intermediárias eram fixas: `map`, `filter`, `flatMap`… Não havia como fazer, por exemplo, "janelas de 3 elementos" sem sair da Stream. O Java 24 (JEP 485) trouxe `Stream.gather(...)` e a classe `Gatherers` com operações prontas:
+
+```java
+import java.util.stream.Gatherers;
+
+// Janelas fixas: lotes de 100 para enviar a uma API
+List<List<Pedido>> lotes = pedidos.stream()
+        .gather(Gatherers.windowFixed(100))
+        .toList();
+
+// Janelas deslizantes: média móvel de 3 dias
+List<Double> medias = vendasDiarias.stream()
+        .gather(Gatherers.windowSliding(3))
+        .map(janela -> janela.stream().mapToDouble(Double::doubleValue).average().orElse(0))
+        .toList();
+
+// scan: todos os resultados intermediários de uma acumulação (saldo após cada lançamento)
+List<BigDecimal> saldos = lancamentos.stream()
+        .gather(Gatherers.scan(() -> BigDecimal.ZERO, BigDecimal::add))
+        .toList();
+
+// fold: acumula em um único resultado (como reduce, mas o tipo do acumulador pode ser outro)
+Optional<String> csv = ids.stream()
+        .gather(Gatherers.fold(() -> "", (acc, id) -> acc.isEmpty() ? id : acc + "," + id))
+        .findFirst();
+```
+
+<Callout tipo="novidade" titulo="Versões">
+Gatherers exigem **Java 24+**. As soluções dos exercícios deste módulo não dependem deles (funcionam no Java 21), mas os desafios opcionais sugerem onde usá-los. Também é possível escrever um `Gatherer` próprio, implementando a interface `java.util.stream.Gatherer`, para operações com estado como "remover duplicatas consecutivas".
+</Callout>
+
+## Pattern matching para processar eventos
+
+No módulo 02 você usou `sealed` + `switch` para regras de frete. O mesmo par brilha para **eventos**: fatos imutáveis que aconteceram no sistema.
+
+```java
+public sealed interface EventoConta {
+    String contaId();
+    Instant momento();
+
+    record ContaAberta(String contaId, Instant momento, String titular) implements EventoConta { }
+    record Deposito(String contaId, Instant momento, BigDecimal valor) implements EventoConta { }
+    record Saque(String contaId, Instant momento, BigDecimal valor) implements EventoConta { }
+    record ContaBloqueada(String contaId, Instant momento, String motivo) implements EventoConta { }
+}
+```
+
+Records aninhados na interface deixam a hierarquia inteira em um só arquivo, e o `permits` fica implícito (o compilador infere as subclasses declaradas no mesmo arquivo).
+
+## Event sourcing: o estado como um "fold" de eventos
+
+Em vez de guardar o **saldo atual** e sobrescrevê-lo a cada operação, **event sourcing** guarda **todos os eventos** e **calcula** o estado quando precisa:
+
+<Figura legenda="O estado é o resultado de aplicar cada evento, em ordem, ao estado anterior">
+<svg viewBox="0 0 700 170" width="700" role="img" aria-label="Estado vazio, aplica ContaAberta, Deposito 500, Saque 120, resultando saldo 380">
+  <defs><marker id="es1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="95" width="110" height="50" rx="10" class="d-box"/><text x="65" y="125" text-anchor="middle" class="d-mono">vazio</text>
+  <rect x="180" y="95" width="120" height="50" rx="10" class="d-info"/><text x="240" y="118" text-anchor="middle" class="d-label">saldo</text><text x="240" y="136" text-anchor="middle" class="d-mono">0,00</text>
+  <rect x="360" y="95" width="120" height="50" rx="10" class="d-info"/><text x="420" y="118" text-anchor="middle" class="d-label">saldo</text><text x="420" y="136" text-anchor="middle" class="d-mono">500,00</text>
+  <rect x="540" y="95" width="150" height="50" rx="10" class="d-accent"/><text x="615" y="118" text-anchor="middle" class="d-label">saldo</text><text x="615" y="136" text-anchor="middle" class="d-mono">380,00</text>
+  <path d="M120 120 H176" class="d-line" marker-end="url(#es1)"/><path d="M300 120 H356" class="d-line" marker-end="url(#es1)"/><path d="M480 120 H536" class="d-line" marker-end="url(#es1)"/>
+  <rect x="100" y="20" width="100" height="40" rx="8" class="d-violet"/><text x="150" y="45" text-anchor="middle" class="d-label">ContaAberta</text>
+  <rect x="280" y="20" width="100" height="40" rx="8" class="d-violet"/><text x="330" y="45" text-anchor="middle" class="d-label">Depósito 500</text>
+  <rect x="460" y="20" width="100" height="40" rx="8" class="d-violet"/><text x="510" y="45" text-anchor="middle" class="d-label">Saque 120</text>
+  <path d="M150 60 L150 118" class="d-line" stroke-dasharray="4 4"/><path d="M330 60 L330 118" class="d-line" stroke-dasharray="4 4"/><path d="M510 60 L510 118" class="d-line" stroke-dasharray="4 4"/>
+</svg>
+</Figura>
+
+O coração é uma **função pura** `(estado, evento) → novo estado`:
+
+```java
+private static EstadoConta aplicar(EstadoConta e, EventoConta evento) {
+    return switch (evento) {
+        case ContaAberta(var conta, var momento, String titular) -> new EstadoConta(conta, titular, ZERO, false, 1);
+        case Deposito d -> e.comSaldo(e.saldo().add(d.valor()));
+        case Saque s -> e.comSaldo(e.saldo().subtract(s.valor()));
+        case ContaBloqueada b -> e.bloqueada();
+    };
+}
+```
+
+Reconstruir é **aplicar em sequência**, um "fold" (ou "reduce") dos eventos sobre o estado inicial. Vantagens: histórico completo para auditoria (essencial em fintechs), capacidade de reconstruir o estado em qualquer momento do passado e de criar novas "projeções" a partir dos mesmos eventos. Custos: mais complexidade e a necessidade de *snapshots* quando os eventos são muitos. Você vai rever eventos no módulo 12, com Kafka.
+
+O exercício 04.04 pede exatamente isso: reconstruir contas a partir de um histórico, com `sealed`, `switch` exaustivo, *record patterns* e Streams.
+
+## Guia de legibilidade
+
+O estilo funcional é uma ferramenta, não uma religião. Algumas regras práticas que times experientes seguem:
+
+<Comparar antes="Esperto demais" depois="Legível">
+```java
+return pedidos.stream().filter(p -> p.status() == PAGO
+    && p.data().getYear() == ano).collect(groupingBy(
+    p -> p.cliente().toUpperCase(), TreeMap::new,
+    collectingAndThen(reducing(ZERO, Pedido::valor,
+    BigDecimal::add), v -> v.setScale(2, HALF_EVEN))))
+    .entrySet().stream().filter(e -> e.getValue()
+    .compareTo(MIL) > 0).map(Map.Entry::getKey).toList();
+```
+
+```java
+Map<String, BigDecimal> totalPorCliente = pedidos.stream()
+        .filter(pagosNoAno(ano))
+        .collect(groupingBy(Pedido::cliente, TreeMap::new, SOMA_VALOR));
+
+return clientesAcimaDe(totalPorCliente, MIL);
+```
+</Comparar>
+
+1. **Uma operação por linha**, alinhadas pelo ponto.
+2. **Extraia predicados e coletores com nome** (`pagosNoAno(ano)`, `SOMA_VALOR`).
+3. **Quebre pipelines longos** em etapas com variáveis de nome significativo.
+4. **Method references** quando deixam mais claro; lambda quando o nome do método não diz tudo.
+5. Se o laço `for` fica mais claro, **use o laço**.
+
+<Quiz
+  id="04-moderno"
+  questoes={[
+    {
+      pergunta: 'Qual Gatherer divide uma lista de 250 pedidos em lotes de no máximo 100?',
+      opcoes: ['`Gatherers.windowSliding(100)`', '`Gatherers.windowFixed(100)`', '`Gatherers.scan(100)`', '`Gatherers.fold(100)`'],
+      correta: 1,
+      explicacao: 'windowFixed cria janelas sem sobreposição: [0..99], [100..199], [200..249].',
+    },
+    {
+      pergunta: 'Em event sourcing, o que é guardado como fonte da verdade?',
+      opcoes: ['O estado atual de cada entidade', 'A sequência de eventos que aconteceram', 'Apenas o último evento', 'Um snapshot diário'],
+      correta: 1,
+      explicacao: 'Os eventos são a fonte da verdade; o estado é derivado deles (snapshots são só otimização).',
+    },
+    {
+      pergunta: 'Por que o switch sobre EventoConta não precisa de default?',
+      opcoes: ['Porque records não admitem default', 'Porque a interface é sealed e o compilador conhece todos os tipos', 'Porque switch com setas nunca tem default', 'Precisa, senão não compila'],
+      correta: 1,
+      explicacao: 'Com sealed, o switch é exaustivo — e um novo evento quebra a compilação até ser tratado.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Gatherers** (Java 24): `windowFixed`, `windowSliding`, `scan`, `fold` e gatherers próprios.
+- `sealed` + records + `switch` exaustivo modelam e processam **eventos** com segurança.
+- **Event sourcing** = estado derivado de um fold de eventos por uma função pura.
+- Estilo funcional com legibilidade: uma operação por linha, nomes para predicados e coletores, laço quando for mais claro.

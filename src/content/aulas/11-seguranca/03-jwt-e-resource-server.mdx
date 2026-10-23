@@ -1,0 +1,874 @@
+---
+titulo: JWT e OAuth2 Resource Server
+descricao: "Como um JWT é montado e validado de ponta a ponta (assinatura, algoritmo, iss, aud, exp com tolerância, typ), HS256 × RS256 × ES256, JWKS e rotação de chaves sem downtime, o Resource Server do Spring Security 7 com validadores e conversor de autoridades, token opaco com introspecção e o ciclo de vida completo: access token curto, refresh rotativo, revogação e onde guardar o token no cliente."
+modulo: 11-seguranca
+ordem: 3
+duracao: 120
+objetivos:
+  - Decodificar um JWT à mão e explicar cabeçalho, claims registradas (iss, sub, aud, exp, nbf, iat, jti) e assinatura, diferenciando JWS de JWE
+  - Configurar um Resource Server no Spring Security 7 com JwtDecoder próprio que fixa o algoritmo e valida emissor, audiência e tempo com tolerância de relógio
+  - Mapear os claims scope e roles para autoridades com JwtAuthenticationConverter e proteger rotas com hasAuthority e hasRole
+  - Provar com testes que a API recusa token expirado, de outra audiência, de outro emissor, adulterado, assinado por outra chave, sem assinatura (alg none) e com confusão HS256/RS256, lendo o WWW-Authenticate de cada recusa
+  - Planejar uma rotação de chaves pelo JWKS sem derrubar clientes e explicar o efeito do cache de chaves
+  - Desenhar o ciclo de vida dos tokens (access curto, refresh rotativo com detecção de reuso, revogação por jti ou versão de sessão) e escolher onde o cliente guarda o token
+  - Decidir entre JWT, token opaco com introspecção e sessão para um cenário concreto, justificando custos e riscos
+tags: [JWT, JWS, JWKS, OAuth2, Resource Server, Spring Security 7, RS256, ES256, rotação de chaves, refresh token]
+flashcards:
+  - frente: O corpo de um JWT assinado (JWS) é secreto?
+    verso: Não. Cabeçalho e corpo são só Base64URL, legíveis por qualquer um que tenha o token. A assinatura garante integridade e origem, não sigilo. Para sigilo existe o JWE (cinco partes, conteúdo cifrado), raro em access tokens.
+  - frente: Quais validações um Resource Server precisa fazer além da assinatura?
+    verso: Algoritmo dentro de uma lista fixa (nunca o que o token pede), exp e nbf com tolerância de relógio pequena, iss igual ao emissor esperado, aud contendo o identificador desta API e typ do cabeçalho. Sem iss e aud, um token legítimo de outro sistema passa.
+  - frente: O que é o ataque de confusão de algoritmo HS256/RS256?
+    verso: O atacante troca alg para HS256 e assina com a chave PÚBLICA do emissor usada como segredo HMAC. Uma biblioteca que escolhe o algoritmo pelo cabeçalho valida com "a chave que tem" e aceita. Defesa - fixar o algoritmo esperado (jwsAlgorithm(RS256)).
+  - frente: Para que servem o JWKS e o kid?
+    verso: O JWKS é um JSON publicado pelo emissor com as chaves PÚBLICAS em uso. O kid no cabeçalho do token diz qual delas verifica a assinatura. Assim o emissor pode ter várias chaves ao mesmo tempo e rotacioná-las sem reconfigurar as APIs.
+  - frente: Como rotacionar a chave de assinatura sem derrubar ninguém?
+    verso: Publicar a chave nova no JWKS ao lado da antiga, esperar os caches das APIs atualizarem, passar a assinar com a nova e só retirar a antiga depois que o último token assinado com ela expirar (validade máxima + TTL do cache).
+  - frente: Por que o access token deve durar poucos minutos?
+    verso: Um JWT é validado localmente e vale até o exp; revogá-lo exige consultar estado. Validade curta (5 a 15 min) limita a janela de um token vazado. A sessão longa fica no refresh token, que é guardado no servidor de autorização e revogável.
+  - frente: O que é detecção de reuso de refresh token?
+    verso: Com rotação, cada uso do refresh token gera um novo e invalida o anterior. Se um refresh token já usado aparece de novo, alguém tem uma cópia - o servidor revoga a família inteira de tokens daquela sessão e obriga novo login.
+  - frente: Por que o Spring Security 7 recusa um token com typ at+jwt por padrão?
+    verso: O validador padrão (JwtTypeValidator.jwt()) aceita typ JWT ou ausente. Tokens no perfil RFC 9068 vêm com at+jwt - nesse caso, use JwtValidators.createAtJwtValidator() ou um JwtTypeValidator com os tipos aceitos.
+---
+
+Sexta-feira, 18h40. O time de cartões do banco digital acaba de colocar no ar uma API nova, e a equipe de segurança recebe um alerta estranho: requisições à **API de extrato** com tokens que foram emitidos para a **API de cartões**. Os tokens são legítimos. Foram assinados pelo servidor de autorização do próprio banco, não estão vencidos, e o `sub` é de um cliente real. O problema é que a API de extrato só conferia a assinatura e a validade. Um parceiro que tinha recebido tokens de cartões, com acesso limitado, descobriu que podia usar o mesmo token para ler extratos. Ninguém forjou nada: a API simplesmente aceitou um token que **não era para ela**.
+
+Na semana seguinte, um teste de intrusão encontra outra falha num serviço legado: ele aceitava tokens com `"alg": "none"` no cabeçalho, isto é, sem assinatura nenhuma. Bastava escrever o JSON que quisesse, codificar em Base64 e enviar. Os dois incidentes têm a mesma causa: **validar um JWT é muito mais do que conferir a assinatura**. Nesta aula você vai entender o que um JWT carrega, cada verificação que um Resource Server precisa fazer e por quê, como as chaves são distribuídas e trocadas sem parar o sistema, e como o token vive e morre. E vai provar tudo isso com testes que atacam uma API real, lendo as respostas HTTP exatas que o Spring Security 7 devolve em cada recusa.
+
+## A intuição: o passaporte e a polícia de fronteira
+
+Pense num passaporte. Quem **emite** é o governo do seu país; quem **confere** é o policial de fronteira de outro país, que nunca falou com o seu governo sobre você. Como ele pode confiar no documento?
+
+- Os dados estão **impressos à vista**: nome, data de nascimento, validade. Qualquer um que pegue o passaporte lê tudo. Não há segredo ali.
+- O documento tem **elementos de segurança** (holograma, marca-d'água, chip assinado) que só o governo emissor sabe produzir, mas que **qualquer fronteira sabe conferir**, porque o governo publica como conferir.
+- O policial confere a **validade**, confere que o país emissor é um que ele reconhece e confere se o visto é **para o país dele**. Um visto para o Canadá não abre a fronteira do Japão.
+- Ele **não liga para o seu governo** a cada viajante. Por isso a fila anda. O preço disso: um passaporte roubado continua "válido" até alguém consultar a lista de documentos perdidos.
+
+Um JWT é esse passaporte. O **servidor de autorização** é o governo que emite; a sua **API** é a fronteira. Os claims são os dados impressos (legíveis por todos); a assinatura é o holograma, que só quem tem a **chave privada** produz e que qualquer um confere com a **chave pública**, publicada num endereço conhecido (o JWKS). A validade é o `exp`, o país emissor é o `iss`, o visto é o `aud`. E a fila anda porque a API valida **localmente**, sem consultar ninguém a cada requisição, com o mesmo preço: revogar um token antes do `exp` exige uma "lista de documentos perdidos", que você vai implementar no checkpoint.
+
+<Figura legenda="O servidor de autorização assina com a chave privada e publica as públicas no JWKS; a API busca o JWKS uma vez, guarda em cache e valida cada token localmente">
+<svg viewBox="0 0 660 330" width="660" role="img" aria-labelledby="jwt-papeis-titulo jwt-papeis-desc">
+  <title id="jwt-papeis-titulo">Quem emite e quem valida um JWT</title>
+  <desc id="jwt-papeis-desc">Três participantes. O servidor de autorização, no alto à esquerda, guarda a chave privada e publica as chaves públicas no endpoint JWKS. O cliente, embaixo à esquerda, obtém um access token do servidor de autorização (seta 1) e chama a API de extrato com o cabeçalho Authorization Bearer (seta 2). A API de extrato, à direita, busca o JWKS uma vez e guarda em cache (seta 3) e valida o token localmente, sem consultar o servidor a cada requisição (passo 4).</desc>
+  <defs><marker id="mk-jwt-papeis" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="250" height="110" rx="10" class="d-violet"/>
+  <text x="135" y="38" text-anchor="middle" class="d-title">Servidor de autorização</text>
+  <text x="135" y="62" text-anchor="middle" class="d-label">assina com a chave PRIVADA</text>
+  <text x="135" y="88" text-anchor="middle" class="d-mono">GET /jwks</text>
+  <text x="135" y="108" text-anchor="middle" class="d-label">publica as chaves públicas</text>
+  <rect x="10" y="210" width="250" height="100" rx="10" class="d-info"/>
+  <text x="135" y="240" text-anchor="middle" class="d-title">Cliente</text>
+  <text x="135" y="264" text-anchor="middle" class="d-label">app, SPA via BFF</text>
+  <text x="135" y="286" text-anchor="middle" class="d-label">ou outro serviço</text>
+  <rect x="400" y="110" width="250" height="130" rx="10" class="d-accent"/>
+  <text x="525" y="140" text-anchor="middle" class="d-title">API de extrato</text>
+  <text x="525" y="162" text-anchor="middle" class="d-label">Resource Server</text>
+  <text x="525" y="190" text-anchor="middle" class="d-text">4. valida localmente</text>
+  <text x="525" y="212" text-anchor="middle" class="d-label">algoritmo, assinatura, typ,</text>
+  <text x="525" y="230" text-anchor="middle" class="d-label">exp/nbf, iss, aud</text>
+  <path d="M110 208 L110 122" class="d-line" marker-end="url(#mk-jwt-papeis)"/>
+  <path d="M160 122 L160 208" class="d-line" marker-end="url(#mk-jwt-papeis)"/>
+  <text x="170" y="170" class="d-label">1. access token</text>
+  <path d="M262 262 L398 210" class="d-line" marker-end="url(#mk-jwt-papeis)"/>
+  <text x="270" y="290" class="d-mono">2. Bearer eyJ...</text>
+  <path d="M398 140 L262 80" class="d-line" marker-end="url(#mk-jwt-papeis)"/>
+  <text x="300" y="86" class="d-label">3. busca o JWKS</text>
+  <text x="300" y="104" class="d-label">(uma vez, cache)</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+Os termos abaixo aparecem o tempo todo em documentação, em código e em entrevista. Vale fixá-los antes do código.
+
+| Termo | O que é |
+|---|---|
+| **JWT** (*JSON Web Token*, RFC 7519) | Um formato para transportar *claims* (afirmações) em JSON de forma compacta. O JWT em si é só o formato; a proteção vem do JWS ou do JWE |
+| **JOSE** | A família de padrões em volta do JWT: JWS (assinatura), JWE (cifragem), JWK (chaves em JSON) e JWA (algoritmos) |
+| **JWS** (RFC 7515) | JWT **assinado**: três partes, conteúdo legível, integridade garantida. É o que 99% das APIs usam como access token |
+| **JWE** (RFC 7516) | JWT **cifrado**: cinco partes, conteúdo ilegível sem a chave. Usado quando o token passa por intermediários que não podem ler o conteúdo |
+| **Claim** | Um par nome/valor do corpo: `"sub": "cliente-8f14e45f"` |
+| **Access token** | A credencial que o cliente envia à API em cada requisição, no cabeçalho `Authorization: Bearer ...` |
+| **Refresh token** | Credencial de vida longa, usada **só** junto ao servidor de autorização para obter novos access tokens. Nunca vai para a API |
+| **ID token** | Token do OpenID Connect que descreve **quem fez login**, para o cliente. Não é para chamar APIs |
+| **Servidor de autorização** (*Authorization Server*) | Quem autentica o usuário e emite os tokens: Keycloak, Auth0, Okta, Entra ID, Cognito, Spring Authorization Server |
+| **Resource Server** | A API que recebe o access token e o valida antes de atender. É o papel da sua API nesta aula |
+| **JWK / JWKS** (RFC 7517) | Uma chave em formato JSON / um conjunto de chaves (*JWK Set*), publicado pelo emissor num endereço HTTPS |
+| **kid** | *Key ID*: campo do cabeçalho que diz qual chave do JWKS assinou o token |
+| **Scope** | Permissão delegada ao cliente, como `extrato:ler`. Diz o que **o app** pode fazer em nome do usuário |
+| **Audiência** (`aud`) | Para quem o token foi emitido: o identificador da API que deve aceitá-lo |
+| **Token opaco** | Uma string aleatória sem significado. A API precisa perguntar ao emissor o que ela significa (introspecção, RFC 7662) |
+| **Bearer** | "Portador": quem tem o token, usa. Não há prova de posse, por isso vazar o token equivale a vazar a credencial |
+
+## Anatomia de um JWT
+
+Um JWS na forma compacta (a que trafega em cabeçalhos HTTP) tem três partes separadas por pontos:
+
+```text
+eyJraWQiOiJjaGF2ZS0yMDI2LTA5IiwiYWxnIjoiUlMyNTYifQ.eyJpc3MiOiJodHRwczovL2F1dGguYmFuY28udGVzdC9...fQ.kq3X1vR0...
+└───────────── cabeçalho ─────────────────────┘ └─────────────────── corpo ────────────────┘ └ assinatura ┘
+```
+
+Cada parte é **Base64URL**: uma codificação (troca bytes por caracteres seguros para URL), não uma cifragem. Decodificado, um token emitido pelo autorizador de teste desta aula fica assim:
+
+```json
+// cabeçalho
+{ "kid": "chave-2026-09", "alg": "RS256" }
+
+// corpo (claims)
+{
+  "iss": "https://auth.banco.test/realms/clientes",
+  "aud": ["extrato-api"],
+  "sub": "cliente-8f14e45f",
+  "azp": "app-mobile",
+  "scope": "extrato:ler",
+  "iat": 1791190800,
+  "nbf": 1791190800,
+  "exp": 1791191100,
+  "jti": "5b0c6e0a-3f6d-4a51-9a3e-2f1f4f0c9d77"
+}
+```
+
+A **assinatura** é calculada sobre `base64url(cabeçalho) + "." + base64url(corpo)`. Com RS256, é uma assinatura RSA com SHA-256 feita com a chave **privada** do emissor. Mudar um único caractere do corpo, por exemplo acrescentar `pix:enviar` ao `scope`, invalida a assinatura. Isso você vai ver acontecer no passo 5.
+
+### As claims registradas
+
+A RFC 7519 define sete nomes de claim "registrados". Nenhum é obrigatório pelo formato, mas um access token sem eles é difícil de validar com segurança:
+
+| Claim | Significado | O que a API faz com ele |
+|---|---|---|
+| `iss` (*issuer*) | Quem emitiu. Normalmente a URL do servidor de autorização | Compara com o valor **exato** esperado. Diferença de uma barra final já é outro emissor |
+| `sub` (*subject*) | De quem é o token: o id do usuário ou, em chamadas entre serviços, do cliente | Vira o nome do usuário autenticado. Deve ser um identificador opaco e estável (um UUID), nunca o e-mail ou o CPF |
+| `aud` (*audience*) | Para quem o token foi emitido. Pode ser uma string ou uma lista | Exige que contenha o identificador **desta** API |
+| `exp` (*expiration*) | Instante a partir do qual o token não vale mais, em segundos desde 1970 (UTC) | Recusa se `agora > exp + tolerância` |
+| `nbf` (*not before*) | Instante antes do qual o token ainda não vale | Recusa se `agora < nbf - tolerância` |
+| `iat` (*issued at*) | Quando foi emitido | Informativo; útil para regras como "recusar tokens emitidos antes da troca de senha" |
+| `jti` (*JWT ID*) | Identificador único do token | Permite revogar um token específico e detectar reuso |
+
+Além delas, os servidores de autorização acrescentam claims próprias ou de outros padrões. As que você mais vai ver: `scope` (string com escopos separados por espaço; alguns provedores usam `scp` como lista), `azp` ou `client_id` (o app que pediu o token), `roles` ou `realm_access.roles` (papéis, no Keycloak), `tid` (tenant, no Entra ID), `auth_time` e `acr` (quando e com que força a pessoa se autenticou).
+
+### O cabeçalho e seus campos perigosos
+
+O cabeçalho diz **como** verificar o token: `alg` (o algoritmo), `kid` (qual chave), `typ` (o tipo do token). Aqui mora a contradição que gera os ataques clássicos: o token diz à API como ele deve ser verificado, e o token é escrito por quem envia. Por isso a regra de ouro da RFC 8725 (*JWT Best Current Practices*): **a API decide quais algoritmos e quais chaves aceita; o cabeçalho só escolhe dentro dessa lista**.
+
+Campos como `jku`, `x5u` e `jwk` apontam para chaves ou as embutem no token: confiar neles deixaria o atacante trazer a própria chave. O `NimbusJwtDecoder` do Spring os ignora; as chaves vêm só da configuração.
+
+### JWS × JWE
+
+| | JWS (assinado) | JWE (cifrado) |
+|---|---|---|
+| Partes | 3: cabeçalho, corpo, assinatura | 5: cabeçalho, chave cifrada, vetor de inicialização, conteúdo cifrado, tag de autenticação |
+| Conteúdo | Legível por qualquer um | Legível só por quem tem a chave de decifragem |
+| Garante | Integridade e origem | Sigilo (e integridade) |
+| Uso típico | Access tokens, ID tokens | Tokens que passam por terceiros e carregam dados que eles não podem ler |
+
+O Resource Server do Spring Security trabalha com JWS. Se você sente que precisa de JWE para um access token, quase sempre a pergunta certa é outra: **por que esse dado está no token?** A seção "O que não colocar no JWT" volta a isso.
+
+### HS256, RS256, ES256 e EdDSA
+
+O `alg` define a família de chave. A escolha muda quem pode emitir e quem pode validar:
+
+| Algoritmo | Chave | Quem valida pode emitir? | Tamanho da assinatura | Quando usar |
+|---|---|---|---|---|
+| **HS256** (HMAC com SHA-256) | Um segredo compartilhado, com pelo menos 256 bits | **Sim**: o mesmo segredo assina e verifica | 32 bytes | Um único serviço que emite e valida os próprios tokens; nunca para várias APIs |
+| **RS256** (RSA PKCS#1 v1.5 com SHA-256) | Par RSA de 2048 bits ou mais | Não: valida com a pública, assina com a privada | 256 bytes (RSA 2048) | O padrão de fato. Todo provedor e toda biblioteca suportam |
+| **PS256** (RSA-PSS) | Par RSA | Não | 256 bytes | Mesma chave do RS256 com um esquema de *padding* mais moderno; exigido em alguns perfis (Open Finance, FAPI) |
+| **ES256** (ECDSA P-256 com SHA-256) | Par de curva elíptica P-256 | Não | 64 bytes | Tokens menores e assinatura mais rápida que RSA; bom para alto volume e cabeçalhos enxutos |
+| **EdDSA** (Ed25519) | Par Ed25519 | Não | 64 bytes | Moderno e rápido, mas com suporte desigual: o enum `SignatureAlgorithm` do Spring Security 7.1 não o inclui |
+
+Com HS256, **toda API que valida também consegue emitir**: se cinco microsserviços têm o segredo, qualquer um deles (ou quem invadir qualquer um deles) cria tokens de administrador. Com chaves assimétricas, os dois poderes ficam separados: só o servidor de autorização tem a privada; as APIs recebem a pública, que não serve para assinar nada. Por isso, assim que existe mais de um serviço validando, a resposta é RS256 ou ES256. Entre os dois, RS256 é a escolha "funciona em qualquer lugar" e ES256 é a escolha "tokens menores e mais rápidos", desde que todos os consumidores suportem.
+
+## Validar é uma lista de verificações, em ordem
+
+<Figura legenda="A sequência de verificações do decoder desta aula; cada degrau recusa uma categoria de ataque, e a mensagem à direita é a que vai no WWW-Authenticate">
+<svg viewBox="0 0 680 500" width="680" role="img" aria-labelledby="jwt-validacao-titulo jwt-validacao-desc">
+  <title id="jwt-validacao-titulo">Pipeline de validação de um JWT</title>
+  <desc id="jwt-validacao-desc">Oito degraus de cima para baixo. 1, ler as três partes: recusa token malformado. 2, algoritmo na lista permitida: recusa alg none com Unsupported algorithm of none e recusa HS256 com Another algorithm expected. 3, achar a chave pelo kid no JWKS: recusa kid desconhecido com no matching key found. 4, conferir a assinatura: recusa corpo alterado e outra chave com Invalid signature. 5, typ do cabeçalho: recusa typ inesperado. 6, exp e nbf com tolerância: Jwt expired at e Jwt used before. 7, iss: The iss claim is not valid. 8, aud: The aud claim is not valid. No fim, o conversor transforma claims em autoridades.</desc>
+  <defs><marker id="mk-jwt-validacao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="290" height="40" rx="8" class="d-box"/>
+  <text x="155" y="35" text-anchor="middle" class="d-text">1. Ler as três partes</text>
+  <text x="320" y="35" class="d-mono">Malformed token</text>
+  <rect x="10" y="64" width="290" height="40" rx="8" class="d-accent"/>
+  <text x="155" y="89" text-anchor="middle" class="d-text">2. alg na lista permitida</text>
+  <text x="320" y="80" class="d-mono">Unsupported algorithm of none</text>
+  <text x="320" y="98" class="d-mono">Another algorithm expected</text>
+  <rect x="10" y="118" width="290" height="40" rx="8" class="d-accent"/>
+  <text x="155" y="143" text-anchor="middle" class="d-text">3. Chave do kid no JWKS</text>
+  <text x="320" y="143" class="d-mono">no matching key(s) found</text>
+  <rect x="10" y="172" width="290" height="40" rx="8" class="d-accent"/>
+  <text x="155" y="197" text-anchor="middle" class="d-text">4. Conferir a assinatura</text>
+  <text x="320" y="197" class="d-mono">Invalid signature</text>
+  <rect x="10" y="226" width="290" height="40" rx="8" class="d-info"/>
+  <text x="155" y="251" text-anchor="middle" class="d-text">5. typ do cabeçalho</text>
+  <text x="320" y="251" class="d-mono">the given typ value needs...</text>
+  <rect x="10" y="280" width="290" height="40" rx="8" class="d-info"/>
+  <text x="155" y="305" text-anchor="middle" class="d-text">6. exp e nbf (± tolerância)</text>
+  <text x="320" y="296" class="d-mono">Jwt expired at ...</text>
+  <text x="320" y="314" class="d-mono">Jwt used before ...</text>
+  <rect x="10" y="334" width="290" height="40" rx="8" class="d-info"/>
+  <text x="155" y="359" text-anchor="middle" class="d-text">7. iss = emissor esperado</text>
+  <text x="320" y="359" class="d-mono">The iss claim is not valid</text>
+  <rect x="10" y="388" width="290" height="40" rx="8" class="d-info"/>
+  <text x="155" y="413" text-anchor="middle" class="d-text">8. aud contém esta API</text>
+  <text x="320" y="413" class="d-mono">The aud claim is not valid</text>
+  <path d="M155 430 L155 448" class="d-line" marker-end="url(#mk-jwt-validacao)"/>
+  <rect x="10" y="450" width="290" height="40" rx="8" class="d-ok"/>
+  <text x="155" y="475" text-anchor="middle" class="d-text">Claims → autoridades</text>
+  <text x="320" y="466" class="d-label">degraus 1 a 4: Nimbus</text>
+  <text x="320" y="484" class="d-label">degraus 5 a 8: validadores do Spring</text>
+</svg>
+</Figura>
+
+A figura mostra a ordem real dentro do `NimbusJwtDecoder`: primeiro a biblioteca Nimbus cuida da parte criptográfica (degraus 1 a 4); depois os **validadores** do Spring (`OAuth2TokenValidator<Jwt>`) conferem os claims (degraus 5 a 8). Vamos a cada ataque que esses degraus barram.
+
+**`alg: none`.** A especificação JWS prevê tokens "não protegidos", com `alg` igual a `none` e assinatura vazia. Uma biblioteca que respeita o cabeçalho aceita qualquer coisa. O `NimbusJwtDecoder` recusa tokens sem assinatura logo na leitura, com a mensagem `Unsupported algorithm of none`.
+
+**Confusão de algoritmo (HS256 × RS256).** O ataque mais elegante da lista. A chave **pública** RSA é pública: está no JWKS, qualquer um baixa. O atacante cria um token com `"alg": "HS256"` e o assina com HMAC usando os bytes da chave pública como segredo. Uma biblioteca ingênua faz `verificar(token, chaveConfigurada, token.alg)`: pega a chave que tem (a pública RSA), vê que o token pede HMAC, calcula o HMAC com aqueles bytes, e a assinatura bate. A defesa é **fixar o algoritmo** no decoder (`jwsAlgorithm(SignatureAlgorithm.RS256)`): um token HS256 nem chega a ter a assinatura conferida.
+
+**Chave errada ou desconhecida.** Um token assinado por outra chave privada falha na assinatura (`Invalid signature`), mesmo que o atacante copie o `kid` de uma chave legítima. Um `kid` que não existe no JWKS falha antes, por não ter chave para conferir.
+
+**Token de outro sistema (`iss`) ou para outra API (`aud`).** Esses tokens são legítimos: assinatura válida, dentro da validade. É exatamente o incidente do início da aula. O `iss` evita aceitar tokens de outro *realm* ou de outro provedor que, por acaso ou por configuração errada, compartilha chaves. O `aud` evita que um token emitido para a API de cartões seja aceito pela API de extrato. Sem esses dois validadores, **todos os seus testes com tokens do próprio sistema passam**, e o erro fica invisível até alguém explorá-lo.
+
+**Tempo (`exp`, `nbf`) e a tolerância de relógio.** Os relógios do servidor de autorização e da sua API nunca estão exatamente sincronizados. Se o emissor está 2 segundos adiantado, um token recém-emitido pode chegar com `nbf` "no futuro". A tolerância (*clock skew*) absorve essa diferença: o padrão do `JwtTimestampValidator` é **60 segundos**. Nesta aula usamos 30 segundos. Tolerância grande demais estende a vida de tokens vencidos; zero gera recusas aleatórias em produção. Entre 30 e 60 segundos, com NTP nos servidores, é o usual.
+
+**`typ`.** O cabeçalho `typ` diz que tipo de JWT é aquele. Ele existe para impedir que um token de um tipo seja usado como outro (um ID token usado como access token, por exemplo). No Spring Security 7, o validador padrão aceita `typ` igual a `JWT` ou ausente, e recusa o resto. Isso tem uma consequência prática que aparece em "Quando dá errado".
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está no projeto Maven da trilha, em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.jwt`, e roda no CI.
+
+A aplicação é a **API de extrato** de um banco digital. Ela **não emite** tokens: é um Resource Server puro. Quem emite é o servidor de autorização do banco (na vida real, um Keycloak ou similar; nos testes, um autorizador falso que o próprio teste sobe). A API tem quatro rotas:
+
+| Rota | Quem pode |
+|---|---|
+| `GET /eu` | qualquer token válido; devolve o que o Spring extraiu do token |
+| `GET /contas/minha/extrato` | escopo `extrato:ler` |
+| `POST /contas/minha/pix` | escopo `pix:enviar` |
+| `GET /backoffice/contas` | papel `SUPORTE` (claim `roles`) |
+
+O que a API precisa saber para confiar num token fica num `record` de propriedades, validado na inicialização:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/jwt/PropriedadesDoToken.java" semImports />
+
+E os valores padrão, num arquivo de propriedades carregado pela aplicação:
+
+```properties
+# Aula 11.03. Quem a API de extrato aceita como emissor de tokens, e para quem o token precisa ter sido emitido.
+# Em produção, estes valores vêm de variáveis de ambiente (EXTRATO_SEGURANCA_JWK_SET_URI etc.).
+# Nos testes, o jwk-set-uri aponta para o servidor de chaves falso que o próprio teste sobe.
+extrato.seguranca.emissor=https://auth.banco.test/realms/clientes
+extrato.seguranca.audiencia=extrato-api
+extrato.seguranca.jwk-set-uri=https://auth.banco.test/realms/clientes/protocol/openid-connect/certs
+extrato.seguranca.tolerancia-do-relogio=30s
+```
+
+A peça central é a configuração de segurança. Leia com calma; os próximos passos explicam cada bloco.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/jwt/SegurancaDaApi.java" semImports destacar="29-35, 45-52" />
+
+O controller é deliberadamente simples. Repare no parâmetro `JwtAuthenticationToken`: o Spring injeta a autenticação já pronta, com o token decodificado (`getToken()`) e o nome do usuário (`getName()`, que vem do `sub`).
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/jwt/ContaController.java" semImports />
+
+Duas decisões já merecem nota:
+
+- **A rota não confere permissão nenhuma.** Todas as regras de acesso por rota ficam na `SecurityFilterChain`, num só lugar. O controller confia que, se a requisição chegou até ele, o token é válido e tem a autoridade exigida. Regras que dependem do **objeto** (esta conta é deste cliente?) são assunto da [próxima aula](../../11-seguranca/04-autorizacao-e-bola/).
+- **Não há CSRF nem sessão.** A API é *stateless*: cada requisição traz a própria credencial num cabeçalho, que o navegador não envia sozinho. Sem cookie de autenticação, não há o que um site malicioso aproveitar, e o CSRF pode ser desligado. Se um dia a mesma API passar a aceitar cookie, essa decisão precisa ser revista (a [aula 11.02](../../11-seguranca/02-spring-security-7/) detalha).
+
+## Mão na massa
+
+Os testes ficam em `java/m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/`. Para rodar uma classe:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test -Dtest=TokenValidoTest      # uma classe
+mvn test                             # o módulo inteiro
+```
+
+### Passo 1: um servidor de autorização de mentira
+
+**O que vamos fazer e por quê.** Para testar um Resource Server de verdade, precisamos de tokens de verdade: assinados com RS256 por uma chave privada, com a chave pública disponível num JWKS acessível por HTTP. Poderíamos subir um Keycloak com Testcontainers, mas isso testaria o Keycloak junto. Aqui a pergunta é outra: **a minha API valida corretamente?** Para isso basta um autorizador mínimo que gere chaves, publique o JWKS e assine o que o teste mandar, inclusive tokens ruins de propósito.
+
+A biblioteca **Nimbus JOSE + JWT** já vem com o `spring-boot-starter-oauth2-resource-server` (é a base do `NimbusJwtDecoder`), então não há dependência nova. E o JDK traz um servidor HTTP simples em `com.sun.net.httpserver`, suficiente para servir um JSON.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/AutorizadorDeTeste.java" semImports destacar="24, 28-37, 41-47, 72-84, 95-98" />
+
+**O que acabou de acontecer.**
+
+- `new RSAKeyGenerator(2048).keyID(kid).generate()` gera um par RSA de 2048 bits e já o representa como JWK, com o `kid` que escolhemos. A chave nasce e morre na memória do teste: nada de arquivo `.pem` commitado no repositório.
+- O servidor HTTP escuta em `127.0.0.1`, porta `0`: o sistema operacional escolhe uma livre, e `jwksUri()` monta o endereço. Cada chamada ao `/jwks` incrementa um contador, que o passo 6 usa para provar como o cache se comporta.
+- `publicadas.toPublicJWKSet()` remove as partes privadas antes de serializar. Esse detalhe é a diferença entre um JWKS e um vazamento: um JWK RSA privado contém os campos `d`, `p`, `q` e afins, e qualquer um que os tenha assina tokens.
+- `claimsValidos()` monta um token "bom" com o `JwtClaimsSet` do Spring: emissor e audiência certos, `sub` opaco, `scope`, `iat`, `nbf`, `exp` cinco minutos à frente e um `jti` aleatório. Os testes partem dele e **estragam uma coisa por vez**. É o mesmo princípio do teste de mutantes: cada teste prova que uma única verificação está funcionando.
+- `emitir` usa o `NimbusJwtEncoder` do próprio Spring Security, com um `JWKSource` contendo só a chave escolhida. O cabeçalho leva `alg: RS256` e o `kid` da chave.
+- `COMPARTILHADO` é um autorizador por JVM: com o mesmo `jwk-set-uri`, o Spring reaproveita o contexto entre as classes de teste.
+
+### Passo 2: o Resource Server, bloco a bloco
+
+**O que vamos fazer e por quê.** Agora voltamos à `SegurancaDaApi` mostrada acima para entender o que cada linha faz e quais alternativas o Spring oferece.
+
+**A cadeia de filtros.** `.oauth2ResourceServer(servidor -> servidor.jwt(...))` liga o `BearerTokenAuthenticationFilter`: ele lê o cabeçalho `Authorization: Bearer ...`, entrega o token ao `JwtDecoder`, passa o `Jwt` resultante ao conversor de autoridades e coloca a autenticação no `SecurityContext`. Se algo falha, o `BearerTokenAuthenticationEntryPoint` responde 401 com o cabeçalho `WWW-Authenticate` no formato da RFC 6750. Se o token é válido mas falta autoridade, o `BearerTokenAccessDeniedHandler` responde 403.
+
+**O decoder (linhas 29 a 35).** Três decisões:
+
+1. `NimbusJwtDecoder.withJwkSetUri(...)` diz de onde vêm as chaves: do JWKS, buscado por HTTP na **primeira requisição** (não na inicialização) e guardado em cache. A API sobe mesmo que o servidor de autorização esteja fora do ar naquele momento.
+2. `.jwsAlgorithm(SignatureAlgorithm.RS256)` fixa o algoritmo. É a linha que barra o `alg: none` e a confusão HS256/RS256. Se o emissor usa mais de um algoritmo, `jwsAlgorithms(algs -> { algs.add(RS256); algs.add(ES256); })` aceita uma lista, mas **sempre uma lista que você escreveu**.
+3. `setJwtValidator(JwtValidators.createDefaultWithValidators(...))` define as verificações de claims. O método acrescenta os validadores padrão que estiverem faltando (o de `typ`, o de tempo e um de certificado X.509 usado só com mTLS) aos que você passou. Como passamos um `JwtTimestampValidator` com tolerância de 30 segundos, ele usa o nosso no lugar do padrão de 60. `JwtIssuerValidator` confere o `iss` por igualdade exata; `JwtAudienceValidator` exige que o `aud` contenha `extrato-api`.
+
+<Callout tipo="atencao" titulo="setJwtValidator substitui, não acrescenta">
+Chamar `decoder.setJwtValidator(new JwtAudienceValidator("extrato-api"))` sozinho **troca** o validador padrão inteiro pelo de audiência: a partir daí, `exp` e `nbf` deixam de ser conferidos, e tokens vencidos passam. Sempre monte a lista com `JwtValidators.createDefaultWithValidators(...)` ou `createDefaultWithIssuer(...)`, que mantêm os padrões, ou com um `DelegatingOAuth2TokenValidator` em que você inclui o de tempo explicitamente.
+</Callout>
+
+**O conversor de autoridades (linhas 45 a 52).** O decoder devolve um `Jwt`; quem decide quais `GrantedAuthority` a requisição terá é o conversor. O padrão do Spring lê o claim `scope` (ou `scp`), separa por espaço e prefixa com `SCOPE_`: `"extrato:ler pix:enviar"` vira `SCOPE_extrato:ler` e `SCOPE_pix:enviar`. Para papéis, criamos um segundo `JwtGrantedAuthoritiesConverter` apontado para o claim `roles`, com prefixo `ROLE_`, que é o que `hasRole("SUPORTE")` procura. O `DelegatingJwtGrantedAuthoritiesConverter` junta os dois resultados. E `setPrincipalClaimName("sub")` deixa explícito de onde vem o `getName()` (o padrão já é `sub`; em alguns provedores você vai querer outro claim, como `preferred_username`, só para exibição, nunca para autorização).
+
+<Callout tipo="info" titulo="E se o seu provedor aninha os papéis?">
+O Keycloak coloca os papéis em `realm_access.roles`, um objeto aninhado, e o `JwtGrantedAuthoritiesConverter` lê só claims de primeiro nível. Escreva um `Converter<Jwt, Collection<GrantedAuthority>>` próprio que navega no mapa (`jwt.getClaimAsMap("realm_access")`) ou, no Spring Boot 4.1, use a propriedade `spring.security.oauth2.resourceserver.jwt.authorities-claim-expressions`.
+</Callout>
+
+**A alternativa só com propriedades.** Se você não precisa de nada além do básico, o Spring Boot monta o decoder e o conversor sozinho a partir de propriedades:
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth.banco.test/realms/clientes   # descobre o JWKS e valida o iss
+          audiences: extrato-api                                 # valida o aud
+          jws-algorithms: RS256                                  # padrão: RS256
+          authorities-claim-name: roles                          # em vez de scope
+          authority-prefix: ROLE_
+          principal-claim-name: sub
+```
+
+As três formas de dizer onde estão as chaves têm consequências diferentes:
+
+| Propriedade | O que acontece | Quando usar |
+|---|---|---|
+| `issuer-uri` | Na primeira requisição, o Spring busca o documento de descoberta (`/.well-known/openid-configuration` ou o de metadados do OAuth 2.0, RFC 8414), lê dele o `jwks_uri` e passa a validar o `iss` | O caso comum com um provedor de identidade. Uma URL só, e o `iss` validado de brinde |
+| `jwk-set-uri` | Busca as chaves direto do JWKS; não há descoberta | Quando o documento de descoberta não está acessível pela rede da API, ou para evitar uma chamada a mais. Combine com `issuer-uri` para manter a validação do `iss` |
+| `public-key-location` | Lê uma chave pública RSA fixa de um arquivo (`classpath:` ou `file:`) | Ambientes sem acesso ao emissor, ou um emissor próprio sem JWKS. Rotação exige novo deploy |
+
+Ao declarar um `@Bean JwtDecoder` próprio, como fizemos, o Spring Boot recua e não cria o dele: as propriedades acima de `jwt.*` que configuram o decoder deixam de ter efeito. Fizemos assim para deixar cada validação explícita e testável, e para ler as configurações do nosso próprio prefixo. A documentação do Spring Security recomenda ainda envolver um decoder que usa descoberta (`NimbusJwtDecoder.withIssuerLocation(...)`) num `SupplierJwtDecoder`, para que a descoberta continue acontecendo só na primeira requisição.
+
+### Passo 3: o caminho feliz
+
+**O que vamos fazer e por quê.** Antes de atacar, conferir que um token bom passa e que a API extrai dele o que esperamos.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/TokenValidoTest.java" semImports destacar="7-10, 17-19, 25-30" />
+
+```bash
+mvn test -Dtest=TokenValidoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.jwt.TokenValidoTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.465 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@DynamicPropertySource` aponta `extrato.seguranca.jwk-set-uri` para o autorizador de teste (um *supplier*, porque a porta só existe depois que o servidor sobe). Não há mock de segurança: o filtro real chama o decoder real, que busca o JWKS por HTTP e confere a assinatura RSA.
+- A resposta de `/eu` mostra o resultado da conversão. O `cliente` é o `sub`; o `clienteApp` é o `azp` (o app que pediu o token). E as autoridades trazem uma surpresa: além dos dois `SCOPE_*`, há **`FACTOR_BEARER`**. É uma novidade do Spring Security 7: cada mecanismo de autenticação acrescenta uma autoridade de **fator** (`FACTOR_PASSWORD` no login com senha, `FACTOR_BEARER` com token), base do suporte a autenticação multifator. Você pode usá-la em regras que exigem "autenticado por token", e precisa lembrar dela ao escrever asserções sobre a lista exata de autoridades.
+
+<Callout tipo="dica" titulo="Por que não usar jwt() do spring-security-test?">
+O `spring-security-test` oferece `SecurityMockMvcRequestPostProcessors.jwt()`, que injeta uma autenticação pronta e **pula o decoder**. É ótimo para testar regras de autorização de controllers sem montar tokens. Mas aqui o objeto do teste é justamente o decoder e os validadores: com `jwt()`, um decoder sem validação de `aud` passaria em todos os testes. Use cada ferramenta para o que ela testa.
+</Callout>
+
+### Passo 4: escopos, papéis e o 403
+
+**O que vamos fazer e por quê.** Um token válido não dá acesso a tudo. Vamos provar que o escopo e o papel do token decidem o que a requisição pode fazer, e ver a diferença entre 401 e 403 no protocolo Bearer.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/AutoridadesTest.java" semImports destacar="23-25, 41-54" />
+
+```bash
+mvn test -Dtest=AutoridadesTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.jwt.AutoridadesTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.734 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O token só com `extrato:ler` tenta fazer um Pix e recebe **403**, com este cabeçalho, copiado da execução:
+
+```text
+WWW-Authenticate: Bearer error="insufficient_scope", error_description="The request requires higher privileges than provided by the access token.", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1", resource_metadata="http://localhost/.well-known/oauth-protected-resource"
+```
+
+  A RFC 6750 distingue `invalid_token` (401: o token não serve; o cliente renova) de `insufficient_scope` (403: o token serve, mas não basta; um token novo do mesmo tipo terá os mesmos escopos).
+- O parâmetro `resource_metadata` é outra novidade do Spring Security 7: ele publica os metadados do Resource Server no padrão da RFC 9728 (*OAuth 2.0 Protected Resource Metadata*) e aponta para eles nas respostas de erro. É assim que um cliente descobre, sem configuração prévia, qual servidor de autorização emite tokens para esta API.
+- O atendente do suporte tem `"roles": ["SUPORTE"]` e `scope` vazio. As autoridades dele são exatamente `FACTOR_BEARER` e `ROLE_SUPORTE`, e ele acessa o backoffice. Um cliente comum, sem o papel, recebe 403 na mesma rota.
+
+<Callout tipo="info" titulo="Escopo ou papel?">
+O **escopo** é o que o **app** pode fazer em nome da pessoa (ler o extrato, não fazer Pix); o **papel** é o que a **pessoa** pode fazer no sistema (atender no backoffice). Um app de terceiros com o escopo `extrato:ler` de uma atendente não deve ganhar o backoffice só porque ela tem o papel. Em APIs com terceiros, exija os dois.
+</Callout>
+
+### Passo 5: atacando a API
+
+**O que vamos fazer e por quê.** Este é o coração da aula. Cada teste monta um token com **um único defeito** e confere que a API responde 401 com a mensagem certa no `WWW-Authenticate`. Se alguém, um dia, remover uma linha do decoder, o teste correspondente quebra.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/TokensRejeitadosTest.java" semImports destacar="75-84, 118-135, 139-147, 156-162" />
+
+```bash
+mvn test -Dtest=TokensRejeitadosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.jwt.TokensRejeitadosTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.322 s
+[INFO] BUILD SUCCESS
+```
+
+As respostas reais de cada cenário, copiadas da execução. A tabela mostra só o `error_description`, e as reticências substituem o prefixo `An error occurred while attempting to decode the Jwt:`, que aparece em todas menos na de `alg: none`:
+
+| Cenário | Status | `error_description` |
+|---|---|---|
+| Sem cabeçalho `Authorization` | 401 | (nenhum: `WWW-Authenticate: Bearer resource_metadata="..."`) |
+| Expirou há 10 minutos | 401 | `… Jwt expired at 2026-10-05T09:26:07Z` |
+| Expirou há 10 segundos | **200** | (dentro da tolerância de 30 s) |
+| `nbf` daqui a 10 minutos | 401 | `… Jwt used before 2026-10-05T09:46:07Z` |
+| `aud` = `cartoes-api` | 401 | `… The aud claim is not valid` |
+| `iss` de outro realm | 401 | `… The iss claim is not valid` |
+| Corpo alterado depois de assinado | 401 | `… Signed JWT rejected: Invalid signature` |
+| Outra chave, mesmo `kid` | 401 | `… Signed JWT rejected: Invalid signature` |
+| `kid` que o JWKS não tem | 401 | `… Signed JWT rejected: Another algorithm expected, or no matching key(s) found` |
+| `alg: none` | 401 | `Unsupported algorithm of none` |
+| HS256 com a chave pública como segredo | 401 | `… Signed JWT rejected: Another algorithm expected, or no matching key(s) found` |
+| `typ: at+jwt` | 401 | `… the given typ value needs to be one of [JWT]` |
+
+E o cabeçalho completo de um deles, para você reconhecer o formato:
+
+```text
+WWW-Authenticate: Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: The aud claim is not valid", error_uri="https://tools.ietf.org/html/rfc6750#section-3.1", resource_metadata="http://localhost/.well-known/oauth-protected-resource"
+```
+
+**O que acabou de acontecer, teste a teste.**
+
+- **Corpo alterado.** O teste decodifica o corpo, troca `extrato:ler` por `extrato:ler pix:enviar`, codifica de novo e cola com o cabeçalho e a assinatura originais. É o ataque mais intuitivo, e o mais fácil de barrar: a assinatura cobria o corpo antigo.
+- **Outra chave com o mesmo `kid`.** O atacante gera um par de chaves próprio e escreve no cabeçalho o `kid` da chave legítima. O decoder pega no JWKS a chave daquele `kid`, a **verdadeira**, e a assinatura não confere. O `kid` só escolhe; quem decide se a chave é confiável é o JWKS.
+- **`alg: none`.** O token é montado com `PlainJWT` da Nimbus: cabeçalho `{"alg":"none"}`, corpo perfeito, assinatura vazia. Repare que a mensagem não tem o prefixo "An error occurred while attempting to decode": o `NimbusJwtDecoder` recusa antes mesmo de tentar processar, ao perceber que não há assinatura.
+- **Confusão HS256/RS256.** O teste faz exatamente o que um atacante faria: pega a chave pública (que está no JWKS, ao alcance de qualquer um), usa os bytes dela como segredo HMAC e assina com `MACSigner`. Como o decoder só aceita RS256, não existe chave "HS256" para o token, e ele é recusado sem nem calcular o HMAC. A linha `.jwsAlgorithm(SignatureAlgorithm.RS256)` repete o padrão do `withJwkSetUri`, mas documenta a decisão e impede que alguém troque o padrão sem perceber.
+- **Tolerância.** O token que expirou há 10 segundos passa, porque a tolerância é de 30. O que expirou há 10 minutos não passa. Os dois testes juntos fixam o comportamento nas duas pontas.
+- **`typ: at+jwt`.** Esse não é um ataque: é um token perfeitamente legítimo no perfil da RFC 9068 (*JWT Profile for OAuth 2.0 Access Tokens*), que recomenda esse `typ`. O teste está aqui porque **o padrão do Spring o recusa**, e você precisa saber disso antes de integrar com um provedor que o usa.
+
+### Passo 6: rotação de chaves sem derrubar ninguém
+
+**O que vamos fazer e por quê.** Chaves de assinatura precisam ser trocadas: por política (a cada 3, 6 ou 12 meses), por suspeita de vazamento ou porque o algoritmo mudou. Se a troca exigisse reconfigurar e reiniciar todas as APIs, ninguém a faria. O JWKS existe para isso: o emissor publica mais de uma chave, e o `kid` de cada token diz qual usar. Vamos provar, contando as buscas ao JWKS, como o decoder do Spring se comporta numa rotação.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/RotacaoDeChavesTest.java" semImports destacar="31, 34-35, 39-40, 47-49" />
+
+```bash
+mvn test -Dtest=RotacaoDeChavesTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.jwt.RotacaoDeChavesTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.837 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Duas requisições com o token de setembro, **uma** busca ao JWKS. O decoder guarda o JWK Set em cache (por padrão, 5 minutos, segundo a documentação do Spring Security) e não consulta o emissor a cada token. É isso que torna a validação local barata.
+- Na fase 1, o autorizador publica a chave de outubro ao lado da de setembro e passa a assinar com ela. O primeiro token de outubro tem um `kid` que o cache não conhece. O decoder, em vez de recusar, **busca o JWKS de novo**, encontra a chave e aceita: duas buscas no total. Os tokens de setembro emitidos antes continuam válidos, porque a chave antiga ainda está no JWKS.
+- Na fase 2, a chave de setembro sai do JWKS. Mas o decoder já a tem em cache, e um `kid` conhecido não provoca nova busca: o token de setembro **continua sendo aceito**. Retirar uma chave do JWKS não revoga os tokens assinados com ela na hora; o efeito só aparece quando o cache de cada API expirar.
+
+<Figura legenda="Rotação em três fases: publicar antes de usar, usar antes de retirar, retirar só depois que o último token antigo venceu e os caches se renovaram">
+<svg viewBox="0 0 680 300" width="680" role="img" aria-labelledby="jwt-rotacao-titulo jwt-rotacao-desc">
+  <title id="jwt-rotacao-titulo">Linha do tempo de uma rotação de chaves pelo JWKS</title>
+  <desc id="jwt-rotacao-desc">Uma linha do tempo com quatro marcos. T0: a chave B é publicada no JWKS ao lado da A; tokens continuam assinados com A. T1, pelo menos um TTL de cache depois: o emissor passa a assinar com B; o JWKS tem A e B. T2, pelo menos a validade máxima de um token depois de T1: A sai do JWKS. T3, mais um TTL de cache: nenhuma API tem mais A em cache. Barras mostram que a chave A fica no JWKS de antes de T0 até T2 e a chave B de T0 em diante. Abaixo, a regra: retirar A cedo demais derruba tokens ainda válidos; atrasar a retirada só custa uma chave a mais no JWKS.</desc>
+  <defs><marker id="mk-jwt-rotacao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <path d="M20 150 L660 150" class="d-line" marker-end="url(#mk-jwt-rotacao)"/>
+  <line x1="110" y1="140" x2="110" y2="160" class="d-line"/>
+  <line x1="270" y1="140" x2="270" y2="160" class="d-line"/>
+  <line x1="430" y1="140" x2="430" y2="160" class="d-line"/>
+  <line x1="590" y1="140" x2="590" y2="160" class="d-line"/>
+  <text x="110" y="182" text-anchor="middle" class="d-title">T0</text>
+  <text x="270" y="182" text-anchor="middle" class="d-title">T1</text>
+  <text x="430" y="182" text-anchor="middle" class="d-title">T2</text>
+  <text x="590" y="182" text-anchor="middle" class="d-title">T3</text>
+  <text x="110" y="204" text-anchor="middle" class="d-label">publica B</text>
+  <text x="270" y="204" text-anchor="middle" class="d-label">assina com B</text>
+  <text x="430" y="204" text-anchor="middle" class="d-label">retira A</text>
+  <text x="590" y="204" text-anchor="middle" class="d-label">A fora dos caches</text>
+  <text x="190" y="134" text-anchor="middle" class="d-label">≥ TTL do cache</text>
+  <text x="350" y="134" text-anchor="middle" class="d-label">≥ validade do token</text>
+  <text x="510" y="134" text-anchor="middle" class="d-label">≥ TTL do cache</text>
+  <rect x="20" y="30" width="410" height="34" rx="6" class="d-info"/>
+  <text x="225" y="52" text-anchor="middle" class="d-text">chave A no JWKS</text>
+  <rect x="110" y="74" width="550" height="34" rx="6" class="d-ok"/>
+  <text x="385" y="96" text-anchor="middle" class="d-text">chave B no JWKS</text>
+  <rect x="20" y="226" width="640" height="62" rx="8" class="d-box"/>
+  <text x="340" y="252" text-anchor="middle" class="d-text">Retirar A cedo demais recusa tokens ainda válidos.</text>
+  <text x="340" y="274" text-anchor="middle" class="d-text">Atrasar a retirada só custa uma chave a mais no JWKS.</text>
+</svg>
+</Figura>
+
+O decoder do Spring busca o JWKS de novo ao ver um `kid` desconhecido, então, para APIs Spring, assinar com B logo depois de publicá-la funcionaria. O procedimento seguro espera mesmo assim um TTL de cache entre T0 e T1, porque nem todo consumidor dos seus tokens é uma API Spring e alguns caches limitam as buscas (veja a seção de decisões). Os provedores de identidade fazem essa coreografia sozinhos; o que você garante é que suas APIs leiam o JWKS, e não uma chave fixa copiada na configuração.
+
+### Passo 7: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.AutoridadesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.JwksComLimiteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.RevogacaoPorJtiTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.RotacaoDeChavesTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.TokensRejeitadosTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.jwt.TokenValidoTest
+[INFO] Tests run: 24, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Vinte e quatro testes, nenhum mock de segurança, nenhuma rede externa: chaves geradas na hora, um JWKS servido por HTTP de verdade e o filtro real do Spring Security. (`JwksComLimiteTest` aparece na seção de decisões; `RevogacaoPorJtiTest` é a solução do checkpoint, então não o abra ainda.)
+
+## Token opaco e introspecção: quando preferir
+
+Nem todo access token precisa ser um JWT. Um **token opaco** é uma string aleatória sem conteúdo, como `kQ3t9...`. A API não consegue validá-lo sozinha: precisa perguntar ao servidor de autorização "este token vale? de quem é? com quais escopos?". Essa pergunta é a **introspecção** (RFC 7662), um `POST` autenticado ao endpoint de introspecção, que responde um JSON com `active`, `sub`, `scope`, `exp` e afins.
+
+No Spring Security, trocar JWT por opaco é trocar `.jwt(...)` por `.opaqueToken(...)` e configurar o endpoint:
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        opaquetoken:
+          introspection-uri: https://auth.banco.test/realms/clientes/protocol/openid-connect/token/introspect
+          client-id: extrato-api
+          client-secret: ${EXTRATO_INTROSPECCAO_SEGREDO}
+```
+
+Por baixo, o Spring usa um `SpringOpaqueTokenIntrospector` (que também pode ser montado à mão com `SpringOpaqueTokenIntrospector.withIntrospectionUri(...).clientId(...).clientSecret(...).build()`).
+
+| | JWT validado localmente | Token opaco com introspecção |
+|---|---|---|
+| Custo por requisição | Uma verificação de assinatura (microssegundos) | Uma chamada HTTP ao servidor de autorização (milissegundos), a menos que haja cache |
+| Revogação | Só quando o token vence, ou com estado extra (denylist) | **Imediata**: o servidor responde `active: false` |
+| Dependência em tempo de execução | Só do JWKS, em cache | O servidor de autorização precisa estar de pé e rápido para **cada** requisição |
+| Conteúdo exposto | Claims legíveis por quem tiver o token | Nada: o token não carrega dado |
+| Tamanho no cabeçalho | Centenas de bytes a alguns KB | Dezenas de bytes |
+
+Prefira opaco quando a **revogação imediata** é requisito (operações de alto risco, contas corporativas com desligamento na hora), quando o token vai para clientes em que você não quer expor nenhum claim, ou quando há poucas APIs com volume moderado. Prefira JWT quando há muitas APIs, volume alto e tolerância a uma janela de alguns minutos até a revogação fazer efeito. Um meio-termo comum: introspecção com cache curto (30 a 60 segundos) por token, que corta a maior parte das chamadas e mantém a revogação quase imediata.
+
+## O ciclo de vida: emitir, renovar, revogar
+
+Validar bem é metade do trabalho. A outra metade é decidir **quanto tempo** um token vive e **como ele morre**.
+
+### Access token curto
+
+O access token é validado localmente e vale até o `exp`. Se vazar (num log, numa extensão de navegador, num proxy mal configurado), o atacante o usa até lá. Por isso ele dura **pouco**: entre 5 e 15 minutos é o usual. Validade de horas ou dias transforma qualquer vazamento num incidente longo, e "token que não expira" é uma das falhas que mais aparecem em auditoria.
+
+### Refresh token rotativo, com detecção de reuso
+
+Ninguém quer fazer login a cada 10 minutos. O **refresh token** resolve: o cliente o guarda e, quando o access token vence, troca o refresh por um par novo junto ao servidor de autorização. Duas propriedades o tornam seguro:
+
+1. **Ele é estado no servidor.** O servidor de autorização sabe quais refresh tokens estão ativos e pode revogá-los: no logout, na troca de senha, quando a pessoa encerra a sessão de um dispositivo roubado.
+2. **Ele é rotativo.** Cada uso devolve um refresh token **novo** e invalida o anterior. O servidor guarda a "família" (a cadeia de refresh tokens daquela sessão). Se um refresh token **já usado** aparece de novo, só há duas explicações: o cliente tem um bug, ou alguém copiou o token. Nos dois casos, a resposta segura é a mesma: **revogar a família inteira** e exigir novo login. Essa é a detecção de reuso recomendada pela RFC 9700 (*OAuth 2.0 Security Best Current Practice*) para clientes públicos (apps e SPAs, que não guardam segredo).
+
+O refresh token **nunca vai para a API**; só para o servidor de autorização. E a API nunca deve aceitar um refresh token como se fosse access token, o que o `aud` e o `typ` ajudam a garantir quando o refresh também é um JWT.
+
+### Revogação antes do `exp`
+
+Às vezes 10 minutos é tempo demais: a conta foi invadida, o funcionário foi desligado, o celular foi roubado. As opções, da mais simples à mais cara:
+
+| Estratégia | Como funciona | Custo |
+|---|---|---|
+| **Esperar o `exp`** | Revoga o refresh token; o access morre sozinho em minutos | Zero, mas há uma janela |
+| **Denylist por `jti`** | Guarda os `jti` revogados (num Redis, com TTL igual ao tempo que falta para o `exp`) e um validador recusa quem estiver na lista | Uma consulta rápida por requisição; a lista é pequena, porque cada entrada se apaga quando o token venceria de qualquer forma |
+| **Versão de sessão** | O token carrega uma claim de versão (por exemplo, `"sv": 7`); o servidor guarda a versão atual por usuário e recusa tokens com versão menor. "Sair de todos os dispositivos" é incrementar o número | Uma consulta por requisição (por usuário, cacheável); revoga **todos** os tokens de uma pessoa de uma vez |
+| **Introspecção** | Usar token opaco, ou introspecção mesmo com JWT, para operações críticas | Uma chamada ao servidor de autorização |
+
+As três últimas trazem o estado de volta: **revogação imediata exige consultar algo**. A decisão madura é aplicar o estado só onde compensa (introspecção nas rotas de Pix, validação local no resto).
+
+### Logout
+
+Com tokens, "sair" tem três partes: **apagar** os tokens no cliente, **revogar** o refresh token no servidor de autorização (RFC 7009) e encerrar a sessão no provedor de identidade, senão o próximo "entrar" volta logado sem pedir senha. O access token já emitido vale até o `exp`, salvo as estratégias acima.
+
+## Onde o cliente guarda o token
+
+A API não escolhe onde o cliente guarda o token, mas o time de backend participa dessa decisão, porque ela muda o desenho da API.
+
+| Onde | Risco principal | Comentário |
+|---|---|---|
+| `localStorage` / `sessionStorage` | **XSS**: qualquer script na página lê e exfiltra o token | Simples, e por isso comum. Um único XSS (inclusive numa dependência de front-end) entrega o token inteiro |
+| Memória do JavaScript | XSS ainda consegue **usar** o token enquanto a página está aberta, mas não o leva embora com facilidade | Perde o token a cada recarga; costuma vir junto com refresh por cookie |
+| Cookie `HttpOnly; Secure; SameSite` | Script não lê o cookie; o risco passa a ser **CSRF** | O navegador envia o cookie sozinho, então a API precisa de proteção contra CSRF e de CORS bem configurado |
+| **BFF** (*Backend for Frontend*) | Os tokens nunca chegam ao navegador | Um backend do próprio front faz o fluxo OAuth, guarda os tokens no servidor e conversa com o navegador por um cookie de sessão `HttpOnly`. É o padrão recomendado para SPAs pelo rascunho *OAuth 2.0 for Browser-Based Applications* da IETF |
+
+Em apps nativos, o lugar é o armazenamento seguro da plataforma (Keychain, Keystore). Com BFF, quem chama a sua API é o BFF, com o token no cabeçalho: a API continua um Resource Server *stateless* como o desta aula, e o cookie e o CSRF ficam no BFF.
+
+## O que não colocar no JWT
+
+O corpo é legível, o token circula por proxies, logs, ferramentas de observabilidade e às vezes pelo navegador. E ele fica "congelado" até o `exp`: o que estava certo na emissão pode estar errado cinco minutos depois.
+
+- **Dados pessoais e sensíveis**: CPF, data de nascimento, endereço, telefone, saldo, limite de crédito. Além do risco de vazamento, isso coloca o token sob a LGPD como dado pessoal trafegando sem necessidade.
+- **Segredos de qualquer tipo**: senhas, chaves de API, códigos de verificação.
+- **Identificadores que mudam ou que revelam a pessoa**: e-mail como `sub`. Use um identificador opaco e estável.
+- **Estado que muda com frequência**: saldo, status do pedido, "plano atual" quando a mudança precisa ter efeito imediato. A API deve consultar a fonte da verdade.
+- **Listas grandes de permissões**: centenas de permissões granulares inflam o token (e o cabeçalho de cada requisição), e muitos servidores e proxies recusam cabeçalhos acima de 8 a 16 KB. Prefira escopos e papéis de grão grosso no token e resolva o grão fino na API.
+- **Decisões de autorização sobre objetos**: "pode ver as contas 1001, 1002 e 1003" não cabe no token. Isso é verificado na API, contra o banco, a cada requisição (aula 11.04).
+
+## E o OAuth 2.0, o Authorization Code e o OpenID Connect?
+
+Esta aula olhou só para a ponta da **API**: o token chega, a API valida. A outra ponta, como o token nasce, é assunto da [aula 11.07, OAuth 2.0 e OpenID Connect](../../11-seguranca/07-oauth2-e-openid-connect/): os papéis do protocolo, o fluxo *Authorization Code* com PKCE para usuários, o *Client Credentials* entre serviços, o ID token do OpenID Connect e um Keycloak de verdade emitindo os tokens que um Resource Server como este valida. Por enquanto, basta saber que, nessa história, a sua API é o **Resource Server** e que ela nunca vê a senha do usuário: quem autentica a pessoa é o servidor de autorização.
+
+## Quando dá errado
+
+As mensagens abaixo são reais, geradas ao rodar os testes desta aula ou ao quebrá-los de propósito.
+
+### "Jwt expired at" logo depois do login
+
+```text
+WWW-Authenticate: Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: Jwt expired at 2026-10-05T09:26:07Z", ...
+```
+
+**Como ler:** o `exp` do token já passou, mesmo somada a tolerância. Se acontece com um token **recém-emitido**, o problema quase sempre é relógio: o servidor da API está adiantado em relação ao emissor, ou um contêiner sem NTP derivou minutos. Compare o horário de `exp` da mensagem com o horário do servidor no mesmo instante. **Como corrigir:** sincronize os relógios (NTP); não "resolva" aumentando a tolerância para minutos, porque isso estende a vida de todos os tokens vencidos. Se acontece só depois de um tempo, o cliente não está renovando o token antes de ele vencer.
+
+### "The aud claim is not valid" depois de integrar com o provedor
+
+```text
+WWW-Authenticate: Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: The aud claim is not valid", ...
+```
+
+**Como ler:** a assinatura e o emissor estão certos, mas o token não foi emitido para esta API. Decodifique o token e olhe o `aud`: muitos provedores colocam por padrão o `client_id` do app, ou um valor genérico como `account` (Keycloak), e não o identificador da API. **Como corrigir:** no servidor de autorização, configure a audiência (no Keycloak, um *audience mapper* no escopo do cliente; no Auth0 e no Entra ID, o identificador da API registrada). **Não** remova o validador de audiência para "fazer funcionar": é exatamente o incidente do início da aula.
+
+### "The iss claim is not valid" com tudo aparentemente igual
+
+**Como ler:** o `iss` é comparado por igualdade exata: `.../realms/clientes` e `.../realms/clientes/` são emissores **diferentes**. Também acontece quando o provedor monta o `iss` a partir do endereço pelo qual foi chamado (URL interna × pública). **Como corrigir:** configure o valor exato que aparece nos tokens e fixe o *hostname* do provedor.
+
+### "the given typ value needs to be one of [JWT]"
+
+```text
+WWW-Authenticate: Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: the given typ value needs to be one of [JWT]", ...
+```
+
+**Como ler:** o provedor emite tokens com `typ: at+jwt` (o perfil da RFC 9068), e o validador padrão do Spring Security 7 só aceita `JWT` ou ausente. **Como corrigir:** se o provedor segue a RFC 9068, use o validador do perfil, que exige os claims do perfil e aceita esse tipo: `JwtValidators.createAtJwtValidator().audience("extrato-api").issuer(emissor).clientId(...).build()`. Para só aceitar o tipo, passe um `new JwtTypeValidator("JWT", "at+jwt")` na lista de `createDefaultWithValidators`, que então o usa no lugar do padrão.
+
+### "Another algorithm expected, or no matching key(s) found"
+
+```text
+WWW-Authenticate: Bearer error="invalid_token", error_description="An error occurred while attempting to decode the Jwt: Signed JWT rejected: Another algorithm expected, or no matching key(s) found", ...
+```
+
+**Como ler:** a mensagem junta dois problemas: o `alg` do token não está na lista permitida (o emissor usa ES256 e você fixou RS256, ou é um ataque HS256), ou o `kid` não existe no JWKS. **Como corrigir:** decodifique o cabeçalho e compare `alg` e `kid` com o JWKS (`curl` no `jwk-set-uri`). Se o emissor usa outro algoritmo, acrescente-o com `jwsAlgorithms(...)`; nunca aceite o que vier no token.
+
+### 401 sem `error` nenhum
+
+```text
+WWW-Authenticate: Bearer resource_metadata="http://localhost/.well-known/oauth-protected-resource"
+```
+
+**Como ler:** a requisição chegou **sem** token. O Spring não diz `invalid_token` porque não há token para estar inválido. Se o cliente jura que mandou, confira o nome e o formato do cabeçalho (`Authorization: Bearer <token>`, com espaço, sem aspas) e se algum proxy ou gateway no caminho remove o `Authorization`.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Valida a assinatura e acha que basta" depois="Algoritmo fixo e todos os claims validados">
+
+```java
+@Bean
+JwtDecoder jwtDecoder(RSAPublicKey chave) {
+    NimbusJwtDecoder decoder = NimbusJwtDecoder.withPublicKey(chave).build();
+    // "para funcionar com o token do parceiro"
+    decoder.setJwtValidator(token -> OAuth2TokenValidatorResult.success());
+    return decoder;
+}
+```
+
+```java
+@Bean
+JwtDecoder jwtDecoder(PropriedadesDoToken propriedades) {
+    NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(propriedades.jwkSetUri())
+            .jwsAlgorithm(SignatureAlgorithm.RS256)
+            .build();
+    decoder.setJwtValidator(JwtValidators.createDefaultWithValidators(
+            new JwtTimestampValidator(propriedades.toleranciaDoRelogio()),
+            new JwtIssuerValidator(propriedades.emissor()),
+            new JwtAudienceValidator(propriedades.audiencia())));
+    return decoder;
+}
+```
+
+</Comparar>
+
+O código da esquerda é real em mais projetos do que se imagina: alguém tinha um token que não passava, desligou a validação "temporariamente", e a assinatura passou a ser a única defesa. Tokens vencidos há meses, de outros sistemas, para outras APIs: tudo passa. E a chave pública fixa obriga um deploy a cada rotação.
+
+As regras de bolso:
+
+- **Nunca escolha o algoritmo pelo cabeçalho.** Fixe-o no decoder. Se você escreve uma biblioteca própria de JWT (não escreva), essa é a primeira linha.
+- **Sempre valide `iss` e `aud`.** Os testes do próprio sistema nunca pegam a falta deles, porque os tokens de teste são "certos". Escreva os testes de recusa como os do passo 5.
+- **`setJwtValidator` substitui o padrão.** Monte a lista com `createDefaultWithValidators`.
+- **HS256 só com um serviço.** Se o segredo vive em mais de um lugar, cada lugar pode emitir tokens. E o segredo precisa ter pelo menos 256 bits aleatórios, não uma frase.
+- **Não leia o `sub` de outro lugar.** O id do usuário vem do token validado (`authentication.getName()`), nunca de um parâmetro, cabeçalho ou corpo enviado pelo cliente.
+- **Não registre o token em log.** Nem em log de depuração, nem em mensagem de exceção, nem no rastreamento distribuído. Registre o `jti` e o `sub`, que permitem investigar sem permitir reutilizar.
+- **Não faça "decode sem verificar" para decidir algo.** Ler o corpo com Base64 para pegar o `sub` antes de validar é aceitar dados de qualquer um. A única leitura confiável é a que sai do `JwtDecoder`.
+- **JWT não é sessão de aplicação web.** Para uma aplicação web tradicional, renderizada no servidor, com um único backend, a sessão com cookie (aula 11.02) é mais simples, revogável na hora e sem nenhuma das armadilhas desta lista. JWT compensa quando há várias APIs, clientes diversos (mobile, parceiros, outros serviços) ou um provedor de identidade central.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Em produção, as perguntas deixam de ser "como valido?" e passam a ser "quem pode emitir, quanto custa validar, o que acontece quando algo falha e como explico a escolha para o time".
+
+### Quem emite: provedor de identidade ou a própria API?
+
+Emitir tokens parece simples (o `NimbusJwtEncoder` faz em três linhas), mas o servidor de autorização é a peça mais sensível do sistema: senhas, MFA, bloqueio de força bruta, sessões, refresh tokens, revogação, rotação de chaves, auditoria. Escrever isso dentro da API de negócio é assumir um produto de segurança inteiro. Para quase todos os times, a recomendação é **delegar a emissão** a um provedor (Keycloak hospedado pela empresa, um serviço gerenciado ou o Spring Authorization Server quando é preciso customizar muito) e manter as APIs como Resource Servers puros. A exceção razoável é um serviço único, sem terceiros, que faz o próprio login e emite tokens HS256 de vida curta, como no [exercício 11.02](../../../exercicios/11-seguranca/02-api-com-jwt/); mesmo aí, desenhe a API para que trocar o emissor depois seja só configuração.
+
+### Onde validar: gateway ou cada serviço?
+
+Validar **só** no API gateway e deixar os serviços internos confiarem em qualquer requisição "de dentro" significa que um serviço comprometido ou um endpoint exposto por engano abre todo o resto. O modelo de **confiança zero** pede que cada serviço valide o token que recebe; o custo é pequeno (microssegundos, com a chave em cache), e o gateway continua útil para limitar requisições e recusar cedo o que é obviamente inválido. Quando um serviço chama outro em nome do usuário, o correto é obter um token com a audiência do serviço chamado (*token exchange*, RFC 8693), e não repassar o mesmo token, o que obrigaria cada API a aceitar uma audiência que não é a dela.
+
+### O JWKS também é superfície de ataque
+
+O passo 6 mostrou que um `kid` desconhecido faz o decoder buscar o JWKS de novo. Isso é ótimo para a rotação e péssimo sob ataque: cada token forjado com um `kid` inventado vira uma chamada HTTP da sua API ao servidor de autorização. Um teste desta aula mede isso:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/JwksComLimiteTest.java" semImports destacar="22, 27-34, 39" />
+
+Com o decoder padrão, um token válido e cinco forjados geraram **seis** buscas ao JWKS. Com um `JWKSource` montado pelo `JWKSourceBuilder` da Nimbus, com cache e limite de frequência (no máximo uma busca a cada 30 segundos), as mesmas requisições geram no máximo duas. Num ataque com milhares de requisições por segundo, a diferença é entre a sua API derrubar o servidor de autorização da empresa e não derrubar. Os trade-offs da proteção: com limite de frequência, uma rotação legítima pode levar até o intervalo do limite para ser percebida, o que reforça o procedimento da figura de rotação (publicar a chave nova bem antes de usá-la). O `JWKSourceBuilder` oferece ainda `outageTolerant(...)`, que continua usando o último JWKS conhecido se o emissor cair, e `retrying(...)`. Outra proteção complementar é limitar requisições com 401 por origem no gateway (aula 11.06).
+
+### Disponibilidade: o que acontece quando o emissor cai?
+
+Com JWKS em cache, a API continua validando tokens com o servidor de autorização fora do ar, mas os clientes não renovam tokens nem fazem login: em 5 a 15 minutos, todos recebem 401. O servidor de autorização é, portanto, uma dependência crítica de **disponibilidade**, com SLO pelo menos tão bom quanto o das APIs; com introspecção, cada requisição depende dele. Instrumente a taxa de 401 por `error_description`: um salto de `Jwt expired` em todas as APIs ao mesmo tempo indica falha na renovação, não ataque.
+
+### Gestão de chaves
+
+A chave privada de assinatura é o ativo mais valioso do sistema: com ela, qualquer um vira qualquer usuário. Em produção, ela vive num cofre (HSM ou serviço de KMS da nuvem), idealmente sem nunca sair dele: o servidor de autorização pede a assinatura ao KMS. A rotação tem cadência definida (trimestral ou semestral é comum) e um procedimento de **rotação de emergência** ensaiado: se a chave vazar, você precisa publicar uma nova e **retirar a antiga na hora**, aceitando derrubar todas as sessões, e precisa saber quanto tempo os caches das APIs levam para perceber.
+
+### Mensagens de erro: quanto contar?
+
+O `error_description` padrão diz exatamente o que falhou ("The aud claim is not valid"). Isso ajuda quem integra e é previsto pela RFC 6750, mas também ensina a um atacante qual verificação contornar. Em APIs internas e de parceiros, o detalhe costuma valer a pena; em APIs públicas, alguns times trocam o `AuthenticationEntryPoint` por um que devolve só `invalid_token` e registram o detalhe no log, com o `jti`.
+
+### Vários emissores e multi-tenant
+
+Uma API B2B pode aceitar tokens de vários provedores ou realms. O `JwtIssuerAuthenticationManagerResolver` lê o `iss` e escolhe o decoder daquele emissor dentre uma lista **confiável** que você configura. A armadilha é deixar essa lista crescer sem controle: um emissor que o atacante consegue cadastrar emite tokens que a sua API aceita.
+
+### Tokens com prova de posse
+
+Todo o modelo desta aula é *Bearer*: quem tem o token, usa. Para alto risco (Open Finance, por exemplo), existem tokens **vinculados ao cliente**: mTLS (RFC 8705) e **DPoP** (RFC 9449), em que o cliente prova a posse de uma chave privada a cada requisição. O Spring Security 7 já traz suporte a ambos no Resource Server. Não é o ponto de partida de um sistema novo, mas é a resposta para "e se o token vazar mesmo assim?".
+
+### Como justificar para o time
+
+Num ADR, cabe em um parágrafo: "A API de extrato é um Resource Server. JWT RS256 do Keycloak corporativo, JWKS em cache com limite de frequência; validamos algoritmo, assinatura, `typ`, tempo com 30 s de tolerância, `iss` e `aud`, com um teste de recusa para cada um. Access token de 10 minutos, refresh rotativo com detecção de reuso, revogação imediata por versão de sessão só nas rotas de Pix. Trocaríamos para token opaco se a revogação imediata virar requisito em todas as rotas." Assim o time sabe o que foi decidido, por quê e o que faria a decisão mudar.
+
+<Callout tipo="entrevista">
+Perguntas que aparecem para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Como você valida um JWT?"** Não pare na assinatura. Algoritmo fixo na configuração (cite `alg: none` e a confusão HS256/RS256), chave escolhida pelo `kid` dentro do JWKS confiável, `exp` e `nbf` com tolerância pequena, `iss` exato e `aud` contendo a sua API. Bônus: `typ` e o perfil `at+jwt` da RFC 9068.
+- **"Como invalidar um JWT antes de expirar?"** Validade curta e refresh token revogável como base; denylist por `jti` com TTL, versão de sessão por usuário ou introspecção quando a revogação imediata é requisito, sabendo que todas trazem o estado de volta. Mostre que entende o trade-off, não que existe uma bala de prata.
+- **"HS256 ou RS256?"** HS256 quando um único serviço emite e valida; assimétrico (RS256 ou ES256) quando há mais de um validador, porque quem tem o segredo HMAC consegue emitir. ES256 para tokens menores.
+- **"Como funciona a rotação de chaves?"** JWKS com várias chaves, `kid` no token, publicar antes de usar e retirar só depois que o último token antigo venceu e os caches renovaram. Cite o risco de buscas ao JWKS provocadas por `kid` inventado.
+- **"JWT ou sessão?"** Sessão para aplicação web com um backend: simples e revogável. JWT para várias APIs, clientes diversos e provedor de identidade central. Para SPA, BFF com cookie `HttpOnly`, e não token no `localStorage`.
+- **"O que você nunca colocaria num JWT?"** Dados pessoais e sensíveis, segredos, estado que muda e listas grandes de permissões. O corpo é legível e fica congelado até o `exp`.
+</Callout>
+
+## Checkpoint: a lista de tokens revogados
+
+Um cliente liga para o atendimento: o celular foi roubado há dez minutos. O refresh token já foi revogado no servidor de autorização, mas o access token do celular ainda vale por alguns minutos, e o banco não quer essa janela nas operações de Pix.
+
+**O desafio:** escreva a classe `ValidadorDeRevogacao`, um `OAuth2TokenValidator<Jwt>` que recebe no construtor um `Predicate<String>` (a consulta à denylist) e:
+
+1. recusa com `invalid_token` e a descrição `The token has been revoked` um token cujo `jti` esteja na lista;
+2. recusa com `invalid_token` e a descrição `The jti claim is required` um token **sem** `jti` (sem identificador, não haveria como revogá-lo);
+3. aceita os demais.
+
+Depois, escreva um teste que monta um `NimbusJwtDecoder.withPublicKey(...)` com `JwtValidators.createDefaultWithValidators(new ValidadorDeRevogacao(revogados::contains))`, sem subir o Spring, e prova os três comportamentos. Para gerar tokens, reaproveite o `AutorizadorDeTeste.emitir(chave, claims)`.
+
+<Dicas>
+<Dica nivel={1}>
+A interface tem um único método: `OAuth2TokenValidatorResult validate(Jwt token)`. O `jti` sai de `token.getId()`.
+</Dica>
+<Dica nivel={2}>
+Para falhar, use `OAuth2TokenValidatorResult.failure(new OAuth2Error(OAuth2ErrorCodes.INVALID_TOKEN, descricao, null))`; para passar, `OAuth2TokenValidatorResult.success()`. No teste, o decoder lança `JwtValidationException`, cuja mensagem contém a descrição.
+</Dica>
+<Dica nivel={3}>
+Para gerar um token sem `jti`, copie os claims válidos e remova o claim: `JwtClaimsSet.from(claimsValidos().build()).claims(c -> c.remove("jti")).build()`.
+</Dica>
+</Dicas>
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/jwt/ValidadorDeRevogacao.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/jwt/RevogacaoPorJtiTest.java" semImports />
+
+**Por que assim.** O validador não sabe onde está a lista: recebe uma função. Em produção, ela consulta um Redis em que cada `jti` revogado é gravado com TTL igual ao tempo que falta para o `exp` daquele token, de modo que a lista se limpa sozinha e nunca cresce além dos tokens ainda válidos. No teste, um `Set` em memória basta. Recusar tokens sem `jti` fecha uma brecha: sem essa regra, um emissor mal configurado (ou um token de outro tipo) passaria pela denylist sem nunca poder ser revogado.
+
+**Por que testar sem Spring.** O comportamento é do decoder e do validador; subir o contexto inteiro só deixaria o teste mais lento. O teste também prova que o validador funciona **junto** com os padrões, porque usa `createDefaultWithValidators`.
+
+**Alternativas.** A versão de sessão (`sv`) revoga todos os tokens de uma pessoa com uma única escrita, em vez de um registro por token, e combina melhor com "sair de todos os dispositivos". A introspecção apenas nas rotas de Pix evita estado próprio, ao custo de uma chamada ao servidor de autorização por operação.
+
+</details>
+
+<Quiz
+  id="11-jwt-resource-server"
+  questoes={[
+    {
+      pergunta: 'A API de extrato confere assinatura, exp e iss. Um parceiro usa um token legítimo, emitido pelo mesmo servidor de autorização para a API de cartões, e consegue ler extratos. Qual verificação faltou?',
+      opcoes: ['O algoritmo', 'O aud: o token não foi emitido para a API de extrato', 'O nbf', 'O jti'],
+      correta: 1,
+      explicacao: 'Assinatura, validade e emissor estavam certos: o token é legítimo. O `aud` diz para quem ele foi emitido; sem o `JwtAudienceValidator`, qualquer token do mesmo emissor serve em qualquer API.',
+    },
+    {
+      pergunta: 'Um atacante assina um token com HS256 usando os bytes da chave pública RSA do emissor como segredo. O que impede a API desta aula de aceitá-lo?',
+      opcoes: ['A chave pública ser secreta', 'O decoder aceitar só RS256 (jwsAlgorithm), então não há chave HMAC para o token', 'O validador de exp', 'O cache do JWKS'],
+      correta: 1,
+      explicacao: 'A chave pública é pública por definição. A defesa é fixar o algoritmo esperado: com RS256 fixo, um token HS256 é recusado com "Another algorithm expected, or no matching key(s) found" sem que o HMAC seja sequer calculado.',
+    },
+    {
+      pergunta: 'Você escreveu `decoder.setJwtValidator(new JwtAudienceValidator("extrato-api"))`. O que acontece com um token vencido há uma hora, com aud correto?',
+      opcoes: ['É recusado: Jwt expired at', 'É aceito: setJwtValidator substituiu os validadores padrão, e o tempo deixou de ser conferido', 'A aplicação não sobe', 'É recusado pelo Nimbus'],
+      correta: 1,
+      explicacao: '`setJwtValidator` troca o validador inteiro. Para acrescentar o de audiência mantendo tempo e typ, use `JwtValidators.createDefaultWithValidators(...)`.',
+    },
+    {
+      pergunta: 'Durante uma rotação, a chave antiga foi retirada do JWKS. Por que tokens assinados com ela ainda são aceitos por alguns minutos?',
+      opcoes: ['Porque o JWT não tem kid', 'Porque cada API guarda o JWK Set em cache e um kid conhecido não provoca nova busca', 'Porque o exp é ignorado', 'Porque a chave pública continua na chave privada'],
+      correta: 1,
+      explicacao: 'O decoder só busca o JWKS de novo quando o cache expira ou aparece um kid desconhecido. Retirar a chave não revoga na hora; em rotação de emergência, considere esse tempo ou reinicie os caches.',
+    },
+    {
+      pergunta: 'Um SPA guarda o access token no localStorage. Qual é o risco principal e a alternativa recomendada?',
+      opcoes: ['CSRF; usar HS256', 'XSS pode ler e levar o token; um BFF guarda os tokens no servidor e usa cookie HttpOnly com o navegador', 'Nenhum, o token é assinado', 'O token expira mais rápido; usar sessionStorage'],
+      correta: 1,
+      explicacao: 'Qualquer script na página lê o localStorage. Com BFF, o token nunca chega ao navegador; o cookie HttpOnly não é legível por script, e o CSRF passa a ser tratado no BFF.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Um JWS é **cabeçalho.corpo.assinatura** em Base64URL: o corpo é **legível**; a assinatura garante integridade e origem. JWE cifra, e raramente é o que você precisa.
+- As claims registradas (`iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`) existem para ser **validadas**: algoritmo fixo, assinatura com a chave do `kid` no JWKS, `typ`, tempo com 30 a 60 s de tolerância, `iss` exato e `aud` desta API.
+- No Spring Security 7: `NimbusJwtDecoder.withJwkSetUri(...).jwsAlgorithm(RS256)`, validadores via `JwtValidators.createDefaultWithValidators(...)` (nunca `setJwtValidator` sozinho), `JwtAuthenticationConverter` para mapear `scope` e `roles`. Erros saem no `WWW-Authenticate` (`invalid_token` 401, `insufficient_scope` 403), com `resource_metadata` da RFC 9728; toda autenticação por token ganha `FACTOR_BEARER`.
+- **HS256** só com um serviço; **RS256/ES256 + JWKS** quando há mais validadores. Rotação: publicar antes de usar, retirar depois do último `exp` e do TTL do cache. `kid` inventado provoca busca ao JWKS: limite a frequência.
+- Token **opaco** com introspecção quando a revogação imediata vale o custo de uma chamada por requisição.
+- Ciclo de vida: access de minutos, refresh rotativo com detecção de reuso, revogação por `jti` ou versão de sessão onde compensar, logout que revoga o refresh e encerra a sessão do provedor. No navegador, BFF com cookie `HttpOnly`.
+- Nada de dado pessoal, segredo, estado mutável ou lista enorme de permissões dentro do token.
+
+## Próximo passo
+
+A API agora sabe **quem** está chamando e com quais escopos e papéis. Mas saber que a requisição veio da cliente `cliente-8f14e45f`, com escopo `extrato:ler`, não responde se ela pode ler **o extrato da conta 1002**. Na [aula 11.04, Autorização, RBAC e BOLA](../../11-seguranca/04-autorizacao-e-bola/), você vai ver por que a autorização no nível do objeto é a falha número 1 das APIs, e como usar o `sub` do token validado para fechá-la.
+
+## Referências
+
+- [RFC 7519 — JSON Web Token (JWT)](https://www.rfc-editor.org/rfc/rfc7519)
+- [RFC 7515 — JSON Web Signature (JWS)](https://www.rfc-editor.org/rfc/rfc7515) e [RFC 7516 — JSON Web Encryption (JWE)](https://www.rfc-editor.org/rfc/rfc7516)
+- [RFC 7517 — JSON Web Key (JWK)](https://www.rfc-editor.org/rfc/rfc7517)
+- [RFC 8725 — JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725)
+- [RFC 9068 — JWT Profile for OAuth 2.0 Access Tokens](https://www.rfc-editor.org/rfc/rfc9068)
+- [RFC 6750 — Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750)
+- [RFC 7662 — OAuth 2.0 Token Introspection](https://www.rfc-editor.org/rfc/rfc7662) e [RFC 7009 — Token Revocation](https://www.rfc-editor.org/rfc/rfc7009)
+- [RFC 9700 — OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700)
+- [RFC 9728 — OAuth 2.0 Protected Resource Metadata](https://www.rfc-editor.org/rfc/rfc9728)
+- [Spring Security — OAuth 2.0 Resource Server: JWT](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html)
+- [Spring Security — OAuth 2.0 Resource Server: Opaque Token](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/opaque-token.html)
+- [Spring Security — Bearer Tokens](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/bearer-tokens.html)
+- [OAuth 2.0 for Browser-Based Applications (IETF, rascunho)](https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/)
+- [Nimbus JOSE + JWT — documentação](https://connect2id.com/products/nimbus-jose-jwt)

@@ -1,0 +1,338 @@
+---
+titulo: "Observabilidade: logs estruturados, métricas, health checks e traces"
+descricao: Os três pilares da observabilidade no Spring Boot 4 — logs em JSON (ECS) com id de correlação e dados pessoais mascarados; métricas com Micrometer (Counter, Timer com histograma, Gauge, DistributionSummary), cardinalidade e Prometheus; Actuator, health indicators e probes de liveness e readiness; tracing com OpenTelemetry; SLI, SLO, RED e alertas por sintoma.
+modulo: 14-devops
+ordem: 5
+duracao: 75
+objetivos:
+  - Emitir logs estruturados em JSON com id de correlação, sem dados pessoais
+  - Publicar métricas de negócio com Micrometer, com tags de baixa cardinalidade, e consultá-las no Prometheus
+  - Configurar o Actuator, um health indicator e as probes de liveness e readiness com os componentes certos
+  - Explicar tracing distribuído (traceId, spanId, traceparent) e definir SLIs, SLOs e alertas por sintoma
+tags: [observabilidade, logs estruturados, ECS, MDC, micrometer, prometheus, actuator, health check, liveness, readiness, opentelemetry, SLO]
+flashcards:
+  - frente: Quais são os três pilares da observabilidade e que pergunta cada um responde?
+    verso: Métricas - ALGO está errado? (números agregados, baratos, bons para alertas). Traces - ONDE está o problema? (o caminho de uma requisição entre serviços). Logs - POR QUE aconteceu? (o detalhe de cada evento).
+  - frente: Por que o MDC precisa ser limpo num finally?
+    verso: O MDC é por thread, e as threads do Tomcat são reaproveitadas num pool. Sem o MDC.remove no finally, a próxima requisição atendida pela mesma thread herda o id de correlação da anterior.
+  - frente: Por que nunca usar o id do cliente como tag de métrica?
+    verso: Cada combinação de valores de tags é uma série temporal separada no Prometheus. Com um milhão de clientes, são milhões de séries - a memória explode e as consultas ficam lentas. Tags devem ter poucos valores possíveis (método, resultado, status).
+  - frente: Por que o Gauge precisa do objeto guardado num campo?
+    verso: O Micrometer guarda só uma referência FRACA ao objeto medido. Se ninguém mais o referencia, o coletor de lixo o remove e o gauge passa a reportar NaN.
+  - frente: Liveness × readiness
+    verso: Liveness - o processo está vivo ou travado? Se falhar, o orquestrador REINICIA o container. Readiness - consigo atender agora? Se falhar, a instância sai do balanceador, sem reiniciar. Dependências externas entram só na readiness.
+  - frente: O que é um SLO?
+    verso: Uma meta interna para um indicador de nível de serviço (SLI), por exemplo 99,9% das requisições de pagamento com sucesso em até 300 ms em 30 dias. O que sobra (0,1%) é o orçamento de erro. O SLA é o contrato com o cliente, com multa, e costuma ser mais frouxo que o SLO.
+  - frente: Como o nome de um Counter do Micrometer aparece no Prometheus?
+    verso: Os pontos viram sublinhados e os contadores ganham o sufixo _total - pagamentos.processados vira pagamentos_processados_total. Um Timer vira pagamentos_autorizacao_seconds, com _count, _sum, _max e, com histograma, _bucket.
+---
+
+Monitorar é saber **se** algo está errado. **Observabilidade** é conseguir descobrir **por quê**, inclusive em problemas que ninguém previu, olhando só para os sinais que o sistema emite. Às 3h da manhã, sem depurador e com dez instâncias rodando, é isso que separa um incidente de 10 minutos de um de 4 horas. Esta aula corresponde aos exercícios 14.01 (logs), 14.02 (métricas) e 14.03 (saúde).
+
+**Pré-requisitos:** Spring Boot e filtros (módulo 8), testes com MockMvc (módulo 10) e a aula de resiliência (módulo 13).
+
+## Intuição: o painel do carro e a oficina
+
+O **painel** do carro mostra números agregados (velocidade, temperatura): são as **métricas**, e a luz de alerta acende quando algo sai do normal. O **GPS** mostra o caminho percorrido: é o **trace**. O **relatório da oficina**, com cada evento detalhado, são os **logs**. Você olha o painel sempre, o trajeto quando algo atrasou, e o relatório para entender a causa.
+
+<Figura legenda="Os três pilares e o que liga um ao outro: o id de correlação (e o traceId) aparece nos logs e nos traces">
+<svg viewBox="0 0 680 250" width="680" role="img" aria-label="Métricas respondem se algo está errado, traces respondem onde, logs respondem por quê; o traceId e o requestId ligam traces e logs">
+  <rect x="10" y="20" width="200" height="120" rx="10" class="d-info"/>
+  <text x="110" y="48" text-anchor="middle" class="d-title">Métricas</text>
+  <text x="110" y="72" text-anchor="middle" class="d-label">ALGO está errado?</text>
+  <text x="110" y="96" text-anchor="middle" class="d-mono">Micrometer</text>
+  <text x="110" y="118" text-anchor="middle" class="d-mono">Prometheus</text>
+  <rect x="240" y="20" width="200" height="120" rx="10" class="d-violet"/>
+  <text x="340" y="48" text-anchor="middle" class="d-title">Traces</text>
+  <text x="340" y="72" text-anchor="middle" class="d-label">ONDE está o problema?</text>
+  <text x="340" y="96" text-anchor="middle" class="d-mono">OpenTelemetry</text>
+  <text x="340" y="118" text-anchor="middle" class="d-mono">traceId, spanId</text>
+  <rect x="470" y="20" width="200" height="120" rx="10" class="d-ok"/>
+  <text x="570" y="48" text-anchor="middle" class="d-title">Logs</text>
+  <text x="570" y="72" text-anchor="middle" class="d-label">POR QUE aconteceu?</text>
+  <text x="570" y="96" text-anchor="middle" class="d-mono">JSON (ECS)</text>
+  <text x="570" y="118" text-anchor="middle" class="d-mono">requestId no MDC</text>
+  <path d="M340 140 V156 H570 V140" class="d-line"/>
+  <text x="455" y="174" text-anchor="middle" class="d-label">mesmo id</text>
+  <text x="10" y="200" class="d-label">Fluxo típico de um incidente: o alerta vem da MÉTRICA (erro subiu),</text>
+  <text x="10" y="222" class="d-label">o TRACE mostra qual serviço atrasou, e o LOG daquela requisição explica a causa.</text>
+</svg>
+</Figura>
+
+## Pilar 1: logs estruturados
+
+Um log em texto livre (`Pedido 42 criado para cliente ana valor 259.90`) é fácil de ler e difícil de consultar: para achar "todos os pedidos acima de R$ 1.000", alguém escreve uma expressão regular frágil. Um log **estruturado** é um objeto JSON por linha, com campos que a ferramenta (Elasticsearch, Loki, CloudWatch) indexa. Desde o Spring Boot 3.4, isso é uma propriedade:
+
+```properties
+# application.properties (NÃO num @PropertySource: o logging é configurado antes de o Spring lê-lo)
+logging.structured.format.console=ecs
+logging.structured.ecs.service.name=trilha-m14
+```
+
+O formato **ECS** (*Elastic Common Schema*) é um dos suportados (há também `logstash` e `gelf`). Uma linha fica assim (formatada em várias linhas e resumida aqui; na saída real, é uma linha só):
+
+```json
+{
+  "@timestamp": "2026-09-29T14:03:11.402Z",
+  "log": { "level": "INFO", "logger": "dev.trilhajava.m14.logs.ServicoDePedidos" },
+  "service": { "name": "trilha-m14" },
+  "message": "pedido criado",
+  "requestId": "gateway-7f3a9c",
+  "pedido": "0f8e6c1a-…",
+  "cpf": "***.***.*47-25"
+}
+```
+
+Repare que, no ECS, o nível sai **aninhado** (`log.level`), e que `requestId`, `pedido` e `cpf` viraram campos. Eles vêm de duas fontes que o Spring Boot inclui automaticamente: o **MDC** e os **pares chave-valor** da API fluente do SLF4J 2:
+
+```java
+log.atInfo()
+        .addKeyValue("pedido", pedido.id())
+        .addKeyValue("valor", valor)
+        .addKeyValue("cpf", Mascaras.cpf(cpf))      // NUNCA o CPF inteiro
+        .log("pedido criado");
+```
+
+### Id de correlação no MDC
+
+O **MDC** (*Mapped Diagnostic Context*) é um mapa **por thread** que o logger anexa a cada linha. Um filtro coloca ali um id por requisição, e **todos** os logs daquela requisição passam a tê-lo, sem passar o id por parâmetro. O `FiltroDeCorrelacao` do exercício 14.01:
+
+```java
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class FiltroDeCorrelacao extends OncePerRequestFilter {
+
+    private static final Pattern VALIDO = Pattern.compile("[A-Za-z0-9._-]{1,64}");
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest requisicao, HttpServletResponse resposta, FilterChain cadeia)
+            throws ServletException, IOException {
+        String recebido = requisicao.getHeader("X-Request-Id");
+        String id = recebido != null && VALIDO.matcher(recebido).matches() ? recebido : UUID.randomUUID().toString();
+        MDC.put("requestId", id);
+        resposta.setHeader("X-Request-Id", id);
+        try {
+            cadeia.doFilter(requisicao, resposta);
+        } finally {
+            MDC.remove("requestId");   // a thread volta ao pool: sem isto, a próxima requisição herda o id
+        }
+    }
+}
+```
+
+Três cuidados: o id recebido de fora é **validado** (um valor com quebra de linha ou aspas poderia forjar linhas de log); ele volta no **header da resposta** e no corpo dos erros (o `ProblemDetail` do `TratadorDeErros` inclui `requestId`), para o cliente informar ao suporte; e o MDC é limpo no **`finally`**.
+
+<Callout tipo="atencao" titulo="Dado pessoal não vai para o log">
+CPF, e-mail, telefone, número de cartão, senha e token não aparecem inteiros em log, nem em mensagens de exceção que serão logadas. Log é copiado para vários sistemas, guardado por meses e lido por muita gente: pela LGPD, é um tratamento de dado pessoal como qualquer outro. Mascare (`***.***.*47-25`) ou registre só um identificador interno.
+</Callout>
+
+## Pilar 2: métricas com Micrometer
+
+O **Micrometer** é a fachada de métricas do Spring (como o SLF4J é para logs): você instrumenta uma vez, e um *registry* exporta para Prometheus, Datadog, CloudWatch etc. Com o Actuator, o Spring Boot já publica métricas de JVM, HTTP (`http.server.requests`), pool de conexões e outras. As de **negócio** são com você:
+
+| Tipo | Mede | No exercício 14.02 |
+|---|---|---|
+| `Counter` | quantas vezes algo aconteceu (só sobe) | `pagamentos.processados`, por método e resultado |
+| `Timer` | quanto tempo leva, e quantas vezes | `pagamentos.autorizacao` |
+| `Gauge` | um valor instantâneo, que sobe e desce | `pagamentos.em.andamento` |
+| `DistributionSummary` | a distribuição de um valor que não é tempo | `pagamentos.valor`, em reais |
+
+```java
+public ServicoDePagamentos(Autorizador autorizador, MeterRegistry metricas) {
+    this.autorizador = autorizador;
+    this.metricas = metricas;
+    // o registry guarda uma referência FRACA: mantenha o objeto num campo, senão o gauge vira NaN
+    this.emAndamento = metricas.gauge("pagamentos.em.andamento", new AtomicInteger());
+}
+
+public Resultado processar(Pagamento pagamento) {
+    String metodo = pagamento.metodo().name().toLowerCase(Locale.ROOT);
+    Timer.Sample cronometro = Timer.start(metricas);
+    emAndamento.incrementAndGet();
+    String resultado = "erro";                       // se o autorizador lançar exceção, conta como erro
+    try {
+        boolean aprovado = autorizador.autorizar(pagamento);
+        resultado = aprovado ? "aprovado" : "recusado";
+        if (aprovado) valores(metodo).record(pagamento.valor().doubleValue());
+        return aprovado ? Resultado.APROVADO : Resultado.RECUSADO;
+    } finally {
+        emAndamento.decrementAndGet();
+        cronometro.stop(Timer.builder("pagamentos.autorizacao")
+                .tag("metodo", metodo).tag("resultado", resultado)
+                .publishPercentileHistogram()        // buckets: p95/p99 calculados no Prometheus
+                .register(metricas));
+        Counter.builder("pagamentos.processados")
+                .tag("metodo", metodo).tag("resultado", resultado)
+                .register(metricas).increment();
+    }
+}
+```
+
+`register` devolve o medidor já existente quando nome e tags coincidem, então chamá-lo a cada vez é seguro. O `finally` garante que **falhas também são medidas**: um timer que só mede o caminho feliz esconde exatamente o que você precisa ver.
+
+### Cardinalidade: a regra mais importante
+
+Cada **combinação de valores de tags** é uma série temporal separada. `metodo` (3 valores) × `resultado` (3) = 9 séries: ótimo. Uma tag `cliente` com um milhão de valores cria um milhão de séries, e o Prometheus fica sem memória. Tags devem ter **poucos valores conhecidos**; id de cliente, de pedido, e-mail e URL com id vão para **logs e traces**, nunca para métricas.
+
+Tags comuns a todas as métricas, como o nome da aplicação, vêm de configuração:
+
+```properties
+management.endpoints.web.exposure.include=health,prometheus
+management.metrics.tags.aplicacao=trilha-m14
+```
+
+### Prometheus e Grafana
+
+O **Prometheus** busca (*scrape*) periodicamente o `/actuator/prometheus` de cada instância e guarda as séries; o **Grafana** desenha os painéis. Os nomes mudam na exportação: pontos viram `_`, contadores ganham `_total`, timers ganham a unidade:
+
+```text
+pagamentos_processados_total{aplicacao="trilha-m14",metodo="pix",resultado="aprovado"} 1532.0
+pagamentos_autorizacao_seconds_bucket{...,le="0.1"} 1490.0
+pagamentos_em_andamento{aplicacao="trilha-m14"} 3.0
+```
+
+```text
+# taxa de erro dos pagamentos nos últimos 5 minutos
+sum(rate(pagamentos_processados_total{resultado="erro"}[5m])) / sum(rate(pagamentos_processados_total[5m]))
+
+# p95 do tempo de autorização (precisa do histograma)
+histogram_quantile(0.95, sum by (le) (rate(pagamentos_autorizacao_seconds_bucket[5m])))
+```
+
+Com `publishPercentileHistogram()`, o percentil é calculado no servidor, **somando todas as instâncias**. Percentis calculados na aplicação (`publishPercentiles(0.95)`) não podem ser agregados entre instâncias: a média de p95s não é o p95.
+
+## Actuator, saúde e probes
+
+Exponha **só o necessário** na web: `health` e `prometheus`. Endpoints como `env`, `heapdump` e `configprops` revelam configuração e memória, e não devem ficar abertos.
+
+Um **health indicator** diz se uma dependência está bem. No Spring Boot 4, as interfaces ficam no pacote `org.springframework.boot.health.contributor`:
+
+```java
+@Component   // o bean provedorHealthIndicator vira o componente "provedor"
+public class ProvedorHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        try {
+            Duration latencia = provedor.ping();
+            Health.Builder saude = latencia.compareTo(Duration.ofSeconds(1)) > 0 ? Health.down() : Health.up();
+            return saude.withDetail("latenciaMs", latencia.toMillis()).build();
+        } catch (RuntimeException e) {
+            return Health.down().withDetail("erro", e.getClass().getSimpleName()).build();  // só o tipo
+        }
+    }
+}
+```
+
+O detalhe leva só o **tipo** da exceção: a mensagem pode conter IP interno, usuário ou URL.
+
+Um orquestrador faz duas perguntas diferentes, e cada uma tem sua **probe**:
+
+| | Liveness | Readiness |
+|---|---|---|
+| Pergunta | o processo está vivo, ou travou? | consigo atender tráfego agora? |
+| Se falhar | o container é **reiniciado** | a instância **sai do balanceador**, sem reiniciar |
+| Endpoint | `/actuator/health/liveness` | `/actuator/health/readiness` |
+| Dependências externas | **nunca** | sim, as essenciais |
+
+Se o provedor de pagamentos cair e ele estiver na liveness, o Kubernetes reinicia **todas** as instâncias, o que não conserta o provedor e ainda derruba o que funcionava. No Spring Boot 4, os grupos de probes já vêm ativos (`management.endpoint.health.probes.enabled` é `true` por padrão); falta dizer o que entra em cada um:
+
+```properties
+management.endpoint.health.group.readiness.include=readinessState,provedor
+management.endpoint.health.group.readiness.show-details=always
+management.endpoint.health.show-details=never
+```
+
+Para **manutenção**, a aplicação pode sair do balanceador sem morrer, publicando um evento de disponibilidade (a liveness continua `UP`):
+
+```java
+AvailabilityChangeEvent.publish(eventos, this, ReadinessState.REFUSING_TRAFFIC);   // e ACCEPTING_TRAFFIC para voltar
+```
+
+## Pilar 3: tracing distribuído
+
+Numa requisição que passa por API, antifraude e serviço de pagamentos, o **trace** é a árvore de **spans** (cada span é uma operação com início, fim e atributos). Todos compartilham o mesmo **traceId**; cada um tem seu **spanId**. Entre serviços, o contexto viaja no header padrão **W3C Trace Context**:
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             versão-traceId (32 hex)-spanId do pai (16 hex)-flags (01 = amostrado)
+```
+
+O **OpenTelemetry** é o padrão aberto para gerar e exportar traces (e também métricas e logs), com o protocolo **OTLP**. No Spring Boot, a instrumentação passa pela **Observation API** do Micrometer, e o **Micrometer Tracing** faz a ponte para o OpenTelemetry. No Boot 4, o `spring-boot-starter-opentelemetry` traz as dependências; os clientes criados pelos builders do Boot (como o `RestClient.Builder`) propagam o `traceparent` sozinhos, e o `traceId` e o `spanId` entram no MDC, ligando o trace aos logs. Por custo, só uma fração das requisições é registrada: `management.tracing.sampling.probability` (padrão `0.1`, ou 10%).
+
+## SLI, SLO, RED e alertas
+
+- **SLI** (indicador): uma medida do que o usuário sente. Ex.: fração de pagamentos concluídos com sucesso em até 300 ms.
+- **SLO** (objetivo): a meta para o SLI. Ex.: 99,9% em 30 dias. O que falta para 100% é o **orçamento de erro**: 0,1% de 30 dias são cerca de 43 minutos.
+- **SLA** (acordo): o contrato com o cliente, com penalidade. Costuma ser mais frouxo que o SLO interno.
+
+Dois roteiros para escolher métricas: **RED** para serviços (*Rate*, *Errors*, *Duration*: requisições por segundo, taxa de erro, latência) e **USE** para recursos (*Utilization*, *Saturation*, *Errors*: CPU, pool de conexões, fila).
+
+Alerte por **sintoma**, não por causa: "a taxa de erro dos pagamentos passou de 1% por 5 minutos" acorda alguém por algo que o cliente sente. "CPU em 80%" pode não afetar ninguém. Todo alerta que dispara deve exigir uma **ação**; alertas que todo mundo ignora treinam o time a ignorar alertas.
+
+## Armadilhas comuns
+
+- **`logging.structured.*` num `@PropertySource`**: não tem efeito, porque o logging é inicializado antes.
+- **MDC sem `finally`**: ids trocados entre requisições, investigação apontando para o cliente errado.
+- **Id do cliente como tag**: explosão de cardinalidade.
+- **Gauge sobre um objeto que ninguém referencia**: vira `NaN` depois de um ciclo do GC.
+- **Banco ou API externa na liveness**: uma queda externa vira um reinício em massa.
+- **Actuator com `exposure.include=*`** em produção: `env` e `heapdump` vazam segredos.
+- **Log demais**: `DEBUG` em produção custa armazenamento e esconde o que importa.
+
+<Callout tipo="entrevista">
+"Como você investigaria uma lentidão em produção?" Mostre o fluxo entre os pilares: o **alerta** vem de uma métrica (p99 subiu, com histograma); o **trace** de uma requisição lenta mostra em qual serviço ou consulta está o tempo; o **log** com o mesmo id explica o porquê. Depois, responda as perguntas clássicas: **liveness × readiness** (e por que dependências externas ficam só na readiness), **cardinalidade** de tags, e o que são **SLO** e orçamento de erro.
+</Callout>
+
+<Quiz
+  id="14-observabilidade"
+  questoes={[
+    {
+      pergunta: 'O filtro coloca o requestId no MDC mas não o remove. O que pode acontecer?',
+      opcoes: ['Nada, o MDC é por requisição', 'Uma requisição seguinte, na mesma thread do pool, herda o id da anterior', 'O Tomcat lança exceção', 'O log sai sem JSON'],
+      correta: 1,
+      explicacao: 'O MDC é por thread, e as threads são reaproveitadas. Limpe sempre no finally.',
+    },
+    {
+      pergunta: 'Qual tag é adequada para a métrica pagamentos.processados?',
+      opcoes: ['cliente (id do cliente)', 'resultado (aprovado, recusado, erro)', 'pedido (id do pedido)', 'cpf mascarado'],
+      correta: 1,
+      explicacao: 'Tags precisam de poucos valores possíveis. Ids geram uma série por valor e explodem a cardinalidade.',
+    },
+    {
+      pergunta: 'O provedor externo de pagamentos caiu. O que deve acontecer com as probes?',
+      opcoes: ['Liveness e readiness DOWN', 'Readiness DOWN (sai do balanceador), liveness UP (não reinicia)', 'Liveness DOWN, readiness UP', 'As duas continuam UP'],
+      correta: 1,
+      explicacao: 'Reiniciar a aplicação não conserta o provedor. Dependências externas entram só na readiness.',
+    },
+    {
+      pergunta: 'Por que usar publishPercentileHistogram em vez de calcular o p95 na aplicação?',
+      opcoes: ['Consome menos memória na aplicação', 'Os buckets podem ser somados entre instâncias, e o p95 é calculado no Prometheus sobre o total', 'É o único jeito de medir tempo', 'O Grafana exige'],
+      correta: 1,
+      explicacao: 'Percentis prontos de cada instância não podem ser agregados; histogramas podem.',
+    },
+    {
+      pergunta: 'Que alerta segue a regra de alertar por sintoma?',
+      opcoes: ['CPU acima de 80%', 'Taxa de erro dos pagamentos acima de 1% por 5 minutos', 'Heap acima de 60%', 'Mais de 100 threads'],
+      correta: 1,
+      explicacao: 'Sintoma é o que o usuário sente. Causas prováveis ajudam na investigação, mas não devem acordar ninguém sozinhas.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Métricas** dizem *se*, **traces** dizem *onde*, **logs** dizem *por quê*; o id de correlação liga logs e traces.
+- **Logs em JSON** com `logging.structured.format.console=ecs` (no `application.properties`); **MDC** + `addKeyValue` viram campos; limpe o MDC no `finally`; **mascare dados pessoais**.
+- **Micrometer**: `Counter`, `Timer` (com `publishPercentileHistogram`), `Gauge` (referência fraca), `DistributionSummary`; tags de **baixa cardinalidade**; `pagamentos.processados` vira `pagamentos_processados_total`.
+- **Actuator** expondo só `health,prometheus`; **liveness** sem dependências externas, **readiness** com elas; `REFUSING_TRAFFIC` para manutenção.
+- **Tracing** com OpenTelemetry: traceId, spanId, `traceparent`, OTLP, amostragem.
+- **SLI/SLO/SLA**, orçamento de erro, **RED/USE** e alertas por **sintoma**.
+
+## Referências
+
+- Documentação do Spring Boot — *Logging* (seção *Structured Logging*), *Metrics*, *Observability*, *Tracing* e *Kubernetes Probes* (docs.spring.io)
+- Documentação do Micrometer — *Concepts*: *Counters*, *Timers*, *Gauges*, *Distribution Summaries* e *Histograms and Percentiles* (docs.micrometer.io)
+- Documentação do Prometheus — *Metric and label naming*, *Histograms and summaries* e *Querying basics* (prometheus.io)
+- Documentação do OpenTelemetry — *Observability primer* e *Context propagation* (opentelemetry.io)
+- W3C — *Trace Context* (w3.org/TR/trace-context)
+- Google — *Site Reliability Engineering*, capítulos *Service Level Objectives* e *Monitoring Distributed Systems* (sre.google)

@@ -1,0 +1,230 @@
+---
+titulo: List, Set, Map e companhia
+descricao: O mapa do Collections Framework, quando usar cada interface, coleções imutáveis com List.of e Map.of, e como iterar e modificar com segurança.
+modulo: 03-colecoes-generics-excecoes
+ordem: 1
+duracao: 50
+objetivos:
+  - Escolher entre List, Set, Map e Deque pelo problema a resolver
+  - Criar coleções imutáveis e entender suas restrições
+  - Iterar e remover elementos sem ConcurrentModificationException
+  - Usar os métodos modernos de Map (getOrDefault, merge, computeIfAbsent)
+tags: [List, Set, Map, Deque, coleções]
+flashcards:
+  - frente: Quando usar List, Set e Map?
+    verso: List para sequência ordenada com duplicados e acesso por posição; Set para elementos únicos; Map para associar chave → valor.
+  - frente: O que List.of(...) devolve?
+    verso: Uma lista imutável — add, remove e set lançam UnsupportedOperationException — que também não aceita null.
+  - frente: Como remover itens de uma lista durante a iteração?
+    verso: Com lista.removeIf(condição) ou Iterator.remove(). Remover dentro de um for-each lança ConcurrentModificationException.
+  - frente: O que Map.merge(chave, valor, função) faz?
+    verso: Se a chave não existe, insere o valor; se existe, combina o valor atual com o novo usando a função (ex. Integer::sum para contar).
+  - frente: Para que serve um Deque?
+    verso: Fila de duas pontas — serve como fila (FIFO, offer/poll) e como pilha (LIFO, push/pop). ArrayDeque é a implementação recomendada.
+---
+
+Quase todo código de backend manipula grupos de coisas: os itens de um pedido, os clientes de uma cidade, o total de vendas por produto. O **Java Collections Framework** oferece as estruturas para isso. Escolher a certa deixa o código mais simples, mais correto e, muitas vezes, milhares de vezes mais rápido.
+
+## O mapa
+
+<Figura legenda="As principais interfaces (em cima) e suas implementações mais usadas">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-label="Collection se divide em List, Set e Queue/Deque; Map é separado. Implementações: ArrayList, LinkedList; HashSet, LinkedHashSet, TreeSet; ArrayDeque, PriorityQueue; HashMap, LinkedHashMap, TreeMap">
+  <defs><marker id="s7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="190" y="12" width="150" height="40" rx="10" class="d-box"/><text x="265" y="37" text-anchor="middle" class="d-mono">Collection</text>
+  <rect x="560" y="12" width="120" height="40" rx="10" class="d-violet"/><text x="620" y="37" text-anchor="middle" class="d-mono">Map</text>
+  <rect x="20" y="90" width="130" height="40" rx="10" class="d-info"/><text x="85" y="115" text-anchor="middle" class="d-mono">List</text>
+  <rect x="200" y="90" width="130" height="40" rx="10" class="d-ok"/><text x="265" y="115" text-anchor="middle" class="d-mono">Set</text>
+  <rect x="380" y="90" width="140" height="40" rx="10" class="d-accent"/><text x="450" y="115" text-anchor="middle" class="d-mono">Queue/Deque</text>
+  <path d="M230 52 L100 88" class="d-line" marker-end="url(#s7)"/>
+  <path d="M265 52 L265 88" class="d-line" marker-end="url(#s7)"/>
+  <path d="M300 52 L430 88" class="d-line" marker-end="url(#s7)"/>
+  <text x="85" y="160" text-anchor="middle" class="d-label">ArrayList ★</text>
+  <text x="85" y="180" text-anchor="middle" class="d-label">LinkedList</text>
+  <text x="265" y="160" text-anchor="middle" class="d-label">HashSet ★</text>
+  <text x="265" y="180" text-anchor="middle" class="d-label">LinkedHashSet</text>
+  <text x="265" y="200" text-anchor="middle" class="d-label">TreeSet</text>
+  <text x="450" y="160" text-anchor="middle" class="d-label">ArrayDeque ★</text>
+  <text x="450" y="180" text-anchor="middle" class="d-label">PriorityQueue</text>
+  <text x="620" y="80" text-anchor="middle" class="d-label">HashMap ★</text>
+  <text x="620" y="100" text-anchor="middle" class="d-label">LinkedHashMap</text>
+  <text x="620" y="120" text-anchor="middle" class="d-label">TreeMap</text>
+  <text x="350" y="238" text-anchor="middle" class="d-label">★ = escolha padrão na maioria dos casos</text>
+</svg>
+</Figura>
+
+| Interface | Pergunta que responde | Exemplo de negócio |
+|---|---|---|
+| **`List`** | "Quais, em que ordem?" (aceita repetidos) | Itens de um pedido, histórico do extrato |
+| **`Set`** | "Este elemento já existe?" (sem repetidos) | CPFs já cadastrados, tags de um produto |
+| **`Map`** | "Qual o valor para esta chave?" | Estoque por SKU, pedidos por cliente |
+| **`Deque`** | "Qual o próximo?" (fila ou pilha) | Fila de processamento, histórico de "desfazer" |
+
+Repare que `Map` **não** é uma `Collection`: ele guarda pares chave → valor.
+
+## `List`
+
+```java
+List<String> itens = new ArrayList<>();
+itens.add("café");
+itens.add("filtro");
+itens.add("café");               // repetido: tudo bem
+itens.get(0);                    // "café"
+itens.size();                    // 3
+itens.contains("filtro");        // true (percorre a lista: O(n))
+itens.remove("café");            // remove a PRIMEIRA ocorrência
+itens.indexOf("café");           // 1
+```
+
+`ArrayList` é a escolha padrão. `LinkedList` quase nunca vale a pena (a próxima aula explica o porquê).
+
+## `Set`
+
+```java
+Set<String> cpfs = new HashSet<>();
+cpfs.add("52998224725");         // true
+cpfs.add("52998224725");         // false: já existia
+cpfs.contains("52998224725");    // true, em tempo constante (O(1))
+```
+
+- **`HashSet`**: o mais rápido, sem ordem garantida.
+- **`LinkedHashSet`**: mantém a **ordem de inserção**.
+- **`TreeSet`**: mantém os elementos **ordenados**.
+
+O `Set` decide o que é "repetido" usando `equals` e `hashCode` — tema da aula 3, e o coração do exercício 03.01.
+
+## `Map`
+
+```java
+Map<String, Integer> estoque = new HashMap<>();
+estoque.put("CAFE-500", 12);
+estoque.put("FILTRO-102", 0);
+estoque.put("CAFE-500", 15);             // substitui o valor anterior
+
+estoque.get("CAFE-500");                  // 15
+estoque.get("NAO-EXISTE");                // null (!)
+estoque.getOrDefault("NAO-EXISTE", 0);    // 0
+estoque.containsKey("FILTRO-102");        // true
+
+for (Map.Entry<String, Integer> e : estoque.entrySet()) {
+    System.out.println(e.getKey() + " → " + e.getValue());
+}
+```
+
+### Os métodos que substituem dez linhas
+
+```java
+// Contar ocorrências
+Map<String, Integer> contagem = new HashMap<>();
+for (String palavra : palavras) {
+    contagem.merge(palavra, 1, Integer::sum);      // insere 1 ou soma 1
+}
+
+// Agrupar: pedidos por cliente
+Map<String, List<Pedido>> porCliente = new HashMap<>();
+for (Pedido p : pedidos) {
+    porCliente.computeIfAbsent(p.clienteId(), id -> new ArrayList<>()).add(p);
+}
+```
+
+- **`merge(chave, valor, função)`**: se a chave não existe, insere o valor; se existe, combina o atual com o novo pela função.
+- **`computeIfAbsent(chave, criador)`**: devolve o valor da chave, criando-o com a função se ainda não existir.
+
+Esses dois métodos aparecem em todo código de agregação. O exercício 03.02 usa `merge` para montar um ranking.
+
+## `Deque`: fila e pilha
+
+```java
+Deque<String> fila = new ArrayDeque<>();
+fila.offer("pedido-1");      // entra no fim
+fila.offer("pedido-2");
+fila.poll();                 // "pedido-1" — sai do início (FIFO)
+
+Deque<String> pilha = new ArrayDeque<>();
+pilha.push("tela-1");
+pilha.push("tela-2");
+pilha.pop();                 // "tela-2" — último a entrar, primeiro a sair (LIFO)
+```
+
+Use `ArrayDeque` para os dois papéis. A classe `Stack` é antiga e sincronizada à toa — evite.
+
+## Coleções imutáveis
+
+```java
+List<String> formas = List.of("PIX", "CARTAO", "BOLETO");
+Set<Integer> ddds = Set.of(11, 21, 31);
+Map<String, BigDecimal> taxas = Map.of("PIX", ZERO, "BOLETO", new BigDecimal("3.50"));
+
+formas.add("CRIPTO");        // UnsupportedOperationException
+List.of("a", null);          // NullPointerException: não aceita null
+List<String> copia = List.copyOf(outraLista);  // cópia imutável
+```
+
+Coleções imutáveis são perfeitas para constantes, retornos de métodos (o extrato do exercício 02.01) e cópias defensivas.
+
+<Callout tipo="atencao" titulo="Imutável não é o mesmo que 'não modificável'">
+`Collections.unmodifiableList(lista)` devolve uma **visão** somente leitura: você não altera por ela, mas se a `lista` original mudar, a visão também muda. `List.copyOf` cria uma **cópia** que nunca muda. Para cópias defensivas, prefira `List.copyOf`.
+</Callout>
+
+## Modificar durante a iteração
+
+```java
+for (Pedido p : pedidos) {
+    if (p.cancelado()) {
+        pedidos.remove(p);       // ConcurrentModificationException
+    }
+}
+```
+
+O for-each usa um `Iterator` por baixo, e a lista "percebe" que foi alterada por fora. As formas corretas:
+
+```java
+pedidos.removeIf(Pedido::cancelado);               // a mais simples
+
+Iterator<Pedido> it = pedidos.iterator();          // controle manual
+while (it.hasNext()) {
+    if (it.next().cancelado()) {
+        it.remove();                               // remove pelo próprio iterator
+    }
+}
+```
+
+<Callout tipo="entrevista">
+Perguntas típicas: "diferença entre `List` e `Set`", "como `HashSet` sabe que um elemento é duplicado", "diferença entre `HashMap`, `LinkedHashMap` e `TreeMap`" e "como remover itens de uma lista enquanto a percorre". Se você responder citando a **complexidade** de cada operação (próxima aula), já se destaca.
+</Callout>
+
+<Quiz
+  id="03-colecoes"
+  questoes={[
+    {
+      pergunta: 'Você precisa verificar muito rapidamente se um e-mail já está cadastrado. Qual estrutura usar?',
+      opcoes: ['ArrayList<String>', 'HashSet<String>', 'LinkedList<String>', 'String[]'],
+      correta: 1,
+      explicacao: '`contains` em HashSet é O(1) em média; em listas e arrays é O(n).',
+    },
+    {
+      pergunta: 'Qual o resultado de `map.merge("x", 1, Integer::sum)` duas vezes em um mapa vazio?',
+      opcoes: ['x → 1', 'x → 2', 'x → [1, 1]', 'Lança exceção'],
+      correta: 1,
+      explicacao: 'A primeira chamada insere 1; a segunda combina 1 + 1.',
+    },
+    {
+      pergunta: 'O que acontece com `List.of("a", "b").add("c")`?',
+      opcoes: ['Adiciona "c"', 'Retorna false', 'Lança UnsupportedOperationException', 'Não compila'],
+      correta: 2,
+      explicacao: 'List.of cria uma lista imutável. A falha acontece em tempo de execução.',
+    },
+    {
+      pergunta: 'Qual implementação de Map mantém as chaves em ordem alfabética?',
+      opcoes: ['HashMap', 'LinkedHashMap', 'TreeMap', 'Nenhuma'],
+      correta: 2,
+      explicacao: 'TreeMap ordena pelas chaves (ordem natural ou Comparator). LinkedHashMap mantém a ordem de inserção.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `List` (ordem e repetidos), `Set` (unicidade), `Map` (chave → valor), `Deque` (fila/pilha).
+- Padrões: `ArrayList`, `HashSet`, `HashMap`, `ArrayDeque`. Use as variantes `Linked*` para ordem de inserção e `Tree*` para ordem classificada.
+- `merge` e `computeIfAbsent` resolvem contagens e agrupamentos em uma linha.
+- `List.of`/`List.copyOf` para coleções imutáveis; `removeIf` para remover durante a iteração.

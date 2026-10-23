@@ -1,0 +1,88 @@
+---
+titulo: "Pilhas: validação, monotonicidade e avaliação"
+codigo: "05.03"
+resumo: Valide delimitadores de payloads, calcule "dias até esquentar" com pilha monotônica, avalie expressões em notação polonesa reversa e normalize caminhos de API.
+modulo: 05-algoritmos
+ordem: 3
+dificuldade: medio
+tempo: 2h
+conceitos: [pilha, ArrayDeque, pilha monotônica, parsing]
+aulas: [05-algoritmos/04-pilhas-e-filas]
+java:
+  modulo: m05-algoritmos
+  teste: PilhasTest
+---
+
+## Contexto
+
+Quatro demandas pequenas chegaram ao time de plataforma, e todas têm a mesma estrutura por trás:
+
+1. um **pré-validador** que rejeita payloads com `()`, `[]` e `{}` desbalanceados antes de enviá-los ao parser (economiza CPU sob ataques de payload malformado);
+2. para o app de agro, "**quantos dias até uma temperatura maior**" em cada dia da previsão;
+3. uma **calculadora de regras** que recebe fórmulas em notação polonesa reversa, vindas de uma ferramenta legada;
+4. a **normalização de caminhos** de um gateway de API, para que `/api//v1/./pedidos/../pedidos` e `/api/v1/pedidos` caiam na mesma regra.
+
+## Requisitos
+
+| Método | Comportamento |
+|---|---|
+| `balanceada(expressao)` | `( ) [ ] { }` corretamente aninhados; outros caracteres são ignorados |
+| `diasAteTemperaturaMaior(temperaturas)` | Para cada dia, a distância até um dia estritamente mais quente (0 se nunca); **O(n)** |
+| `avaliarRpn(expressao)` | Tokens separados por espaço, `+ - * /` (divisão inteira); expressão malformada → `IllegalArgumentException` |
+| `simplificarCaminho(caminho)` | Caminho absoluto canônico: trata `.`, `..` e barras repetidas |
+
+## Exemplos
+
+```text
+balanceada("{\"itens\": [1, 2, {\"x\": (3)}]}")   → true
+balanceada("([)]")                                 → false
+diasAteTemperaturaMaior([73,74,75,71,69,72,76,73]) → [1,1,4,2,1,1,0,0]
+avaliarRpn("3 4 + 2 *")                           → 14
+simplificarCaminho("/a/./b/../../c/")             → /c
+simplificarCaminho("/../")                         → /
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `PilhasTest` passam.
+- [ ] Nenhum uso de `java.util.Stack`.
+- [ ] `diasAteTemperaturaMaior` é O(n) — você consegue explicar por quê.
+- [ ] Nenhuma comparação de `Character` com `==`/`!=`.
+
+## Desafios opcionais
+
+- Suporte a números negativos e ao operador `^` em `avaliarRpn`.
+- `infixaParaRpn("(3 + 4) * 2")` com o algoritmo *shunting-yard* de Dijkstra.
+
+<Dicas>
+<Dica nivel={1}>
+Os quatro problemas usam `ArrayDeque`. Em cada um, pergunte: o que entra na pilha, e quando algo sai? Parênteses: aberturas entram, fechamentos tiram. Temperaturas: índices de dias "sem resposta" entram. RPN: números entram, operadores tiram dois.
+</Dica>
+<Dica nivel={2}>
+Temperaturas: ao processar o dia `hoje`, **enquanto** o topo da pilha tiver temperatura menor, ele foi "resolvido": `resposta[topo] = hoje - topo`. Depois, empilhe `hoje`. Caminho: `split("/")`, ignore `""` e `"."`, `".."` remove o último, o resto entra; no fim, `"/" + String.join("/", partes)`.
+</Dica>
+<Dica nivel={3}>
+RPN com `switch (token) { case "+", "-", "*", "/" -> { ... } default -> pilha.push(Long.parseLong(token)); }`. O primeiro `pop` é o operando da **direita**. Valide que há dois operandos antes de cada operador e que sobra exatamente um valor no final; converta `NumberFormatException` em `IllegalArgumentException` com a causa.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/Pilhas.java" />
+
+### Pontos-chave
+
+- **`Map.of(')', '(', …)`** evita um `switch` para descobrir o par de cada fechamento, e `equals` compara os `Character` corretamente.
+- **Pilha monotônica guarda índices**, não temperaturas: é o índice que permite calcular a distância.
+- **Switch com setas aninhado** em `avaliarRpn`: o externo classifica o token, o interno escolhe a operação. `case "", "." -> { }` em `simplificarCaminho` mostra que um `case` pode, legitimamente, não fazer nada.
+- **`pollLast()`** em `simplificarCaminho` devolve `null` com a lista vazia em vez de lançar exceção — exatamente o comportamento desejado para `..` na raiz.
+
+### Avalie sua solução
+
+- `balanceada("))")` e `balanceada("((")` devolvem `false`?
+- Sua RPN trata `10 3 -` como 7 (e não -7)?
+- `simplificarCaminho("//api//v1///pedidos")` devolve `/api/v1/pedidos`?
+
+</Solucao>

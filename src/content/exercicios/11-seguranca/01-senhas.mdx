@@ -1,0 +1,217 @@
+---
+titulo: "Credenciais: hash, política de senhas, bloqueio e migração"
+codigo: "11.01"
+resumo: Implemente o cadastro e o login de um sistema que herdou senhas em texto puro e SHA-256 — com BCrypt, política de senhas do NIST, lista de senhas vazadas, bloqueio temporário, proteção contra enumeração de usuários e migração automática dos hashes antigos.
+modulo: 11-seguranca
+ordem: 1
+dificuldade: medio
+tempo: 2–3h
+conceitos: [PasswordEncoder, BCrypt, DelegatingPasswordEncoder, NIST 800-63B, enumeração de usuários, bloqueio de conta]
+aulas: [11-seguranca/01-autenticacao-e-senhas, 10-testes/01-por-que-e-como-testar, 08-spring-boot/03-ioc-e-injecao-de-dependencias]
+java:
+  modulo: m11-seguranca
+  arquivos: [src/main/java/dev/trilhajava/m11/senhas/ServicoDeCredenciais.java]
+---
+
+## Contexto
+
+Uma plataforma de cursos online foi comprada por uma empresa maior, e a auditoria de segurança da compradora encontrou o pior cenário possível: as senhas dos primeiros usuários estavam em **texto puro**, e as de uma segunda leva, num SHA-256 sem custo nenhum. O login também informava "e-mail não cadastrado", e um script tentava senhas sem parar sem que nada acontecesse.
+
+Você vai reescrever o `ServicoDeCredenciais`, sem obrigar ninguém a trocar de senha.
+
+## O que você vai praticar
+
+- **Hash de senha com salt e custo (BCrypt).** Senha não se guarda: guarda-se um hash de mão única, com um salt aleatório (a mesma senha gera hashes diferentes) e lento de propósito. Você não implementa o BCrypt, só usa. Veja [Guardar senhas: a regra de ouro](../../../aulas/11-seguranca/01-autenticacao-e-senhas/#guardar-senhas-a-regra-de-ouro).
+- **`PasswordEncoder` e `DelegatingPasswordEncoder`.** Três métodos fazem tudo: `encode(senha)` gera o hash, `matches(senha, hash)` confere, `upgradeEncoding(hash)` diz se o hash é de um algoritmo antigo. O "delegating" grava o algoritmo como prefixo (`{bcrypt}...`, `{noop}...`) e sabe conferir todos eles, o que torna a migração possível. Veja [No Spring: `PasswordEncoder`](../../../aulas/11-seguranca/01-autenticacao-e-senhas/#no-spring-passwordencoder).
+- **Política de senhas do NIST.** Tamanho mínimo generoso e lista de senhas vazadas funcionam; regras de composição ("uma maiúscula, um símbolo") produzem senhas previsíveis. E o BCrypt só olha os primeiros **72 bytes**: em UTF-8, uma letra acentuada ocupa 2 bytes. Veja [Política de senhas: o que o NIST recomenda](../../../aulas/11-seguranca/01-autenticacao-e-senhas/#política-de-senhas-o-que-o-nist-recomenda).
+- **Não entregar informação ao atacante.** Mesma resposta **e mesmo tempo** para "e-mail não existe" e "senha errada"; bloqueio temporário contra força bruta. Veja [Não entregue informação ao atacante](../../../aulas/11-seguranca/01-autenticacao-e-senhas/#não-entregue-informação-ao-atacante).
+- **Tempo injetado (`Clock`).** O serviço recebe um `Clock` em vez de chamar `Instant.now()`. Em produção passa-se `Clock.systemUTC()`; no seu programa, um relógio que você avança à mão ("15 minutos depois" sem esperar 15 minutos). Veja [O que é um bom teste](../../../aulas/10-testes/01-por-que-e-como-testar/#o-que-é-um-bom-teste).
+- **Dependências pelo construtor.** O serviço não cria o repositório nem o codificador: recebe prontos. É isso que permite ao seu programa montar tudo com `new`, sem subir o Spring. Veja [IoC e injeção de dependências](../../../aulas/08-spring-boot/03-ioc-e-injecao-de-dependencias/).
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m11.senhas` (não precisa mudar):
+
+- `Usuario` — record imutável com `email`, `hashDaSenha`, `falhasSeguidas` e `bloqueadoAte` (um `Instant`, ou `null`); `Usuario.novo(email, hash)` cria um com zero falhas e sem bloqueio;
+- `RepositorioDeUsuarios` (`Optional<Usuario> buscar(String email)` e `void salvar(Usuario usuario)`, que substitui o anterior de mesmo e-mail) e `RepositorioDeUsuariosEmMemoria`;
+- `ResultadoLogin` — `SUCESSO`, `CREDENCIAIS_INVALIDAS` e `BLOQUEADO`;
+- `SenhaFracaException` e `EmailJaCadastradoException`.
+
+### O que você implementa
+
+Em `ServicoDeCredenciais` (a classe já existe, vazia):
+
+```java
+public ServicoDeCredenciais(RepositorioDeUsuarios usuarios, PasswordEncoder codificador, Clock clock,
+        Set<String> senhasVazadas)
+
+public void cadastrar(String email, String senha)            // regras 1 a 7
+public ResultadoLogin autenticar(String email, String senha)  // regras 1 e 8 a 13
+```
+
+- `cadastrar` **não devolve nada**: guarda um `Usuario` no repositório ou lança uma exceção (e aí não guarda nada).
+- `autenticar` **devolve** um `ResultadoLogin` e atualiza o `Usuario` guardado (falhas, bloqueio, hash).
+- As mensagens das exceções são livres; só o **tipo** importa.
+- Os exemplos usam o `DelegatingPasswordEncoder` do Spring (`PasswordEncoderFactories.createDelegatingPasswordEncoder()`) e esta lista de senhas vazadas: `senha12345678`, `123456789012`, `qwertyuiop123`, `brasil2026!!`.
+
+| Chamada | Resultado |
+|---|---|
+| `cadastrar("  Ana.Souza@Email.COM ", "cafe com leite e pao de queijo")` | guarda `ana.souza@email.com` com hash `{bcrypt}$2a$10$...` |
+| `cadastrar("carlos@email.com", "curta123456")` | `SenhaFracaException` |
+| `cadastrar("carlos.email.com", "outra frase bem comprida")` | `IllegalArgumentException` |
+| `autenticar("Ana.Souza@email.com", "cafe com leite e pao de queijo")` | `SUCESSO` |
+| `autenticar("ninguem@email.com", "qualquer coisa longa")` | `CREDENCIAIS_INVALIDAS` |
+
+## Regras
+
+**Cadastro**
+
+1. **E-mail normalizado e válido** (em `cadastrar` **e** em `autenticar`): tire os espaços das pontas e passe para minúsculas. Depois disso, ele precisa ter **exatamente um `@`**, com pelo menos um caractere antes e um depois, e **nenhum espaço**. Senão, `IllegalArgumentException`. `"  Ana.Souza@Email.COM "` → `ana.souza@email.com`; são inválidos `null`, `""`, `"carlos.email.com"`, `"@email.com"`, `"carlos@"`, `"carlos@@email.com"` e `"carlos silva@email.com"`.
+2. **Senha com 12 a 64 caracteres e no máximo 72 bytes em UTF-8** (`senha.getBytes(StandardCharsets.UTF_8).length`). Senão, `SenhaFracaException`. `"curta123456"` (11) e `"a"` × 65 são recusadas; `"á"` × 40 também (40 caracteres, 80 bytes). `"abcdefghijkl"` (12) e `"b"` × 64 são aceitas.
+3. **Senha fora da lista de vazadas, sem diferenciar maiúsculas.** `"senha12345678"`, `"SENHA12345678"` e `"Brasil2026!!"` → `SenhaFracaException`.
+4. **Senha sem o usuário do e-mail** (o texto antes do `@`), sem diferenciar maiúsculas, **se** ele tiver 3 caracteres ou mais. Para `carlos@email.com`, `"meu nome e CARLOS silva"` → `SenhaFracaException`; para `al@email.com`, `"qualquer frase longa"` é aceita (`"al"` tem só 2).
+5. **Nenhuma regra de composição.** `"correct horse battery staple"` e `"pão de queijo com café"` são aceitas: sem exigir número, maiúscula ou símbolo.
+6. **Um cadastro por e-mail**, comparando o e-mail já normalizado. `"ELIS@email.com"` depois de `"elis@email.com"` → `EmailJaCadastradoException`, e a senha do primeiro continua valendo.
+7. **Guarde `codificador.encode(senha)`, nunca a senha.** Com o `DelegatingPasswordEncoder`, o hash começa com `{bcrypt}$2`, não contém a senha, e a mesma senha em dois usuários gera hashes diferentes (salt).
+
+**Login**
+
+8. **Senha certa → `SUCESSO`; errada → `CREDENCIAIS_INVALIDAS`.**
+9. **E-mail inexistente → `CREDENCIAIS_INVALIDAS`, fazendo exatamente uma conferência de senha** (uma chamada a `codificador.matches`). Sem ela, a resposta sai em 2 ms em vez de ~100 ms, e o **tempo** revela quais e-mails existem.
+10. **5 falhas seguidas bloqueiam a conta por 15 minutos**, contados pelo `Clock` a partir da 5ª falha. Enquanto bloqueada, `autenticar` devolve `BLOQUEADO` **mesmo com a senha certa**. 14 minutos depois: ainda `BLOQUEADO`; 15 minutos depois: volta a funcionar.
+11. **Um login com sucesso zera as falhas.** 4 falhas, 1 sucesso e mais 4 falhas não bloqueiam.
+12. **Senha com mais de 72 bytes → `CREDENCIAIS_INVALIDAS`**, mesmo que os primeiros 72 bytes sejam a senha certa. O BCrypt olharia só os 72 primeiros bytes e aceitaria "senha certa + qualquer lixo".
+13. **Hash legado migra no primeiro login com sucesso.** Se `codificador.upgradeEncoding(hash)` for `true` (é o caso de `{noop}...` e `{sha256}...`), guarde `codificador.encode(senha)` no lugar. Com a senha errada, o hash antigo fica como está.
+
+## Passo a passo sugerido
+
+Faça um passo de cada vez e experimente depois de cada um (veja **Experimente**, logo abaixo).
+
+1. **Monte o serviço e um jeito de experimentar.** Escreva o construtor guardando as quatro dependências e crie uma classe sua com `main` que monta o serviço com `new` (sem Spring) e chama `cadastrar` e `autenticar`.
+2. **Cadastro mínimo (regras 1 e 7).** Em `cadastrar`, normalize o e-mail (ainda sem validar) e salve `Usuario.novo(email, codificador.encode(senha))`. Imprima o que ficou guardado: um `{bcrypt}$2a$10$…` que não contém a senha, e dois usuários com a mesma senha têm hashes diferentes.
+3. **Validação do e-mail (regra 1).** Escreva um método privado que confira o formato percorrendo o texto: `indexOf('@')`, `lastIndexOf('@')` e um laço com `Character.isWhitespace(c)` bastam. `carlos.email.com` passa a dar `IllegalArgumentException`.
+4. **Política (regras 2 a 6).** Um método privado `validarPolitica(email, senha)`, chamado antes de salvar, com um `if` por regra. Experimente cada senha citada nas regras.
+5. **Login básico (regra 8).** Busque o usuário e use `codificador.matches`.
+6. **E-mail inexistente e senha longa (regras 9 e 12).** No construtor, calcule o hash de uma senha qualquer (o "hash fictício") e confira contra ele quando o e-mail não existir.
+7. **Falhas e bloqueio (regras 10 e 11).** Cada mudança é um `new Usuario(...)` salvo no repositório. Use `clock.instant()` para saber "agora".
+8. **Migração (regra 13).** No caminho do sucesso, pergunte `upgradeEncoding`.
+9. **Brinque.** Mude a lista de vazadas, tente um e-mail com dois `@`, meça com `System.nanoTime()` o tempo de `autenticar` para um e-mail existente e um inexistente.
+
+## Experimente
+
+O `ServicoDeCredenciais` é uma classe comum que recebe as dependências pelo construtor. Para experimentá-lo, basta criá-las com `new`, sem subir o Spring: o programa roda em um ou dois segundos (quase tudo é o BCrypt trabalhando). Um começo:
+
+```java
+package dev.trilhajava.m11.senhas;
+
+import java.time.Clock;
+import java.util.Set;
+import org.springframework.security.crypto.factory.PasswordEncoderFactories;
+
+public class ExperimenteCredenciais {
+
+    public static void main(String[] args) {
+        var repositorio = new RepositorioDeUsuariosEmMemoria();
+        var servico = new ServicoDeCredenciais(repositorio,
+                PasswordEncoderFactories.createDelegatingPasswordEncoder(), Clock.systemUTC(),
+                Set.of("senha12345678", "123456789012", "qwertyuiop123", "brasil2026!!"));
+
+        servico.cadastrar("  Ana.Souza@Email.COM ", "cafe com leite e pao de queijo");
+        System.out.println(repositorio.buscar("ana.souza@email.com").orElseThrow().hashDaSenha());
+        System.out.println(servico.autenticar("Ana.Souza@email.com", "cafe com leite e pao de queijo"));
+        System.out.println(servico.autenticar("ninguem@email.com", "qualquer coisa longa"));
+    }
+}
+```
+
+```text
+{bcrypt}$2a$10$…   (68 caracteres, muda a cada execução)
+SUCESSO
+CREDENCIAIS_INVALIDAS
+```
+
+Para experimentar as regras mais difíceis, você vai precisar de dois dublês simples no seu programa:
+
+- **Um relógio que você avança (regra 10).** `Clock` é uma classe abstrata; uma subclasse sua com um campo `Instant agora` e um método `avancar(Duration)` basta. Assim você testa os 14 e os 15 minutos sem esperar.
+- **Um codificador que conta (regra 9).** Uma classe que implementa `PasswordEncoder`, delega para o codificador de verdade e soma 1 num contador a cada `matches`. Com ele você vê que o e-mail inexistente também gasta **uma** conferência.
+
+Resultados esperados, na ordem das regras:
+
+| Cenário | Resultado |
+|---|---|
+| mesma senha em dois usuários | hashes diferentes; nenhum contém a senha |
+| senhas `"curta123456"`, `"a"` × 65, `"á"` × 40 | `SenhaFracaException` |
+| senha `"SENHA12345678"` (vazada, em maiúsculas) | `SenhaFracaException` |
+| `carlos@email.com` com `"meu nome e CARLOS silva"` | `SenhaFracaException` |
+| `"pão de queijo com café"`; `al@email.com` com `"qualquer frase longa"` | aceitas |
+| `"carlos.email.com"` | `IllegalArgumentException` |
+| `"CARLOS@email.com"` depois de `"carlos@email.com"` | `EmailJaCadastradoException` |
+| senha certa / errada | `SUCESSO` / `CREDENCIAIS_INVALIDAS` |
+| e-mail inexistente | `CREDENCIAIS_INVALIDAS`, com **1** chamada a `matches` |
+| senha certa + sufixo, passando de 72 bytes | `CREDENCIAIS_INVALIDAS` |
+| 5 falhas seguidas, depois a senha certa | `BLOQUEADO` (e ainda `BLOQUEADO` 14 minutos depois) |
+| 15 minutos depois da 5ª falha, senha certa | `SUCESSO` |
+| 4 falhas, 1 sucesso, mais 4 falhas | não bloqueia |
+| usuário com `{noop}senha antiga em texto puro`, login certo | `SUCESSO`, e o hash guardado passa a ser `{bcrypt}…` |
+
+O texto das mensagens das exceções é livre; o que importa é o **tipo**.
+
+## Critérios de aceite
+
+- [ ] Todos os cenários da tabela acima dão o resultado indicado.
+- [ ] Nenhuma senha em texto puro fica guardada, nem aparece em mensagens de exceção.
+- [ ] Você explica, com as suas palavras, por que o e-mail inexistente precisa gastar o mesmo tempo de uma senha errada.
+
+## Desafios opcionais
+
+- Troque o BCrypt por **Argon2id** (`Argon2PasswordEncoder.defaultsForSpringSecurity_v5_8()`, com a dependência `org.bouncycastle:bcprov-jdk18on`) e veja o `upgradeEncoding` migrar também os hashes BCrypt.
+- Consulte senhas vazadas na API *Pwned Passwords* com **k-anonimato**: envie só os 5 primeiros caracteres do SHA-1 da senha.
+- Meça com `System.nanoTime()`, no seu programa, o tempo de `autenticar` para um e-mail existente e para um inexistente, com e sem o hash fictício.
+
+<Dicas>
+<Dica nivel={1}>
+O `PasswordEncoder` faz o trabalho pesado: `encode` gera um hash com salt, `matches` confere, e `upgradeEncoding(hash)` diz se aquele hash usa um algoritmo antigo. Você não precisa saber como o BCrypt funciona por dentro, só usar os três métodos na ordem certa. Separe o código em métodos privados pequenos (`normalizar`, `validarPolitica`, `registrarFalha`) e teste cada um no seu programa.
+</Dica>
+<Dica nivel={2}>
+- Contra a enumeração de usuários, calcule **no construtor** o hash de uma senha qualquer e, quando o e-mail não existir, chame `codificador.matches(senha, hashFicticio)` antes de devolver `CREDENCIAIS_INVALIDAS`.
+- O `Usuario` é imutável: cada mudança (falha, bloqueio, sucesso, hash novo) é um `new Usuario(...)` salvo no repositório.
+- Para a regra 3 sem diferenciar maiúsculas, guarde no construtor uma cópia da lista com tudo em minúsculas (`toLowerCase(Locale.ROOT)`), e compare com a senha também em minúsculas.
+</Dica>
+<Dica nivel={3}>
+Ordem no login: normalizar o e-mail → senha longa demais? → buscar → (inexistente: hash fictício) → **bloqueado?** (`agora.isBefore(bloqueadoAte)`) → `matches` → falha (soma; na 5ª, `bloqueadoAte = agora.plus(Duration.ofMinutes(15))`) ou sucesso (zera, e regrava o hash se `upgradeEncoding`). Conferir o bloqueio **antes** da senha impede que o atacante continue testando senhas durante o bloqueio.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/senhas/ServicoDeCredenciais.java" />
+
+### Por que assim
+
+- **O prefixo faz a migração funcionar.** Com o `DelegatingPasswordEncoder`, um hash legado como `{noop}segredo` continua conferindo, e `upgradeEncoding` devolve `true` para ele (e para qualquer hash que não seja do algoritmo atual). No primeiro login com sucesso, o usuário ganha um hash BCrypt, sem e-mail de "troque sua senha".
+- **Mesma resposta, mesmo tempo.** O `CREDENCIAIS_INVALIDAS` único esconde a existência do e-mail na resposta. O hash fictício esconde no **tempo**, porque sem ele o BCrypt não roda e a resposta sai 100 vezes mais rápido.
+- **O bloqueio é temporário.** Um bloqueio permanente deixaria qualquer um travar a conta de qualquer pessoa de propósito, só errando a senha cinco vezes.
+- **72 bytes.** 64 caracteres ASCII cabem com folga, mas 40 letras acentuadas já são 80 bytes: por isso a política confere os dois. No login, uma entrada maior é recusada antes de chegar ao BCrypt, que a truncaria.
+- **E-mail validado com `indexOf`, sem regex.** A regra 1 é simples o bastante para três comparações e um laço, que qualquer pessoa lê e depura. Validar e-mail "de verdade" é outro assunto: o único teste definitivo é mandar um e-mail de confirmação.
+
+### Alternativa: validar o e-mail com regex
+
+```java
+if (email == null || !email.strip().matches("[^@\\s]+@[^@\\s]+")) {
+    throw new IllegalArgumentException("E-mail inválido");
+}
+```
+
+`[^@\s]` é "qualquer caractere que não seja `@` nem espaço em branco" (`\s`, escrito `\\s` numa string Java); o `+` pede um ou mais. A expressão inteira diz: "um ou mais desses, um `@`, um ou mais desses". Como `matches` exige que o texto **todo** case com a expressão, isso já garante exatamente um `@`, com algo dos dois lados. É mais curta, mas é preciso saber ler regex para entender o que ela aceita.
+
+### Avalie sua solução
+
+- O que acontece se duas requisições de login com a senha errada chegarem ao mesmo tempo? A contagem de falhas pode se perder? (Num banco, como você resolveria isso?)
+- Por que "a senha não pode conter o e-mail" compara com o texto **antes** do `@`, e não com o e-mail inteiro?
+- Tire o hash fictício da sua solução e rode o seu programa: o resultado continua `CREDENCIAIS_INVALIDAS`, mas o que muda no contador de `matches` e no tempo medido? O que um atacante aprenderia com isso?
+
+</Solucao>

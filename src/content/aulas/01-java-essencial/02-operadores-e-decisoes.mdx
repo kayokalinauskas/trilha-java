@@ -1,0 +1,220 @@
+---
+titulo: Operadores e decisões (if, switch moderno e ternário)
+descricao: Operadores lógicos com curto-circuito, precedência, igualdade de objetos, if bem escrito e o switch moderno com setas e yield.
+modulo: 01-java-essencial
+ordem: 2
+duracao: 45
+objetivos:
+  - Usar && e || aproveitando o curto-circuito para evitar erros
+  - Diferenciar == de equals
+  - Escrever condicionais legíveis com guard clauses
+  - Usar switch como expressão (setas, múltiplos rótulos, yield)
+tags: [operadores, if, switch]
+flashcards:
+  - frente: O que é curto-circuito em && e ||?
+    verso: O operando da direita só é avaliado se necessário. Em a && b, se a é false, b nem roda. Permite checar null antes de chamar um método.
+  - frente: Qual a diferença entre == e equals para objetos?
+    verso: == compara se são o mesmo objeto (referência); equals compara o conteúdo, segundo a implementação da classe.
+  - frente: O que é uma guard clause?
+    verso: Um if no início do método que trata o caso inválido e sai cedo (return/throw), evitando aninhamento.
+  - frente: O que o switch com setas (->) muda em relação ao switch antigo?
+    verso: Não tem fall-through (sem break), pode ser usado como expressão que devolve valor e aceita vários rótulos no mesmo case.
+  - frente: Para que serve yield no switch?
+    verso: Para devolver o valor de um case que precisa de um bloco com várias instruções.
+---
+
+Toda regra de negócio acaba virando uma **decisão** no código: "se o pedido passar de R$ 199, o frete é grátis", "se o cliente estiver inadimplente, bloqueie a compra". Nesta aula você vai escrever decisões corretas e — tão importante quanto — **fáceis de ler**.
+
+## Operadores essenciais
+
+| Categoria | Operadores | Observação |
+|---|---|---|
+| Aritméticos | `+ - * / %` | `/` entre inteiros trunca; `%` é o resto |
+| Atribuição composta | `+= -= *= /=` | `total += item` equivale a `total = total + item` (com cast implícito!) |
+| Incremento | `++ --` | `i++` usa e depois incrementa; `++i` incrementa e depois usa |
+| Comparação | `== != < <= > >=` | Para objetos, `==` compara referência |
+| Lógicos | `&& \|\| !` | Com curto-circuito |
+| Ternário | `cond ? a : b` | Uma expressão, não um comando |
+
+### Curto-circuito: `&&` e `||`
+
+O Java avalia a expressão da esquerda para a direita e **para assim que o resultado estiver decidido**:
+
+```java
+if (cliente != null && cliente.estaAtivo()) {
+    // se cliente for null, cliente.estaAtivo() NEM É CHAMADO
+}
+
+if (nome == null || nome.isBlank()) {
+    // se nome for null, isBlank() nem é chamado
+}
+```
+
+Isso não é detalhe: é a forma idiomática de **proteger contra `NullPointerException`**. Inverta a ordem (`cliente.estaAtivo() && cliente != null`) e o programa quebra justamente no caso que você queria tratar.
+
+<Callout tipo="atencao">
+Existem também `&` e `|` (sem duplicar), que **sempre** avaliam os dois lados. Em condições lógicas, use sempre `&&` e `||`.
+</Callout>
+
+### Precedência: na dúvida, parênteses
+
+```java
+boolean freteGratis = valor >= 199 || ehPrime && !ehMarketplace;
+```
+
+`&&` tem precedência maior que `||`, então isso significa `valor >= 199 || (ehPrime && !ehMarketplace)`. Estava certo? Depende da regra de negócio — e quem lê não deveria precisar consultar uma tabela para descobrir. **Coloque os parênteses** e, melhor ainda, dê nomes:
+
+```java
+boolean assinantePrime = ehPrime && !ehMarketplace;
+boolean freteGratis = valor >= 199 || assinantePrime;
+```
+
+## `==` versus `equals`
+
+Para **primitivos**, `==` compara valores. Para **objetos**, compara **referências**: "são o mesmo objeto na memória?".
+
+```java
+String a = "java";
+String b = new String("java");
+
+a == b          // false: objetos diferentes
+a.equals(b)     // true: mesmo conteúdo
+```
+
+Regra prática: **objetos se comparam com `equals`** (e `BigDecimal` com `compareTo`). Se um lado pode ser `null`, use `Objects.equals(a, b)`, que trata o `null` com segurança, ou coloque a constante na frente: `"ADMIN".equals(perfil)`.
+
+## `if` legível: guard clauses
+
+Compare as duas versões da mesma regra:
+
+<Comparar antes="Aninhado" depois="Guard clauses">
+```java
+BigDecimal calcularDesconto(Pedido p) {
+    if (p != null) {
+        if (p.temItens()) {
+            if (p.cliente().ehVip()) {
+                return p.total().multiply(VIP);
+            } else {
+                return BigDecimal.ZERO;
+            }
+        } else {
+            throw new IllegalArgumentException("vazio");
+        }
+    } else {
+        throw new IllegalArgumentException("nulo");
+    }
+}
+```
+
+```java
+BigDecimal calcularDesconto(Pedido p) {
+    if (p == null) {
+        throw new IllegalArgumentException("Pedido nulo");
+    }
+    if (!p.temItens()) {
+        throw new IllegalArgumentException("Pedido vazio");
+    }
+    if (!p.cliente().ehVip()) {
+        return BigDecimal.ZERO;
+    }
+    return p.total().multiply(VIP);
+}
+```
+</Comparar>
+
+A segunda versão trata os casos de borda **primeiro** e sai cedo. O "caminho feliz" fica no final, sem indentação. Essa técnica se chama **guard clause** (cláusula de guarda) e é uma das formas mais simples de deixar código legível.
+
+## O ternário
+
+Para escolher entre **dois valores**, o operador ternário é conciso:
+
+```java
+String rotulo = estoque > 0 ? "Disponível" : "Esgotado";
+```
+
+Use-o só para expressões curtas. Ternários aninhados (`a ? b : c ? d : e`) são um convite ao erro — prefira `if` ou `switch`.
+
+## O switch moderno
+
+O `switch` "clássico", herdado do C, tem uma armadilha famosa: o **fall-through**. Sem `break`, a execução "cai" no próximo `case`:
+
+```java
+switch (status) {
+    case "PAGO":
+        enviar();
+    case "CANCELADO":        // esqueceu o break: pedido pago também é cancelado!
+        cancelar();
+        break;
+}
+```
+
+Desde o Java 14, existe a forma com **setas**, que resolve isso e ainda permite usar o `switch` como **expressão** que devolve um valor:
+
+```java
+enum Status { PENDENTE, PAGO, ENVIADO, ENTREGUE, CANCELADO }
+
+String mensagem = switch (status) {
+    case PENDENTE -> "Aguardando pagamento";
+    case PAGO, ENVIADO -> "Pedido a caminho";      // vários rótulos
+    case ENTREGUE -> "Entregue! Avalie sua compra";
+    case CANCELADO -> "Pedido cancelado";
+};
+```
+
+- **Sem fall-through**: cada `case` executa só o seu lado direito.
+- **Vários rótulos** separados por vírgula.
+- **Exaustividade**: com `enum`, se você esquecer uma constante, **o código não compila**. Adicionou `DEVOLVIDO` ao enum? O compilador aponta cada `switch` que precisa ser atualizado.
+
+Quando um `case` precisa de mais de uma instrução, use um bloco com **`yield`** para devolver o valor:
+
+```java
+BigDecimal taxa = switch (formaPagamento) {
+    case PIX -> BigDecimal.ZERO;
+    case BOLETO -> new BigDecimal("3.50");
+    case CARTAO -> {
+        BigDecimal percentual = parcelas > 1 ? new BigDecimal("0.0499") : new BigDecimal("0.0299");
+        yield valor.multiply(percentual);
+    }
+};
+```
+
+<Callout tipo="novidade" titulo="Isso é só o começo">
+No Java 21, o `switch` ganhou **pattern matching**: dá para decidir pelo **tipo** do objeto e desestruturá-lo (`case Pix(String chave) -> ...`). Você vai usar isso no módulo 02, com `sealed interfaces`, e é uma das ferramentas mais poderosas do Java moderno.
+</Callout>
+
+<Quiz
+  id="01-operadores"
+  questoes={[
+    {
+      pergunta: 'Qual condição é segura quando `pedido` pode ser null?',
+      opcoes: ['`pedido.total() > 0 && pedido != null`', '`pedido != null && pedido.total() > 0`', '`pedido != null & pedido.total() > 0`', 'Nenhuma: é preciso try/catch'],
+      correta: 1,
+      explicacao: 'Com `&&`, se `pedido != null` for false, o lado direito nem é avaliado. Com `&` (sem duplicar) os dois lados sempre rodam.',
+    },
+    {
+      pergunta: '`"PIX".equals(forma)` em vez de `forma.equals("PIX")`. Qual a vantagem?',
+      opcoes: ['É mais rápido', 'Não lança NullPointerException se `forma` for null', 'Ignora maiúsculas', 'Nenhuma'],
+      correta: 1,
+      explicacao: 'O literal nunca é null, então o método é chamado nele. Se `forma` for null, o resultado é simplesmente false.',
+    },
+    {
+      pergunta: 'O que acontece se um switch com setas sobre um enum não tratar uma das constantes e for usado como expressão?',
+      opcoes: ['Retorna null', 'Lança exceção em tempo de execução', 'Não compila', 'Usa o primeiro case'],
+      correta: 2,
+      explicacao: 'Switch como expressão precisa ser exaustivo. Com enum, o compilador verifica se todas as constantes foram tratadas.',
+    },
+    {
+      pergunta: 'Qual o principal benefício das guard clauses?',
+      opcoes: ['Deixam o código mais rápido', 'Reduzem o aninhamento e deixam o caminho principal claro', 'Substituem os testes', 'São obrigatórias em Java'],
+      correta: 1,
+      explicacao: 'Tratar os casos de borda primeiro e sair cedo mantém o fluxo principal sem indentação e fácil de ler.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `&&` e `||` têm curto-circuito: use isso para checar `null` antes de chamar métodos.
+- Objetos se comparam com `equals` (ou `Objects.equals`); `==` compara referências.
+- Guard clauses tratam o caso inválido primeiro e deixam o caminho principal limpo.
+- Prefira o `switch` com setas: sem fall-through, pode devolver valor e é exaustivo com `enum`.

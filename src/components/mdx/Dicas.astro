@@ -1,0 +1,88 @@
+---
+/** Contêiner de dicas progressivas. Use <Dica> dentro, da mais sutil para a mais direta. */
+import Icon from '../Icon.astro';
+---
+
+<section class="dicas" id="dicas" data-dicas data-pagefind-ignore="all" aria-label="Dicas progressivas">
+  <header class="dicas-head">
+    <span class="dicas-icon"><Icon name="bulb" size={18} /></span>
+    <div>
+      <h2 class="dicas-title">Travou? Dicas progressivas</h2>
+      <p class="dicas-sub">Cada dica revela um pouco mais. Abra uma, tente de novo, e só então abra a próxima.</p>
+    </div>
+  </header>
+  <div class="dicas-lista"><slot /></div>
+  <button type="button" class="btn btn-sm" data-proxima-dica>
+    <Icon name="eye" size={15} /> <span>Mostrar dica 1</span>
+  </button>
+</section>
+
+<script>
+  import { registrarDica } from '../../lib/progresso';
+
+  document.querySelectorAll<HTMLElement>('[data-dicas]').forEach((bloco) => {
+    const dicas = [...bloco.querySelectorAll<HTMLElement>('.dica')];
+    const botao = bloco.querySelector<HTMLButtonElement>('[data-proxima-dica]')!;
+    const rotulo = botao.querySelector('span')!;
+    const exercicio = bloco.closest<HTMLElement>('[data-exercicio]')?.dataset.exercicio;
+    let abertas = 0;
+
+    const atualizarBotao = () => {
+      if (abertas >= dicas.length) botao.hidden = true;
+      else rotulo.textContent = `Mostrar dica ${abertas + 1} de ${dicas.length}`;
+    };
+    atualizarBotao();
+
+    botao.addEventListener('click', () => {
+      const dica = dicas[abertas];
+      if (!dica) return;
+      dica.hidden = false;
+      dica.classList.add('revelada');
+      abertas++;
+      if (exercicio) registrarDica(exercicio, abertas);
+      atualizarBotao();
+      dica.focus();
+    });
+  });
+</script>
+
+<style>
+  .dicas {
+    margin-block: 2.4em;
+    padding: clamp(18px, 3vw, 26px);
+    border-radius: var(--radius-l);
+    border: 1px dashed color-mix(in srgb, var(--ok) 45%, var(--border));
+    background: color-mix(in srgb, var(--ok-soft) 50%, var(--surface));
+  }
+  .dicas-head {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .dicas-icon {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+  .dicas-title {
+    font-size: 1.1rem !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .dicas-sub {
+    margin: 0 !important;
+    font-size: 0.87rem;
+    color: var(--text-3);
+  }
+  .dicas-lista {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+</style>

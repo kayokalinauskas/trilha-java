@@ -1,0 +1,764 @@
+---
+titulo: "Resiliência: timeouts, retry, circuit breaker e bulkhead"
+descricao: "Como uma dependência lenta derruba um sistema inteiro e como montar as defesas em camadas: timeouts com orçamento de tempo, retry com backoff e jitter só no que é idempotente, circuit breaker, bulkhead, rate limiter e fallback honesto. Com o Resilience4j 2.4, o suporte nativo do Spring Framework 7 e uma operadora de convênio simulada que fica lenta, cai e volta."
+modulo: 13-arquitetura
+ordem: 6
+duracao: 110
+objetivos:
+  - Explicar, com números, como uma dependência lenta esgota as threads e derruba rotas que nem usam essa dependência
+  - Configurar timeouts de conexão e de leitura no RestClient e dimensionar um orçamento de tempo para a chamada inteira
+  - Aplicar retry com backoff exponencial e jitter apenas a falhas transitórias e a operações idempotentes, usando chave de idempotência num POST
+  - Configurar um circuit breaker do Resilience4j (janela, amostra mínima, limiar, tempo aberto, exceções ignoradas) e ler suas transições de estado
+  - Limitar a concorrência com @ConcurrencyLimit e a vazão com um rate limiter, e escolher um fallback que não engane quem usa o resultado
+  - Comparar o retry e o limite de concorrência nativos do Spring Framework 7 com o Resilience4j e justificar a escolha para o time
+  - Definir as métricas e os alertas que mostram as defesas funcionando em produção
+tags: [resiliência, timeout, retry, circuit breaker, bulkhead, rate limiter, fallback, Resilience4j, Spring Framework 7]
+flashcards:
+  - frente: Por que uma dependência LENTA é pior que uma que caiu?
+    verso: A que caiu falha rápido (conexão recusada). A lenta segura threads e conexões esperando; o pool esgota e o serviço para de responder para todos, inclusive nas rotas que nem usam aquela dependência. É a falha em cascata.
+  - frente: Quais os dois timeouts de uma chamada HTTP e o que é o orçamento de tempo?
+    verso: Conexão (abrir o socket, curto, como 500 ms) e leitura (esperar a resposta, perto do p99 da dependência). O orçamento é o teto da chamada inteira, somando tentativas e esperas do retry; ele precisa caber no timeout de quem chama você.
+  - frente: Quando NÃO repetir uma chamada?
+    verso: Quando a falha é permanente (400, 404, 422) ou quando a operação não é idempotente. Um POST que cria algo só pode ser repetido com uma chave de idempotência reaproveitada em todas as tentativas.
+  - frente: Para que serve o jitter no backoff?
+    verso: Para espalhar as repetições no tempo. Sem ele, mil clientes que falharam juntos repetem juntos (200 ms, 400 ms, 800 ms) e batem na dependência em ondas sincronizadas, exatamente quando ela tenta se recuperar.
+  - frente: Os três estados de um circuit breaker
+    verso: Fechado - as chamadas passam e o resultado é contado numa janela. Aberto - as chamadas falham na hora, sem tocar na dependência. Meio-aberto - depois do tempo aberto, algumas chamadas de teste passam; se derem certo, fecha; se falharem, abre de novo.
+  - frente: Bulkhead e rate limiter limitam a mesma coisa?
+    verso: Não. Bulkhead limita chamadas SIMULTÂNEAS (protege as suas threads). Rate limiter limita chamadas POR PERÍODO (respeita a cota do outro lado, como 5 por segundo). No Spring 7, @ConcurrencyLimit é um bulkhead.
+  - frente: O que é um fallback honesto?
+    verso: Uma resposta de contingência que diz o que realmente se sabe, como "elegibilidade não confirmada", em vez de inventar um resultado positivo. Fallback é decisão de produto; às vezes o certo é não ter fallback e falhar.
+  - frente: O que é retry storm?
+    verso: Repetições multiplicadas em camadas. Se três serviços em cadeia fazem 1 + 2 tentativas cada, uma requisição do usuário vira até 27 chamadas na última dependência, justamente quando ela está sobrecarregada.
+---
+
+Segunda-feira, 7h40, recepção de uma rede de clínicas. Antes de cada consulta, o sistema confere na operadora do convênio se a carteirinha do paciente está ativa. Nesse dia, a operadora não caiu: ficou **lenta**, respondendo em 20 segundos. Em menos de um minuto, a recepção não conseguia mais abrir a agenda, os médicos não conseguiam abrir prontuários e o login parou de funcionar. Nada disso conversa com a operadora. O incidente terminou com o time reiniciando a aplicação três vezes e, por fim, desligando a consulta de elegibilidade na mão.
+
+O que aconteceu é o padrão mais comum de incidente em sistemas distribuídos: uma dependência degradada que arrasta junto quem depende dela, e depois quem depende de quem depende. Nas aulas anteriores você viu que mensageria absorve parte disso (se o serviço de e-mail cai, as mensagens esperam no broker). Mas muitas chamadas precisam ser **síncronas**: a recepção precisa saber agora se o convênio cobre a consulta, o médico precisa da autorização do exame antes de pedir, o checkout precisa do frete para mostrar o total. Esta aula é sobre sobreviver quando essas dependências falham, e sobre fazer isso de forma que dê para explicar, medir e operar.
+
+Você vai construir, com código que roda e testes, as defesas em camadas de um cliente da operadora de convênio: timeouts com orçamento de tempo, retry com backoff e jitter, circuit breaker, limite de concorrência, rate limiter e fallback. A operadora é simulada por um servidor HTTP de verdade, embutido no JDK, que você programa para ficar lento, responder 503 e cair. Nada de Docker, nada de rede externa.
+
+## A intuição: o disjuntor e as anteparas
+
+Pense na instalação elétrica de uma casa. Se o chuveiro entra em curto, o **disjuntor** do chuveiro desarma. Ele não espera a fiação pegar fogo: percebe a corrente anormal e corta. Enquanto ele está desarmado, ligar o chuveiro não faz nada, e você não toma choque tentando. Depois de consertar, você religa; se o curto continuar, ele desarma de novo. E, mais importante, a geladeira e as luzes continuam funcionando, porque cada circuito tem o seu disjuntor.
+
+Agora pense num navio. O casco é dividido em compartimentos estanques, separados por **anteparas** (em inglês, *bulkheads*). Se um compartimento é furado, a água enche só aquele compartimento, e o navio continua flutuando. O Titanic afundou, entre outros motivos, porque as anteparas não iam até o teto e a água passou de um compartimento para o outro.
+
+Essas duas imagens resumem a aula:
+
+- **Timeout** é o fusível mais básico: nenhuma espera é infinita.
+- **Retry** é tentar religar uma vez ou duas, com intervalo, quando a queda foi um soluço.
+- **Circuit breaker** é o disjuntor: depois de muitas falhas, para de tentar por um tempo.
+- **Bulkhead** é a antepara: uma dependência travada ocupa só o seu compartimento de threads.
+- **Rate limiter** é o limite de consumo combinado com a companhia elétrica: você não pede mais do que o contrato permite.
+- **Fallback** é a lanterna: quando a luz acaba, o que você oferece no lugar, sabendo que não é a mesma coisa.
+
+<Figura legenda="Sem defesa, as oito threads ficam presas esperando a operadora e a agenda espera na fila. Com timeout e bulkhead, a operadora ocupa no máximo duas threads, por no máximo 300 ms.">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="cascata-titulo cascata-desc">
+  <title id="cascata-titulo">Threads do servidor com e sem defesas</title>
+  <desc id="cascata-desc">À esquerda, oito threads, todas ocupadas por consultas à operadora que levam 2 segundos; requisições de agenda, login e prontuário esperam numa fila do lado de fora. À direita, com timeout de 300 milissegundos e limite de duas consultas simultâneas, duas threads atendem a operadora e seis atendem agenda, login e prontuário, sem fila.</desc>
+  <text x="180" y="24" text-anchor="middle" class="d-title">Sem defesa</text>
+  <text x="570" y="24" text-anchor="middle" class="d-title">Timeout + bulkhead</text>
+  <rect x="20" y="40" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="60" text-anchor="middle" class="d-label">thread 1 · esperando a operadora (2 s)</text>
+  <rect x="20" y="74" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="94" text-anchor="middle" class="d-label">thread 2 · esperando a operadora (2 s)</text>
+  <rect x="20" y="108" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="128" text-anchor="middle" class="d-label">thread 3 · esperando a operadora (2 s)</text>
+  <rect x="20" y="142" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="162" text-anchor="middle" class="d-label">thread 4 · esperando a operadora (2 s)</text>
+  <rect x="20" y="176" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="196" text-anchor="middle" class="d-label">thread 5 · esperando a operadora (2 s)</text>
+  <rect x="20" y="210" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="230" text-anchor="middle" class="d-label">thread 6 · esperando a operadora (2 s)</text>
+  <rect x="20" y="244" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="264" text-anchor="middle" class="d-label">thread 7 · esperando a operadora (2 s)</text>
+  <rect x="20" y="278" width="320" height="30" rx="6" class="d-accent"/><text x="180" y="298" text-anchor="middle" class="d-label">thread 8 · esperando a operadora (2 s)</text>
+  <text x="180" y="324" text-anchor="middle" class="d-text">fila: agenda, login, prontuário…</text>
+  <rect x="410" y="40" width="320" height="30" rx="6" class="d-info"/><text x="570" y="60" text-anchor="middle" class="d-label">thread 1 · operadora (no máx. 300 ms)</text>
+  <rect x="410" y="74" width="320" height="30" rx="6" class="d-info"/><text x="570" y="94" text-anchor="middle" class="d-label">thread 2 · operadora (no máx. 300 ms)</text>
+  <rect x="410" y="108" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="128" text-anchor="middle" class="d-label">thread 3 · agenda</text>
+  <rect x="410" y="142" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="162" text-anchor="middle" class="d-label">thread 4 · login</text>
+  <rect x="410" y="176" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="196" text-anchor="middle" class="d-label">thread 5 · prontuário</text>
+  <rect x="410" y="210" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="230" text-anchor="middle" class="d-label">thread 6 · agenda</text>
+  <rect x="410" y="244" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="264" text-anchor="middle" class="d-label">thread 7 · agenda</text>
+  <rect x="410" y="278" width="320" height="30" rx="6" class="d-ok"/><text x="570" y="298" text-anchor="middle" class="d-label">thread 8 · prontuário</text>
+  <text x="570" y="324" text-anchor="middle" class="d-text">consulta extra: recusada na hora</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+Os termos abaixo aparecem em toda conversa sobre resiliência, e vários deles têm nomes em inglês que o mercado usa sem traduzir.
+
+| Termo | O que é | Na clínica |
+|---|---|---|
+| **Dependência** | Qualquer coisa fora do seu processo que você chama: outra API, banco, cache, fila | a operadora de convênio |
+| **Falha transitória** | Falha que tende a sumir sozinha: 503 durante um deploy, conexão resetada, timeout isolado | a operadora respondeu 503 por 2 segundos |
+| **Falha permanente** | Falha que se repete igual em toda tentativa: 400, 404, 422, regra de negócio | carteirinha que não existe (404) |
+| **Idempotente** | Operação que, executada duas vezes, tem o mesmo efeito de executar uma | consultar elegibilidade (GET) |
+| **Chave de idempotência** | Identificador enviado pelo cliente para o servidor reconhecer a repetição de um pedido que já processou | `Idempotency-Key: pedido-medico-777` |
+| **Timeout de conexão** | Quanto esperar para abrir o socket TCP | 500 ms |
+| **Timeout de leitura** | Quanto esperar pela resposta depois de conectado | 800 ms |
+| **Orçamento de tempo** (*deadline*) | O teto da operação inteira, somando tentativas e esperas | 2 s para conferir o convênio |
+| **Backoff** | Esperar mais a cada nova tentativa (200 ms, 400 ms, 800 ms) | |
+| **Jitter** | Um valor aleatório somado ou subtraído da espera, para as repetições de clientes diferentes não coincidirem | ± 100 ms |
+| **Circuit breaker** | Componente que mede as falhas numa janela e, acima de um limiar, para de chamar a dependência por um tempo | |
+| **Janela deslizante** | O conjunto de chamadas recentes que o circuito avalia: as últimas N (por contagem) ou as dos últimos N segundos (por tempo) | as últimas 20 consultas |
+| **Bulkhead** | Limite de chamadas **simultâneas** a uma dependência | no máximo 4 consultas ao mesmo tempo |
+| **Rate limiter** | Limite de chamadas **por período** | no máximo 5 por segundo |
+| **Fallback** | O que responder quando a dependência não respondeu | "elegibilidade não confirmada" |
+| **Falha em cascata** | A falha de uma dependência derrubando quem depende dela, em sequência | |
+| **Retry storm** | Tempestade de repetições: retries multiplicados em várias camadas que soterram uma dependência já fraca | |
+
+Um ponto de vocabulário que vale fixar desde já: **resiliência não é evitar falhas**. A operadora vai falhar, a rede vai falhar, o seu próprio serviço vai falhar. Resiliência é **conter** a falha (ela não se espalha), **degradar** com honestidade (o sistema faz menos, mas não mente) e **se recuperar** sozinho quando a causa some.
+
+## As cinco camadas, uma a uma
+
+Antes do código, cada defesa com o problema que ela resolve e o que ela **não** resolve. Nenhuma camada sozinha basta, e cada uma tem um custo.
+
+### Camada 1: timeout em toda chamada
+
+Muitos clientes HTTP, por padrão, esperam **para sempre**. O `HttpClient` do JDK, sem `connectTimeout`, fica à mercê do sistema operacional para abrir a conexão; sem um timeout de leitura, espera a resposta indefinidamente. Uma chamada sem timeout é uma thread que você aceitou perder.
+
+Toda chamada de rede precisa de dois números:
+
+| Timeout | Protege contra | Como escolher |
+|---|---|---|
+| **conexão** | host inacessível, firewall que descarta pacotes sem responder | curto: numa rede saudável, conectar leva milissegundos. 500 ms a 1 s |
+| **leitura** | servidor que aceitou a conexão e não responde | perto do **p99** da dependência (o tempo abaixo do qual ficam 99% das respostas) com uma margem. Se o p99 é 600 ms, 800 ms |
+
+Escolher pelo p99 é uma decisão consciente: você aceita cortar 1% das respostas lentas para não deixar o pior caso ditar o tempo de todos. Se a dependência não publica o p99, meça (o módulo 14 mostra como) e, até ter o número, comece conservador e ajuste.
+
+No Spring Boot 4, os timeouts padrão dos clientes HTTP criados pelo `RestClient.Builder` da autoconfiguração ficam em propriedades (é preciso o `spring-boot-starter-restclient`; veja a [aula de RestClient](../../08-spring-boot/06-restclient-versionamento-openapi/)):
+
+```properties
+spring.http.clients.connect-timeout=500ms
+spring.http.clients.read-timeout=800ms
+```
+
+Valem para **todos** os clientes. Quando uma dependência precisa de números próprios (e quase sempre precisa), configure o cliente dela explicitamente, como você vai ver no código.
+
+**O orçamento de tempo.** Os timeouts de uma tentativa não são a história toda. Se cada tentativa pode levar 800 ms e você tenta três vezes com esperas de 200 e 400 ms, o pior caso passa de 3 segundos. E quem chamou **você** tem o próprio timeout: se o aplicativo da recepção desiste em 3 s, gastar 3,2 s numa resposta que ninguém vai ler é desperdício puro. O orçamento é o teto da operação inteira, e ele se calcula de fora para dentro:
+
+1. O cliente da recepção espera até 3 s.
+2. A sua API precisa de uns 200 ms para o resto do trabalho (banco, serialização).
+3. Sobram uns 2,5 s; reserve margem e dê **2 s** à conferência de convênio, com tentativas e esperas.
+
+Em arquiteturas com muitos serviços em cadeia, a prática madura é **propagar o prazo** (*deadline propagation*): a primeira chamada calcula "isto tem de terminar até 10:00:03.000" e repassa esse instante adiante (o gRPC faz isso nativamente; em HTTP, com um cabeçalho combinado entre os times). Cada serviço usa o que **sobra** do prazo, em vez de um timeout fixo que ignora quanto já foi gasto.
+
+### Camada 2: retry, com critério
+
+Repetir resolve falhas **transitórias**: o 503 de um deploy, uma conexão resetada, um timeout isolado. Mas retry mal configurado é uma das formas mais eficientes de transformar um soluço num incidente. Quatro regras:
+
+1. **Só o que é transitório.** 5xx, timeout, conexão recusada: talvez a próxima dê certo. Um 404 vai dar 404 de novo; um 400 também. Repetir uma falha permanente só gasta tempo e carga.
+2. **Só o que é idempotente.** Um GET de elegibilidade pode ser repetido à vontade. Um POST que pede uma autorização de exame **cria** algo do outro lado. Se a primeira tentativa deu timeout, você não sabe se ela foi processada: o timeout diz que **você** desistiu de esperar, não que o servidor desistiu de processar. Repetir sem proteção pode gerar duas autorizações, ou, num pagamento, duas cobranças. A proteção é a **chave de idempotência**: o cliente gera um identificador **uma vez**, antes da primeira tentativa, e o envia em todas; o servidor guarda o resultado por chave e, ao ver a mesma chave, devolve o resultado já criado. (O lado do servidor dessa ideia é o mesmo dos [consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/) do módulo 12.)
+3. **Com backoff e jitter.** Tentar de novo imediatamente quase sempre encontra a dependência no mesmo estado. Espere, e espere mais a cada tentativa (200 ms, depois 400 ms). O **jitter** espalha as repetições: sem ele, mil clientes que falharam juntos repetem juntos, em ondas sincronizadas. A [aula de retry e DLQ](../../12-mensageria/06-retry-e-dlq/#backoff-exponencial-com-jitter) mostra a conta em detalhe.
+4. **Poucas tentativas, dentro do orçamento.** Uma tentativa mais duas repetições costuma bastar. Se três tentativas não resolveram, a quarta raramente resolve, e cada uma é carga extra numa dependência que já está sofrendo.
+
+O **Spring Framework 7** trouxe retry nativo, sem o projeto separado Spring Retry: a anotação `@Retryable` (pacote `org.springframework.resilience.annotation`) e a API programática `RetryTemplate` com `RetryPolicy` (pacote `org.springframework.core.retry`). Os padrões, conferidos na documentação e no código do Framework: **3 repetições**, **1 segundo** de espera, multiplicador 1 (espera fixa), sem jitter e repetindo **qualquer** exceção. Ou seja: o padrão não serve para produção. Sempre diga `includes`, `maxRetries`, `delay`, `multiplier` e `jitter`.
+
+### Camada 3: circuit breaker
+
+Se a operadora está claramente fora do ar, continuar chamando, mesmo com timeout e retry, só gasta o seu tempo (cada consulta leva o orçamento inteiro para falhar) e piora a situação dela (você ajuda a manter a sobrecarga que a derrubou). O **circuit breaker** acompanha as chamadas recentes e, quando a proporção de falhas passa de um limiar, **abre**: as chamadas seguintes falham **na hora**, sem tocar na dependência. A falha lenta vira falha rápida, que é o que você quer quando não há chance de sucesso.
+
+<Figura legenda="Os três estados do circuit breaker e o que provoca cada transição">
+<svg viewBox="0 0 760 270" width="760" role="img" aria-labelledby="circuito-titulo circuito-desc">
+  <title id="circuito-titulo">Estados do circuit breaker</title>
+  <desc id="circuito-desc">Fechado: as chamadas passam e são contadas. Quando a taxa de falhas na janela atinge o limiar, vai para Aberto, onde as chamadas falham na hora. Depois do tempo aberto, vai para Meio-aberto, que deixa passar algumas chamadas de teste. Se o teste dá certo, volta a Fechado; se falha, volta a Aberto.</desc>
+  <defs><marker id="mk-circuito-1306" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="100" width="190" height="66" rx="30" class="d-ok"/>
+  <text x="115" y="128" text-anchor="middle" class="d-title">FECHADO</text>
+  <text x="115" y="150" text-anchor="middle" class="d-label">chamadas passam</text>
+  <rect x="285" y="100" width="190" height="66" rx="30" class="d-accent"/>
+  <text x="380" y="128" text-anchor="middle" class="d-title">ABERTO</text>
+  <text x="380" y="150" text-anchor="middle" class="d-label">falha na hora</text>
+  <rect x="550" y="100" width="190" height="66" rx="30" class="d-info"/>
+  <text x="645" y="128" text-anchor="middle" class="d-title">MEIO-ABERTO</text>
+  <text x="645" y="150" text-anchor="middle" class="d-label">chamadas de teste</text>
+  <path d="M210 120 H281" class="d-line" marker-end="url(#mk-circuito-1306)"/>
+  <text x="246" y="92" text-anchor="middle" class="d-label">falhas ≥ limiar</text>
+  <path d="M475 120 H546" class="d-line" marker-end="url(#mk-circuito-1306)"/>
+  <text x="512" y="92" text-anchor="middle" class="d-label">tempo aberto</text>
+  <path d="M645 166 C645 245, 115 245, 115 170" class="d-line" marker-end="url(#mk-circuito-1306)"/>
+  <text x="380" y="236" text-anchor="middle" class="d-label">os testes deram certo</text>
+  <path d="M590 100 C540 30, 430 30, 400 96" class="d-line" marker-end="url(#mk-circuito-1306)"/>
+  <text x="495" y="34" text-anchor="middle" class="d-label">um teste falhou</text>
+</svg>
+</Figura>
+
+Os parâmetros que você precisa entender (os nomes são do Resilience4j, a biblioteca de referência no ecossistema Java):
+
+| Parâmetro | O que decide | Padrão do Resilience4j | Na clínica |
+|---|---|---|---|
+| `slidingWindowType` | janela por contagem (`COUNT_BASED`) ou por tempo (`TIME_BASED`) | contagem | contagem |
+| `slidingWindowSize` | o tamanho da janela: N chamadas ou N segundos | 100 | 20 |
+| `minimumNumberOfCalls` | a amostra mínima antes de calcular qualquer taxa | 100 | 10 |
+| `failureRateThreshold` | o percentual de falhas que abre o circuito | 50 | 50 |
+| `slowCallDurationThreshold` e `slowCallRateThreshold` | a partir de quanto tempo uma chamada conta como lenta, e que percentual de lentas abre o circuito | 60 s e 100% | (os timeouts já cortam antes) |
+| `waitDurationInOpenState` | quanto tempo fica aberto antes de testar | 60 s | 30 s |
+| `permittedNumberOfCallsInHalfOpenState` | quantas chamadas de teste no meio-aberto | 10 | 2 |
+| `ignoreExceptions` | exceções que **não** contam nem como sucesso nem como falha | nenhuma | `CarteirinhaDesconhecidaException` |
+
+Dois detalhes fazem toda a diferença:
+
+- **O que conta como falha.** O circuito mede a saúde da **dependência**, não a qualidade dos pedidos. Um 404 de carteirinha inexistente é erro de quem digitou: se contasse, dez carteirinhas digitadas errado abririam o circuito para todos os pacientes. Ignore as exceções de cliente.
+- **A amostra mínima.** Sem `minimumNumberOfCalls`, duas falhas nas duas primeiras chamadas do dia seriam "100% de falhas". Com amostra mínima, o circuito só decide com dados suficientes.
+
+Quando o circuito está aberto, o Resilience4j lança `CallNotPermittedException`, com a mensagem `CircuitBreaker 'operadora' is OPEN and does not permit further calls`. O seu código captura e decide o fallback.
+
+### Camada 4: bulkhead e rate limiter
+
+O circuit breaker leva algumas chamadas para perceber o problema, e uma dependência **lenta** (não fora) pode nunca abrir o circuito se os timeouts forem generosos. Enquanto isso, quantas threads ela está ocupando? O **bulkhead** responde: no máximo N. Quem passar do limite é recusado na hora (ou espera um pouco, se você preferir), e o resto do serviço continua com as suas threads.
+
+No Spring Framework 7, isso é uma anotação: `@ConcurrencyLimit(limit = 4)`. A política padrão é `BLOCK` (quem passa do limite espera uma vaga); com `policy = ThrottlePolicy.REJECT`, quem passa do limite recebe `InvocationRejectedException` imediatamente. Para proteger threads de uma dependência travada, `REJECT` costuma ser a escolha certa: esperar uma vaga é só outra forma de ficar preso.
+
+O **rate limiter** limita outra coisa: chamadas **por período**. Ele não protege as suas threads; protege a **cota** combinada com o outro lado. Muitas APIs de parceiros (operadoras, bancos, Correios, gateways de pagamento) têm limite contratual, como 5 requisições por segundo, e respondem 429 (*Too Many Requests*) ou até bloqueiam o cliente que passa disso. O Spring Framework 7 não tem rate limiter nativo; o Resilience4j tem, no módulo `resilience4j-ratelimiter`.
+
+| | Bulkhead | Rate limiter |
+|---|---|---|
+| limita | chamadas simultâneas | chamadas por período |
+| protege | as **suas** threads e conexões | a cota do **outro lado** |
+| resposta a uma dependência lenta | essencial: limita o estrago | não ajuda: 5 por segundo, cada uma presa 20 s, ainda são 100 threads presas |
+| no Spring 7 | `@ConcurrencyLimit` | não há |
+| no Resilience4j | `Bulkhead` (semáforo) e `ThreadPoolBulkhead` | `RateLimiter` |
+
+### Camada 5: fallback honesto
+
+Depois de todas as camadas, algumas chamadas vão falhar. O **fallback** é o que você responde no lugar. E aqui mora uma armadilha de produto, não só técnica: o fallback precisa ser **honesto**. Se a operadora não respondeu, devolver "ativa" para a recepção não deixar de atender é uma mentira que vira glosa (a operadora recusando o pagamento da consulta) semanas depois. O fallback honesto diz o que se sabe: "elegibilidade não confirmada". A clínica decide o que fazer com isso (atender e conferir depois, pedir um termo de responsabilidade ao paciente, oferecer o particular), e essa decisão é do negócio.
+
+| Dependência | Fallback razoável | Por quê |
+|---|---|---|
+| elegibilidade do convênio | "não confirmada", com o motivo | a recepção decide com informação verdadeira |
+| recomendações de exames preventivos | uma lista padrão por faixa etária | errar aqui custa pouco |
+| cálculo de frete | uma tabela simplificada, marcada como estimativa | o cliente vê o aviso |
+| antifraude de um pagamento | **nenhum**: recusar ou deixar pendente | aprovar sem análise é pior que não vender |
+| autorização de exame | **nenhum**: a solicitação fica pendente para nova tentativa | inventar um número de autorização é fraude |
+
+Repare que dois itens da tabela não têm fallback. Isso é uma resposta válida. Fallback não é obrigatório; **decidir** sobre ele é.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está no projeto Maven da trilha, em `java/m13-arquitetura/aulas`, pacote `dev.trilhajava.m13.aulas.resiliencia`, e roda no CI. O módulo ganhou duas dependências, marcadas no `pom.xml` com o comentário "Aula 13.06": `resilience4j-circuitbreaker` e `resilience4j-ratelimiter`, na versão 2.4.0 (a mesma do exercício 13.04). O retry e o limite de concorrência vêm do próprio Spring Framework 7, que já está no módulo.
+
+As peças, de fora para dentro:
+
+| Classe | Papel |
+|---|---|
+| `OperadoraFalsa` | servidor HTTP embutido no JDK que simula a operadora; você programa atraso, 503 e queda |
+| `ClienteDaOperadora` | faz **uma** chamada HTTP com timeouts e traduz o resultado em tipos do domínio |
+| `PoliticaDeResiliencia` | todos os números das defesas num `record` |
+| `VerificadorDeElegibilidade` | compõe retry (Spring 7) dentro do circuit breaker (Resilience4j) e decide o fallback |
+| `AutorizacaoDeProcedimentos` | POST com chave de idempotência e `@Retryable` |
+| `ConsultaProtegidaDeElegibilidade` | bulkhead com `@ConcurrencyLimit` |
+| `ConfiguracaoDeResiliencia` | liga as anotações com `@EnableResilientMethods` |
+| `CotaDaOperadora` | rate limiter do Resilience4j |
+| `DemoDaCascata`, `DemoDoCircuito` | programas que mostram o comportamento com números reais |
+
+<Figura legenda="A ordem das camadas no código da aula: cada uma envolve a de dentro">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="camadas-titulo camadas-desc">
+  <title id="camadas-titulo">Camadas de resiliência aninhadas</title>
+  <desc id="camadas-desc">Retângulos aninhados. O mais externo é o bulkhead, com no máximo 4 consultas simultâneas. Dentro dele, o fallback honesto. Dentro, o circuit breaker. Dentro, o retry com uma tentativa mais duas, backoff, jitter e orçamento de 2 segundos. Dentro, o cliente HTTP com timeouts de 500 e 800 milissegundos. No centro, a chamada à operadora.</desc>
+  <rect x="10" y="10" width="740" height="310" rx="14" class="d-violet"/>
+  <text x="30" y="36" class="d-title">Bulkhead · @ConcurrencyLimit(4, REJECT)</text>
+  <rect x="40" y="50" width="680" height="256" rx="12" class="d-box"/>
+  <text x="60" y="76" class="d-title">Fallback honesto · NAO_CONFIRMADA</text>
+  <rect x="70" y="90" width="620" height="202" rx="12" class="d-accent"/>
+  <text x="90" y="116" class="d-title">Circuit breaker · janela 20, 50%, aberto 30 s</text>
+  <rect x="100" y="130" width="560" height="148" rx="12" class="d-info"/>
+  <text x="120" y="156" class="d-title">Retry · 1 + 2, backoff ×2, jitter, orçamento 2 s</text>
+  <rect x="130" y="170" width="500" height="94" rx="12" class="d-ok"/>
+  <text x="150" y="196" class="d-title">ClienteDaOperadora · conexão 500 ms, leitura 800 ms</text>
+  <rect x="230" y="212" width="300" height="38" rx="8" class="d-box"/>
+  <text x="380" y="236" text-anchor="middle" class="d-mono">GET /elegibilidade/89001234</text>
+</svg>
+</Figura>
+
+A ordem não é detalhe. O retry fica **dentro** do circuit breaker: uma consulta da recepção vira **uma** entrada na janela do circuito, já com as repetições, e, com o circuito aberto, nem as repetições acontecem. O fallback fica **fora** do circuito, para tratar tanto a falha depois das repetições quanto o circuito aberto. E o bulkhead fica por fora de tudo, porque é ele que decide se a thread entra.
+
+## Mão na massa
+
+Todos os comandos rodam na pasta do módulo:
+
+```bash
+cd java/m13-arquitetura/aulas
+```
+
+### Passo 1: uma operadora que falha quando você manda
+
+**O que vamos fazer e por quê.** Para estudar resiliência, você precisa provocar falhas sob demanda: lentidão de 2 s, três 503 seguidos, uma queda que dura minutos. Uma API real não colabora, e um container exigiria Docker. O JDK traz um servidor HTTP simples (`com.sun.net.httpserver.HttpServer`) que sobe numa porta livre em milissegundos. Em cima dele, a `OperadoraFalsa` implementa o contrato da operadora e expõe botões para as falhas.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/OperadoraFalsa.java" />
+
+**O que reparar.**
+
+- `new InetSocketAddress("127.0.0.1", 0)`: a porta 0 pede ao sistema operacional uma porta livre. Testes em paralelo não brigam por porta, e `url()` informa qual foi escolhida.
+- `Executors.newVirtualThreadPerTaskExecutor()`: cada requisição numa thread virtual. Uma operadora "lenta" dorme 2 s em cada requisição sem ocupar uma thread de plataforma; o servidor falso aguenta qualquer volume que a aula use.
+- No `POST /autorizacoes`, a autorização é **criada antes** da espera. Esse detalhe reproduz o cenário mais perigoso do retry: o cliente vê timeout, mas o efeito já aconteceu do outro lado. Com a chave de idempotência, a segunda tentativa recebe a autorização já criada.
+- `chamadasRecebidas()` e `autorizacoesCriadas()` são os "olhos" dos testes: provam quantas vezes a operadora foi incomodada e quantas autorizações existem de fato.
+
+### Passo 2: o cliente com timeouts
+
+**O que vamos fazer e por quê.** O cliente faz **uma** chamada e traduz o resultado: 200 vira `RespostaDaOperadora`; 404 vira `CarteirinhaDesconhecidaException` (permanente); 5xx e timeout viram `OperadoraIndisponivelException` (transitória). Essa tradução é a base de tudo: o retry e o circuito decidem pelo **tipo** da exceção, então a fronteira entre transitório e permanente é traçada aqui, num lugar só.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/ClienteDaOperadora.java" />
+
+**O que reparar.**
+
+- O timeout de conexão é do `HttpClient` do JDK (`connectTimeout`); o de leitura é da fábrica do Spring (`JdkClientHttpRequestFactory.setReadTimeout`). São objetos diferentes, e é comum configurar um e esquecer o outro.
+- `onStatus(...)` transforma o status em exceção do domínio **antes** de tentar ler o corpo. Quem usa o cliente nunca vê `HttpClientErrorException`, e a regra "404 não é culpa da operadora" fica registrada no tipo.
+- O método `traduzir` existe por causa de um comportamento descoberto ao rodar os testes desta aula, que aparece em "Quando dá errado": um timeout que estoura no meio do **corpo** da resposta não chega como `ResourceAccessException`.
+- Os dois métodos documentam a idempotência: o GET pode ser repetido; o POST só com a chave.
+
+### Passo 3: a falha em cascata ao vivo
+
+**O que vamos fazer e por quê.** Antes de montar as defesas, veja o problema com números. A `DemoDaCascata` simula um servidor com 8 threads (o Tomcat tem 200 por padrão; 8 deixam o efeito visível com poucas requisições). Chegam 24 requisições ao mesmo tempo: 16 conferem o convênio, com a operadora levando 2 s, e 8 só abrem a agenda, que leva 10 ms e não depende da operadora. A rodada 1 não tem defesa; a rodada 2 usa timeout de leitura de 300 ms e um bulkhead de 2 vagas (um `Semaphore`, que é o que o `@ConcurrencyLimit` faz por dentro).
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/DemoDaCascata.java" semImports />
+
+Rode:
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m13.aulas.resiliencia.DemoDaCascata
+```
+
+Saída (os milissegundos variam de máquina para máquina):
+
+```text
+== Sem defesa (timeout de leitura de 30 s, sem limite)
+   agenda: 8 requisições; a última terminou em 4761 ms
+   convênio: {confirmada=16}; tudo terminou em 4801 ms
+== Timeout de 300 ms e no máximo 2 consultas simultâneas
+   agenda: 8 requisições; a última terminou em 31 ms
+   convênio: {recusada na hora=14, timeout=2}; tudo terminou em 325 ms
+```
+
+**O que acabou de acontecer.** Na rodada 1, abrir a agenda, uma operação de 10 ms, levou **4,7 segundos**, sem que a agenda tivesse nada a ver com a operadora. As oito threads estavam ocupadas esperando, e as requisições de agenda ficaram na fila. Com 200 threads e 50 consultas por segundo a uma operadora que leva 20 s, a conta é a mesma: em 4 segundos as 200 threads estão presas, e o serviço para. Na rodada 2, a agenda levou 31 ms. O preço foi alto e visível: **nenhuma** consulta de convênio foi confirmada (14 recusadas na hora, 2 cortadas pelo timeout). É exatamente essa a troca da resiliência: você abre mão da parte doente para salvar o resto, e a parte doente precisa de um fallback.
+
+<Callout tipo="info" titulo="E com threads virtuais?">
+Com `spring.threads.virtual.enabled=true` no Boot, cada requisição roda numa thread virtual, e "acabar as threads" deixa de ser o gargalo. O problema muda de lugar, mas não some: milhares de requisições presas seguram memória, conexões do pool HTTP e conexões do banco abertas na mesma transação, e continuam martelando a operadora doente. Timeouts, circuit breaker e limite de concorrência continuam necessários; o que muda é que o bulkhead passa a proteger esses outros recursos, não só as threads.
+</Callout>
+
+### Passo 4: a política em um lugar só
+
+**O que vamos fazer e por quê.** Timeouts, repetições, janela do circuito: são números que dependem uns dos outros. Espalhados em anotações por várias classes, ninguém consegue revisá-los juntos. Um `record` com todos eles, e um comentário com a conta do orçamento, transforma a configuração em algo que se discute num code review.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/PoliticaDeResiliencia.java" />
+
+**A conta do orçamento, em detalhe.** Pior caso com os valores de produção: tentativa 1 (até 800 ms) + espera 1 (200 ms ± 100) + tentativa 2 (até 800 ms) chegam a cerca de 1,8 a 1,9 s. Antes de esperar 400 ms para a tentativa 3, o `RetryTemplate` confere se a espera estouraria o orçamento de 2 s e, se sim, desiste **preventivamente**, sem dormir à toa. Em produção, você passaria esses números por propriedades (`@ConfigurationProperties`), para ajustar sem recompilar; o `record` já tem o formato certo para isso.
+
+### Passo 5: retry dentro do circuit breaker
+
+**O que vamos fazer e por quê.** O coração da aula. O `VerificadorDeElegibilidade` monta as camadas 2, 3 e 5: um `RetryTemplate` do Spring Framework 7 dentro de um `CircuitBreaker` do Resilience4j, com o fallback em volta.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/VerificadorDeElegibilidade.java" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- `RetryPolicy.builder().includes(OperadoraIndisponivelException.class)`: só a falha transitória é repetida. Qualquer outra exceção, inclusive `CarteirinhaDesconhecidaException`, sai na primeira tentativa.
+- `.delay(...).multiplier(2).jitter(...)`: backoff exponencial com jitter. `.timeout(...)` é o orçamento total das tentativas: ele não interrompe uma tentativa em andamento (quem faz isso é o timeout de leitura), mas impede que uma nova comece se não couber.
+- `retry.invoke(...)` repassa a **última exceção original** quando as tentativas acabam. A alternativa, `retry.execute(...)`, lança a exceção verificada `RetryException`, com a lista de todas as falhas; útil quando você quer registrar cada tentativa.
+- `CircuitBreaker.of("operadora", ...)`: o nome vira a identidade do circuito em logs e métricas. Um circuito **por dependência**, nunca um para tudo.
+- `ignoreExceptions(CarteirinhaDesconhecidaException.class)`: o 404 não conta na janela.
+- `getEventPublisher().onStateTransition(...)`: toda mudança de estado vira um log de aviso. Em produção, além do log, métrica e alerta (veja a seção de visão sênior).
+- No `catch`, dois fallbacks com motivos diferentes: circuito aberto e operadora indisponível depois das repetições. O `CarteirinhaDesconhecidaException` **não** é capturado: é uma resposta legítima da operadora, e a recepção precisa saber que a carteirinha está errada.
+
+Os testes provam três comportamentos:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/resiliencia/VerificadorDeElegibilidadeTest.java" semImports />
+
+```bash
+mvn test -Dtest=VerificadorDeElegibilidadeTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.resiliencia.VerificadorDeElegibilidadeTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.638 s
+[INFO] BUILD SUCCESS
+```
+
+Repare nas contagens: dois 503 seguidos custam **3** chamadas à operadora e o paciente nem percebe; seis carteirinhas inexistentes custam **6** chamadas (nenhuma repetição) e o circuito continua fechado; e, com a operadora fora, 4 consultas geram 12 chamadas (4 × 3 tentativas), o circuito abre, e a quinta consulta **não toca** na operadora.
+
+### Passo 6: o circuito abrindo e fechando
+
+**O que vamos fazer e por quê.** Os testes provam as regras; a demonstração mostra o circuito vivo, com os logs de transição que você veria em produção. A janela é de 4 chamadas, abre com 50% de falhas e fica aberta só 1 s, para a demonstração caber em poucos segundos.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/DemoDoCircuito.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m13.aulas.resiliencia.DemoDoCircuito
+```
+
+Saída real (os horários dos logs foram removidos para caber na tela):
+
+```text
+-- operadora fora do ar
+INFO VerificadorDeElegibilidade -- operadora indisponível depois das repetições: operadora respondeu 503 SERVICE_UNAVAILABLE
+consulta 1: NAO_CONFIRMADA | operadora recebeu  3 requisições | circuito CLOSED
+INFO VerificadorDeElegibilidade -- operadora indisponível depois das repetições: operadora respondeu 503 SERVICE_UNAVAILABLE
+consulta 2: NAO_CONFIRMADA | operadora recebeu  6 requisições | circuito CLOSED
+INFO VerificadorDeElegibilidade -- operadora indisponível depois das repetições: operadora respondeu 503 SERVICE_UNAVAILABLE
+consulta 3: NAO_CONFIRMADA | operadora recebeu  9 requisições | circuito CLOSED
+WARN VerificadorDeElegibilidade -- circuito 'operadora': State transition from CLOSED to OPEN
+INFO VerificadorDeElegibilidade -- operadora indisponível depois das repetições: operadora respondeu 503 SERVICE_UNAVAILABLE
+consulta 4: NAO_CONFIRMADA | operadora recebeu 12 requisições | circuito OPEN
+INFO VerificadorDeElegibilidade -- circuito aberto; elegibilidade de 89001234 não confirmada
+consulta 5: NAO_CONFIRMADA | operadora recebeu 12 requisições | circuito OPEN
+INFO VerificadorDeElegibilidade -- circuito aberto; elegibilidade de 89001234 não confirmada
+consulta 6: NAO_CONFIRMADA | operadora recebeu 12 requisições | circuito OPEN
+-- 1,1 s depois, operadora de volta
+WARN VerificadorDeElegibilidade -- circuito 'operadora': State transition from OPEN to HALF_OPEN
+consulta 7: ATIVA          | operadora recebeu 13 requisições | circuito HALF_OPEN
+WARN VerificadorDeElegibilidade -- circuito 'operadora': State transition from HALF_OPEN to CLOSED
+consulta 8: ATIVA          | operadora recebeu 14 requisições | circuito CLOSED
+consulta 9: ATIVA          | operadora recebeu 15 requisições | circuito CLOSED
+```
+
+**O que acabou de acontecer.**
+
+- Consultas 1 a 4: cada uma custou 3 requisições (as repetições), todas falharam. Na quarta, a janela de 4 encheu com 100% de falhas, acima dos 50%: `CLOSED to OPEN`.
+- Consultas 5 e 6: respondidas **na hora**, com o contador da operadora parado em 12. É isto que o circuito compra: falha rápida e alívio para a dependência.
+- Passado o tempo aberto, a próxima chamada encontrou o circuito pronto para testar: `OPEN to HALF_OPEN`. A consulta 7 foi a primeira chamada de teste e deu certo; a 8 foi a segunda (`permittedNumberOfCallsInHalfOpenState(2)`) e, com as duas bem-sucedidas, `HALF_OPEN to CLOSED`.
+- Repare que a transição para `HALF_OPEN` só aconteceu quando uma chamada chegou. Por padrão, o Resilience4j não usa um temporizador para isso (`automaticTransitionFromOpenToHalfOpenEnabled` é `false`); a transição acontece na primeira chamada depois do tempo aberto.
+
+### Passo 7: o nativo do Spring 7, com idempotência e bulkhead
+
+**O que vamos fazer e por quê.** Agora as anotações. `@Retryable` e `@ConcurrencyLimit` são aplicados por **proxy**, então precisam de um bean do Spring e da configuração que os liga.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/ConfiguracaoDeResiliencia.java" />
+
+A autorização de procedimento é um POST que cria algo do outro lado. Ela só pode ter `@Retryable` porque recebe a chave de idempotência de quem chama:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/AutorizacaoDeProcedimentos.java" />
+
+E a consulta protegida por um bulkhead de 4 vagas, que recusa a quinta:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/ConsultaProtegidaDeElegibilidade.java" />
+
+O teste sobe um contexto do Spring mínimo (sem Spring Boot) com a configuração, o cliente apontando para a operadora falsa e a política de testes:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/resiliencia/RecursosNativosDoSpringTest.java" semImports />
+
+```bash
+mvn test -Dtest=RecursosNativosDoSpringTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.resiliencia.RecursosNativosDoSpringTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.501 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- No primeiro teste, a operadora criou a autorização `AUT-1` e demorou 600 ms para responder; o cliente desistiu aos 300 ms. O `@Retryable` repetiu com a **mesma** chave, e a operadora devolveu `AUT-1` de novo. Resultado: 2 chamadas, 1 autorização. Sem a chave (ou com uma chave nova a cada tentativa, um erro comum), seriam duas autorizações para o mesmo exame.
+- No segundo, dez threads virtuais largam juntas (o `CountDownLatch` garante a largada simultânea). Quatro entram, seis recebem `InvocationRejectedException` na hora. A thread rejeitada não ocupou nada: nem conexão, nem espera.
+- Por que a chave é um **parâmetro**, e não gerada dentro do método anotado? Porque o `@Retryable` reexecuta o método inteiro: um `UUID.randomUUID()` dentro dele geraria uma chave nova a cada tentativa, e a idempotência sumiria em silêncio.
+
+### Passo 8: a cota da operadora
+
+**O que vamos fazer e por quê.** O contrato com a operadora permite 5 requisições por segundo. O `RateLimiter` do Resilience4j controla isso do lado do cliente.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/resiliencia/CotaDaOperadora.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m13.aulas.resiliencia.CotaDaOperadora
+```
+
+```text
+rajada 1: passou passou passou passou passou RECUSADA RECUSADA RECUSADA
+rajada 2: passou passou passou passou passou RECUSADA RECUSADA RECUSADA
+```
+
+**O que acabou de acontecer.** Cinco vagas por período de 1 s. Na rajada de 8, cinco passam e três recebem `RequestNotPermitted`, porque `timeoutDuration` é zero (não esperar por vaga). Um segundo depois, as vagas se renovam. Com `timeoutDuration` de, por exemplo, 200 ms, quem chegasse sem vaga esperaria até 200 ms pela renovação: útil em processamento em lote, perigoso numa requisição de usuário, porque é mais uma espera dentro do orçamento.
+
+Onde encaixar a cota nas camadas? **Dentro do retry**, envolvendo cada tentativa: cada repetição é uma requisição que a operadora conta. Esse é o desafio do checkpoint, mais abaixo.
+
+## Quando dá errado
+
+As mensagens abaixo foram copiadas da execução do código desta aula, quebrando algo de propósito.
+
+### O timeout que não parecia timeout
+
+O primeiro teste de concorrência falhou assim, antes de o cliente ganhar o método `traduzir`:
+
+```text
+Expecting actual throwable to be an instance of:
+  org.springframework.resilience.InvocationRejectedException
+but was:
+  org.springframework.web.client.RestClientException: Error while extracting response for type [dev.trilhajava.m13.aulas.resiliencia.RespostaDaOperadora] and content type [application/json]
+Caused by: org.springframework.http.converter.HttpMessageNotReadableException: JSON parse error: closed
+Caused by: tools.jackson.core.exc.JacksonIOException: closed
+Caused by: java.io.IOException: closed
+```
+
+**Como ler:** a operadora mandou o status e os cabeçalhos a tempo, mas o timeout de leitura estourou enquanto o corpo era lido; o fluxo foi fechado, e o Jackson recebeu `IOException: closed` no meio do JSON. O Spring embrulhou isso como erro de **extração** da resposta, não como `ResourceAccessException`. Um cliente que só captura `ResourceAccessException` deixaria esse timeout escapar como erro desconhecido: sem retry, sem fallback, com um 500 para a recepção. **Como corrigir:** trate como transitória qualquer `RestClientException` cuja causa mais profunda (`getMostSpecificCause()`) seja `IOException`, como faz o `traduzir`. A lição geral vale mais que o caso: **teste o caminho de timeout de verdade**, contra um servidor que demora, e não só um mock que lança a exceção que você imagina.
+
+Já o timeout clássico, quando nem o status chega, aparece assim (a mensagem é do Spring 7 com o cliente do JDK, que cancela a requisição):
+
+```text
+dev.trilhajava.m13.aulas.resiliencia.OperadoraIndisponivelException: operadora não respondeu a tempo: I/O error on GET request for "http://127.0.0.1:52727/elegibilidade/89001234": Request cancelled
+```
+
+### O @Retryable que não repetia
+
+Para gerar esta, o `AutorizacaoDeProcedimentos` foi registrado num contexto **sem** a `ConfiguracaoDeResiliencia`, com a operadora fora do ar:
+
+```text
+dev.trilhajava.m13.aulas.resiliencia.OperadoraIndisponivelException: operadora respondeu 503 SERVICE_UNAVAILABLE chamadas=1
+```
+
+**Como ler:** uma chamada só. Não há erro de configuração, aviso no log nem falha ao subir: sem `@EnableResilientMethods`, a anotação é só um metadado que ninguém lê. **Como corrigir:** ligue as anotações numa classe `@Configuration` e tenha **um teste** que prove o número de tentativas (como o `repetirComAMesmaChaveNaoCriaDuasAutorizacoes`, que confere `chamadasRecebidas() == 2`). O mesmo sintoma aparece quando o método anotado é chamado **de dentro** da própria classe (`this.solicitar(...)`): a chamada não passa pelo proxy. E com `@ConcurrencyLimit`, o efeito é pior ainda: o limite simplesmente não existe, e você só descobre no incidente.
+
+### As tentativas acabaram, ou o orçamento acabou
+
+Com `retry.execute(...)` em vez de `invoke`, a exceção diz o motivo da desistência. Tentativas esgotadas:
+
+```text
+org.springframework.core.retry.RetryException: Retry policy for operation '...' exhausted; aborting execution | tentativas=3
+```
+
+Orçamento estourado (máximo de 5 repetições com 300 ms de espera, mas orçamento de 500 ms):
+
+```text
+org.springframework.core.retry.RetryException: Retry policy for operation '...' would exceed timeout (500ms) due to pending sleep time (300ms); preemptively aborting execution | tentativas=2
+```
+
+**Como ler:** na segunda, o `RetryTemplate` desistiu **antes** de dormir, porque a espera passaria do orçamento. Se os logs mostram "would exceed timeout" com frequência, o orçamento está apertado demais para as esperas configuradas, ou a dependência está lenta: as duas coisas pedem conversa, não um orçamento maior por reflexo.
+
+### Circuito aberto e limite de concorrência
+
+```text
+io.github.resilience4j.circuitbreaker.CallNotPermittedException: CircuitBreaker 'operadora' is OPEN and does not permit further calls
+```
+
+```text
+org.springframework.resilience.InvocationRejectedException: Concurrency limit reached: 4 - not allowed to enter dev.trilhajava.m13.aulas.resiliencia.ConsultaProtegidaDeElegibilidade.consultar
+```
+
+**Como ler:** essas duas não são bugs, são as defesas funcionando. O erro é deixá-las chegar ao usuário como 500. Traduza a primeira em fallback (como o `VerificadorDeElegibilidade` faz) e a segunda em **503 com `Retry-After`** na sua API, ou em fallback, conforme o caso. E conte as duas em métricas: elas são o sinal mais precoce de que uma dependência está em apuros.
+
+### O teste que falhava de vez em quando
+
+Ao escrever o teste de concorrência, a primeira versão também conferia `chamadasRecebidas() == 4` e falhou com `expected: 4 but was: 8`. As quatro consultas que entraram eram as primeiras do teste; a primeira conexão HTTP de uma JVM recém-iniciada (abrir socket, carregar classes, JIT) passou dos 300 ms de leitura, e o retry repetiu. A asserção foi removida porque testava a velocidade da máquina, não a regra. **Lição:** testes com timeout precisam de folga generosa entre o atraso simulado e o timeout (aqui, 150 ms contra 300 ms), e as asserções devem conferir o comportamento que não depende do relógio.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Retry em toda parte, com os padrões" depois="Retry só no transitório e idempotente, dentro do orçamento">
+```java
+@Retryable   // 3 repetições, 1 s fixo, QUALQUER exceção
+public Autorizacao solicitar(Pedido pedido) {
+    String chave = UUID.randomUUID().toString(); // nova a cada tentativa!
+    return operadora.autorizar(pedido, chave);
+}
+```
+
+```java
+@Retryable(includes = OperadoraIndisponivelException.class,
+        maxRetries = 2, delay = 50, multiplier = 2, jitter = 10)
+public String solicitar(String carteirinha, String procedimento,
+                        String chaveDeIdempotencia) {
+    return operadora.solicitarAutorizacao(
+            carteirinha, procedimento, chaveDeIdempotencia);
+}
+```
+</Comparar>
+
+O código da esquerda tem três defeitos em quatro linhas: repete um 400 de validação (que nunca vai passar), espera 1 s fixo sem jitter (as repetições de todos os clientes coincidem) e, o pior, gera uma chave nova a cada tentativa, o que anula a idempotência. Cada tentativa vira uma autorização nova.
+
+As armadilhas que mais aparecem em produção:
+
+- **Retry storm (retries em camadas).** O app da recepção repete 3 vezes, o gateway de API repete 3 vezes, o seu serviço repete 3 vezes: uma requisição vira até 27 chamadas na operadora, justo quando ela está sobrecarregada. Regra: **repita em uma camada só**, de preferência a mais próxima da dependência, e faça as camadas de cima não repetirem (ou repetirem só erros de rede antes de chegar ao serviço). Em escala, adote um **orçamento de retries** (*retry budget*): repetições não podem passar de, por exemplo, 10% das requisições em uma janela; acima disso, para de repetir.
+- **Timeout de quem chama menor que o seu orçamento.** A recepção desiste aos 2 s e você continua tentando até 3 s: trabalho desperdiçado e carga extra na operadora. O orçamento sempre cabe no timeout de quem chama, com margem.
+- **Um circuito para tudo.** Um único circuit breaker para "as APIs externas" abre quando a operadora A cai e derruba as chamadas à operadora B, que estava saudável. Um circuito **por dependência** (às vezes, por endpoint, quando a mesma API tem partes com saúde diferente).
+- **Contar erro do cliente como falha.** 400, 404 e 422 no circuito fazem usuários com dados errados derrubarem a integração para todos.
+- **Fallback que mente.** Cache vencido apresentado como atual, "aprovado" quando ninguém aprovou, lista vazia que parece "não há resultados". Se o fallback muda a decisão de quem lê, ele precisa ser marcado (`NAO_CONFIRMADA`, `desatualizada = true`, "estimativa").
+- **Fallback que chama outra dependência frágil.** O fallback da operadora consulta um serviço de cache remoto que, sob o mesmo incidente, também está lento. Fallback deve ser barato e local, ou ter as próprias defesas.
+- **Bulkhead com `BLOCK` numa requisição de usuário.** Esperar uma vaga é só uma fila invisível. Para requisições de usuário, `REJECT` e uma resposta clara; `BLOCK` cabe em processamento em lote, em que esperar é aceitável.
+- **Esquecer o pool de conexões.** O bulkhead de 4 vagas não adianta se o pool HTTP compartilhado com outras dependências tem 5 conexões e a operadora lenta segura todas. Dependências críticas merecem cliente e pool próprios.
+- **Proxy que não intercepta.** `@Retryable` e `@ConcurrencyLimit` em método `private`, em chamada interna (`this.metodo()`) ou em objeto criado com `new` não fazem nada. Não há erro: só ausência de proteção.
+
+**Quando NÃO usar:**
+
+- **Circuit breaker em chamada de baixíssimo volume.** Um job que chama a API uma vez por hora nunca enche a janela; o circuito não decide nada. Timeout e retry bastam.
+- **Retry em operação que não é idempotente e não aceita chave.** Se a API do parceiro não tem idempotência, não repita POSTs. Registre o pedido como "pendente de confirmação" e reconcilie depois (consultando o status), ou mova a operação para mensageria com [outbox](../../12-mensageria/04-transactional-outbox/).
+- **Resiliência síncrona onde o assíncrono resolve.** Se o usuário não precisa da resposta agora (enviar um e-mail, gerar uma nota fiscal), coloque na fila e deixe o consumidor repetir no tempo dele. É mais simples do que qualquer combinação de anotações.
+- **Biblioteca nova para um caso simples.** Se tudo o que você precisa é um retry pequeno num ponto e um limite de concorrência em outro, o Spring Framework 7 já tem. Uma dependência a menos é uma atualização de segurança a menos.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+### Spring Framework 7 nativo ou Resilience4j?
+
+A pergunta vai aparecer no seu time, porque as duas coisas agora existem lado a lado.
+
+| Critério | Spring Framework 7 | Resilience4j 2.4 |
+|---|---|---|
+| retry | `@Retryable`, `RetryTemplate`, `RetryPolicy` (backoff, jitter, orçamento total, `includes`/`excludes`/`predicate`) | `Retry`, com a mesma ideia e mais opções (como decidir pelo resultado, não só pela exceção) |
+| limite de concorrência | `@ConcurrencyLimit` (`BLOCK` ou `REJECT`) | `Bulkhead` (semáforo) e `ThreadPoolBulkhead` |
+| circuit breaker | **não há** | `CircuitBreaker`, completo |
+| rate limiter | **não há** | `RateLimiter` |
+| time limiter | `timeout` do retry é orçamento entre tentativas; não interrompe uma tentativa | `TimeLimiter`, para chamadas assíncronas (`CompletableFuture`) |
+| métricas | `MethodRetryEvent` publicado no contexto a cada falha; o resto você monta | métricas prontas no Micrometer e indicadores de saúde no Actuator, via `resilience4j-spring-boot4` |
+| configuração por propriedades | atributos `...String` das anotações aceitam placeholders (`${...}`) | `resilience4j.circuitbreaker.instances.<nome>.*` e equivalentes |
+| dependência extra | nenhuma | uma por módulo usado |
+
+Uma recomendação defensável: **use o nativo para retry e limite de concorrência, e o Resilience4j para circuit breaker e rate limiter**, exatamente como o código desta aula. Se o time já usa Resilience4j para tudo e tem os painéis prontos, manter tudo nele também é defensável: consistência operacional vale mais que uma dependência a menos. O que não se defende é misturar sem critério, com o mesmo método anotado pelos dois e ninguém sabendo em que ordem os proxies rodam.
+
+Sobre a ordem, um detalhe que pega até gente experiente: com as **anotações** do Resilience4j no Spring Boot, a ordem padrão documentada é `Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( Function ) ) ) ) )`. Ou seja, o retry fica **fora** do circuito, o oposto da composição desta aula. Nessa ordem, cada tentativa conta na janela, e o circuito abre mais rápido; em compensação, quando ele abre, o retry de fora recebe `CallNotPermittedException` e, se ela não estiver excluída da política de retry, repete à toa contra um circuito aberto. As duas ordens funcionam; o que não funciona é não saber qual está valendo. A ordem das anotações muda com as propriedades `...AspectOrder` do Resilience4j; na composição programática, ela é a ordem em que você escreve as chamadas, que é o motivo de esta aula preferir o código explícito.
+
+### Como chegar aos números
+
+Valores de resiliência copiados de um tutorial são o problema número um em code review. Cada número precisa de uma origem:
+
+- **Timeout de leitura:** o p99 medido da dependência, mais margem. Sem medição, combine um valor provisório e coloque "medir p99" como tarefa do mesmo sprint.
+- **Orçamento total:** de fora para dentro, a partir do timeout de quem chama.
+- **Repetições:** quantas cabem no orçamento. Se cabem zero, o orçamento está dizendo que retry não é a defesa certa ali.
+- **Janela e amostra mínima do circuito:** pelo volume. Com 10 chamadas por segundo, uma janela de 20 chamadas cobre 2 s, sensível demais a picos; uma janela por tempo de 30 s, com amostra mínima de 50, é mais estável. Com 1 chamada por minuto, o circuito quase não serve.
+- **Tempo aberto:** quanto a dependência costuma levar para se recuperar. Curto demais martela a dependência com testes; longo demais deixa o fallback no ar depois que ela voltou.
+- **Bulkhead:** pela **lei de Little**: concorrência = vazão × latência. 20 chamadas por segundo a uma dependência de 150 ms precisam, em média, de 3 vagas; com folga para picos, 6 a 8. Se a latência subir para 2 s, as mesmas 20 por segundo pediriam 40 vagas; o bulkhead de 8 recusa o excesso, que é exatamente a função dele.
+
+### Métricas e alertas
+
+Resiliência sem observabilidade é chute: o circuito pode estar abrindo dez vezes por dia, e ninguém saber. O mínimo para cada dependência:
+
+| Sinal | Métrica (Micrometer) | Alerta típico |
+|---|---|---|
+| estado do circuito | `resilience4j.circuitbreaker.state` | aberto por mais de 1 minuto |
+| taxa de falhas | `resilience4j.circuitbreaker.failure.rate` | acima de 20% por 5 minutos (antes de abrir) |
+| chamadas recusadas pelo circuito | `resilience4j.circuitbreaker.calls`, filtrando o tipo `not_permitted` | qualquer valor sustentado |
+| repetições | um contador seu, alimentado pelo `RetryListener` ou pelo `MethodRetryEvent` | repetições acima de 10% das chamadas |
+| fallbacks servidos | um contador seu, com a dependência e o motivo como tags | acima do normal da semana |
+| rejeições do bulkhead | um contador seu para `InvocationRejectedException` | qualquer valor sustentado |
+| latência da dependência | histograma do cliente HTTP (a observabilidade do `RestClient` no Boot) | p99 perto do timeout de leitura |
+
+As métricas do Resilience4j são publicadas no Micrometer pela integração com o Spring Boot (`resilience4j-spring-boot4` junto com o Actuator, segundo a documentação do Resilience4j), e o Actuator ganha um indicador de saúde de circuitos com `management.health.circuitbreakers.enabled=true`. Cuidado com esse último: se o health do Kubernetes depende dele, um circuito aberto para a operadora tira o **pod** do balanceador, e o problema de uma dependência vira indisponibilidade total, o oposto do que se queria. Circuito aberto entra no painel e no alerta, não na *readiness probe*. O [módulo 14](../../14-devops/05-observabilidade/) mostra como expor e consultar essas métricas.
+
+Duas regras para os alertas: alerte sobre **sintomas** que pedem ação (circuito aberto há minutos, fallback acima do normal), não sobre cada transição; e escreva o *runbook* junto: "circuito da operadora aberto: conferir a página de status dela, avisar a recepção que as elegibilidades vão aparecer como não confirmadas, não reiniciar a aplicação".
+
+### Custos e riscos de cada defesa
+
+- **Timeout curto demais** corta respostas legítimas e, com retry, **aumenta** a carga (a resposta lenta é processada e descartada, e o retry pede de novo). Timeout é o número que mais merece medição.
+- **Retry** multiplica a carga no pior momento e pode duplicar efeitos. Sempre pergunte "e se a primeira tentativa foi processada?".
+- **Circuit breaker** mal ajustado oscila (abre, fecha, abre) e deixa usuários alternando entre resposta e fallback. Em escala, cada instância da aplicação tem o **seu** circuito: com 20 pods, são 20 circuitos decidindo separadamente, o que é bom (não há ponto único) e confuso no painel (some por instância).
+- **Bulkhead** recusa usuários de propósito. Combine com o produto o que a tela mostra.
+- **Fallback** tem custo de produto e, em domínios regulados (saúde, finanças), jurídico. Um fallback que dispensa uma checagem obrigatória é um risco de compliance, não uma melhoria de disponibilidade.
+
+### Como justificar para o time e quando mudar de abordagem
+
+Uma proposta de resiliência boa cabe numa página: o incidente ou risco que motiva, a dependência, os números com a origem de cada um, o fallback combinado com o produto, as métricas e os alertas, e o teste que prova cada comportamento. Registre como uma decisão de arquitetura (a [aula 13.08](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/) mostra como).
+
+Sinais de que é hora de mudar:
+
+- **Fallback servido o tempo todo:** a dependência não é instável, é insuficiente. Converse com o fornecedor, aumente a cota, ou traga o dado para perto (réplica local, cache aquecido por eventos).
+- **Muitos serviços com a mesma configuração copiada:** mova as defesas comuns (timeouts, retries de rede, mTLS) para a infraestrutura, num *service mesh* ou no gateway, e deixe na aplicação só o que depende do domínio (o que é idempotente, qual é o fallback).
+- **Chamadas síncronas em cadeia longa:** quatro serviços em sequência, cada um com orçamento e retry, são frágeis por construção. Revise a fronteira entre serviços ([aula de microsserviços](../../13-arquitetura/05-microsservicos/)) ou troque parte da cadeia por eventos.
+
+<Callout tipo="entrevista">
+**"Como você protege seu serviço de uma dependência instável?"** Uma boa resposta vem em camadas e com números: timeout de conexão e de leitura em toda chamada, com o de leitura perto do p99; um orçamento total que cabe no timeout de quem chama; retry com backoff e jitter só para falhas transitórias e operações idempotentes; circuit breaker por dependência, ignorando erros do cliente; bulkhead para a dependência lenta não esgotar threads e conexões; fallback decidido com o produto, e honesto.
+
+**"Você repetiria um POST de pagamento que deu timeout?"** Só com chave de idempotência gerada antes da primeira tentativa e reaproveitada em todas, e com o servidor garantindo a deduplicação. O timeout diz que eu desisti de esperar, não que o servidor desistiu de processar. Sem chave, consulto o status ou deixo pendente para reconciliação.
+
+**"Retry dentro ou fora do circuit breaker?"** As duas ordens existem. Dentro: uma chamada lógica é uma entrada na janela e o circuito aberto corta as repetições. Fora (o padrão das anotações do Resilience4j): cada tentativa conta, e a política de retry precisa excluir `CallNotPermittedException`. O que conta é saber qual está valendo e testar.
+
+**"O que é retry storm e como evitar?"** Retries multiplicados em camadas (3 × 3 × 3 = 27 chamadas). Repetir em uma camada só, orçamento de retries e jitter.
+
+**"Spring 7 nativo ou Resilience4j?"** O nativo cobre retry e limite de concorrência, sem dependência extra. Circuit breaker e rate limiter, só no Resilience4j, que também traz métricas prontas. Cite o critério (consistência operacional, painéis já existentes) e não a preferência.
+
+**"Que métricas você olharia?"** Estado e taxa de falhas do circuito, chamadas recusadas, repetições como fração das chamadas, fallbacks servidos, rejeições do bulkhead e o p99 da dependência comparado ao timeout. E circuito aberto fora da readiness probe.
+</Callout>
+
+## Checkpoint
+
+O `CotaDaOperadora` está pronto, mas ninguém o usa. A operadora acabou de avisar que vai aplicar a cota de 5 requisições por segundo a partir do mês que vem.
+
+**O desafio:** coloque a cota no `VerificadorDeElegibilidade`. Responda antes de codificar:
+
+1. Em que camada a cota entra: fora do circuito, entre o circuito e o retry, ou dentro do retry, envolvendo cada tentativa?
+2. O que fazer com `RequestNotPermitted`: repetir, contar como falha no circuito, ou ir direto para o fallback?
+3. `timeoutDuration` zero ou maior que zero, numa consulta feita com o paciente no balcão?
+
+Depois, escreva um teste: com a cota de 2 por segundo e a operadora saudável, três consultas seguidas dão `ATIVA`, `ATIVA` e `NAO_CONFIRMADA`, e o circuito continua `CLOSED`.
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+**1. Dentro do retry.** A operadora conta cada **requisição**, e cada tentativa do retry é uma requisição. Se a cota ficasse fora do retry, uma consulta com duas repetições gastaria uma vaga e faria três requisições, estourando o contrato justamente nos momentos de instabilidade.
+
+```java
+RespostaDaOperadora resposta = circuito.executeSupplier(
+        () -> retry.invoke(
+                () -> cota.executar(() -> operadora.consultarElegibilidade(carteirinha))));
+```
+
+**2. Fallback direto, sem repetir e sem contar como falha no circuito.** Sem vaga não é falha da operadora: é limite seu. Repetir dentro do mesmo segundo só disputa a mesma cota; contar no circuito faria um pico de demanda abrir o circuito para uma operadora saudável. Na prática: `RequestNotPermitted` fica fora do `includes` do retry (já fica, porque o `includes` só tem `OperadoraIndisponivelException`), entra no `ignoreExceptions` do circuito, e ganha um `catch` próprio com o motivo "cota da operadora esgotada", para a métrica distinguir esse fallback dos outros.
+
+```java
+.ignoreExceptions(CarteirinhaDesconhecidaException.class, RequestNotPermitted.class)
+// ...
+} catch (RequestNotPermitted e) {
+    return Elegibilidade.naoConfirmada(carteirinha, "cota da operadora esgotada");
+}
+```
+
+**3. Zero, ou bem pequeno.** Com o paciente no balcão, esperar vaga consome o orçamento de 2 s. Um `timeoutDuration` de 100 a 200 ms absorve rajadas curtas sem segurar a recepção; mais que isso, e a espera vira o novo gargalo. Para conferências em lote (a agenda do dia seguinte, durante a madrugada), o contrário: espera longa, porque ninguém está esperando na frente.
+
+**O teste:** com `new CotaDaOperadora(2, Duration.ZERO)` e o verificador recebendo a cota no construtor, três chamadas a `verificar` dentro do mesmo segundo dão `ATIVA`, `ATIVA` e `NAO_CONFIRMADA` com o motivo da cota, `operadora.chamadasRecebidas()` é 2 e `estadoDoCircuito()` é `CLOSED`.
+
+**Indo além:** quando a cota é **por cliente** e você tem 10 instâncias da aplicação, cada uma com o seu rate limiter local de 5 por segundo, o total chega a 50. Divida a cota pelas instâncias (frágil quando o número de pods muda) ou use um limitador distribuído (por exemplo, com Redis), ciente do custo de uma chamada de rede a mais em cada requisição.
+
+</details>
+
+<Quiz
+  id="13-resiliencia"
+  questoes={[
+    {
+      pergunta: 'A operadora passou a responder em 20 s e seu serviço não tem timeout. O que acontece com as rotas de agenda, que não usam a operadora?',
+      opcoes: ['Nada: só as rotas de convênio ficam lentas', 'Ficam lentas ou param, porque as threads (e conexões) se esgotam esperando a operadora', 'O Spring cancela sozinho as chamadas após 5 s', 'O circuit breaker abre sozinho, mesmo sem configuração'],
+      correta: 1,
+      explicacao: 'É a falha em cascata: na demonstração da aula, abrir a agenda (10 ms) levou 4,7 s com as threads presas na operadora. Sem timeout, nada interrompe a espera.',
+    },
+    {
+      pergunta: 'Qual combinação torna seguro repetir automaticamente um POST /autorizacoes que deu timeout?',
+      opcoes: ['@Retryable com os valores padrão', 'Uma chave de idempotência gerada antes da primeira tentativa, reenviada em todas, e um servidor que deduplica pela chave', 'Gerar uma chave nova com UUID dentro do método anotado', 'Aumentar o timeout de leitura para 60 s'],
+      correta: 1,
+      explicacao: 'O timeout não diz se o servidor processou. A mesma chave em todas as tentativas faz o servidor devolver o resultado já criado. Uma chave nova a cada tentativa (UUID dentro do método com `@Retryable`) anula a proteção.',
+    },
+    {
+      pergunta: 'Por que o circuito da operadora ignora `CarteirinhaDesconhecidaException` (404)?',
+      opcoes: ['Por desempenho', 'Porque o 404 é erro de quem chama; contá-lo faria carteirinhas digitadas errado abrirem o circuito para todos', 'Porque o Resilience4j não aceita exceções de domínio', 'Porque 404 deveria ser repetido'],
+      correta: 1,
+      explicacao: 'O circuito mede a saúde da dependência, não a qualidade dos pedidos. No teste da aula, seis 404 seguidos deixam o circuito CLOSED e geram seis chamadas, nenhuma repetição.',
+    },
+    {
+      pergunta: 'O contrato com a operadora permite 5 requisições por segundo, e ela fica lenta (2 s por resposta) em alguns momentos. Quais defesas resolvem cada problema?',
+      opcoes: ['Rate limiter para os dois', 'Bulkhead para a cota e rate limiter para a lentidão', 'Rate limiter para a cota; bulkhead (limite de concorrência) e timeout para a lentidão', 'Só o circuit breaker'],
+      correta: 2,
+      explicacao: 'Rate limiter limita chamadas por período (a cota do outro lado). Bulkhead limita chamadas simultâneas (as suas threads). Cinco por segundo, cada uma presa 2 s, ainda acumulam threads: o rate limiter não protege contra lentidão.',
+    },
+    {
+      pergunta: 'Três serviços em cadeia repetem cada falha com 1 tentativa + 2 repetições. A última dependência fica sobrecarregada. Quantas chamadas uma requisição do usuário pode gerar nela, e qual a correção?',
+      opcoes: ['3; nenhuma correção é necessária', '9; aumentar o backoff', '27; repetir em uma camada só, com jitter e um orçamento de retries', '6; trocar retry por circuit breaker em todas as camadas'],
+      correta: 2,
+      explicacao: '3 × 3 × 3 = 27: é o retry storm. A correção é concentrar as repetições numa camada (a mais próxima da dependência), espalhar com jitter e limitar a fração de repetições.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Uma dependência **lenta** é mais perigosa que uma fora do ar: ela prende threads e conexões e derruba até as rotas que não a usam. Resiliência é conter, degradar com honestidade e se recuperar.
+- **Timeout** em toda chamada: conexão curta, leitura perto do p99. O **orçamento de tempo** soma tentativas e esperas e cabe no timeout de quem chama.
+- **Retry** só para falhas transitórias e operações idempotentes, com backoff, jitter e poucas tentativas. POST só com **chave de idempotência** gerada uma vez. No Spring 7: `@Retryable` e `RetryTemplate`, cujos padrões (3 repetições, 1 s, qualquer exceção) não servem para produção.
+- **Circuit breaker** (Resilience4j): fechado, aberto, meio-aberto; janela, amostra mínima, limiar e tempo aberto vêm do volume e da recuperação da dependência; ignore erros do cliente; um circuito por dependência.
+- **Bulkhead** (`@ConcurrencyLimit`, de preferência com `REJECT`) limita chamadas simultâneas; **rate limiter** (Resilience4j) limita chamadas por período.
+- **Fallback** é decisão de produto e precisa ser honesto; às vezes o certo é não ter.
+- A **ordem** das camadas muda o comportamento: saiba qual está valendo (na composição programática, a que você escreveu; nas anotações do Resilience4j, retry fica fora do circuito por padrão).
+- Meça e alerte: estado e taxa de falhas do circuito, repetições, fallbacks, rejeições e p99. Circuito aberto vai para o painel, não para a readiness probe.
+
+## Próximo passo
+
+No [exercício 13.04, Um cliente de câmbio que sobrevive ao provedor](../../../exercicios/13-arquitetura/04-cliente-resiliente/), você monta as camadas para outro domínio, com regras próprias de fallback e um relógio controlado no circuito. Em seguida, a [aula 13.07, Domain-Driven Design](../../13-arquitetura/07-domain-driven-design/), volta ao desenho do domínio: com as fronteiras entre contextos bem traçadas, fica mais claro quais chamadas precisam mesmo ser síncronas e quais podem virar eventos.
+
+## Referências
+
+- [Spring Framework: Resilience Features](https://docs.spring.io/spring-framework/reference/core/resilience.html)
+- [Spring Framework: Javadoc de `@Retryable`](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/resilience/annotation/Retryable.html) e de [`@ConcurrencyLimit`](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/resilience/annotation/ConcurrencyLimit.html)
+- [Spring Framework: REST Clients (`RestClient`)](https://docs.spring.io/spring-framework/reference/integration/rest-clients.html)
+- [Spring Boot: HTTP Clients](https://docs.spring.io/spring-boot/reference/io/rest-client.html)
+- [Resilience4j: CircuitBreaker](https://resilience4j.readme.io/docs/circuitbreaker)
+- [Resilience4j: RateLimiter](https://resilience4j.readme.io/docs/ratelimiter) e [Bulkhead](https://resilience4j.readme.io/docs/bulkhead)
+- [Resilience4j: Getting Started com Spring Boot](https://resilience4j.readme.io/docs/getting-started-3) (ordem dos aspectos, métricas e health)
+- [IETF: The Idempotency-Key HTTP Header Field (draft)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)

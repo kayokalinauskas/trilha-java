@@ -1,0 +1,116 @@
+---
+titulo: Matrículas — entidades, relacionamentos e a última vaga
+codigo: "09.01"
+resumo: Mapeie um schema existente como entidades JPA (com uma associação muitos-para-muitos que tem dados próprios), escreva as consultas e garanta que 12 alunos disputando 3 vagas ao mesmo tempo nunca virem 4 matrículas.
+modulo: 09-persistencia
+ordem: 1
+dificuldade: medio
+tempo: 3–4h
+conceitos: [entidades, ManyToOne, ddl-auto validate, projeção, lock pessimista, Transactional]
+aulas: [09-persistencia/01-jpa-e-contexto-de-persistencia, 09-persistencia/02-relacionamentos, 09-persistencia/03-spring-data-jpa]
+java:
+  modulo: m09-persistencia
+  teste: MatriculasTest
+---
+
+## Contexto
+
+Uma escola de programação abre turmas com vagas limitadas, e as inscrições abrem num horário anunciado nas redes sociais. No último lançamento, a turma de "Banco de Dados" com 30 vagas terminou com **34 alunos**: o sistema antigo contava as matrículas e depois inseria, e dezenas de pessoas clicaram no mesmo segundo.
+
+O banco de dados já existe (o DBA não aceita mudanças sem migração). Você vai **mapear** esse schema com JPA e reescrever o serviço de matrículas.
+
+## O schema (pronto)
+
+`src/main/resources/db/matriculas/V1__cria_tabelas.sql`, aplicado pelo Flyway:
+
+```sql
+aluno     (id IDENTITY, nome, email UNIQUE)
+turma     (id IDENTITY, codigo UNIQUE, disciplina, vagas > 0)
+matricula (id IDENTITY, aluno_id → aluno, turma_id → turma,
+           status 'ATIVA' | 'CANCELADA', matriculada_em TIMESTAMPTZ,
+           UNIQUE (aluno_id, turma_id))
+```
+
+O Hibernate roda com `ddl-auto=validate`: se as suas entidades não baterem com as tabelas, a aplicação nem sobe — e a mensagem diz o que está diferente.
+
+## Requisitos
+
+Crie as entidades `Aluno`, `Turma` e `Matricula` (com um enum de status), os repositórios Spring Data e implemente `ServicoDeMatriculas`:
+
+| Método | Comportamento |
+|---|---|
+| `long matricular(alunoId, turmaId)` | cria a matrícula ATIVA e devolve o id; se existir uma CANCELADA, **reativa a mesma linha** |
+| `void cancelar(alunoId, turmaId)` | cancela a matrícula ativa |
+| `List<String> turmasDoAluno(alunoId)` | códigos das turmas com matrícula ativa, em ordem alfabética |
+| `List<AlunoMatriculado> listaDeChamada(codigoTurma)` | alunos ativos da turma, por nome — **em uma única consulta SQL** |
+| `long vagasRestantes(codigoTurma)` | vagas − matrículas ativas |
+
+## Regras
+
+1. Aluno, turma ou matrícula ativa inexistente → `RegistroNaoEncontradoException`.
+2. Matrícula ativa repetida → `MatriculaDuplicadaException`.
+3. Turma sem vagas → `TurmaLotadaException` (com o código da turma na mensagem).
+4. **Concorrência**: 12 alunos diferentes tentando as 3 últimas vagas ao mesmo tempo → exatamente 3 matrículas.
+5. `AlunoMatriculado` (record pronto) é uma **projeção**: não carregue entidades para montá-la.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `MatriculasTest` passam.
+- [ ] Todos os `@ManyToOne` são `LAZY` e o status é gravado como texto.
+- [ ] Nenhum `@ManyToMany`: a matrícula é uma entidade.
+- [ ] A lista de chamada faz exatamente 1 consulta (o teste confere pelas estatísticas do Hibernate).
+
+## Desafios opcionais
+
+- Lista de espera: se a turma estiver lotada, a matrícula entra como `EM_ESPERA` (nova migração `V2`!) e é promovida automaticamente quando alguém cancela.
+- Resolva a concorrência **sem** lock pessimista, com um `UPDATE turma SET ocupadas = ocupadas + 1 WHERE id = ? AND ocupadas < vagas` (nova coluna, nova migração). Compare as duas abordagens.
+- Ligue `spring.jpa.show-sql=true` em `matriculas.properties` e leia o SQL de cada método.
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelas entidades e rode os testes só para ver a aplicação subir: os erros de validação do Hibernate apontam a coluna e o tipo esperados. `Matricula` tem dois `@ManyToOne(fetch = LAZY)` com `@JoinColumn(name = "aluno_id")` e `"turma_id"`, `@Enumerated(EnumType.STRING)` no status e `Instant` para a data.
+</Dica>
+<Dica nivel={2}>
+- Consultas derivadas resolvem quase tudo: `findByAlunoIdAndTurmaId`, `countByTurmaIdAndStatus`, `findByCodigo`.
+- A lista de chamada é uma `@Query` com `select new dev.trilhajava.m09.matriculas.AlunoMatriculado(a.nome, a.email, m.matriculadaEm)`.
+- Para a concorrência: "contar matrículas e inserir" precisa acontecer com a **turma travada**. Um método no repositório de turmas com `@Lock(LockModeType.PESSIMISTIC_WRITE)` resolve.
+</Dica>
+<Dica nivel={3}>
+Ordem dentro de `matricular` (um método `@Transactional`): busque o aluno; busque a turma **com lock**; procure a matrícula existente (ativa → duplicada); conte as ativas e compare com `vagas` (lotada); se havia uma cancelada, reative-a (o dirty checking faz o UPDATE); senão, `save(new Matricula(...))`. Como a turma está travada, a próxima matrícula na mesma turma só conta depois do seu commit.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Serviço">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/ServicoDeMatriculas.java" />
+</Tab>
+<Tab rotulo="Matricula">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/Matricula.java" />
+</Tab>
+<Tab rotulo="Repositórios">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/MatriculaRepository.java" />
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/TurmaRepository.java" />
+</Tab>
+<Tab rotulo="Aluno e Turma">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/Aluno.java" />
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/matriculas/Turma.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Matrícula como entidade**: status e data não caberiam num `@ManyToMany`. A constraint `UNIQUE (aluno_id, turma_id)` garante no banco que não existem duas linhas para o mesmo par — por isso a rematrícula **reativa** a linha em vez de inserir outra.
+- **Lock na turma, não na tabela**: o `SELECT ... FOR UPDATE` trava só a linha daquela turma. Matrículas em turmas diferentes continuam em paralelo; na mesma turma, entram em fila. Sem o lock, dois alunos contariam "29 ativas" ao mesmo tempo e os dois entrariam.
+- **Projeção para a lista de chamada**: uma consulta com JOIN devolve exatamente as três informações da tela. Carregar matrículas e navegar até o aluno seria N+1.
+- **Dirty checking**: `reativar` e `cancelar` só alteram o objeto; o UPDATE sai no commit.
+
+### Avalie sua solução
+
+- Se o seu `matricular` contasse as vagas **antes** de travar a turma, o teste de concorrência ainda passaria? (Rode umas 5 vezes: race conditions são intermitentes.)
+- Qual índice o `countByTurmaIdAndStatus` usa? Ele existe na migração?
+
+</Solucao>

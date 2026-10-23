@@ -1,0 +1,1033 @@
+---
+titulo: Testes de contrato entre serviços
+descricao: "Como garantir que o serviço de pedidos e o serviço de frete continuam se entendendo sem subir os dois juntos: contratos orientados pelo consumidor, Spring Cloud Contract na prática (com Spring Boot 4.1), Pact e o can-i-deploy, validação por OpenAPI, evolução compatível de API e contratos de eventos."
+modulo: 10-testes
+ordem: 7
+duracao: 110
+objetivos:
+  - Explicar por que testes ponta a ponta entre serviços não escalam e o que um teste de contrato verifica no lugar deles
+  - Escrever um contrato em YAML do Spring Cloud Contract com matchers de regex e de tipo, só com os campos que o consumidor usa
+  - Gerar e rodar os testes do provedor a partir do contrato, com uma classe base em @WebMvcTest
+  - Rodar o cliente HTTP real do consumidor contra os stubs gerados do mesmo contrato, com o StubRunnerExtension
+  - Classificar uma mudança de API como compatível ou incompatível e dizer como o pipeline barra a incompatível
+  - Comparar Spring Cloud Contract, Pact (com Pact Broker e can-i-deploy) e validação por OpenAPI, e justificar a escolha para um time
+tags: [testes de contrato, Spring Cloud Contract, Pact, consumer-driven contracts, OpenAPI, versionamento de API]
+flashcards:
+  - frente: O que um teste de contrato verifica que um teste com mock HTTP comum não verifica?
+    verso: Que o dublê do consumidor e o provedor real dizem a MESMA coisa. O stub do consumidor e o teste do provedor saem do mesmo contrato; se o provedor mudar, o teste dele quebra, e o stub do consumidor deixa de ser mentira.
+  - frente: O que significa "contrato orientado pelo consumidor" (consumer-driven contract)?
+    verso: Cada consumidor declara as interações de que depende, e só os campos que usa. O provedor verifica todos os contratos dos consumidores no próprio pipeline. Assim o provedor sabe exatamente o que pode mudar sem quebrar ninguém.
+  - frente: No Spring Cloud Contract, o que o plugin Maven gera a partir de um contrato?
+    verso: Testes JUnit para o provedor (em target/generated-test-sources/contracts, estendendo a sua classe base) e mapeamentos WireMock para o consumidor (em target/stubs, empacotados num jar de stubs).
+  - frente: Acrescentar um campo opcional na resposta é uma mudança compatível?
+    verso: Sim, desde que os consumidores sejam leitores tolerantes (ignorem campos desconhecidos). Remover, renomear, mudar o tipo de um campo ou tornar obrigatório um campo da requisição são mudanças incompatíveis.
+  - frente: O que o comando can-i-deploy do Pact Broker responde?
+    verso: Se uma versão de um serviço pode ir para um ambiente, consultando a matriz de verificações. Ele só libera se os contratos com todas as versões dos parceiros que estão naquele ambiente foram verificados com sucesso.
+  - frente: Teste de contrato substitui teste funcional do provedor?
+    verso: Não. O contrato verifica o formato da conversa (caminho, status, campos, tipos). As regras de negócio do provedor continuam nos testes de unidade e de integração dele. Contrato com regra de negócio demais vira um teste frágil.
+  - frente: Por que o valor do frete viaja como texto ("23.90") no contrato desta aula?
+    verso: Porque número JSON costuma ser lido como double por bibliotecas e ferramentas. O próprio teste gerado leu 23.90 como "23.9". Texto com duas casas preserva os centavos, e o consumidor converte direto para BigDecimal.
+---
+
+Sexta-feira, 17h40. O time do serviço de frete publica uma melhoria pequena: o campo `prazoEmDiasUteis` passa a se chamar `prazoEmDias`, porque "agora também entregamos no sábado". Todos os testes do serviço de frete passam. Às 18h05, o checkout da loja começa a mostrar "Entrega em 0 dias" para todos os pedidos, e o serviço de pedidos, que monta a promessa de entrega, passa a lançar `NullPointerException` em uma parte dos fluxos. Ninguém mexeu no serviço de pedidos. Os testes dele também passavam: ele usava um mock HTTP que devolvia `prazoEmDiasUteis`, exatamente como o serviço de frete respondia **na semana passada**.
+
+O problema não foi falta de teste. Os dois serviços tinham boa cobertura. O problema foi que **cada lado testava contra a sua própria ideia do outro**. O mock do consumidor era uma fotografia antiga do provedor, e nada obrigava essa fotografia a acompanhar a realidade. A saída tradicional é um ambiente compartilhado onde os dois sobem juntos e um teste ponta a ponta exercita a conversa. Ela funciona com dois serviços; com vinte, vira o gargalo da empresa inteira. Nesta aula você vai aprender a alternativa que os times de microsserviços usam: **testes de contrato**, em que o mock do consumidor e o teste do provedor saem do mesmo arquivo, e um não consegue mudar sem que o outro perceba.
+
+## A intuição: a tomada e o plugue
+
+Pense na tomada da sua casa e no carregador do seu celular. Eles foram fabricados por empresas diferentes, em países diferentes, sem que nenhuma das duas testasse o produto conectado ao da outra. Mesmo assim, encaixam. O que garante isso é uma **norma**: um documento que diz a distância entre os pinos, o diâmetro, a tensão. O fabricante da tomada testa a tomada contra a norma, com um calibrador. O fabricante do carregador testa o plugue contra a norma, com outro calibrador. Nenhum dos dois precisa do produto do outro na bancada.
+
+Teste de contrato é isso aplicado a serviços:
+
+- **A norma é o contrato**: um arquivo que descreve uma interação concreta ("quando chegar um POST em `/fretes/cotacoes` com este corpo, responda 200 com estes campos").
+- **O calibrador do consumidor é um stub**: um servidor falso, gerado a partir do contrato, contra o qual o cliente HTTP real do consumidor é testado.
+- **O calibrador do provedor é um teste gerado**: ele manda a requisição do contrato para o provedor real e confere se a resposta tem o formato combinado.
+
+Se o provedor renomear um campo, o teste gerado dele falha antes do merge, no pipeline do próprio provedor. Se o consumidor passar a mandar um campo que o contrato não prevê, o stub não reconhece a requisição e o teste do consumidor falha. A fotografia antiga deixa de existir: só há uma fonte da verdade.
+
+Há uma diferença importante em relação à norma da tomada. A norma elétrica é escrita por um comitê e vale para todos. Os contratos entre serviços costumam ser escritos **a partir das necessidades de quem consome**: cada consumidor diz do que depende, e o provedor se compromete a não quebrar nenhum deles. É como se cada fabricante de carregador pudesse registrar "eu uso só os pinos redondos e 127 V", e o fabricante da tomada ficasse livre para mudar todo o resto.
+
+## Vocabulário
+
+| Termo | O que é | Nesta aula |
+|---|---|---|
+| **Provedor** (*provider*, *producer*) | O serviço que expõe a API ou publica o evento | Serviço de frete |
+| **Consumidor** (*consumer*) | O serviço que chama a API ou consome o evento | Serviço de pedidos |
+| **Interação** | Um par requisição → resposta (ou um evento) com valores de exemplo | "Cotar 1,2 kg para 01310-100 devolve 23.90 em 3 dias" |
+| **Contrato** | O conjunto de interações que um consumidor espera de um provedor | Os arquivos YAML em `src/test/resources/contracts/frete` |
+| **Contrato orientado pelo consumidor** (*consumer-driven contract*, CDC) | Cada consumidor declara só o que usa; o provedor verifica todos | O contrato cita `valor` e `prazoEmDiasUteis`, não `transportadora` |
+| **Stub** | Servidor falso que responde conforme o contrato (aula 3: um stub controla as entradas) | Mapeamentos WireMock gerados pelo plugin |
+| **Verificação do provedor** | Rodar as interações do contrato contra o provedor real | A classe `FreteTest`, gerada |
+| **Matcher** | Regra que afrouxa a comparação: tipo, regex, formato | "`valor` é texto com duas casas", em vez de "`valor` é 23.90" |
+| **Estado do provedor** (*provider state*) | Os dados que precisam existir no provedor para a interação fazer sentido | "Existe o pedido 42" antes de um GET `/pedidos/42` |
+| **Pact Broker** | Servidor que guarda contratos e resultados de verificação, versão a versão | Visto em "Visão de pleno e sênior" |
+| **can-i-deploy** | Consulta ao broker: esta versão pode ir para tal ambiente? | Idem |
+| **Mudança compatível** (*backward compatible*) | Mudança no provedor que nenhum consumidor existente percebe | Acrescentar um campo na resposta |
+| **Leitor tolerante** (*tolerant reader*) | Consumidor que lê só o que precisa e ignora o resto | `CotacaoDeFrete` com dois campos |
+
+Um esclarecimento antes de seguir: **teste de contrato não é teste funcional do provedor**. Ele não pergunta "o frete de 1,2 kg para São Paulo está certo?". Pergunta "se eu mandar uma requisição neste formato, recebo uma resposta neste formato?". A regra de preço continua testada por testes de unidade da `CalculadoraDeFrete`, como você fez na [aula de JUnit e AssertJ](../../10-testes/02-junit-e-assertj/). Misturar as duas coisas é a armadilha mais comum do assunto, e ela volta mais adiante.
+
+## Por que ponta a ponta entre serviços não escala
+
+Antes do código, vale entender o problema com números, porque é com eles que você convence um time.
+
+Um teste ponta a ponta (*end-to-end*, E2E) entre serviços precisa de todos os serviços do caminho no ar, na versão certa, com dados coerentes entre si. Com dois serviços, isso é um `docker compose up`. Numa empresa com 30 serviços e cinco times, aparecem estes custos:
+
+1. **Ambiente compartilhado é fila.** Existe um ambiente de homologação, e todos os times querem testar nele ao mesmo tempo. Uma versão quebrada de um serviço derruba os testes de todos os outros. O time de frete espera o time de estoque consertar o deploy dele para descobrir se o próprio PR funciona.
+2. **Lentidão.** Subir serviços, bancos, filas e popular dados leva minutos. Um conjunto de testes E2E de 40 minutos não roda em cada PR; roda à noite, e o erro é descoberto no dia seguinte, longe de quem o causou.
+3. **Instabilidade.** Rede, *timeouts*, dados que outro teste alterou, um serviço que demorou a ficar pronto. Testes instáveis (*flaky*) ensinam o time a apertar "rodar de novo", e um teste que todo mundo ignora não protege nada.
+4. **Combinações.** Pedidos v12 funciona com frete v7, mas e com frete v8, que sobe amanhã? E se pedidos voltar para v11 num rollback? O E2E testa **uma** combinação: a que estava no ambiente naquela hora.
+5. **Diagnóstico difícil.** O teste falha com "esperava status 201, recebeu 500" no gateway. A causa está três serviços abaixo, e alguém passa a tarde lendo logs.
+
+Testes de contrato atacam exatamente a parte que o E2E fazia de mais útil, que é **verificar que os serviços se entendem**, sem nenhum desses custos. Cada lado roda no próprio pipeline, em segundos, sem rede e sem ambiente compartilhado. O que sobra para o E2E são poucos testes de jornadas críticas (o cliente consegue comprar?), rodando como monitoramento, e não como portão de cada PR.
+
+Isso não significa abolir o E2E. A [pirâmide de testes da aula 1](../../10-testes/01-por-que-e-como-testar/) continua valendo: muitos testes de unidade, uma camada de integração (fatias, Testcontainers) e poucos testes ponta a ponta. Os testes de contrato entram na camada de integração, **entre** serviços, no lugar da maior parte dos E2E que existiam só para pegar quebra de formato.
+
+<Figura legenda="O contrato é o ponto de encontro: dele saem o stub que testa o consumidor e o teste que verifica o provedor. Os dois serviços nunca precisam subir juntos">
+<svg viewBox="0 0 760 380" width="760" role="img" aria-labelledby="contrato-fluxo-titulo contrato-fluxo-desc">
+  <title id="contrato-fluxo-titulo">Um contrato, dois lados verificados separadamente</title>
+  <desc id="contrato-fluxo-desc">No centro, o contrato em YAML. Uma seta para a esquerda leva ao stub WireMock gerado pelo plugin, e o teste do consumidor, abaixo dele, faz chamadas HTTP de verdade a esse stub usando o ClienteDeFrete real. Uma seta para a direita leva ao teste gerado FreteTest, que chama via MockMvc o provedor real, abaixo dele. Os dois lados nunca se chamam diretamente.</desc>
+  <defs><marker id="mk-contrato-fluxo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="130" y="34" text-anchor="middle" class="d-title">Consumidor · pedidos</text>
+  <text x="630" y="34" text-anchor="middle" class="d-title">Provedor · frete</text>
+  <rect x="20" y="60" width="220" height="70" rx="10" class="d-info"/>
+  <text x="130" y="89" text-anchor="middle" class="d-title">Stub WireMock</text>
+  <text x="130" y="112" text-anchor="middle" class="d-label">gerado pelo plugin</text>
+  <rect x="290" y="60" width="180" height="70" rx="10" class="d-accent"/>
+  <text x="380" y="89" text-anchor="middle" class="d-title">Contrato</text>
+  <text x="380" y="112" text-anchor="middle" class="d-label">YAML versionado</text>
+  <rect x="520" y="60" width="220" height="70" rx="10" class="d-violet"/>
+  <text x="630" y="89" text-anchor="middle" class="d-title">Teste gerado</text>
+  <text x="630" y="112" text-anchor="middle" class="d-label">FreteTest extends Base</text>
+  <path d="M288 95 L244 95" class="d-line" marker-end="url(#mk-contrato-fluxo)"/>
+  <path d="M472 95 L516 95" class="d-line" marker-end="url(#mk-contrato-fluxo)"/>
+  <text x="266" y="150" text-anchor="middle" class="d-label">stubs</text>
+  <text x="494" y="150" text-anchor="middle" class="d-label">testes</text>
+  <rect x="20" y="230" width="220" height="70" rx="10" class="d-box"/>
+  <text x="130" y="259" text-anchor="middle" class="d-title">Teste do consumidor</text>
+  <text x="130" y="282" text-anchor="middle" class="d-label">ClienteDeFrete real</text>
+  <rect x="520" y="230" width="220" height="70" rx="10" class="d-ok"/>
+  <text x="630" y="259" text-anchor="middle" class="d-title">Provedor real</text>
+  <text x="630" y="282" text-anchor="middle" class="d-label">controller + regra</text>
+  <path d="M130 228 L130 134" class="d-line" marker-end="url(#mk-contrato-fluxo)"/>
+  <path d="M630 134 L630 228" class="d-line" marker-end="url(#mk-contrato-fluxo)"/>
+  <text x="140" y="185" class="d-label">HTTP de verdade</text>
+  <text x="640" y="185" class="d-label">MockMvc</text>
+  <text x="380" y="255" text-anchor="middle" class="d-text">Os dois lados</text>
+  <text x="380" y="277" text-anchor="middle" class="d-text">nunca se chamam</text>
+  <text x="380" y="350" text-anchor="middle" class="d-label">Cada lado roda sozinho, no próprio pipeline, em segundos</text>
+</svg>
+</Figura>
+
+## As ferramentas no ecossistema Java
+
+Existem dois grandes caminhos maduros no Java, e um terceiro que parte da especificação OpenAPI. Antes de escolher, conferimos o que funciona hoje com a stack desta trilha (Java 25, Spring Boot 4.1, Spring Framework 7, JUnit 6):
+
+| Ferramenta | Versão atual | Compatibilidade com Boot 4.1 | Onde o contrato nasce |
+|---|---|---|---|
+| **Spring Cloud Contract** | 5.0.3 (trem Spring Cloud 2025.1) | Oficial: o trem 2025.1 suporta Boot 4.1 a partir do 2025.1.2 | No repositório do **provedor**, em YAML, Groovy ou Kotlin; os consumidores propõem mudanças por PR |
+| **Pact JVM** | 4.7.5 | Tem o módulo `au.com.dius.pact.provider:spring7` para Spring 7 e Boot 4 | No **teste do consumidor**, em código; vira um arquivo JSON publicado num broker |
+| **Validação por OpenAPI** | várias bibliotecas | Depende da biblioteca | Na especificação OpenAPI do provedor |
+
+Nesta aula, o exemplo executável usa o **Spring Cloud Contract 5.0.3**: ele roda de verdade no build do projeto, com Spring Boot 4.1.1 e JUnit 6, e todas as saídas mostradas foram copiadas da execução. O Pact aparece mais adiante em blocos marcados como **"não executado neste projeto"**: a API foi conferida na documentação oficial, mas o código não roda no CI da trilha.
+
+<Callout tipo="info" titulo="Por que Spring Cloud Contract no exemplo">
+Os dois são escolhas legítimas, e a seção de decisões compara os dois com calma. Para uma aula, o Spring Cloud Contract tem uma vantagem prática: provedor e consumidor cabem num único módulo Maven, o contrato é um arquivo que você lê sem conhecer uma DSL Java, e não é preciso um servidor (o broker) para os dois lados se encontrarem. Num sistema real, com times separados, o arranjo muda, e isso também está na seção de decisões.
+</Callout>
+
+## O código que vamos construir
+
+Tudo está em `java/m10-testes/aulas`, nos pacotes `dev.trilhajava.m10.aulas.contrato.frete` (o provedor) e `dev.trilhajava.m10.aulas.contrato.pedidos` (o consumidor). Num sistema real, seriam dois repositórios; aqui, ficam lado a lado para você ver a conversa inteira. Repare que **nenhuma classe de um pacote importa classe do outro**: o consumidor tem as próprias cópias dos tipos que troca com o provedor. É essa separação que torna o contrato necessário.
+
+### O provedor: o serviço de frete
+
+A API recebe um CEP e um peso e devolve o valor, o prazo e outros dados da cotação:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/contrato/frete/CotacaoController.java" semImports />
+
+A regra de preço é simples de propósito: interessa a forma da conversa, não a tabela de fretes.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/contrato/frete/CalculadoraDeFrete.java" semImports />
+
+E a resposta. Repare no tipo do `valor`:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/contrato/frete/Cotacao.java" />
+
+Dinheiro como texto num JSON parece estranho no começo. O motivo: o número JSON não tem tipo decimal, e muitas bibliotecas e ferramentas (inclusive a que o próprio teste gerado usa, como você vai ver em "Quando dá errado") leem número como `double`. `"23.90"` chega do outro lado exatamente como saiu, e o consumidor o converte direto para `BigDecimal`. Outra opção comum é mandar centavos como inteiro (`2390`). O importante é decidir isso **no contrato**, e não deixar cada consumidor descobrir sozinho.
+
+### O consumidor: o serviço de pedidos
+
+O serviço de pedidos tem um adaptador que esconde o HTTP do resto da aplicação. É o mesmo padrão da [aula de Mockito](../../10-testes/03-mockito/#armadilhas-e-quando-não-mockar): a regra de negócio depende de uma interface ou classe sua, e só o adaptador conhece `RestClient`, JSON e códigos de status.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/contrato/pedidos/ClienteDeFrete.java" semImports />
+
+O que o consumidor lê da resposta:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/contrato/pedidos/CotacaoDeFrete.java" />
+
+Três decisões merecem atenção:
+
+- **O consumidor lê só dois campos.** O provedor devolve quatro (`valor`, `prazoEmDiasUteis`, `modalidade`, `transportadora`), mas o serviço de pedidos só precisa de dois. Ele é um **leitor tolerante**: se o provedor acrescentar campos amanhã, nada muda aqui.
+- **O tratamento do 422 é parte da conversa.** `onStatus(...)` transforma a resposta de "CEP sem cobertura" numa exceção do domínio do consumidor. Esse comportamento também precisa estar no contrato, senão o provedor pode trocar 422 por 400 e ninguém percebe.
+- **O corpo enviado é um `record` local** (`ClienteDeFrete.PedidoDeCotacao`), não a classe do provedor. Compartilhar uma biblioteca com os DTOs entre serviços parece economizar trabalho, mas acopla as versões dos dois: para o provedor evoluir a classe, todos os consumidores precisam atualizar a dependência. A seção de armadilhas volta a isso.
+
+Como testar o `ClienteDeFrete`? Na [aula de testes de fatia](../../10-testes/04-testes-de-fatia-no-spring/) você viu que dá para testar um cliente HTTP com um servidor falso (`MockRestServiceServer` ou WireMock). O problema é o de sempre: **quem garante que o servidor falso responde como o provedor real?** O teste de contrato responde a essa pergunta.
+
+## Mão na massa
+
+Os comandos rodam a partir da pasta do módulo:
+
+```bash
+cd java/m10-testes/aulas
+```
+
+### Passo 1: as dependências e o plugin
+
+**O que vamos fazer e por quê.** O Spring Cloud Contract tem duas partes: um **verificador**, usado pelo provedor, e um **Stub Runner**, usado pelo consumidor. Como aqui os dois lados estão no mesmo módulo, as duas dependências entram juntas. Além delas, um plugin Maven lê os contratos e gera, a cada build, os testes do provedor e os stubs do consumidor.
+
+Trecho do `pom.xml` do módulo:
+
+```xml
+<!-- Aula 10.07 (testes de contrato): Spring Cloud Contract 5.0 (trem Spring Cloud 2025.1, compatível com o Boot 4.1). -->
+<properties>
+  <spring-cloud-contract.version>5.0.3</spring-cloud-contract.version>
+</properties>
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-contract-dependencies</artifactId>
+      <version>${spring-cloud-contract.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+
+<!-- dentro de <dependencies> -->
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-contract-verifier</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-contract-stub-runner</artifactId>
+  <scope>test</scope>
+</dependency>
+
+<!-- dentro de <build><plugins> -->
+<plugin>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-contract-maven-plugin</artifactId>
+  <version>${spring-cloud-contract.version}</version>
+  <extensions>true</extensions>
+  <configuration>
+    <testFramework>JUNIT5</testFramework>
+    <testMode>MOCKMVC</testMode>
+    <baseClassForTests>dev.trilhajava.m10.aulas.contrato.frete.ContratoDeFreteBase</baseClassForTests>
+    <basePackageForTests>dev.trilhajava.m10.aulas.contrato.frete.gerados</basePackageForTests>
+  </configuration>
+</plugin>
+```
+
+**O que acabou de acontecer.**
+
+- O BOM `spring-cloud-contract-dependencies` fixa as versões de tudo o que o Spring Cloud Contract usa (WireMock, Rest Assured, JsonPath). Num projeto com outras peças do Spring Cloud, você importaria o BOM do trem inteiro, `spring-cloud-dependencies` versão `2025.1.3`, que já traz o Contract 5.0.3.
+- `testFramework` `JUNIT5` diz ao gerador que use a API do Jupiter (`org.junit.jupiter.api.Test`). Ela é a mesma no JUnit 6, e os testes gerados rodam na plataforma do JUnit 6 sem ajuste.
+- `testMode` `MOCKMVC` faz os testes gerados chamarem o controller pelo MockMvc, sem servidor HTTP. Existem também `WEBTESTCLIENT` (WebFlux), `JAXRSCLIENT` e `EXPLICIT` (HTTP de verdade, contra uma aplicação em pé).
+- `baseClassForTests` é a classe que os testes gerados vão estender (passo 3). `basePackageForTests` é o pacote onde eles nascem. A escolha não é cosmética: como o pacote fica **abaixo** de `...contrato.frete`, o `@WebMvcTest` da classe base encontra a `@SpringBootApplication` do serviço de frete subindo pelos pacotes, do jeito que você viu na aula de fatias.
+
+### Passo 2: o primeiro contrato
+
+**O que vamos fazer e por quê.** O serviço de pedidos depende de uma interação: "cotar o frete de um carrinho para um CEP do Sudeste". Vamos descrevê-la em YAML, com valores de exemplo concretos e **matchers** nos pontos em que o valor exato não importa.
+
+`src/test/resources/contracts/frete/cotar_frete_para_cep_atendido.yml`:
+
+```yaml
+description: |
+  O serviço de pedidos cota o frete de um carrinho de 1,2 kg para São Paulo.
+  Ele usa o valor (como texto, com duas casas) e o prazo em dias úteis; o resto não importa.
+name: cotar_frete_para_cep_atendido
+request:
+  method: POST
+  url: /fretes/cotacoes
+  headers:
+    Content-Type: application/json
+  body:
+    cepDestino: "01310-100"
+    pesoEmGramas: 1200
+  matchers:
+    body:
+      - path: $.cepDestino
+        type: by_regex
+        value: "[0-3][0-9]{4}-[0-9]{3}"
+      - path: $.pesoEmGramas
+        type: by_regex
+        predefined: number
+response:
+  status: 200
+  headers:
+    Content-Type: application/json
+  body:
+    valor: "23.90"
+    prazoEmDiasUteis: 3
+  matchers:
+    body:
+      - path: $.valor
+        type: by_regex
+        value: "[0-9]+\\.[0-9]{2}"
+      - path: $.prazoEmDiasUteis
+        type: by_type
+```
+
+**O que acabou de acontecer, bloco a bloco.**
+
+- `request` descreve o que o consumidor manda. O corpo tem valores concretos, que serão **enviados** pelo teste gerado do provedor. Os `matchers` da requisição afrouxam o lado do **stub**: o WireMock aceita qualquer CEP que comece com 0 a 3 e qualquer número como peso. Assim o consumidor pode testar com outro CEP de São Paulo sem precisar de um contrato novo.
+- `response` descreve o que o consumidor espera receber. O stub devolve exatamente esse corpo. Os `matchers` da resposta afrouxam o lado do **provedor**: o teste gerado não exige `23.90`, exige "texto com dígitos, ponto e duas casas". Se a tabela de preços mudar amanhã, o contrato continua valendo, porque o consumidor depende do **formato** do valor, não do preço. Já `by_type` em `prazoEmDiasUteis` exige que seja um número inteiro.
+- O contrato **não cita** `modalidade` nem `transportadora`. Isso é o "orientado pelo consumidor" na prática: o contrato registra só aquilo de que o serviço de pedidos depende. O provedor fica livre para mudar ou remover os outros campos sem quebrar ninguém, pelo menos até outro consumidor registrar que precisa deles.
+
+Esse equilíbrio entre valores concretos e matchers é a decisão mais importante ao escrever contratos. Valor concreto demais deixa o contrato frágil (qualquer reajuste de preço quebra o teste do provedor). Matcher demais deixa o contrato inútil (um contrato que aceita "qualquer JSON" não pega nada). A regra prática: **fixe o que o consumidor usa para decidir algo, e afrouxe o que ele só repassa ou exibe**.
+
+### Passo 3: a classe base e a verificação do provedor
+
+**O que vamos fazer e por quê.** O plugin gera um teste por interação, mas não sabe montar a sua aplicação. Quem diz como preparar o provedor é a classe base. Aqui ela sobe só a camada web com a regra real de frete, como um teste de fatia comum.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/contrato/frete/ContratoDeFreteBase.java" />
+
+Rode a verificação do provedor. O `clean` é importante aqui (o motivo está em "Quando dá errado"):
+
+```bash
+mvn clean test -Dtest=FreteTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] --- spring-cloud-contract:5.0.3:generateTests (default-generateTests) @ m10-testes-aulas ---
+[INFO] Generating server tests source code for Spring Cloud Contract Verifier contract verification
+[INFO] --- spring-cloud-contract:5.0.3:convert (default-convert) @ m10-testes-aulas ---
+[INFO] Converting from Spring Cloud Contract Verifier contracts to WireMock stubs mappings
+[INFO] Running dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest
+[INFO] BUILD SUCCESS
+```
+
+São três testes porque a pasta `contracts/frete` tem três contratos: o deste passo, o do passo 5 e o do checkpoint. O teste gerado fica em `target/generated-test-sources/contracts`. Vale abrir e ler (trecho do primeiro método):
+
+```java
+@SuppressWarnings("rawtypes")
+public class FreteTest extends ContratoDeFreteBase {
+
+	@Test
+	public void validate_cotar_frete_para_cep_atendido() throws Exception {
+		// given:
+			MockMvcRequestSpecification request = given()
+					.header("Content-Type", "application/json")
+					.body("{\"cepDestino\":\"01310-100\",\"pesoEmGramas\":1200}");
+
+		// when:
+			ResponseOptions response = given().spec(request)
+
+					.post("/fretes/cotacoes");
+
+		// then:
+			assertThat(response.statusCode()).isEqualTo(200);
+			assertThat(response.header("Content-Type")).isEqualTo("application/json");
+
+
+		// and:
+			DocumentContext parsedJson = JsonPath.parse(response.getBody().asString());
+
+		// and:
+			assertThat(parsedJson.read("$.valor", String.class)).matches("[0-9]+\\.[0-9]{2}");
+			assertThat((Object) parsedJson.read("$.prazoEmDiasUteis")).isInstanceOf(java.lang.Integer.class);
+	}
+```
+
+**O que acabou de acontecer.**
+
+- O nome da classe vem da pasta do contrato (`frete` → `FreteTest`), e o nome do método vem do campo `name` do YAML. Dê nomes que digam a regra: quando o teste falhar no CI, `validate_cotar_frete_para_cep_atendido` explica sozinho o que quebrou.
+- O teste é gerado em estilo *given/when/then*, com Rest Assured sobre o MockMvc (`RestAssuredMockMvc.mockMvc(mvc)` na classe base é o que liga um ao outro).
+- As asserções da resposta seguem os matchers: `matches(regex)` para o valor e `isInstanceOf(Integer.class)` para o prazo. Não há asserção sobre `transportadora`: o provedor manda o campo, mas ninguém depende dele.
+- O teste gerado **não é versionado**. Ele nasce a cada build a partir do contrato. Quem é versionado é o contrato e a classe base.
+
+<Callout tipo="dica" titulo="A classe base é onde mora o estado do provedor">
+Neste exemplo, a regra de frete é pura, então a classe base não prepara dado nenhum. Num provedor com banco, a interação "consultar o pedido 42" só faz sentido se o pedido 42 existir. É na classe base (ou em classes base por pasta, com a opção `packageWithBaseClasses` do plugin) que você prepara esse estado: um `@MockitoBean` do repositório com `given(...)`, um fake em memória ou dados inseridos num PostgreSQL de Testcontainers. Prefira preparar o estado na fronteira (repositório) e deixar o controller e a regra reais.
+</Callout>
+
+### Passo 4: o consumidor contra os stubs
+
+**O que vamos fazer e por quê.** O mesmo build que gerou o teste do provedor converteu o contrato em mapeamentos do WireMock, em `target/stubs`. Agora o consumidor sobe um WireMock com esses mapeamentos e testa o `ClienteDeFrete` real, com `RestClient` real, fazendo HTTP de verdade numa porta local.
+
+O mapeamento gerado (trecho de `target/stubs/META-INF/dev.trilhajava/m10-testes-aulas/2.0.0/mappings/frete/cotar_frete_para_cep_atendido.json`):
+
+```json
+"request" : {
+  "urlPath" : "/fretes/cotacoes",
+  "method" : "POST",
+  "headers" : {
+    "Content-Type" : {
+      "equalTo" : "application/json"
+    }
+  },
+  "bodyPatterns" : [ {
+    "matchesJsonPath" : "$[?(@.cepDestino =~ /([0-3][0-9]{4}-[0-9]{3})/)]"
+  }, {
+    "matchesJsonPath" : "$[?(@.pesoEmGramas =~ /(-?(\\d*\\.\\d+|\\d+))/)]"
+  } ]
+},
+"response" : {
+  "status" : 200,
+  "body" : "{\"valor\":\"23.90\",\"prazoEmDiasUteis\":3}",
+  "headers" : {
+    "Content-Type" : "application/json"
+  }
+}
+```
+
+Repare como os matchers mudaram de lado: na requisição, viraram expressões JsonPath com regex; na resposta, o stub devolve o valor concreto do contrato. E o teste do consumidor:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/contrato/pedidos/ClienteDeFreteContratoTest.java" semImports />
+
+```bash
+mvn clean test -Dtest=ClienteDeFreteContratoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest
+INFO org.springframework.cloud.contract.stubrunner.StubServer -- Started stub server for project [dev.trilhajava:m10-testes-aulas:+:stubs] on port 12576 with [3] mappings
+INFO org.springframework.cloud.contract.stubrunner.StubRunnerExecutor -- All stubs are now running RunningStubs [namesAndPorts={dev.trilhajava:m10-testes-aulas:+:stubs=12576}]
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest
+[INFO] BUILD SUCCESS
+```
+
+A porta muda a cada execução: o Stub Runner escolhe uma livre.
+
+**O que acabou de acontecer.**
+
+- `StubRunnerExtension` é a extensão JUnit do Stub Runner. Ela não precisa de contexto Spring: antes dos testes da classe, baixa os stubs, sobe um WireMock e os registra; depois, derruba o servidor.
+- `downloadStub("dev.trilhajava", "m10-testes-aulas")` identifica o provedor pelas coordenadas Maven. Num sistema real, o provedor publica um jar `...-stubs.jar` no repositório de artefatos (Nexus, Artifactory) a cada build da `main`, e o consumidor o baixa com `stubsMode(StubsMode.REMOTE)` e `repoRoot("https://...")`, ou do `~/.m2` local com `StubsMode.LOCAL`.
+- Aqui, como os dois lados estão no mesmo módulo, usamos o protocolo `stubs://`, documentado pelo Spring Cloud Contract para projetos com vários módulos: `repoRoot("stubs://file:///.../target/stubs/")` lê os stubs direto da pasta que o build acabou de gerar.
+- `findStubUrl("m10-testes-aulas")` devolve a URL do WireMock (`http://localhost:12576`), que vira a URL base do `ClienteDeFrete`. Nada no cliente sabe que está falando com um stub.
+- O teste confere **o comportamento do consumidor**: o texto `"23.90"` virou `BigDecimal` 23.90, e o 422 virou `FreteIndisponivelException`. O stub é a entrada controlada (lembra da aula de Mockito?), mas dessa vez uma entrada que o provedor é obrigado a honrar.
+
+### Passo 5: o caminho de erro também é contrato
+
+**O que vamos fazer e por quê.** O consumidor depende de duas coisas na resposta de erro: o status 422 e, para registrar no log, o campo `cep` do Problem Details (RFC 9457). Se o provedor trocar 422 por 400, ou trocar o formato de erro, o `onStatus` do consumidor deixa de funcionar e a exceção que chega à regra de negócio vira uma `HttpClientErrorException` genérica. Erros merecem contrato tanto quanto o caminho feliz.
+
+`src/test/resources/contracts/frete/recusar_cep_sem_cobertura.yml`:
+
+```yaml
+description: |
+  Para um CEP fora da área de entrega, o serviço de frete responde 422 com Problem Details.
+  O serviço de pedidos só depende do status, do tipo do problema e do campo "cep".
+name: recusar_cep_sem_cobertura
+request:
+  method: POST
+  url: /fretes/cotacoes
+  headers:
+    Content-Type: application/json
+  body:
+    cepDestino: "69005-040"
+    pesoEmGramas: 800
+  matchers:
+    body:
+      - path: $.cepDestino
+        type: by_regex
+        value: "69[0-9]{3}-[0-9]{3}"
+response:
+  status: 422
+  headers:
+    Content-Type: application/problem+json
+  body:
+    type: "https://frete.dev/problemas/cep-sem-cobertura"
+    cep: "69005-040"
+```
+
+O teste do provedor gerado para ele:
+
+```java
+	@Test
+	public void validate_recusar_cep_sem_cobertura() throws Exception {
+		// given:
+			MockMvcRequestSpecification request = given()
+					.header("Content-Type", "application/json")
+					.body("{\"cepDestino\":\"69005-040\",\"pesoEmGramas\":800}");
+
+		// when:
+			ResponseOptions response = given().spec(request)
+
+					.post("/fretes/cotacoes");
+
+		// then:
+			assertThat(response.statusCode()).isEqualTo(422);
+			assertThat(response.header("Content-Type")).isEqualTo("application/problem+json");
+
+
+		// and:
+			DocumentContext parsedJson = JsonPath.parse(response.getBody().asString());
+			assertThatJson(parsedJson).field("['type']").isEqualTo("https://frete.dev/problemas/cep-sem-cobertura");
+			assertThatJson(parsedJson).field("['cep']").isEqualTo("69005-040");
+	}
+```
+
+**O que acabou de acontecer.** O contrato cita `type` e `cep`, mas não `title`, `detail` nem `status` do corpo. O `detail` é texto para humanos ("Não entregamos no CEP 69005-040") e pode mudar de redação a qualquer momento; amarrá-lo no contrato tornaria o teste do provedor frágil sem proteger nada que o consumidor use. O `type`, ao contrário, é um identificador estável, feito para máquinas decidirem o que fazer. É nele que um consumidor mais sofisticado basearia a decisão.
+
+Os regex dos dois contratos (`[0-3]...` e `69...`) não se sobrepõem. Isso importa no lado do stub: se duas interações aceitassem a mesma requisição, o WireMock escolheria uma delas, e o teste do consumidor passaria ou falharia dependendo da ordem dos mapeamentos. Quando a sobreposição é inevitável, o YAML aceita o campo `priority` (número menor, prioridade maior).
+
+### Passo 6: o leitor tolerante, provado
+
+**O que vamos fazer e por quê.** Afirmamos que o consumidor ignora campos novos. Vamos provar com um teste que simula o provedor **do futuro**, que acrescentou três campos à resposta. Não é um teste de contrato (o servidor falso aqui é escrito à mão, com `MockRestServiceServer`); é um teste de unidade do adaptador que documenta uma propriedade de que a evolução da API depende.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/contrato/pedidos/LeitorToleranteTest.java" semImports />
+
+```bash
+mvn test -Dtest=LeitorToleranteTest
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.pedidos.LeitorToleranteTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** `MockRestServiceServer.bindTo(builder)` intercepta as chamadas do `RestClient` construído a partir daquele builder, sem abrir porta nenhuma. A resposta tem um objeto aninhado (`janelaDeEntrega`) e um booleano que o `CotacaoDeFrete` não conhece, e a leitura funciona.
+
+Uma observação honesta: removemos o `@JsonIgnoreProperties(ignoreUnknown = true)` do record e rodamos de novo, e **o teste continuou passando**. Na configuração padrão que o `RestClient.builder()` usa no Spring Framework 7, campos desconhecidos já são ignorados. A anotação fica por dois motivos: deixa a intenção explícita para quem lê o record, e mantém o comportamento se alguém configurar um conversor JSON estrito na aplicação. Se o seu projeto liga a falha por campo desconhecido de propósito (há times que fazem isso para pegar erros de digitação em DTOs de entrada), você precisa saber que ela também quebra a evolução compatível das respostas que você consome.
+
+### Passo 7: a suíte inteira
+
+```bash
+mvn clean verify
+```
+
+Trecho da saída, só com as classes desta aula:
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteNordesteTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.contrato.pedidos.LeitorToleranteTest
+```
+
+(`ClienteDeFreteNordesteTest` é a solução do checkpoint; não a abra ainda.) A ordem importa e o Maven a garante: os contratos são convertidos em stubs na fase `process-test-resources`, antes da fase `test`, então os stubs já existem quando o teste do consumidor roda.
+
+## Quando dá errado
+
+As mensagens abaixo foram geradas quebrando o código de propósito e rodando os testes. Cada uma corresponde a uma quebra real que um teste de contrato existe para pegar.
+
+### O provedor renomeou um campo
+
+A quebra da história do começo da aula: no `Cotacao`, `prazoEmDiasUteis` virou `prazoEmDias`.
+
+```text
+[ERROR] Tests run: 2, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 6.521 s <<< FAILURE! -- in dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest
+[ERROR] dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest.validate_cotar_frete_para_cep_atendido -- Time elapsed: 0.323 s <<< ERROR!
+com.jayway.jsonpath.PathNotFoundException: No results for path: $['prazoEmDiasUteis']
+```
+
+**Como ler:** o teste gerado pelo contrato `cotar_frete_para_cep_atendido` procurou `prazoEmDiasUteis` na resposta e não encontrou. Isso falha **no PR do serviço de frete**, antes do merge, e não às 18h05 de uma sexta-feira no checkout. **Como corrigir:** não se corrige mudando o contrato. O contrato é a voz do consumidor, e mudá-lo sozinho é desligar o alarme. As saídas corretas são: manter o campo antigo e acrescentar o novo (mudança compatível), ou combinar a migração com o time de pedidos (seção de evolução de API).
+
+### O provedor passou a mandar dinheiro como número
+
+Aqui o `Cotacao.valor` virou `BigDecimal`, e o Jackson passou a escrever `23.90` como número JSON:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest.validate_cotar_frete_para_cep_atendido -- Time elapsed: 0.086 s <<< FAILURE!
+java.lang.AssertionError: 
+
+Expecting actual:
+  "23.9"
+to match pattern:
+  "[0-9]+\.[0-9]{2}"
+	at dev.trilhajava.m10.aulas.contrato.frete.gerados.FreteTest.validate_cotar_frete_para_cep_atendido(FreteTest.java:40)
+```
+
+**Como ler:** o provedor mandou `23.90`, mas o JsonPath leu o número como `double` e devolveu `"23.9"`: o zero sumiu no caminho. É a demonstração mais convincente de por que o contrato fixa dinheiro como texto. A mudança de tipo (texto para número) é incompatível mesmo quando o valor "é o mesmo", porque cada consumidor lê números do seu jeito. **Como corrigir:** volte o campo para texto. Se a mudança for desejada, ela segue o roteiro de mudança incompatível: campo novo, convivência, migração dos consumidores, remoção do antigo.
+
+### O consumidor mandou um campo com outro nome
+
+Agora a quebra é do outro lado: no `ClienteDeFrete.PedidoDeCotacao`, `cepDestino` virou `cep`.
+
+```text
+ERROR WireMock -- 
+                                               Request was not matched
+                                               =======================
+
+-----------------------------------------------------------------------------------------------------------------------
+| Closest stub                                             | Request                                                  |
+-----------------------------------------------------------------------------------------------------------------------
+                                                           |
+POST                                                       | POST
+[path] /fretes/cotacoes                                    | /fretes/cotacoes
+                                                           |
+Content-Type: application/json                             | Content-Type: application/json
+                                                           |
+$[?(@.cepDestino =~ /([0-3][0-9]{4}-[0-9]{3})/)]           | {"cep":"01310-100","pesoEmGramas":1200}             <<<<< Body does not match
+                                                           |
+-----------------------------------------------------------------------------------------------------------------------
+```
+
+E no teste:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest.cotaOFreteParaUmCepAtendido -- Time elapsed: 0.279 s <<< ERROR!
+org.springframework.web.client.HttpClientErrorException$NotFound: 404 Not Found: "<EOL><EOL>                                               Request was not matched ...
+```
+
+**Como ler:** o WireMock responde 404 quando nenhum mapeamento aceita a requisição, e o diagnóstico vem no log: a coluna da esquerda é o stub mais parecido (que exige `cepDestino`), a da direita é a requisição real, e `<<<<< Body does not match` aponta a linha divergente. **Como corrigir:** volte o nome do campo. O detalhe valioso é **onde** a falha apareceu: no pipeline do consumidor, sem que o provedor precisasse estar no ar. Repare também na segunda falha do mesmo teste: o caso do CEP sem cobertura recebeu 404 em vez de 422, então o `onStatus` não reconheceu e o teste reclamou que a exceção não era `FreteIndisponivelException`. Uma única quebra pode aparecer como falhas diferentes; comece sempre pelo log do WireMock.
+
+### O nome do stub não confere
+
+Com `downloadStub("dev.trilhajava", "servico-de-frete")` no lugar do artefato certo:
+
+```text
+INFO org.springframework.cloud.contract.stubrunner.StubServer -- Started stub server for project [dev.trilhajava:servico-de-frete:+:stubs] on port 12576 with [2] mappings
+[ERROR] dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest.cotaOFreteParaUmCepAtendido -- Time elapsed: 0.021 s <<< ERROR!
+org.springframework.cloud.contract.stubrunner.StubNotFoundException: Stub not found for stub with notation [m10-testes-aulas]
+	at dev.trilhajava.m10.aulas.contrato.pedidos.ClienteDeFreteContratoTest.criarCliente(ClienteDeFreteContratoTest.java:31)
+```
+
+**Como ler:** a primeira linha engana. Com o protocolo `stubs://` apontando para uma pasta, o Stub Runner carregou os mapeamentos que encontrou lá, com o nome que você pediu. O erro aparece depois, quando `findStubUrl("m10-testes-aulas")` procura um stub com outro nome. **Como corrigir:** use o mesmo `artifactId` no `downloadStub` e no `findStubUrl`, e confira o caminho `META-INF/<groupId>/<artifactId>/<versão>` dentro de `target/stubs` (ou dentro do jar de stubs, num repositório remoto).
+
+### O teste gerado sumiu sem avisar
+
+Esta é traiçoeira porque o build **passa**. Depois de um `mvn clean test` bem-sucedido, alteramos uma classe qualquer do módulo e rodamos `mvn test`, sem `clean`:
+
+```text
+[INFO] Recompiling the module because of changed source code.
+[INFO] Nothing to generate - all classes are up to date
+[INFO] Nothing to generate - all stubs are up to date
+[INFO] Recompiling the module because of changed dependency.
+[INFO] BUILD SUCCESS
+```
+
+Nenhum `FreteTest` na saída. Com o filtro `-Dtest=FreteTest`, o Surefire ao menos reclama:
+
+```text
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.5.4:test (default-test) on project m10-testes-aulas: No tests matching pattern "FreteTest" were executed! (Set -Dsurefire.failIfNoSpecifiedTests=false to ignore this error.) -> [Help 1]
+```
+
+**Como ler:** o plugin viu que o contrato não mudou e não gerou nada, e nesta execução o teste gerado não foi compilado junto com os demais (o arquivo continua em `target/generated-test-sources/contracts`, mas não há `FreteTest.class`). Conferimos esse comportamento no projeto, com o plugin 5.0.3; não encontramos a causa documentada. **Como corrigir:** rode `mvn clean verify` quando for verificar contratos, e garanta que o CI sempre compile do zero (a maioria dos pipelines já faz isso, porque começa de um checkout limpo).
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Contrato que testa a regra de negócio do provedor" depois="Contrato que fixa o formato que o consumidor usa">
+```yaml
+# Um contrato por faixa de peso e por região,
+# com o valor exato de cada combinação
+response:
+  status: 200
+  body:
+    valor: "23.90"
+    prazoEmDiasUteis: 3
+    modalidade: "EXPRESSA"
+    transportadora: "Rápido Log"
+    calculadoEm: "2026-10-05T10:00:00Z"
+# sem matchers: qualquer reajuste quebra
+```
+
+```yaml
+# Um contrato por COMPORTAMENTO que o
+# consumidor trata de forma diferente
+response:
+  status: 200
+  body:
+    valor: "23.90"
+    prazoEmDiasUteis: 3
+  matchers:
+    body:
+      - path: $.valor
+        type: by_regex
+        value: "[0-9]+\\.[0-9]{2}"
+```
+</Comparar>
+
+O contrato da esquerda tem três problemas. **Duplica os testes de unidade do provedor**: se a tabela de frete tem 40 combinações, não são 40 contratos; a tabela já é testada na `CalculadoraDeFrete`. **Amarra campos que o consumidor não usa**: `transportadora` e `calculadoEm` ficam congelados sem que ninguém dependa deles. **Fixa valores voláteis**: um reajuste de preço vira um teste de contrato vermelho, o time do provedor aprende que "contrato quebra à toa" e começa a pedir para desligá-lo. A regra de bolso: **um contrato por comportamento distinto do ponto de vista do consumidor** (cotação aceita, CEP sem cobertura, peso acima do limite), não um por combinação de dados.
+
+Outras armadilhas que aparecem em code review:
+
+- **Mudar o contrato para o build do provedor passar.** O contrato é a voz do consumidor. Se o teste gerado quebrou, alguma coisa que um consumidor usa mudou. Alterar o YAML sem conversar com o consumidor é desligar o alarme de incêndio porque ele está tocando.
+- **Biblioteca compartilhada de DTOs.** Um jar `frete-api-model` com as classes `Cotacao` e `PedidoDeCotacao`, usado pelos dois lados, parece garantir compatibilidade. Na prática, garante só que os dois compilam com **a mesma versão** da biblioteca. Quando o provedor sobe a versão 2 e o consumidor ainda está na 1, o contrato real (o JSON na rede) quebrou, e o compilador não tem como saber. Além disso, o consumidor passa a depender de todos os campos, inclusive os que não usa. Cada lado com as próprias classes e um contrato entre eles é o arranjo que escala.
+- **Contrato sem consumidor de verdade.** Um contrato que o provedor escreveu "para documentar", e que nenhum teste de consumidor usa, vira só mais um teste do provedor. O valor do teste de contrato está em **os dois lados** rodarem contra o mesmo arquivo.
+- **Stubs gerados à mão "inspirados" no contrato.** Se o consumidor escreve os próprios mapeamentos WireMock copiando do YAML, voltamos à fotografia antiga. Os stubs precisam vir do mesmo build que verifica o provedor.
+- **Esquecer os erros.** Times escrevem o contrato do caminho feliz e esquecem o 404, o 409, o 422. É justamente no tratamento de erro que consumidores mais quebram, porque é o código menos exercitado.
+**Quando NÃO usar testes de contrato:**
+
+- **Um único time, um monólito, ou serviços que sempre sobem juntos.** Se o consumidor e o provedor são deployados no mesmo pipeline, na mesma versão, um teste de integração comum entre eles (ou um teste do sistema inteiro) é mais simples e dá a mesma garantia.
+- **APIs públicas com consumidores desconhecidos.** Uma API aberta para milhares de clientes que você não conhece não tem como receber contratos de cada um. Ali o que funciona é uma especificação OpenAPI rígida, versionamento explícito, testes do provedor contra a especificação e uma política de depreciação com prazo.
+- **Integração com terceiros que você não controla.** O gateway de pagamento não vai rodar o seu contrato no pipeline dele. Para ele, valem testes contra o *sandbox* do fornecedor, gravações de respostas reais e monitoramento em produção. Um contrato seu sobre a API de terceiros é só um stub com outro nome.
+- **Equipes que não vão manter.** Testes de contrato exigem disciplina dos dois times e alguma infraestrutura (repositório de stubs ou broker). Sem um dono, eles apodrecem: contratos marcados como `ignored: true`, verificações desligadas "temporariamente". Nesse cenário, um bom conjunto de testes do provedor contra a sua especificação OpenAPI dá mais retorno pelo mesmo esforço.
+
+## Evolução de API: compatível ou incompatível
+
+Testes de contrato não impedem a API de mudar. Eles tornam visível **quem** cada mudança afeta. Para usar isso bem, você precisa classificar as mudanças antes de fazê-las.
+
+| Mudança no provedor | Compatível? | Por quê |
+|---|---|---|
+| Acrescentar campo na resposta | Sim | Leitores tolerantes ignoram |
+| Acrescentar campo **opcional** na requisição | Sim | Consumidores antigos não mandam, e o provedor usa um padrão |
+| Acrescentar endpoint novo | Sim | Ninguém usa ainda |
+| Acrescentar valor novo num enum da resposta | **Depende** | Consumidor com `switch` exaustivo ou enum Java estrito quebra ao receber `"AGENDADA"` |
+| Remover ou renomear campo da resposta | Não | Quem lia o campo recebe `null` ou falha |
+| Mudar o tipo de um campo (texto → número) | Não | Cada consumidor desserializa do seu jeito (você viu o `"23.9"`) |
+| Tornar obrigatório um campo da requisição | Não | Consumidores antigos passam a receber 400 |
+| Mudar o status de um erro (422 → 400) | Não | O tratamento por status deixa de reconhecer |
+| Mudar a semântica sem mudar o formato (prazo em dias corridos em vez de úteis) | Não, e **nenhuma ferramenta pega** | O contrato vê o mesmo número inteiro |
+
+A última linha merece destaque: teste de contrato verifica **sintaxe e estrutura**, não significado. Mudar a unidade de um campo sem mudar o nome é a pior quebra possível, porque passa por todos os testes. A defesa é de projeto: nomes que carregam a unidade (`prazoEmDiasUteis`, `pesoEmGramas`, como nesta aula) e campo novo quando a semântica muda.
+
+### Lei de Postel e o leitor tolerante
+
+A lei de Postel, do RFC do TCP, diz: seja conservador no que você envia e liberal no que você aceita. Aplicada a APIs:
+
+- **O provedor é conservador ao enviar**: nunca remove ou muda o tipo de um campo sem processo; acrescenta em vez de alterar.
+- **O consumidor é liberal ao receber**: lê só os campos de que precisa, ignora os desconhecidos, trata enums desconhecidos com um caso padrão em vez de lançar exceção.
+
+O padrão do **leitor tolerante**, descrito por Martin Fowler, é a metade do consumidor: o `CotacaoDeFrete` com dois campos e `ignoreUnknown` é exatamente isso. Há um limite, porém: ser liberal ao receber **requisições** pode ser um problema de segurança e de qualidade (aceitar campos desconhecidos num DTO de entrada esconde erros de digitação do cliente e abre espaço para *mass assignment*, tema do módulo 11). A tolerância vale para o que você **consome** de outro serviço.
+
+### O roteiro de uma mudança incompatível
+
+Quando uma mudança incompatível é necessária, ela vira uma sequência de mudanças compatíveis, um padrão conhecido como *expand and contract* (expandir e contrair):
+
+1. **Expandir.** O provedor passa a mandar **os dois** campos: `prazoEmDiasUteis` e `prazoEmDias`. Os contratos antigos continuam verdes.
+2. **Migrar.** Cada consumidor atualiza o código e o contrato para usar o campo novo. O provedor vê, pelos contratos, quem ainda depende do antigo.
+3. **Contrair.** Quando nenhum contrato cita mais `prazoEmDiasUteis`, o provedor remove o campo. Se alguém esqueceu, o teste gerado do contrato dessa pessoa quebra no PR da remoção, e não em produção.
+
+O passo 3 é o grande ganho dos contratos orientados pelo consumidor: **o provedor sabe quando pode remover**. Sem contratos, a resposta para "alguém ainda usa este campo?" é olhar logs, perguntar no chat e torcer.
+
+Versionar a URL (`/v2/fretes/cotacoes`) fica para mudanças de modelo grandes demais para conviver no mesmo recurso: custa duas versões no ar e um prazo de depreciação para cobrar.
+
+## Pact: o outro caminho (não executado neste projeto)
+
+O Pact inverte a ordem: o contrato nasce **no teste do consumidor**, escrito em código. Ao rodar, o teste sobe um servidor falso com as interações declaradas, executa o cliente real contra ele e, se tudo passar, grava um arquivo JSON (o *pact*). Esse arquivo é publicado num **Pact Broker**, e o provedor o baixa e verifica.
+
+Os blocos abaixo seguem a documentação oficial do Pact JVM 4.7 (módulos `au.com.dius.pact.consumer:junit5` e `au.com.dius.pact.provider:spring7`), adaptados ao exemplo da aula. **Eles não são compilados nem executados no projeto da trilha.**
+
+O lado do consumidor:
+
+```java
+// NÃO EXECUTADO NESTE PROJETO: ilustração com a API do Pact JVM 4.7
+@ExtendWith(PactConsumerTestExt.class)
+@PactTestFor(providerName = "servico-de-frete")
+class ClienteDeFretePactTest {
+
+    @Pact(consumer = "servico-de-pedidos")
+    V4Pact cotacaoParaCepAtendido(PactDslWithProvider builder) {
+        return builder
+                .given("a região Sudeste é atendida")
+                .uponReceiving("uma cotação de 1,2 kg para 01310-100")
+                    .path("/fretes/cotacoes")
+                    .method("POST")
+                    .headers("Content-Type", "application/json")
+                    .body(new PactDslJsonBody()
+                            .stringType("cepDestino", "01310-100")
+                            .integerType("pesoEmGramas", 1200))
+                .willRespondWith()
+                    .status(200)
+                    .body(new PactDslJsonBody()
+                            .stringMatcher("valor", "[0-9]+\\.[0-9]{2}", "23.90")
+                            .integerType("prazoEmDiasUteis", 3))
+                .toPact(V4Pact.class);
+    }
+
+    @Test
+    void cotaOFrete(MockServer servidor) {
+        var cliente = new ClienteDeFrete(RestClient.builder(), servidor.getUrl());
+
+        CotacaoDeFrete cotacao = cliente.cotar("01310-100", 1200);
+
+        assertThat(cotacao.valor()).isEqualByComparingTo("23.90");
+    }
+}
+```
+
+O lado do provedor, verificando todos os pacts publicados no broker para `servico-de-frete`:
+
+```java
+// NÃO EXECUTADO NESTE PROJETO: ilustração com a API do Pact JVM 4.7 (módulo spring7)
+@WebMvcTest(CotacaoController.class)
+@Import(CalculadoraDeFrete.class)
+@Provider("servico-de-frete")
+@PactBroker
+class FretePactVerificationTest {
+
+    @Autowired
+    MockMvc mvc;
+
+    @BeforeEach
+    void alvo(PactVerificationContext contexto) {
+        contexto.setTarget(new Spring7MockMvcTestTarget(mvc));
+    }
+
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void verificar(PactVerificationContext contexto) {
+        contexto.verifyInteraction();
+    }
+
+    @State("a região Sudeste é atendida")
+    void sudesteAtendido() {
+        // prepara o estado do provedor para esta interação
+    }
+}
+```
+
+Compare com o que você construiu:
+
+- **Onde o contrato nasce.** No Pact, no teste do consumidor: é impossível o contrato pedir algo que o consumidor não testou, porque o arquivo só é gravado quando o teste passa. No Spring Cloud Contract, o YAML vive no repositório do provedor, e o consumidor propõe mudanças por PR. Os dois são "orientados pelo consumidor"; muda quem segura a caneta.
+- **Estados do provedor.** No Pact, o `given("...")` do consumidor vira um método `@State` no provedor, e a verificação falha se o provedor não souber preparar aquele estado. No Spring Cloud Contract, o estado vai na classe base.
+- **Linguagens.** O Pact tem implementações em JavaScript, Go, .NET, Python e outras, e o formato do arquivo é uma especificação aberta (Pact Specification v4). Um *front-end* em TypeScript e um backend em Java podem ter contratos entre si. O Spring Cloud Contract é focado na JVM (há uma imagem Docker para provedores em outras linguagens, mas o ecossistema é Spring).
+- **Infraestrutura.** O Pact brilha com o broker (o Pact Broker é código aberto; o PactFlow é a versão comercial). Sem broker, você troca arquivos JSON por um caminho combinado, e perde o can-i-deploy, a parte mais valiosa.
+
+<Callout tipo="atencao" titulo="Compatibilidade conferida, não testada">
+A documentação do Pact JVM diz que o módulo `spring7` existe para Spring 7 e Spring Boot 4, e o histórico de mudanças da série 4.7 registra correções específicas para o Spring Framework 7. A tabela de versões do projeto informa JDK 17 ou superior, "testado até o 23". Esta trilha usa o JDK 25: antes de adotar o Pact, rode um piloto no seu projeto.
+</Callout>
+
+## Contratos de eventos
+
+Na arquitetura orientada a eventos, que você verá no [módulo 12](../../12-mensageria/01-por-que-mensageria/), o acoplamento continua existindo, só que mais escondido. O serviço de pedidos publica `PedidoConfirmado`; o serviço de frete consome para agendar a coleta; o de notificações consome para mandar o e-mail. Se pedidos renomear `cepDestino` no evento, nenhum HTTP falha: as mensagens continuam fluindo, os consumidores passam a ler `null`, e o problema aparece como coleta agendada para lugar nenhum. Quebra em evento é **mais silenciosa** do que quebra em API.
+
+As duas ferramentas suportam contratos de mensagens:
+
+- **Spring Cloud Contract**: o contrato descreve uma mensagem de saída em vez de uma resposta HTTP. No YAML, `label` dá nome ao contrato, `input.triggeredBy` diz qual método da classe base provoca a publicação, e `outputMessage` descreve o destino (`sentTo`), os cabeçalhos e o corpo. O teste gerado chama o gatilho e confere a mensagem publicada; no consumidor, o Stub Runner entrega a mensagem do contrato ao seu listener quando você chama `trigger("<label>")`.
+- **Pact**: interações assíncronas (*message pacts*). O consumidor declara a mensagem que espera e testa o próprio handler com ela; o provedor implementa um método anotado com `@PactVerifyProvider("descrição")` que devolve a mensagem que ele de fato produz, e o Pact compara.
+
+Um esboço do contrato de evento no Spring Cloud Contract (não executado neste projeto; os campos seguem o esquema YAML oficial):
+
+```yaml
+# NÃO EXECUTADO NESTE PROJETO
+label: pedido_confirmado
+input:
+  triggeredBy: confirmarPedido()
+outputMessage:
+  sentTo: pedidos.confirmados
+  headers:
+    tipo-do-evento: PedidoConfirmado
+    versao-do-esquema: "1"
+  body:
+    numeroPedido: "PED-100"
+    cepDestino: "01310-100"
+    pesoEmGramas: 1200
+```
+
+Em eventos, a evolução compatível segue as mesmas regras de APIs, com dois agravantes. Primeiro, **mensagens antigas continuam na fila**: depois de um deploy, consumidores ainda vão ler eventos produzidos pela versão anterior, às vezes por dias (reprocessamento, filas com retenção longa). Segundo, **você costuma não saber quem consome**: um tópico Kafka aceita consumidores novos sem avisar o produtor. Por isso, em plataformas de eventos, é comum somar contratos a um **registro de esquemas** (*schema registry*), com regras de compatibilidade verificadas na publicação do esquema. Contrato e registro se complementam: o registro garante que o esquema evolui de forma compatível; o contrato garante que cada consumidor conhecido entende as mensagens de verdade.
+
+## Validação a partir de OpenAPI
+
+Muitos times já têm uma especificação OpenAPI (no módulo 8, o springdoc gera uma a partir dos controllers). Dá para usá-la como contrato? Em parte.
+
+Há três usos complementares:
+
+1. **Verificar o provedor contra a especificação.** Em cada teste de fatia, valide a requisição e a resposta contra o arquivo OpenAPI. A biblioteca *swagger-request-validator* da Atlassian (`com.atlassian.oai:swagger-request-validator-mockmvc`) faz isso como um `ResultMatcher` do MockMvc: `.andExpect(openApi().isValid("openapi.yaml"))`. Assim, a especificação publicada não mente sobre o que o provedor responde.
+2. **Barrar mudanças incompatíveis na especificação.** Ferramentas de comparação (como o *openapi-diff*) comparam a especificação da `main` com a do PR e falham se um campo foi removido, um tipo mudou ou um parâmetro virou obrigatório. É a tabela de compatibilidade desta aula, automatizada.
+3. **Verificar o consumidor contra a especificação.** Os mocks do consumidor (WireMock, `MockRestServiceServer`) são validados contra a especificação do provedor. É a ideia por trás do *bi-directional contract testing* do PactFlow (comercial), que compara os pacts dos consumidores com a OpenAPI do provedor.
+
+A diferença essencial: uma especificação OpenAPI descreve **tudo o que o provedor oferece**; um contrato orientado pelo consumidor descreve **o que cada consumidor usa**. Com só a especificação, toda remoção de campo é uma mudança incompatível, porque o provedor não sabe se alguém usa. Com contratos, o provedor sabe. Por outro lado, a especificação é barata (você provavelmente já tem uma) e serve a consumidores desconhecidos. Muitos times maduros usam os dois: OpenAPI como documentação verificada e portão contra quebras óbvias, contratos para as integrações internas críticas.
+
+<Callout tipo="info" titulo="Dependências não conferidas no build">
+As bibliotecas de validação por OpenAPI citadas aqui não foram adicionadas ao projeto da trilha. Antes de usar, confira na documentação de cada uma a compatibilidade com o Spring Framework 7 e o Jackson 3.
+</Callout>
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber escrever um contrato é a parte fácil. O que diferencia quem lidera a adoção é saber onde ele entra no fluxo de entrega, quanto custa e quando não vale a pena.
+
+### Onde os contratos entram no pipeline
+
+<Figura legenda="O fluxo com um broker: o contrato é publicado com a versão do consumidor, o provedor verifica e publica o resultado, e o can-i-deploy consulta a matriz antes de cada deploy">
+<svg viewBox="0 0 760 420" width="760" role="img" aria-labelledby="contrato-ci-titulo contrato-ci-desc">
+  <title id="contrato-ci-titulo">Fluxo de contratos no pipeline de entrega</title>
+  <desc id="contrato-ci-desc">Quatro etapas em sequência, de cima para baixo. Primeiro, o pipeline do consumidor publica o contrato no broker com a versão igual ao commit. Segundo, o broker guarda a matriz de quem verificou o quê em qual versão. Terceiro, o pipeline do provedor verifica os contratos e publica o resultado no broker. Quarto, antes de cada deploy, o can-i-deploy consulta a matriz para o ambiente de destino e só libera se todas as combinações foram verificadas.</desc>
+  <defs><marker id="mk-contrato-ci" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="100" y="16" width="560" height="68" rx="10" class="d-info"/>
+  <text x="380" y="44" text-anchor="middle" class="d-title">1. Consumidor publica o contrato</text>
+  <text x="380" y="67" text-anchor="middle" class="d-label">versão do contrato = commit do consumidor</text>
+  <path d="M380 86 L380 116" class="d-line" marker-end="url(#mk-contrato-ci)"/>
+  <rect x="100" y="118" width="560" height="68" rx="10" class="d-box"/>
+  <text x="380" y="146" text-anchor="middle" class="d-title">2. Broker guarda a matriz</text>
+  <text x="380" y="169" text-anchor="middle" class="d-label">quem verificou o quê, em qual versão, em qual ambiente</text>
+  <path d="M380 188 L380 218" class="d-line" marker-end="url(#mk-contrato-ci)"/>
+  <rect x="100" y="220" width="560" height="68" rx="10" class="d-violet"/>
+  <text x="380" y="248" text-anchor="middle" class="d-title">3. Provedor verifica no próprio CI</text>
+  <text x="380" y="271" text-anchor="middle" class="d-label">e publica o resultado de volta no broker</text>
+  <path d="M380 290 L380 320" class="d-line" marker-end="url(#mk-contrato-ci)"/>
+  <rect x="100" y="322" width="560" height="68" rx="10" class="d-accent"/>
+  <text x="380" y="350" text-anchor="middle" class="d-title">4. can-i-deploy antes de cada deploy</text>
+  <text x="380" y="373" text-anchor="middle" class="d-label">libera só se a matriz estiver verde para o ambiente</text>
+  <text x="380" y="412" text-anchor="middle" class="d-label">Depois do deploy: record-deployment registra o que está em cada ambiente</text>
+</svg>
+</Figura>
+
+O ponto que mais gente erra é achar que basta o provedor verificar os contratos. A pergunta real de um deploy é: **esta versão do serviço de frete é compatível com as versões dos consumidores que estão em produção agora?** Não com a `main` dos consumidores, que pode ter contratos novos ainda não implantados. É isso que o Pact Broker resolve com a matriz e o `can-i-deploy`:
+
+```bash
+# antes do deploy do serviço de frete em produção
+pact-broker can-i-deploy --pacticipant servico-de-frete --version "$GIT_SHA" --to-environment producao
+
+# depois do deploy, registra o que está em cada ambiente
+pact-broker record-deployment --pacticipant servico-de-frete --version "$GIT_SHA" --environment producao
+```
+
+O broker responde consultando a matriz: para cada consumidor com versão registrada em `producao`, o contrato dessa versão foi verificado com sucesso pela versão `$GIT_SHA` do provedor? Se sim, libera; se não, o comando sai com código diferente de zero e o pipeline para. O mesmo comando roda no pipeline do **consumidor**: ele só vai para produção se a versão do provedor que já está lá satisfaz o contrato novo. Isso impede o erro clássico de o consumidor subir antes de o provedor implementar o que ele pede.
+
+Com o Spring Cloud Contract não há matriz pronta. A abordagem comum é: o provedor publica o jar de stubs junto com cada versão no repositório de artefatos; o consumidor testa contra os stubs **da versão do provedor que está em produção** (o Stub Runner aceita versão explícita na notação, e muitos times usam a versão que o pipeline de deploy registrou); e os contratos ficam num repositório central ou no do provedor, alterados por PR com revisão dos dois times. Funciona bem para uma organização Spring, mas exige que você monte a parte de "o que está em qual ambiente".
+
+### Como justificar a escolha para o time
+
+| Critério | Spring Cloud Contract | Pact |
+|---|---|---|
+| Stack | Toda em Spring/JVM | Poliglota (front-end, outros backends) |
+| Quem escreve o contrato | YAML no repositório do provedor, por PR | Código no teste do consumidor |
+| Infraestrutura | Repositório Maven que você já tem | Pact Broker (autogerenciado) ou PactFlow (comercial) |
+| Pergunta "posso fazer deploy?" | Você monta | `can-i-deploy` pronto |
+| Curva de aprendizado | Baixa para quem conhece Spring e WireMock | Média: DSL, estados, broker, versionamento |
+| Contratos de eventos | Sim, integrado ao Spring Messaging, Kafka e outros | Sim, *message pacts* |
+
+Um argumento para a reunião: comece pela integração que **mais quebrou** no último trimestre, não por todas, e meça antes e depois (incidentes de integração, tempo do E2E, PRs bloqueados por ambiente compartilhado). Contratos são um investimento contínuo, e o retorno precisa aparecer nesses números.
+
+### Custos e operação
+
+- **Manutenção dos contratos.** Contratos são código. Precisam de dono, revisão e limpeza: contratos de consumidores aposentados devem ser removidos, senão travam o provedor para sempre.
+- **Tempo de build.** Cada interação vira um teste de fatia no provedor. Com a classe base em `@WebMvcTest`, são milissegundos por teste depois que o contexto sobe. Uma classe base com `@SpringBootTest` e Testcontainers multiplica o custo; reserve-a para quando o estado do provedor realmente exige banco.
+- **Broker é infraestrutura de produção do CI.** Se o broker cair, ninguém faz deploy (porque o `can-i-deploy` falha). Trate-o como tal: backup, monitoramento, alta disponibilidade compatível com a importância do pipeline. E decida conscientemente o que acontece se ele estiver indisponível (bloquear é o mais seguro; liberar com aviso é o mais pragmático).
+- **Segurança.** Contratos não devem conter dados reais (CPF, e-mail, cartão), porque circulam por repositórios e brokers acessíveis a muitos times. O broker exige autenticação e, idealmente, permissões por time para publicar. E o contrato não testa autenticação e autorização do provedor: um endpoint que passou a exigir um escopo novo de token é uma mudança incompatível que o contrato, preparado com segurança desligada na fatia, pode não ver. Teste a camada de segurança separadamente (módulo 11).
+
+### Quando trocar de abordagem
+
+- **De E2E para contratos**: quando o E2E passa de 15 a 20 minutos, quando a instabilidade dele faz o time apertar "rodar de novo" por hábito, ou quando mais de dois times disputam o mesmo ambiente.
+- **De Spring Cloud Contract para Pact**: quando aparecem consumidores fora da JVM (um front-end em TypeScript, um serviço em Go) ou quando montar a matriz "o que está em produção" à mão virou um projeto.
+- **De contratos para OpenAPI com portão de compatibilidade**: quando os consumidores deixam de ser conhecidos (API pública, parceiros externos) ou quando os times não mantêm os contratos.
+- **De volta para testes de integração comuns**: quando serviços são fundidos, ou quando provedor e consumidor passam a ser do mesmo time e a subir sempre juntos. Contrato entre dois módulos do mesmo deploy é custo sem retorno.
+
+<Callout tipo="entrevista">
+Perguntas comuns para Pleno e Sênior: **"Como você garante que uma mudança no seu serviço não quebra quem o consome?"**, **"Qual a diferença entre teste de contrato e teste de integração?"** e **"Como você remove um campo de uma API usada por outros times?"**. Uma boa resposta: E2E entre serviços não escala (ambiente compartilhado, lentidão, instabilidade, testa uma combinação só); uso contratos orientados pelo consumidor, em que o stub do consumidor e o teste do provedor saem do mesmo arquivo, e cada lado roda no próprio pipeline; o contrato cobre formato e status, inclusive de erro, e não a regra de negócio, que continua nos testes do provedor; para remover um campo, faço expandir e contrair, e o contrato me diz quando nenhum consumidor depende mais dele; antes do deploy, consulto a matriz (can-i-deploy) para a combinação que está em produção, não a `main`. Pontos que impressionam: citar a lei de Postel e o leitor tolerante, saber que mudança de semântica passa por qualquer ferramenta (por isso nomes como `prazoEmDiasUteis`), mencionar contratos de eventos e o registro de esquemas, e dizer quando **não** usar contratos (API pública, terceiros, mesmo time).
+</Callout>
+
+## Checkpoint: o Nordeste
+
+O serviço de pedidos vai começar a vender para o Recife. Para CEPs que começam com 5, ele precisa cotar o frete e mostrar o prazo, que é mais longo. O provedor já atende essa região (releia a `CalculadoraDeFrete`): o que falta é o **contrato**, para que essa dependência fique registrada e protegida.
+
+**O desafio:**
+
+1. Crie `src/test/resources/contracts/frete/cotar_frete_para_o_nordeste.yml`: um POST com `cepDestino` `"50030-230"` e `pesoEmGramas` 1000. Calcule pela regra do provedor o valor e o prazo esperados.
+2. Use um regex de CEP no contrato que **não se sobreponha** aos dois contratos existentes.
+3. Crie `ClienteDeFreteNordesteTest` no pacote do consumidor, conferindo valor e prazo com o `ClienteDeFrete` real.
+4. Rode `mvn clean test -Dtest="FreteTest,ClienteDeFreteNordesteTest"`. Repare que o `FreteTest` ganha um método novo, `validate_cotar_frete_para_o_nordeste`, **sem que você escreva nenhuma linha no provedor**.
+5. Para ter certeza de que o contrato protege algo: mude temporariamente, na `CalculadoraDeFrete`, a modalidade de `"EXPRESSA"` para `"ECONOMICA"` e veja que nada quebra (por quê?). Depois troque o prazo fora do Sudeste de 7 para 8 e veja o teste do Nordeste falhar. Desfaça as mudanças.
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+O cálculo: CEP começando com 5 está fora do Sudeste, então base R$ 21,90 + R$ 6,00 por quilo iniciado. 1000 g é exatamente 1 quilo iniciado: 21,90 + 6,00 = **27,90**, em **7** dias úteis.
+
+O contrato:
+
+```yaml
+description: |
+  Solução do checkpoint da aula 10.07: o serviço de pedidos passou a vender para o Recife.
+  Um pacote de 1 kg para um CEP que começa com 5 custa 27.90 e chega em 7 dias úteis.
+name: cotar_frete_para_o_nordeste
+request:
+  method: POST
+  url: /fretes/cotacoes
+  headers:
+    Content-Type: application/json
+  body:
+    cepDestino: "50030-230"
+    pesoEmGramas: 1000
+  matchers:
+    body:
+      - path: $.cepDestino
+        type: by_regex
+        value: "5[0-9]{4}-[0-9]{3}"
+response:
+  status: 200
+  headers:
+    Content-Type: application/json
+  body:
+    valor: "27.90"
+    prazoEmDiasUteis: 7
+  matchers:
+    body:
+      - path: $.valor
+        type: by_regex
+        value: "[0-9]+\\.[0-9]{2}"
+```
+
+O teste do consumidor:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/contrato/pedidos/ClienteDeFreteNordesteTest.java" semImports />
+
+**Por que o regex `5[0-9]{4}-[0-9]{3}`.** Ele não se sobrepõe a `[0-3]...` (Sudeste) nem a `69...` (sem cobertura). Um regex como `[4-9]...` cobriria também os CEPs `69`, e o WireMock teria duas interações candidatas para a mesma requisição.
+
+**Por que o prazo não tem matcher.** Diferente do valor, o prazo é algo que o consumidor usa para decidir (ele monta a promessa de entrega). Deixá-lo exato no contrato faz o provedor avisar, pelo teste gerado, se o prazo da região mudar. É uma decisão de negócio: se o prazo puder variar sem impacto, troque por `by_type`.
+
+**Por que mudar a modalidade não quebra nada.** Nenhum contrato cita `modalidade`. É a liberdade que os contratos orientados pelo consumidor dão ao provedor: o que ninguém usa, pode mudar. Já o prazo de 8 dias quebra o teste gerado do Nordeste, porque o contrato fixou o valor exato que o consumidor usa para prometer a entrega.
+
+</details>
+
+<Quiz
+  id="10-testes-de-contrato"
+  questoes={[
+    {
+      pergunta: 'Qual a principal vantagem de um teste de contrato sobre um teste do consumidor com um mock HTTP escrito à mão?',
+      opcoes: ['Ele roda mais rápido', 'O stub do consumidor e o teste do provedor saem do mesmo contrato, então o mock não pode divergir do provedor real sem que um dos lados falhe', 'Ele dispensa testes de unidade no provedor', 'Ele testa a regra de negócio do provedor'],
+      correta: 1,
+      explicacao: 'Um mock escrito à mão é uma fotografia do provedor que ninguém obriga a acompanhar a realidade. No teste de contrato, o provedor é verificado contra o mesmo arquivo que gera o stub.',
+    },
+    {
+      pergunta: 'O teste gerado do provedor falha com `PathNotFoundException: No results for path: $[\'prazoEmDiasUteis\']` depois de um PR que renomeou o campo. Qual a ação correta?',
+      opcoes: ['Atualizar o YAML do contrato para o nome novo e seguir com o merge', 'Marcar o contrato como ignored', 'Manter o campo antigo junto com o novo e combinar a migração com o consumidor (expandir e contrair)', 'Trocar o matcher do campo por by_type'],
+      correta: 2,
+      explicacao: 'O contrato é a voz do consumidor. Mudá-lo sozinho é desligar o alarme. A saída é tornar a mudança compatível: os dois campos convivem até nenhum contrato depender do antigo.',
+    },
+    {
+      pergunta: 'Qual destas mudanças no provedor é compatível com consumidores que são leitores tolerantes?',
+      opcoes: ['Mudar `valor` de texto para número', 'Acrescentar o campo `rastreavel` na resposta', 'Tornar obrigatório um campo novo da requisição', 'Trocar o status de erro de 422 para 400'],
+      correta: 1,
+      explicacao: 'Acrescentar campo na resposta é compatível: o leitor tolerante ignora o que não conhece. As outras três quebram consumidores existentes.',
+    },
+    {
+      pergunta: 'Por que o contrato desta aula NÃO cita os campos `transportadora` e `modalidade`?',
+      opcoes: ['Porque o Spring Cloud Contract não aceita textos com acento', 'Porque o consumidor não usa esses campos; citá-los congelaria partes da API de que ninguém depende', 'Porque campos de texto não podem ter matcher', 'Por esquecimento; o ideal é citar todos os campos'],
+      correta: 1,
+      explicacao: 'Em contratos orientados pelo consumidor, cada contrato registra só o que aquele consumidor usa. O provedor fica livre para mudar o resto.',
+    },
+    {
+      pergunta: 'Antes de implantar o serviço de frete em produção, o que o `can-i-deploy` do Pact Broker verifica?',
+      opcoes: ['Se todos os testes de unidade do provedor passaram', 'Se a versão do provedor foi verificada com sucesso contra os contratos das versões dos consumidores que estão em produção', 'Se a especificação OpenAPI é válida', 'Se o contrato da main de cada consumidor foi verificado'],
+      correta: 1,
+      explicacao: 'A pergunta do deploy é sobre a combinação real do ambiente de destino. A main dos consumidores pode ter contratos que ainda não estão em produção.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Testes ponta a ponta entre serviços não escalam: ambiente compartilhado, lentidão, instabilidade e uma única combinação de versões testada. Fique com poucos E2E, para jornadas críticas.
+- Num **teste de contrato**, o stub do consumidor e o teste do provedor saem do mesmo arquivo. Cada lado roda no próprio pipeline, em segundos, e nenhum dos dois pode mudar a conversa sem que o outro perceba.
+- **Orientado pelo consumidor**: cada contrato registra só o que aquele consumidor usa. O provedor sabe o que pode mudar e quando pode remover um campo.
+- No **Spring Cloud Contract 5.0** (compatível com Boot 4.1), o plugin Maven transforma YAML em testes JUnit do provedor (estendendo uma classe base, aqui em `@WebMvcTest`) e em stubs WireMock, que o `StubRunnerExtension` sobe para o consumidor.
+- Fixe nos contratos o que o consumidor usa para decidir; afrouxe com matchers (`by_regex`, `by_type`) o que ele só repassa. Um contrato por comportamento, não por combinação de dados. Erros também são contrato.
+- Mudanças compatíveis: acrescentar campo na resposta, campo opcional na requisição, endpoint novo. Incompatíveis: remover, renomear, mudar tipo, tornar obrigatório, mudar status. Mudança de **semântica** passa por qualquer ferramenta. Use **expandir e contrair** e seja um **leitor tolerante**.
+- O **Pact** escreve o contrato no teste do consumidor, é poliglota e tem o **Pact Broker** com `can-i-deploy`, que responde se a combinação do ambiente de destino foi verificada. **OpenAPI** complementa: verifica o provedor contra a especificação e barra quebras óbvias, mas não sabe quem usa o quê.
+- Eventos também têm contrato, e quebras neles são mais silenciosas; combine contratos com um registro de esquemas.
+- Rode `mvn clean verify` para verificar contratos: num build incremental, o teste gerado pode não ser executado.
+
+## Próximo passo
+
+Os serviços agora se entendem, e os testes provam isso a cada PR. Falta outra pergunta que nenhum teste funcional responde: o serviço de frete aguenta 500 cotações por segundo na Black Friday? Na [aula 10.08, Testes de desempenho e carga](../../10-testes/08-desempenho-e-carga/), você vai medir latência e vazão, encontrar o gargalo antes do cliente e transformar metas de desempenho em critérios verificáveis no pipeline.
+
+## Referências
+
+- [Spring Cloud Contract: documentação de referência](https://docs.spring.io/spring-cloud-contract/reference/)
+- [Spring Cloud Contract: plugin Maven](https://docs.spring.io/spring-cloud-contract/reference/maven-project.html)
+- [Spring Cloud Contract: Stub Runner e o protocolo stubs://](https://docs.spring.io/spring-cloud-contract/reference/project-features-stubrunner/stub-runner-stubs-protocol.html)
+- [Spring Cloud Contract: esquema YAML dos contratos](https://docs.spring.io/spring-cloud-contract/reference/yml-schema.html)
+- [Spring Cloud: trens de versão e compatibilidade com o Spring Boot](https://spring.io/projects/spring-cloud)
+- [Pact: documentação](https://docs.pact.io/)
+- [Pact JVM: consumidor com JUnit 5](https://github.com/pact-foundation/pact-jvm/tree/master/consumer/junit5)
+- [Pact JVM: provedor com Spring 7 e Spring Boot 4](https://github.com/pact-foundation/pact-jvm/tree/master/provider/spring7)
+- [Pact Broker: can-i-deploy](https://docs.pact.io/pact_broker/can_i_deploy)
+- [Spring Framework: testes de clientes com MockRestServiceServer](https://docs.spring.io/spring-framework/reference/testing/spring-mvc-test-client.html)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)

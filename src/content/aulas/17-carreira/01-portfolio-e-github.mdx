@@ -1,0 +1,171 @@
+---
+titulo: "Portfólio e GitHub: provas em vez de promessas"
+descricao: Como transformar o que você construiu na trilha em evidência que um recrutador entende em dois minutos e um tech lead confere em dez. Inclui o projeto âncora (o Fintech Core), o README que vende o projeto, o perfil do GitHub, o histórico de commits, deploy, contribuição open source e os erros que fazem um portfólio trabalhar contra você.
+modulo: 17-carreira
+ordem: 1
+duracao: 45
+objetivos:
+  - Escolher um projeto âncora e dois ou três projetos de apoio que provem as habilidades pedidas nas vagas
+  - Escrever um README que responde o quê, por quê, como rodar e quais decisões foram tomadas
+  - Organizar o perfil do GitHub (repositórios fixados, README de perfil) para uma leitura de dois minutos
+  - Evitar os sinais que depõem contra um portfólio, como tutoriais copiados, segredos no histórico e commits sem sentido
+tags: [carreira, portfólio, GitHub, README, open source, Fintech Core]
+flashcards:
+  - frente: O que é um projeto âncora no portfólio?
+    verso: O projeto principal, mais completo e mais parecido com o trabalho real da vaga. Na trilha é o Fintech Core, com API REST, JPA, testes com Testcontainers, segurança, mensageria, Docker e CI. Ele deve aparecer primeiro e ter o melhor README.
+  - frente: Quais perguntas o README de um projeto de portfólio responde?
+    verso: O que é e para quem, o que ele demonstra, como rodar em um comando (ex. docker compose up), a arquitetura em um diagrama, as decisões e trade-offs, como rodar os testes e o que você faria a seguir.
+  - frente: Por que um segredo removido num commit posterior continua exposto?
+    verso: Porque o histórico do Git guarda todas as versões. Quem clona o repositório vê o commit antigo. O certo é revogar a chave imediatamente e, se quiser, reescrever o histórico - revogar é obrigatório, reescrever é opcional.
+  - frente: O que um tech lead procura ao abrir o seu repositório?
+    verso: Testes que verificam regras de negócio, estrutura de pacotes coerente, tratamento de erros, commits com mensagens claras, README honesto e sinais de que você entende as decisões (ADRs, trade-offs). Não procura quantidade de tecnologias.
+  - frente: Qual o valor de uma contribuição open source pequena?
+    verso: Mostra que você lê código alheio, segue convenções de outro projeto, escreve um PR claro e aceita revisão. Um PR de documentação ou de teste aceito vale mais do que um fork parado.
+---
+
+Todo processo seletivo tenta responder uma pergunta: **essa pessoa consegue fazer o trabalho?** Para quem tem experiência, o histórico profissional responde boa parte. Para quem está entrando na área, ou mudando de área, quase não há histórico. O portfólio é onde você troca promessas ("conheço Spring Boot") por provas ("aqui está uma API com testes de integração, segurança e CI, e aqui está por que eu fiz assim").
+
+A boa notícia: se você fez a trilha, a prova já existe. Esta aula é sobre **apresentá-la** para dois leitores diferentes.
+
+## Dois leitores, dois tempos
+
+Quem abre o seu GitHub raramente lê tudo. Na prática existem duas leituras:
+
+| Leitor | Tempo | O que procura |
+|---|---|---|
+| Recrutador(a) ou pessoa de RH | 1–2 minutos | Se o perfil existe, se é ativo, se os projetos batem com a vaga, se o README é claro |
+| Tech lead ou dev que vai entrevistar | 10–15 minutos | Testes, estrutura, tratamento de erros, commits, decisões; e o que perguntar na entrevista |
+
+O portfólio precisa funcionar nas duas leituras. A primeira é decidida pelo **perfil e pelo README**; a segunda, pelo **código**. E a segunda leitura muitas vezes vira roteiro da entrevista técnica: "vi que você usou outbox aqui, me conta por quê". Tudo que está no repositório pode virar pergunta, então **só publique o que você sabe explicar**.
+
+## O projeto âncora
+
+Dez projetos pequenos e parecidos (uma calculadora, uma lista de tarefas, um CRUD de livros) dizem menos do que **um projeto completo**. Escolha um projeto âncora e dê a ele o melhor tratamento. Na trilha, o candidato natural é o **Fintech Core**, o projeto integrador dos marcos 1 a 6:
+
+- API REST com validação e `ProblemDetail` (m08);
+- JPA, Flyway, locking e paginação (m09);
+- testes de unidade e de integração com Testcontainers (m10);
+- Spring Security com JWT e checagem de posse (m11);
+- eventos com outbox e consumidor idempotente (m12);
+- Docker, CI no GitHub Actions e métricas (m14).
+
+É exatamente a lista que aparece nas vagas de backend Java Jr e Pleno. Crie um repositório seu com a **sua** solução, não uma cópia da solução de referência. Se você resolveu com ajuda da referência, tudo bem; reescreva com as suas palavras, mude o domínio se quiser (uma carteira de investimentos, um sistema de reservas) e registre no README o que você aprendeu.
+
+Ao lado do âncora, dois ou três **projetos de apoio** mostram amplitude: uma ferramenta de linha de comando em Java puro, a integração com IA do m16, uma contribuição open source. Menos é mais: o que não está pronto para ser lido fica privado ou arquivado.
+
+<Callout tipo="atencao" titulo="Cópia de tutorial é fácil de reconhecer">
+Projetos que seguem um curso passo a passo têm a mesma estrutura, os mesmos nomes e até os mesmos bugs em centenas de repositórios. Um entrevistador que já viu dez "clones de Netflix" idênticos não vai contar o décimo primeiro como evidência. Se você partiu de um tutorial, **modifique**: mude o domínio, acrescente testes que o tutorial não tinha, resolva um problema que ele ignorou, e conte isso no README.
+</Callout>
+
+## O README que vende o projeto
+
+O README é a página de vendas **e** a documentação. Uma estrutura que funciona:
+
+1. **Título e uma frase**: o que é e para quem. "API de conta digital com transferências, extrato e eventos, feita para estudar backend Java de nível Pleno."
+2. **O que o projeto demonstra**: 4 a 6 itens, cada um ligado a um trecho do código. É o resumo para o leitor de dois minutos.
+3. **Como rodar**: de preferência **um comando** (`docker compose up`) e o endereço do Swagger/OpenAPI. Se exige Java 25, diga.
+4. **Arquitetura**: um diagrama simples (Mermaid renderiza direto no GitHub) e a organização dos pacotes.
+5. **Decisões e trade-offs**: por que outbox e não publicar direto no Kafka? Por que lock otimista na transferência? Links para ADRs curtos (`docs/adr/`).
+6. **Testes**: como rodar e o que eles cobrem. Um badge de CI que está verde vale mais do que um parágrafo.
+7. **Próximos passos e limitações**: o que você faria com mais tempo. Mostra senso crítico, e responde antes a pergunta "o que você mudaria?".
+
+<Comparar antes="Lista de palavras" depois="Evidência verificável">
+
+```markdown
+## Tecnologias
+Java, Spring, Spring Boot, JPA, Hibernate,
+PostgreSQL, MySQL, MongoDB, Redis, Kafka,
+RabbitMQ, Docker, Kubernetes, AWS,
+Microsserviços, Clean Code, SOLID
+```
+
+```markdown
+## O que este projeto demonstra
+- Transferência concorrente sem saldo negativo:
+  lock otimista + retry, testado com 50 threads
+  (TransferenciaConcorrenteIT)
+- Eventos sem perda: outbox + consumidor idempotente
+- Posse de recurso: cada cliente só vê a própria
+  conta (teste de BOLA em ContaControllerIT)
+```
+
+</Comparar>
+
+A lista da esquerda não prova nada e ainda cria perguntas que você talvez não saiba responder ("onde está o Kubernetes?"). A da direita diz o que foi feito, como foi verificado e onde olhar.
+
+## O perfil do GitHub
+
+- **Repositórios fixados** (até 6): o âncora primeiro, depois os de apoio. Cada um com descrição de uma linha e *topics* (`java`, `spring-boot`, `postgresql`).
+- **README de perfil** (um repositório com o seu nome de usuário): três a cinco linhas. Quem você é, o que está construindo, onde falar com você. Evite paredes de badges e contadores de visitas.
+- **Nome, foto ou avatar, localização e link do LinkedIn** preenchidos. "Brazil (UTC−3)" ajuda recrutadores de vagas remotas.
+- **O gráfico de contribuições** não é critério sério para ninguém que entende do assunto. Não faça commits vazios para deixá-lo verde; commits artificiais aparecem na primeira olhada no histórico.
+
+## O histórico conta uma história
+
+O tech lead vai abrir o histórico de commits. O que ele quer ver é o que você faria num time:
+
+- mensagens que explicam o **porquê** (Conventional Commits do m14 ajudam: `fix(transferencia): impede saldo negativo em transferências simultâneas`);
+- commits pequenos e coerentes, e não um único "commit inicial" com o projeto inteiro;
+- branches e pull requests, mesmo trabalhando sozinho, com uma descrição curta; é um treino barato do fluxo real.
+
+<Callout tipo="erro" titulo="Segredos no histórico">
+Uma senha de banco, um token da AWS ou uma chave de API commitados continuam no histórico mesmo depois de apagados no commit seguinte. Robôs varrem o GitHub atrás disso em minutos. Se aconteceu: **revogue a chave imediatamente**, e só então pense em reescrever o histórico. Para o futuro, use variáveis de ambiente, `.env` no `.gitignore` e deixe ligado o *secret scanning* e o *push protection* do GitHub.
+</Callout>
+
+## Deploy: vale a pena?
+
+Um link funcionando impressiona o leitor de dois minutos, mas não é obrigatório para uma API. Uma alternativa que costuma bastar: `docker compose up` que sobe tudo, a documentação OpenAPI e uma coleção de requisições (`.http` do IntelliJ ou do VS Code) no repositório. Se fizer deploy, use um plano gratuito ou barato com **limite de gastos configurado**, sem dados reais e com o banco protegido. Uma API aberta na internet com a senha padrão do Postgres é um anti-portfólio.
+
+## Open source: por onde começar
+
+Uma contribuição aceita num projeto real mostra algo que projeto pessoal nenhum mostra: você lê código alheio, segue as convenções de outra pessoa e aceita revisão. Não precisa ser uma feature grande:
+
+- procure issues marcadas como `good first issue` ou `help wanted` em projetos Java que você usa;
+- comece por **documentação, testes ou mensagens de erro**: são contribuições valorizadas e com menos atrito;
+- leia o `CONTRIBUTING.md`, comente na issue antes de começar e mantenha o PR pequeno;
+- se o PR não for aceito, a conversa com os mantenedores ainda é aprendizado; conte isso na entrevista.
+
+<Callout tipo="entrevista">
+"Me fale de um projeto seu" é quase certo em entrevistas de Jr. Prepare uma versão de **dois minutos** do projeto âncora: o problema, a arquitetura em uma frase, **uma decisão difícil** com o trade-off, **um bug** que você encontrou e como resolveu, e o que faria diferente. E conheça o seu próprio código: é constrangedor não saber explicar uma classe do seu repositório.
+</Callout>
+
+<Quiz
+  id="17-portfolio-e-github"
+  questoes={[
+    {
+      pergunta: 'Você tem um projeto completo e oito projetos pequenos de cursos. O que fixar no GitHub?',
+      opcoes: ['Os nove, para mostrar volume', 'O projeto completo primeiro e só os de apoio que você sabe explicar e que mostram algo diferente', 'Só os projetos de cursos, que são mais conhecidos', 'Nada: o gráfico de contribuições basta'],
+      correta: 1,
+      explicacao: 'Um projeto âncora bem apresentado vale mais do que volume. O que não acrescenta evidência nova ou você não sabe defender fica privado ou arquivado.',
+    },
+    {
+      pergunta: 'Você percebe que commitou a chave da API de um provedor há três semanas. Qual o primeiro passo?',
+      opcoes: ['Apagar o arquivo num novo commit', 'Revogar a chave no provedor e gerar outra', 'Tornar o repositório privado e esquecer', 'Reescrever o histórico com force push'],
+      correta: 1,
+      explicacao: 'A chave deve ser tratada como vazada: o histórico é público e pode ter sido clonado. Revogar resolve o risco; reescrever o histórico é opcional e vem depois.',
+    },
+    {
+      pergunta: 'Qual seção de README mais ajuda o tech lead que vai te entrevistar?',
+      opcoes: ['Uma lista de 20 tecnologias', 'Decisões e trade-offs, com links para o código e para os testes', 'Badges de visitas', 'O histórico de versões do Java'],
+      correta: 1,
+      explicacao: 'Decisões explicadas mostram entendimento e já sugerem as perguntas da entrevista, que você vai saber responder porque escreveu.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O portfólio troca promessas por **provas**. Ele é lido em dois tempos: 2 minutos (perfil e README) e 15 minutos (código).
+- Um **projeto âncora** completo, como o Fintech Core com a sua solução, vale mais do que dez projetos pequenos.
+- O README responde: o que é, o que demonstra, como rodar em um comando, arquitetura, decisões, testes e próximos passos.
+- Histórico com commits claros e PRs mostra como você trabalharia num time. **Segredo commitado se revoga**.
+- Contribuições pequenas em open source (docs, testes) são evidência forte de trabalho em equipe.
+- Só publique o que você sabe explicar: o repositório vira roteiro da entrevista.
+
+## Referências
+
+- GitHub Docs — *Managing your profile README* e *Pinning items to your profile*
+- GitHub Docs — *About secret scanning* e *Push protection*
+- Conventional Commits 1.0.0 (conventionalcommits.org)
+- Michael Nygard — *Documenting Architecture Decisions* (o formato de ADR)
+- GitHub — *Creating diagrams* (Mermaid em arquivos Markdown)

@@ -1,0 +1,11 @@
+# PostgreSQL para desenvolvimento. Com spring-boot-docker-compose no classpath,
+# "mvn spring-boot:run" sobe este serviço sozinho e configura a conexão.
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: fintech
+      POSTGRES_USER: fintech
+      POSTGRES_PASSWORD: fintech
+    ports:
+      - "5432:5432"

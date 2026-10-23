@@ -1,0 +1,12 @@
+{
+  "name": "Trilha Java Backend",
+  "short_name": "Trilha Java",
+  "description": "Do básico até a vaga de backend Java Júnior/Pleno.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f0d0b",
+  "theme_color": "#0f0d0b",
+  "lang": "pt-BR",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

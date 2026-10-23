@@ -1,0 +1,737 @@
+---
+titulo: JUnit 6 e AssertJ a fundo
+descricao: "Como escrever testes que as pessoas leem e que pegam bugs de verdade: a anatomia e o ciclo de vida de um teste JUnit 6, testes organizados por regra com @Nested e @DisplayName, tabelas de casos com @ParameterizedTest para cobrir partições e limites, AssertJ para coleções, BigDecimal e exceções, e como ler cada mensagem de falha. Tudo em cima da agenda de uma clínica, com o tempo controlado por um Clock."
+modulo: 10-testes
+ordem: 2
+duracao: 100
+objetivos:
+  - Explicar o ciclo de vida de um teste JUnit 6 (instância por método, @BeforeEach, @AfterEach, @BeforeAll, @AfterAll) e prever a ordem das chamadas
+  - Organizar uma classe de teste por regra de negócio com @Nested e @DisplayName
+  - Escrever testes parametrizados com @CsvSource, @ValueSource, @NullAndEmptySource, @EnumSource e @MethodSource, escolhendo os casos por partições e limites
+  - Verificar coleções, BigDecimal e exceções com AssertJ (containsExactly, extracting, tuple, isEqualByComparingTo, assertThatThrownBy, soft assertions, as)
+  - Ler as mensagens de falha do JUnit e do AssertJ e apontar a causa do erro
+  - Controlar o tempo nos testes com um Clock injetado e usar @Tag e @Disabled com critério
+tags: [JUnit 6, AssertJ, testes parametrizados, asserções, Clock]
+flashcards:
+  - frente: O JUnit cria quantas instâncias da classe de teste?
+    verso: Por padrão, uma por método de teste (PER_METHOD). Por isso um campo alterado num teste não aparece no outro, e o @BeforeEach monta tudo de novo a cada teste. @BeforeAll e @AfterAll rodam uma vez e, nesse modo, precisam ser static.
+  - frente: Qual a diferença entre assertThrows e assertThatThrownBy?
+    verso: assertThrows (JUnit) devolve a exceção e você confere o resto com outras asserções. assertThatThrownBy (AssertJ) encadeia as verificações na mesma frase (isInstanceOf, hasMessage, hasMessageContaining). As duas falham se nada for lançado.
+  - frente: Por que assertThat(multa).isEqualTo(BigDecimal.ZERO) falha quando a multa é 0.00?
+    verso: BigDecimal.equals compara valor E escala; 0 e 0.00 têm escalas diferentes. Para dinheiro, use isEqualByComparingTo("0"), que usa compareTo e ignora a escala.
+  - frente: Como escolher as linhas de um @CsvSource?
+    verso: Divida as entradas em partições (grupos que o código trata igual) e pegue um valor de cada, mais os dois lados de cada limite (24h exatas e 23h59, por exemplo). Os valores esperados são calculados à mão, nunca copiados da saída do código.
+  - frente: Quando usar @MethodSource em vez de @CsvSource?
+    verso: Quando os argumentos não cabem bem em texto (objetos, Duration calculada, listas) ou quando cada caso merece um nome próprio, com Arguments.argumentSet("nome", ...).
+  - frente: O que são soft assertions e quando valem a pena?
+    verso: Asserções que não param no primeiro erro (assertSoftly). No fim, o AssertJ relata todas as falhas juntas. Valem para conferir vários campos de UM resultado; não servem para juntar comportamentos diferentes num teste só.
+  - frente: Como testar uma regra que depende da hora atual?
+    verso: O código recebe um java.time.Clock e usa LocalDateTime.now(clock). O teste passa Clock.fixed(...) ou um relógio de teste que avança quando o teste manda. Nunca LocalDate.now() sem argumento no código de produção.
+---
+
+Uma clínica abriu a agenda on-line e, na primeira semana, três pacientes reclamaram da mesma coisa: cancelaram a consulta **exatamente** 24 horas antes e pagaram multa. A regra dizia "com 24 horas ou mais de antecedência, sem multa". O código dizia `antecedencia > 24h`. Havia testes, e eles passavam: um cancelava com dois dias de antecedência (sem multa, correto) e outro com duas horas (com multa, correto). Nenhum olhava a **borda**. E quando um colega tentou entender a suíte, encontrou métodos chamados `test1`, `test2` e `testCancelar`, que falhavam com mensagens como `expected: <true> but was: <false>`.
+
+O problema aqui não é falta de teste, é teste mal escrito: ele não diz qual regra protege, não cobre os limites e, quando falha, não conta o que aconteceu. Nesta aula você vai escrever, passo a passo, a suíte da **agenda dessa clínica** usando as duas ferramentas que todo backend Java usa: o **JUnit 6**, que descobre e executa os testes, e o **AssertJ**, com que você descreve o que espera. Ao final, você vai saber organizar uma suíte por regra de negócio, transformar uma regra numa tabela de casos que pega o erro das 24 horas e ler cada mensagem de falha como um relatório do que deu errado.
+
+<Callout tipo="novidade" titulo="JUnit 6 (set/2025)">
+O JUnit 6 unificou as versões (Platform, Jupiter e Vintage agora são todos 6.x), exige **Java 17+**, adotou anotações de null safety (JSpecify) e passou a ler o `@CsvSource` com um parser de CSV mais rigoroso. Para quem vem do JUnit 5, a API do dia a dia (`@Test`, `@ParameterizedTest`, `@Nested`) é a mesma. O projeto desta aula usa o JUnit 6.0 e o AssertJ 3.27 que vêm no `spring-boot-starter-test` do Spring Boot 4.1: nenhuma dependência extra.
+</Callout>
+
+## A intuição: a bancada de inspeção
+
+Pense no controle de qualidade de uma fábrica de relógios. Cada relógio vai para uma **bancada limpa**: o inspetor monta os instrumentos, faz as medições, anota o laudo e limpa a bancada antes do próximo. Ninguém inspeciona um relógio numa bancada suja com as peças do anterior, porque aí um defeito de um pareceria defeito do outro.
+
+O JUnit é essa linha de inspeção. Para **cada teste**, ele cria uma instância nova da classe de teste (a bancada limpa), roda a preparação (`@BeforeEach`), roda o teste, roda a limpeza (`@AfterEach`) e joga a instância fora. O que precisa acontecer uma vez só, como ligar as luzes da fábrica, vai no `@BeforeAll`; desligar, no `@AfterAll`.
+
+O AssertJ é a **régua e o laudo**. Uma régua boa não diz só "reprovado": diz "esperava 30 mm e mediu 29,5 mm, na peça 4". É isso que separa `expected: <true> but was: <false>` de uma mensagem que mostra a lista esperada, a lista obtida e em qual posição elas diferem.
+
+<Figura legenda="O ciclo de vida no JUnit 6: @BeforeAll e @AfterAll rodam uma vez; cada @Test ganha uma instância nova, com @BeforeEach antes e @AfterEach depois">
+<svg viewBox="0 0 680 450" width="680" role="img" aria-labelledby="ciclo-titulo ciclo-desc">
+  <title id="ciclo-titulo">Ciclo de vida de uma classe de teste no JUnit 6</title>
+  <desc id="ciclo-desc">No topo, @BeforeAll, que roda uma vez por classe e é estático. Dele saem duas colunas, uma por teste. Cada coluna é uma instância nova da classe de teste e tem quatro etapas em sequência: construtor, @BeforeEach, o método @Test e @AfterEach. As duas colunas terminam em @AfterAll, que também roda uma vez. Uma nota no rodapé diz que o que um teste grava nos campos não chega ao outro.</desc>
+  <defs><marker id="mk-ciclo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="190" y="8" width="300" height="46" rx="10" class="d-violet"/>
+  <text x="340" y="29" text-anchor="middle" class="d-title">@BeforeAll</text>
+  <text x="340" y="47" text-anchor="middle" class="d-label">static · uma vez por classe</text>
+  <path d="M300 54 L210 80" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <path d="M380 54 L470 80" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="60" y="82" width="260" height="252" rx="12" class="d-box"/>
+  <text x="190" y="104" text-anchor="middle" class="d-title">instância #1</text>
+  <rect x="90" y="118" width="200" height="36" rx="8" class="d-info"/>
+  <text x="190" y="141" text-anchor="middle" class="d-mono">construtor</text>
+  <path d="M190 154 L190 168" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="90" y="170" width="200" height="36" rx="8" class="d-info"/>
+  <text x="190" y="193" text-anchor="middle" class="d-mono">@BeforeEach</text>
+  <path d="M190 206 L190 220" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="90" y="222" width="200" height="36" rx="8" class="d-accent"/>
+  <text x="190" y="245" text-anchor="middle" class="d-mono">@Test primeiroTeste</text>
+  <path d="M190 258 L190 272" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="90" y="274" width="200" height="36" rx="8" class="d-info"/>
+  <text x="190" y="297" text-anchor="middle" class="d-mono">@AfterEach</text>
+  <rect x="360" y="82" width="260" height="252" rx="12" class="d-box"/>
+  <text x="490" y="104" text-anchor="middle" class="d-title">instância #2</text>
+  <rect x="390" y="118" width="200" height="36" rx="8" class="d-info"/>
+  <text x="490" y="141" text-anchor="middle" class="d-mono">construtor</text>
+  <path d="M490 154 L490 168" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="390" y="170" width="200" height="36" rx="8" class="d-info"/>
+  <text x="490" y="193" text-anchor="middle" class="d-mono">@BeforeEach</text>
+  <path d="M490 206 L490 220" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="390" y="222" width="200" height="36" rx="8" class="d-accent"/>
+  <text x="490" y="245" text-anchor="middle" class="d-mono">@Test segundoTeste</text>
+  <path d="M490 258 L490 272" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="390" y="274" width="200" height="36" rx="8" class="d-info"/>
+  <text x="490" y="297" text-anchor="middle" class="d-mono">@AfterEach</text>
+  <path d="M210 334 L300 362" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <path d="M470 334 L380 362" class="d-line" marker-end="url(#mk-ciclo)"/>
+  <rect x="190" y="364" width="300" height="46" rx="10" class="d-violet"/>
+  <text x="340" y="385" text-anchor="middle" class="d-title">@AfterAll</text>
+  <text x="340" y="403" text-anchor="middle" class="d-label">static · uma vez, no fim</text>
+  <text x="340" y="438" text-anchor="middle" class="d-text">Instância nova por teste: o que um grava nos campos, o outro não vê</text>
+</svg>
+</Figura>
+
+O ponto central da figura: **testes não compartilham estado**. Isso é a propriedade *Independent* do FIRST, que você viu na [aula anterior](../01-por-que-e-como-testar/), garantida pelo próprio JUnit. Um teste pode rodar sozinho, em qualquer ordem, e dar o mesmo resultado.
+
+## Vocabulário
+
+| Termo | O que é | Nesta aula |
+|---|---|---|
+| **JUnit Platform** | O motor que descobre e executa testes; o Maven (Surefire) e as IDEs conversam com ele | Você não mexe nele diretamente |
+| **JUnit Jupiter** | A API que você usa para escrever testes: `@Test`, `@BeforeEach`, `@ParameterizedTest`... | Tudo que começa com `org.junit.jupiter` |
+| **Asserção** | Uma verificação que lança um erro se o esperado não acontece | `assertEquals` (JUnit), `assertThat` (AssertJ) |
+| **Fixture** | O cenário que o teste prepara antes de agir | A agenda com três consultas do passo 7 |
+| **Ciclo de vida** | A ordem em que o JUnit chama construtor, `@BeforeEach`, teste e `@AfterEach` | Passo 3 |
+| **Display name** | O nome legível que aparece no relatório e na IDE | `@DisplayName("ao cancelar")` |
+| **Teste parametrizado** | Um método de teste executado uma vez para cada linha de dados | Passos 5 e 6 |
+| **Partição** | Um grupo de entradas que o código trata do mesmo jeito | "24h ou mais" e "menos de 24h" |
+| **Limite (borda)** | O ponto onde uma partição vira outra; onde moram os erros de `>` trocado por `>=` | 24h exatas e 23h59 |
+| **Tag** | Uma etiqueta para filtrar quais testes rodam | `@Tag("carga")` |
+
+Duas bibliotecas de asserção aparecem lado a lado nesta aula. As asserções do próprio JUnit (`org.junit.jupiter.api.Assertions`) são poucas e simples: `assertEquals`, `assertTrue`, `assertThrows`. O **AssertJ** (`org.assertj.core.api.Assertions`) é uma API fluente: você escreve `assertThat(valor)` e o autocompletar da IDE mostra tudo o que dá para verificar sobre aquele tipo. Para uma lista aparecem `containsExactly` e `extracting`; para um `BigDecimal`, `isEqualByComparingTo`; para uma data, `isBefore`. Nesta trilha, a regra é **AssertJ por padrão**; as asserções do JUnit aparecem para você reconhecê-las em código alheio e para comparar as mensagens de erro.
+
+## O código que vamos testar
+
+Tudo que aparece nesta aula existe no projeto Maven da trilha, em `java/m10-testes/aulas`, no pacote `dev.trilhajava.m10.aulas.junit`, e roda no CI. O domínio é a agenda de uma clínica. Os tipos de apoio são dois enums, um `record` e uma exceção. O preço vem da especialidade:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/junit/Especialidade.java" />
+
+E o convênio dá um desconto percentual, arredondado para centavos:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/junit/Convenio.java" />
+
+A consulta é um `record`; toda consulta dura 30 minutos:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/junit/Consulta.java" />
+
+Agora a classe principal. Leia o Javadoc com calma: as seis regras dele são o que a suíte vai proteger, e cada passo da aula ataca uma ou duas.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/junit/Agenda.java" semImports destacar="45-47, 65-66, 70-73" />
+
+Três detalhes merecem atenção antes de qualquer teste:
+
+- **O tempo é uma dependência.** A `Agenda` recebe um `java.time.Clock` no construtor e nunca chama `LocalDateTime.now()` sem argumento: sempre `LocalDateTime.now(clock)` (linhas 45 e 65). Em produção, o Spring entrega `Clock.systemDefaultZone()`; no teste, você entrega um relógio que marca a hora que quiser. Sem isso, a regra "2 horas de antecedência" daria resultados diferentes conforme a hora em que a suíte roda, e o teste da multa só passaria em certos horários. Esse é o tipo de teste *flaky* que ensina o time a ignorar o vermelho.
+- **As regras têm bordas.** "Exatamente 2 horas vale" (linha 46 usa `isBefore`, que é estrito). "24 horas ou mais: sem multa" (linha 71 usa `>= 0`). Cada borda é um lugar onde um `>` trocado por `>=` passa despercebido, a menos que exista um teste **em cima** dela.
+- **Dinheiro é `BigDecimal` com escala 2.** A multa zero é `0.00`, não `0`. Parece detalhe; no passo 7 e em "Quando o teste falha" você vai ver o que isso faz com `equals`.
+
+## Mão na massa
+
+Os testes ficam em `java/m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/`. Para rodar, entre na pasta do módulo e use o Maven; `-Dtest` filtra pela classe:
+
+```bash
+cd java/m10-testes/aulas
+mvn test -Dtest=AgendaPrimeiroTest   # uma classe
+mvn test                             # o módulo inteiro
+```
+
+Na IDE, o triângulo verde ao lado da classe ou do método faz o mesmo, e mostra os resultados numa árvore.
+
+### Passo 1: o "agora" dos testes
+
+**O que vamos fazer e por quê.** Todos os testes precisam de um "agora" fixo. Se cada teste chamasse `LocalDateTime.now()`, os resultados mudariam conforme o dia e a hora da execução. Criamos uma classe de dados compartilhada com um instante escolhido a dedo: uma **segunda-feira às 9h**, para que "amanhã" seja terça (dia útil) e "hoje às 15h" esteja dentro do expediente.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/DadosDaAgenda.java" />
+
+**O que acabou de acontecer.** `Clock.fixed(instante, zona)` devolve um relógio de verdade, da própria biblioteca do Java, que sempre responde o mesmo instante. Não é mock: é um *fake* pronto, como você vai ver na [aula de Mockito](../03-mockito/). A zona importa: `LocalDateTime.now(clock)` converte o instante para a zona do relógio, e é por isso que `relogioEm` usa a mesma `SAO_PAULO` na conversão e no relógio. Os atalhos `hojeAs` e `amanhaAs` deixam os testes curtos e legíveis: `amanhaAs(10, 0)` se lê como "amanhã às 10h".
+
+Um relógio parado resolve quase tudo, mas não um cenário: "marquei a consulta ontem e hoje ela já começou". Para isso, o teste precisa **avançar** o tempo no meio do cenário. A solução é um relógio de teste escrito à mão, com um método `avancar`:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/RelogioDeTeste.java" semImports />
+
+`Clock` é uma classe abstrata com três métodos; implementar os três é tudo o que precisa. Esse relógio aparece nos passos 4 e 6. (Numa aplicação Spring, um `@Bean` que devolve `Clock.systemDefaultZone()` entrega o relógio real aos serviços.)
+
+### Passo 2: o primeiro teste, só com JUnit
+
+**O que vamos fazer e por quê.** Antes de qualquer recurso avançado, a anatomia mínima: uma classe, um método com `@Test`, as três partes *Arrange, Act, Assert* e asserções do próprio JUnit. O cenário é o mais simples: marcar uma cardiologia particular para amanhã às 10h.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/AgendaPrimeiroTest.java" destacar="10, 12-13, 22-24" />
+
+```bash
+mvn test -Dtest=AgendaPrimeiroTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.junit.AgendaPrimeiroTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in dev.trilhajava.m10.aulas.junit.AgendaPrimeiroTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- **A classe não é `public`** (linha 10): no JUnit 6, classes e métodos de teste podem ter visibilidade de pacote, só não `private`. O nome termina em `Test` porque é o padrão que o Surefire procura (`*Test`, `*Tests`, `Test*`, `*TestCase`). Uma classe `AgendaTeste` compilaria e **nunca rodaria** no `mvn test`, sem aviso.
+- **`@Test`** (linha 12): o método não pode ser `private` nem `static`, devolve `void` e não recebe parâmetros (salvo quando uma extensão os fornece, como nos parametrizados).
+- **`assertEquals(esperado, obtido)`** (linhas 22 a 24): a **ordem importa**. Invertida, o teste passa ou falha igual, mas a mensagem de erro fica trocada e você procura o bug no lugar errado.
+- A linha 23 só funciona porque o esperado foi escrito como `"320.00"`, com a mesma escala do valor calculado. Em "Quando o teste falha" você vai ver o que acontece com `"320"`.
+
+### Passo 3: o ciclo de vida, visto no console
+
+**O que vamos fazer e por quê.** A figura da intuição diz que o JUnit cria uma instância por teste. Em vez de acreditar, vamos ver. Esta classe não testa a agenda: ela imprime uma linha em cada etapa do ciclo e usa um campo comum para provar que ele não é compartilhado.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/CicloDeVidaTest.java" semImports destacar="6, 8-9, 11-14, 16-19, 37" />
+
+```bash
+mvn test -Dtest=CicloDeVidaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.junit.CicloDeVidaTest
+@BeforeAll: uma vez, antes de qualquer instância
+  construtor: instância #1
+    @BeforeEach na instância #1
+      @Test primeiroTeste: consultasMarcadas = 1
+    @AfterEach na instância #1
+  construtor: instância #2
+    @BeforeEach na instância #2
+      @Test segundoTeste: consultasMarcadas = 1
+    @AfterEach na instância #2
+@AfterAll: uma vez, no fim (2 instâncias criadas)
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.100 s -- in dev.trilhajava.m10.aulas.junit.CicloDeVidaTest
+```
+
+**O que acabou de acontecer.**
+
+- `@BeforeAll` rodou **antes do primeiro construtor**. Como ainda não existe instância, o método precisa ser `static`. Serve para preparar algo caro e somente leitura: subir um contêiner (aula 5), ler um arquivo grande de referência.
+- Cada teste ganhou **seu próprio construtor** (instâncias #1 e #2). Os dois incrementam `consultasMarcadas` e os dois veem **1** (linha 37). Com instância compartilhada, o segundo veria 2 e o resultado dependeria da ordem.
+- `@AfterEach` roda **mesmo se o teste falhar**: é o lugar de limpar o que ficou fora da JVM (arquivos temporários, linhas num banco). Objetos em memória vão embora com a instância.
+- O contador `instanciasCriadas` é `static` e por isso **sobrevive** entre testes: chegou a 2. É exatamente assim que se cria dependência entre testes sem querer; aqui ele existe só para a demonstração.
+
+<Callout tipo="atencao" titulo="A ordem dos testes não é a do arquivo">
+O JUnit executa os métodos numa ordem **determinística, mas propositalmente não óbvia**. Aqui calhou de ser a do arquivo; no `AgendaTest` do passo 4, não é. Se um teste só passa depois de outro, ele está errado. (`@TestMethodOrder` força uma ordem e `@TestInstance(PER_CLASS)` compartilha uma instância entre os testes: os dois existem para casos específicos, não para esconder dependência.)
+</Callout>
+
+### Passo 4: organizando por regra, com @Nested e @DisplayName
+
+**O que vamos fazer e por quê.** Uma classe de teste com trinta métodos soltos vira uma gaveta bagunçada. Queremos que a suíte se leia como a especificação: "Agenda da clínica, ao agendar, recusa um horário já ocupado". O `@Nested` agrupa testes em classes internas, uma por regra ou situação; o `@DisplayName` dá a cada grupo e a cada teste uma frase em português. Aproveitamos para comparar as duas formas de testar exceções.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/AgendaTest.java" semImports destacar="3, 9-13, 15-17, 31-34, 40-42, 64-67, 98" />
+
+```bash
+mvn test -Dtest=AgendaTest
+```
+
+```text
+[INFO] Running Agenda da clínica
+[INFO] Running sem nenhuma consulta marcada
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in sem nenhuma consulta marcada
+[INFO] Running ao agendar
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in ao agendar
+[INFO] Running ao cancelar
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.025 s -- in ao cancelar
+[INFO] Tests run: 0, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.046 s -- in Agenda da clínica
+[INFO] BUILD SUCCESS
+```
+
+O Surefire já mostra os *display names*. Na IDE (e no relatório em `target/surefire-reports`), o resultado vira uma árvore que se lê como especificação: "Agenda da clínica › ao cancelar › com 24h ou mais de antecedência, não cobra multa".
+
+**O que acabou de acontecer.**
+
+- **`@Nested`** só funciona em classes internas **não estáticas**: é isso que permite a `AoAgendar` e `AoCancelar` usar os campos `agenda` e `relogio` da classe de fora. "Tests run: 0 in Agenda da clínica" aparece porque a classe de fora só tem grupos.
+- **Os `@BeforeEach` se empilham** de fora para dentro: em `AoCancelar`, primeiro `criarAgenda()` (linha 10), depois `marcarConsulta()` (linha 65). Cada grupo acrescenta só o cenário que é dele.
+- **`@DisplayName`** descreve a **regra**, não a implementação ("não cobra multa", e não "testa o método cancelar"). Quando o teste quebrar, o nome já diz o que parou de funcionar.
+- **Linha 98:** `relogio.avancar(Duration.ofHours(25))` faz o tempo andar no meio do teste; a consulta das 10h de terça começou. Sem `Clock` injetado, esse teste levaria 25 horas.
+- **`assertThatIllegalArgumentException().isThrownBy(...)`** é um atalho do AssertJ; há também `assertThatIllegalStateException()` e o genérico `assertThatExceptionOfType(X.class)`.
+
+#### Exceções: assertThrows ou assertThatThrownBy?
+
+Os testes das linhas 29 a 43 verificam a mesma regra de dois jeitos. Compare:
+
+<Comparar antes="JUnit: assertThrows devolve a exceção" depois="AssertJ: assertThatThrownBy encadeia tudo">
+```java
+IllegalArgumentException erro = assertThrows(
+        IllegalArgumentException.class,
+        () -> agenda.agendar("  ", CLINICA_GERAL,
+                PARTICULAR, amanhaAs(10, 0)));
+
+assertEquals("paciente é obrigatório",
+        erro.getMessage());
+```
+
+```java
+assertThatThrownBy(() -> agenda.agendar("  ",
+        CLINICA_GERAL, PARTICULAR, amanhaAs(10, 0)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("paciente é obrigatório");
+```
+</Comparar>
+
+Os dois funcionam e os dois falham se nada for lançado. As diferenças práticas:
+
+- `assertThrows` **devolve a exceção** já tipada: útil quando ela carrega dados a inspecionar. No AssertJ, o equivalente é `isInstanceOfSatisfying(Tipo.class, e -> ...)`.
+- `assertThatThrownBy` oferece verificações prontas: `hasMessage`, `hasMessageContaining`, `hasMessageStartingWith`, `hasCauseInstanceOf`.
+- Os dois aceitam **subclasses**; para o tipo exato, `assertThrowsExactly` ou `isExactlyInstanceOf`.
+- A lambda deve conter **só a chamada que deve lançar**. Se o Arrange estiver dentro dela e lançar a mesma exceção por outro motivo, o teste passa pelo motivo errado; por isso o `horarioOcupado` (linha 47) marca a primeira consulta **fora** da lambda.
+
+Verifique sempre a mensagem (ou parte dela), não só o tipo: `IllegalArgumentException` pode vir de dez lugares.
+
+### Passo 5: tabelas de casos com @CsvSource e @EnumSource
+
+**O que vamos fazer e por quê.** O preço da consulta depende de duas coisas: especialidade (4 valores) e convênio (3 valores). Um teste por combinação seria doze métodos quase idênticos. Um **teste parametrizado** escreve a lógica uma vez e recebe os dados de uma fonte; cada linha vira um teste separado no relatório, que passa ou falha sozinho.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/PrecoDaConsultaTest.java" semImports destacar="8-17, 18, 24-25, 32-33" />
+
+```bash
+mvn test -Dtest=PrecoDaConsultaTest
+```
+
+```text
+[INFO] Running Preço da consulta
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.240 s -- in Preço da consulta
+[INFO] BUILD SUCCESS
+```
+
+Doze testes: seis linhas do CSV, quatro especialidades e dois convênios. No relatório, cada linha ganha o seu nome, como `DERMATOLOGIA com BASICO: R$ 209.02`.
+
+**O que acabou de acontecer.**
+
+- **`@ParameterizedTest`** substitui o `@Test`. O atributo `name` define o nome de cada execução: `{0}`, `{1}` e `{2}` são os argumentos pela posição, `{index}` é o número da linha.
+- **`quoteTextArguments = false`**: no JUnit 6, argumentos que chegam como texto aparecem **entre aspas** no nome, para deixar visíveis espaços e strings vazias. Numa tabela de enums e números, as aspas só poluem; no passo 6, com strings em branco, elas são o que você quer ver.
+- **`@CsvSource(textBlock = ...)`** recebe a tabela num *text block*. Linhas com `#` são comentários, e os espaços em volta dos valores são ignorados, então dá para alinhar as colunas. Para tabelas grandes, `@CsvFileSource` lê um arquivo de `src/test/resources`.
+- **Conversão implícita:** o CSV é texto, mas o método recebe `Especialidade`, `Convenio` e `BigDecimal`. O JUnit converte sozinho enums (pelo nome), números, `BigDecimal`, `LocalDate`, `LocalTime`, `Duration` e outros. Um erro de digitação (`CARDIOLGIA`) falha com uma mensagem de conversão clara.
+- **Os valores esperados foram calculados à mão:** 245,90 × 0,85 = 209,015, que arredonda para 209,02 (HALF_UP). Copiar a saída do código para a tabela faria o teste proteger o bug. A linha do 209,02 é a mais valiosa: é uma das duas em que o **modo de arredondamento** faz diferença.
+- **`@EnumSource(Especialidade.class)`** roda uma vez por constante; quando alguém acrescentar `ORTOPEDIA` ao enum, o teste a cobre **automaticamente**. Com `names` e `mode = EXCLUDE`, você escolhe um subconjunto.
+- Cada execução parametrizada também ganha **instância nova**, por isso todas podem marcar "amanhã às 10h" sem esbarrar em "horário já ocupado".
+
+### Passo 6: partições e limites, com @ValueSource e @MethodSource
+
+**O que vamos fazer e por quê.** Uma tabela de casos só é boa se os casos forem bem escolhidos. A técnica tem dois passos. Primeiro, **particione** as entradas: separe os grupos de valores que o código trata do mesmo jeito. Depois, teste **um valor típico de cada partição e os dois lados de cada limite**. Para a multa de cancelamento, fica assim:
+
+| Partição | Regra | Casos escolhidos |
+|---|---|---|
+| Antecedência ≥ 24h | sem multa | 49h (típico) e **24h exatas** (limite, lado de dentro) |
+| 0 < antecedência < 24h | multa de 50% | **23h59** (limite, lado de fora) e 1 minuto (outro extremo) |
+| Antecedência ≤ 0 | `IllegalStateException` | coberto no passo 4 (`consultaJaComecou`) |
+
+O par "24h exatas / 23h59" é o que pega o bug da abertura desta aula. Com os casos "2 dias" e "2 horas", tanto `>=` quanto `>` passam. Com o par da borda, só o código certo passa.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/MultaDeCancelamentoTest.java" semImports destacar="9-15, 17-19, 24" />
+
+**O que acabou de acontecer.**
+
+- **`@MethodSource("antecedencias")`** busca os argumentos num método `static` que devolve um `Stream` de `Arguments`. Use quando os dados não cabem bem em texto: uma `Duration` calculada, um objeto montado, uma lista.
+- **`argumentSet("nome", ...)`** dá um nome a cada caso; no relatório aparece `[2] 24h exatas: sem multa (limite)`. Para casos sem nome, `Arguments.of(...)`.
+- **O esperado chega como `String`** e o parâmetro é `BigDecimal`: a conversão implícita também vale aqui.
+- **Linha 24:** o relógio avança até que falte exatamente `antecedencia` para a consulta. Assim, o dado da tabela é a regra de negócio, e a conta de datas fica num lugar só.
+
+Agora as regras de expediente e de paciente obrigatório, com as fontes mais simples:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/ExpedienteTest.java" semImports destacar="8-9, 16-17, 24, 31-33" />
+
+```bash
+mvn test -Dtest=ExpedienteTest,MultaDeCancelamentoTest
+```
+
+```text
+[INFO] Running Expediente e dados obrigatórios
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.079 s -- in Expediente e dados obrigatórios
+[INFO] Running Multa de cancelamento
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s -- in Multa de cancelamento
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **`@ValueSource`** fornece **um** argumento por execução (`strings`, `ints`, `longs`...). Com a conversão implícita, `"17:30"` vira `LocalTime` e `"2026-09-19"` vira `LocalDate`.
+- **As partições do horário:** os **limites aceitos** (08:00 e 17:30), os **recusados** logo ao lado (07:30 e 18:00), um minuto fora da grade (12:15) e um caso que quase ninguém lembra: `10:00:30`, com segundos. Se você não sabe dizer por que um valor está na lista, ele sobra.
+- **`@NullAndEmptySource`** acrescenta execuções com `null` e `""`. Com `@ValueSource(strings = {" ", "\t"})`, cobre as quatro formas de "paciente sem nome"; em "Quando o teste falha" você vai ver por que as quatro importam.
+- **Parametrize só quando a lógica é idêntica.** "Aceita" e "recusa" são comportamentos diferentes, por isso viraram dois métodos, sem `if` no corpo.
+
+### Passo 7: AssertJ a fundo
+
+**O que vamos fazer e por quê.** A regra "as consultas de um dia, em ordem de horário" devolve uma **lista**, e listas são onde asserções fracas mais escondem bugs. `assertEquals(3, consultas.size())` passa com as consultas erradas, fora de ordem ou de outro dia. Vamos montar uma agenda com quatro consultas marcadas **fora de ordem** de propósito (uma delas em outro dia) e verificar a lista com as ferramentas de coleção do AssertJ.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/ConsultasDoDiaTest.java" semImports destacar="11-15, 23-25, 31-36, 44-52, 63, 71-77" />
+
+```bash
+mvn test -Dtest=ConsultasDoDiaTest
+```
+
+```text
+[INFO] Running Consultas do dia (AssertJ a fundo)
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.662 s -- in Consultas do dia (AssertJ a fundo)
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, asserção por asserção.**
+
+- **`extracting(Consulta::id).containsExactly("C-2", "C-3", "C-1")`**: `extracting` transforma a lista de consultas numa lista de ids, e `containsExactly` exige **esses elementos, nessa ordem, e nada mais**. Uma linha verifica o filtro (sem a C-4), a ordenação e a quantidade.
+- **`extracting(Consulta::paciente, Consulta::inicio)` com `tuple(...)`**: extrair vários campos gera tuplas; é como verificar alguns campos de cada elemento sem montar objetos inteiros.
+- **Variações de `contains`**, para escolher a certa:
+
+| Asserção | Exige |
+|---|---|
+| `containsExactly(a, b)` | exatamente esses, nessa ordem |
+| `containsExactlyInAnyOrder(b, a)` | exatamente esses, em qualquer ordem |
+| `contains(a)` | pelo menos esses (pode haver outros) |
+| `containsOnly(a, b)` | só esses valores, em qualquer ordem, repetições permitidas |
+| `doesNotContain(x)` | nenhum desses |
+
+- **`allSatisfy(c -> assertThat(...))`** aplica uma asserção a cada elemento; `noneMatch`, `anyMatch` e `allMatch` fazem o mesmo com um predicado.
+- **`filteredOn(...).singleElement()`** exige que sobre **exatamente um** elemento, que vira o objeto da próxima asserção. Bem mais forte que `findFirst().get()`, que não reclama se houver dois.
+- **`isEqualByComparingTo("632.84")`** compara `BigDecimal` com `compareTo`, ignorando a escala: é **a** asserção para dinheiro.
+- **`as("faturamento previsto para %s", AMANHA)`** acrescenta uma descrição à **mensagem de falha**. Precisa vir **antes** da asserção.
+- **`assertSoftly(soft -> { ... })`**: as asserções `soft.assertThat(...)` não param no primeiro erro; no fim do bloco, o AssertJ relata **todas as falhas juntas**. Serve para conferir vários campos de **um** resultado.
+
+<Callout tipo="dica" titulo="Objetos inteiros: equals ou comparação recursiva">
+`Consulta` é um `record`, então `isEqualTo(new Consulta(...))` funciona, desde que o `BigDecimal` esperado tenha a mesma escala. Para ignorar campos ou comparar `BigDecimal` pelo valor, use `usingRecursiveComparison().ignoringFields("id").withComparatorForType(BigDecimal::compareTo, BigDecimal.class)`.
+</Callout>
+
+### Passo 8: @Tag e @Disabled com critério
+
+**O que vamos fazer e por quê.** Dois recursos que mexem em **quais** testes rodam. `@Tag` etiqueta testes para que você possa incluí-los ou excluí-los na linha de comando ou no CI. `@Disabled` desliga um teste, com um motivo. Os dois são úteis, e os dois viram lixo quando usados sem critério.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/AgendaEtiquetasTest.java" semImports destacar="7, 26-29, 33" />
+
+Rodando o módulo inteiro **sem** os testes de carga, e depois **só** eles:
+
+```bash
+mvn test -DexcludedGroups=carga
+```
+
+```text
+[WARNING] Tests run: 68, Failures: 0, Errors: 0, Skipped: 1
+[INFO] BUILD SUCCESS
+```
+
+```bash
+mvn test -Dgroups=carga
+```
+
+```text
+[INFO] Running Agenda: testes com etiqueta e desligados
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.385 s -- in Agenda: testes com etiqueta e desligados
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **`@Tag("carga")`** marca o teste que enche um ano inteiro de agenda (5.220 consultas). `-Dgroups` e `-DexcludedGroups` aceitam listas (`carga,lento`) e expressões (`!carga & !integracao`). Uso típico: um *job* de CI rápido a cada commit, sem as etiquetas pesadas, e um noturno com tudo. Escolha poucas etiquetas e escreva-as sempre igual: uma digitada errado não gera erro, só deixa de filtrar.
+- **`@Disabled("motivo")`**: o teste aparece como *Skipped* e o motivo vai para o relatório. Um bom motivo diz **por que** o teste está desligado e **o que** o religa (um número de issue). O teste de feriado é uma **especificação pendente**: quando alguém implementar feriados, basta remover a anotação.
+
+Quando **não** usar `@Disabled`: para calar um teste que começou a falhar e você não entende por quê. Desligado "até eu olhar" costuma ficar desligado para sempre. Se o teste é *flaky*, corrija a causa (quase sempre tempo, ordem ou estado compartilhado).
+
+<Callout tipo="info" titulo="Primos do @Disabled">
+`assumeTrue(condicao)` marca o teste como pulado (não como falha) quando o ambiente não serve; `@EnabledOnOs`, `@EnabledIfEnvironmentVariable` fazem o mesmo de forma declarativa. `@Timeout(2)` faz o teste falhar depois de 2 segundos. São para dependências de ambiente, não para esconder problemas.
+</Callout>
+
+### Passo 9: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 1 -- in Agenda: testes com etiqueta e desligados
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m10.aulas.junit.AgendaPrimeiroTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ao cancelar
+…
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0 -- in Preço da consulta
+…  (os 13 testes do reembolso, da aula de Mockito)
+[WARNING] Tests run: 69, Failures: 0, Errors: 0, Skipped: 1
+[INFO] BUILD SUCCESS
+```
+
+Cinquenta e seis testes para a agenda (seis deles são a solução do checkpoint mais abaixo, em `AntecedenciaMinimaTest`; não a abra ainda), nenhum banco, nenhuma espera, e todos rodam em cerca de dois segundos. O `[WARNING]` na última linha é só por causa do teste desligado: o Surefire destaca qualquer *Skipped*, para ninguém esquecer dele.
+
+## Quando o teste falha: lendo as mensagens
+
+As mensagens abaixo são reais: foram geradas introduzindo bugs de propósito na `Agenda` e no `Convenio` (ou nos testes) e rodando a suíte. Depois, tudo voltou ao normal. Aprender a ler essas mensagens é metade do valor do AssertJ.
+
+Toda falha no Surefire tem o mesmo formato: uma linha `[ERROR]` com a classe, o método e `<<< FAILURE!`, seguida do tipo do erro e da mensagem. **FAILURE** significa que uma asserção falhou (o código fez algo diferente do esperado). **ERROR** significa que o teste lançou uma exceção inesperada (um `NullPointerException`, por exemplo), o que em geral indica um problema no próprio teste ou um bug que explodiu antes da asserção.
+
+### expected: &lt;320&gt; but was: &lt;320.00&gt;
+
+No `AgendaPrimeiroTest`, o esperado foi trocado para `new BigDecimal("320")`:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.AgendaPrimeiroTest.agendaUmaConsultaParticular -- Time elapsed: 0.010 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: expected: <320> but was: <320.00>
+```
+
+**Como ler:** `expected` é o primeiro argumento do `assertEquals`, `but was` é o segundo. Os dois **parecem** o mesmo número, e é isso que torna a mensagem traiçoeira: para `BigDecimal.equals`, `320` (escala 0) e `320.00` (escala 2) são diferentes. O AssertJ cai na mesma armadilha com `isEqualTo`: trocando o teste da multa para `isEqualTo(BigDecimal.ZERO)`, a falha foi `expected: 0 but was: 0.00`. Nos dois casos o código está certo; o teste é que comparou do jeito errado. **Como corrigir:** `isEqualByComparingTo("320")`, que compara só o valor numérico.
+
+### Expected ... to be thrown, but nothing was thrown
+
+Na `Agenda`, `paciente.isBlank()` foi trocado por `paciente.isEmpty()`, um bug comum: `"  "` não é vazio, então passa.
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.AgendaTest.pacienteEmBrancoComJUnit -- Time elapsed: 0.006 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: Expected java.lang.IllegalArgumentException to be thrown, but nothing was thrown.
+
+[ERROR] dev.trilhajava.m10.aulas.junit.AgendaTest.pacienteEmBrancoComAssertJ -- Time elapsed: 0.007 s <<< FAILURE!
+java.lang.AssertionError: 
+
+Expecting code to raise a throwable.
+```
+
+**Como ler:** a primeira é do `assertThrows`; a segunda, do `assertThatThrownBy`. As duas dizem a mesma coisa: a lambda terminou **sem exceção**. **Como corrigir:** procure no código de produção a validação que deveria ter disparado. O teste parametrizado do passo 6 mostrou algo mais interessante com o mesmo bug:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.ExpedienteTest.recusaPacienteSemNome(String)[3] -- Time elapsed: 0.001 s <<< FAILURE!
+java.lang.AssertionError: 
+
+Expecting code to raise a throwable.
+
+[ERROR] dev.trilhajava.m10.aulas.junit.ExpedienteTest.recusaPacienteSemNome(String)[4] -- Time elapsed: 0.002 s <<< FAILURE!
+…
+```
+
+O `[3]` e o `[4]` são os **índices** das execuções: 1 é `null`, 2 é `""` (as duas do `@NullAndEmptySource`), 3 é `" "` e 4 é `"\t"`. As duas primeiras **passaram** com o bug: o `null` é barrado por `paciente == null` e o `""` é vazio de fato. Só os casos de espaço em branco denunciam o `isEmpty`; sem eles, esse bug iria para produção. Na IDE, em vez do índice, aparece o nome `recusa paciente [" "]`, com as aspas que deixam o espaço visível.
+
+### A borda que só um teste pega
+
+Trocando `>= 0` por `> 0` na multa (o bug da abertura da aula):
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.MultaDeCancelamentoTest.multaPelaAntecedencia(Duration, BigDecimal)[2] -- Time elapsed: 0.002 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+expected: 0.00
+ but was: 160.00
+```
+
+**Como ler:** só a execução `[2]` falhou: `24h exatas: sem multa (limite)`. As outras três (49h, 23h59 e 1 minuto) passaram, e o `semMulta` do passo 4 também, porque ele cancela com 25h. Um único caso, escolhido na borda, separou o código certo do errado. É o argumento mais forte para a análise de partições e limites.
+
+### Contain exactly (and in same order)
+
+Removendo o `.sorted(...)` de `consultasDo`:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.ConsultasDoDiaTest.emOrdemDeHorario -- Time elapsed: 0.004 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+Expecting actual:
+  ["C-1", "C-2", "C-3"]
+to contain exactly (and in same order):
+  ["C-2", "C-3", "C-1"]
+but there were differences at these indexes:
+  - element at index 0: expected "C-2" but was "C-1"
+  - element at index 1: expected "C-3" but was "C-2"
+  - element at index 2: expected "C-1" but was "C-3"
+```
+
+**Como ler:** `Expecting actual` é o que o código devolveu; `to contain exactly` é o que o teste pediu. Os mesmos três elementos, em ordem diferente: a lista saiu na ordem de **marcação**, não na de horário, e o AssertJ aponta cada índice divergente. Um `assertEquals` de listas mostraria só as duas listas. Repare também no que **não** falhou: o `filtrosECondicoes` passou, porque não verifica a ordem. Cada asserção protege exatamente o que diz.
+
+### Soft assertions: todas as falhas de uma vez
+
+Com o mesmo bug de ordenação, `getLast()` deixou de ser a consulta da Carla e passou a ser a do Bruno:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.ConsultasDoDiaTest.campoACampo -- Time elapsed: 1.087 s <<< FAILURE!
+org.assertj.core.error.AssertJMultipleFailuresError: 
+
+Multiple Failures (5 failures)
+-- failure 1 --
+[id] 
+expected: "C-1"
+ but was: "C-3"
+at ConsultasDoDiaTest.campoACampo(ConsultasDoDiaTest.java:91)
+-- failure 2 --
+[paciente] 
+expected: "Carla"
+ but was: "Bruno"
+…
+-- failure 4 --
+[valor] 
+expected: 159.84
+ but was: 153.00
+…
+-- failure 5 --
+[fim] 
+expected: 2026-09-15T16:00 (java.time.LocalDateTime)
+ but was: 2026-09-15T11:30 (java.time.LocalDateTime)
+when comparing values using 'ChronoLocalDateTime.timeLineOrder()'
+```
+
+**Como ler:** cinco falhas, cada uma com o rótulo do `as(...)` entre colchetes, e todas coerentes entre si: o objeto inteiro é outro. Isso diz "peguei a consulta errada", não "calculei o valor errado". Com asserções comuns, você veria só a falha do `id`. Trocando `HALF_UP` por `HALF_DOWN` no `Convenio`, o mesmo teste deu `Multiple Failures (1 failure)`, só no `[valor]`: a **forma** do relatório já aponta a direção.
+
+### A descrição do as() e a linha da tabela
+
+O mesmo `HALF_DOWN` derrubou o faturamento e duas linhas da tabela de preços:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.junit.ConsultasDoDiaTest.faturamentoDoDia -- Time elapsed: 0.002 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+[faturamento previsto para 2026-09-15] 
+expected: 632.84
+ but was: 632.83
+
+[ERROR] dev.trilhajava.m10.aulas.junit.PrecoDaConsultaTest.valorComDesconto(Especialidade, Convenio, BigDecimal)[4] -- Time elapsed: 0.001 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+expected: 209.02
+ but was: 209.01
+…
+```
+
+**Como ler:** sem o `as`, você teria que abrir o teste para saber que número é aquele. Na tabela, falharam as linhas `[4]` e `[5]`, as duas em que o valor tem meio centavo (209,015 e 159,835); as outras passariam com qualquer arredondamento. De novo, o caso que vale é o que fica na borda.
+
+## Armadilhas e quando NÃO usar
+
+As asserções abaixo aparecem em code review toda semana. Todas compilam, todas passam e quase nenhuma protege alguma coisa.
+
+<Comparar antes="Asserções que não dizem nada" depois="Asserções que dizem o que importa">
+```java
+assertThat(consultas.size() > 0);   // sem .isTrue(): não verifica NADA
+assertTrue(consultas.size() == 3);  // falha com "expected: <true> but was: <false>"
+assertThat(consulta).isNotNull();   // passa com a consulta errada
+assertEquals(valor, new BigDecimal("320.00")); // ordem invertida
+assertThat(multa).isEqualTo(BigDecimal.ZERO);  // escala: 0 != 0.00
+
+for (Consulta c : consultas) {      // lógica no teste
+    if (c.convenio() == PREMIUM) {
+        assertThat(c.paciente()).isEqualTo("Carla");
+    }
+}
+```
+
+```java
+assertThat(consultas).isNotEmpty();
+assertThat(consultas).hasSize(3);   // mostra a lista se falhar
+assertThat(consulta.id()).isEqualTo("C-1");
+assertEquals(new BigDecimal("320.00"), valor);
+assertThat(multa).isEqualByComparingTo("0");
+
+assertThat(consultas)
+        .filteredOn(c -> c.convenio() == PREMIUM)
+        .singleElement()
+        .extracting(Consulta::paciente)
+        .isEqualTo("Carla");
+```
+</Comparar>
+
+A primeira linha da esquerda é a pior: `assertThat(boolean)` sem nada depois só cria o objeto de asserção e o descarta. O teste passa sempre. O laço com `if` da esquerda tem outro problema: se nenhuma consulta for PREMIUM, o `if` nunca entra e o teste passa sem verificar nada. O `singleElement()` da direita falha nesse caso.
+
+As regras de bolso:
+
+- **Toda asserção verifica um valor específico.** `isNotNull()` é o começo da frase, não o fim. Pergunte: "se o código devolver a coisa errada, este teste falha?"
+- **Nada de lógica no teste.** Laços, `if` e cálculos no teste também podem ter bugs, e ninguém testa o teste.
+- **Valores esperados calculados à mão**, e `BigDecimal` sempre com `isEqualByComparingTo`.
+- **Não parametrize comportamentos diferentes** nem casos sem nada em comum: uma tabela em que cada linha testa uma regra diferente é uma lista de testes disfarçada.
+- **Soft assertions para campos de um resultado**, não para juntar agendamento, cancelamento e listagem num teste só.
+- **`@BeforeAll` só para recursos caros e somente leitura**; objeto mutável ali reintroduz a dependência de ordem.
+
+<Callout tipo="erro" titulo="O teste que só passa em alguns horários">
+Um teste escrito às 14h de uma quarta com `agenda.agendar(..., LocalDate.now().atTime(17, 0))` passa. Rodado pelo CI às 16h, falha (menos de 2h); no sábado, também. O time passa a rodar de novo "até ficar verde", e no dia em que a falha é real, ninguém acredita nela. A cura é a do passo 1: um `Clock` que o teste controla.
+</Callout>
+
+## Checkpoint: a borda da antecedência mínima
+
+Agora é a sua vez. A regra 3 do Javadoc diz: "antecedência mínima de 2 horas (exatamente 2 horas vale)". Nenhum teste da aula verifica essa borda. Se alguém trocar `inicio.isBefore(agora.plus(ANTECEDENCIA_MINIMA))` por `!inicio.isAfter(agora.plus(ANTECEDENCIA_MINIMA))`, uma consulta marcada com exatamente 2h de antecedência passa a ser recusada, e a suíte continua verde.
+
+**O desafio:** crie a classe `MinhaAntecedenciaTest` no pacote de testes `dev.trilhajava.m10.aulas.junit`, com testes parametrizados que cubram as partições e os limites da regra:
+
+1. **Aceita** quando falta exatamente 2h (agora 09:00, consulta 11:00), quando falta um pouco mais (agora 08:59, consulta 11:00) e quando falta muito (agora 09:00, consulta 17:30).
+2. **Recusa** com `HorarioIndisponivelException` e mensagem com "2h de antecedência" quando falta 1h59 (agora 09:01, consulta 11:00), quando falta 1h30 (agora 09:00, consulta 10:30) e quando o horário já passou (agora 09:00, consulta 08:30).
+
+Todas as consultas são **hoje** (a segunda-feira de `DadosDaAgenda`). Rode com `mvn test -Dtest=MinhaAntecedenciaTest`. Depois, para ter certeza de que os testes pegam o bug, troque temporariamente a condição na `Agenda` como descrito acima, veja a linha "09:00, 11:00" falhar, e desfaça a troca. (Ela aparece como **ERROR**, não FAILURE: o `agendar` lançou uma exceção que o teste não esperava.)
+
+<Dicas>
+<Dica nivel={1}>
+Cada caso precisa de um "agora" diferente, então cada execução precisa de uma `Agenda` com o seu próprio relógio. Um método auxiliar que recebe o horário e devolve a agenda deixa os testes curtos. `DadosDaAgenda.relogioEm(...)` e `DadosDaAgenda.HOJE` já existem.
+</Dica>
+<Dica nivel={2}>
+Use `@CsvSource` com duas colunas, "agora" e "início", e deixe a conversão implícita transformar `"09:01"` em `LocalTime`. Faça **dois** métodos parametrizados, um para "aceita" e outro para "recusa", em vez de uma coluna `boolean` com `if` no corpo. No `name`, `{0}` e `{1}` deixam cada linha legível no relatório.
+</Dica>
+<Dica nivel={3}>
+O esqueleto:
+
+```java
+private Agenda agendaAs(LocalTime agora) {
+    return new Agenda(relogioEm(HOJE.atTime(agora)));
+}
+
+@ParameterizedTest(name = "às {0}, aceita a consulta das {1}")
+@CsvSource({ "09:00, 11:00", "08:59, 11:00", "09:00, 17:30" })
+void aceita(LocalTime agora, LocalTime inicio) { ... }
+```
+
+No método de recusa, crie a agenda **fora** da lambda do `assertThatThrownBy`, para que a lambda contenha só a chamada que deve lançar.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/junit/AntecedenciaMinimaTest.java" semImports />
+
+**Por que assim.** As linhas "09:00, 11:00" (aceita) e "09:01, 11:00" (recusa) ficam uma de cada lado da borda: 2h exatas e 1h59. É esse par que pega a troca de `isBefore` por `!isAfter`. As demais cobrem o miolo de cada partição e uma partição fácil de esquecer: o horário que já passou. O limite é testado **mexendo no relógio**, não no horário da consulta, porque não existe "consulta às 10:59".
+
+**Por que dois métodos.** Um confere a consulta criada; o outro, a exceção e a mensagem. Com uma coluna `boolean`, o corpo teria um `if` e o relatório não diria qual comportamento quebrou.
+
+**Por que a mensagem.** `hasMessageContaining("2h de antecedência")` garante que a recusa veio da regra de antecedência. Sem isso, a linha "09:00, 08:30" passaria mesmo se o horário fosse recusado por outro motivo, como fora do expediente.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+Em *live coding*, o pedido quase sempre termina com "agora escreva os testes". O que mostra experiência: nomes de teste que descrevem regras (`@DisplayName`), agrupados por situação (`@Nested`); uma tabela `@ParameterizedTest` escolhida por **partições e limites**, com os valores esperados calculados à mão; `assertThatThrownBy` verificando tipo **e** mensagem; `isEqualByComparingTo` para dinheiro, explicando que `BigDecimal.equals` considera a escala; e o tempo controlado por um `Clock` injetado. Perguntas clássicas: "por que o JUnit cria uma instância por teste?" (isolamento, a propriedade *Independent*), "qual a diferença entre `@BeforeEach` e `@BeforeAll`?" e "como você testa algo que depende da data de hoje?". Bônus: dizer que você lê a mensagem de falha antes de abrir o código, e que escolhe asserções pensando em **como elas vão falhar**.
+</Callout>
+
+<Quiz
+  id="10-junit"
+  questoes={[
+    {
+      pergunta: 'Dois testes da mesma classe incrementam o campo `int contador = 0` e verificam que ele vale 1. O que acontece?',
+      opcoes: ['O segundo teste falha, porque o contador vale 2', 'Os dois passam: o JUnit cria uma instância nova da classe para cada teste', 'Depende da ordem de execução', 'Não compila: campos em classes de teste precisam ser static'],
+      correta: 1,
+      explicacao: 'O ciclo de vida padrão é PER_METHOD: cada teste ganha uma instância nova, com os campos inicializados de novo. Só campos `static` sobrevivem entre testes, e por isso são perigosos.',
+    },
+    {
+      pergunta: '`assertThat(new BigDecimal("0.00")).isEqualTo(BigDecimal.ZERO)`: o que acontece?',
+      opcoes: ['Passa', 'Falha com "expected: 0 but was: 0.00", porque equals do BigDecimal considera a escala', 'Erro de compilação', 'Depende do Locale da máquina'],
+      correta: 1,
+      explicacao: 'Para `BigDecimal.equals`, 0 (escala 0) e 0.00 (escala 2) são diferentes. Use `isEqualByComparingTo("0")`, que compara com `compareTo`.',
+    },
+    {
+      pergunta: 'A regra é "cancelamento com 24h ou mais: sem multa". Qual par de casos pega a troca de `>=` por `>`?',
+      opcoes: ['48h e 2h', '24h exatas e 23h59', '25h e 1h', '0h e 100h'],
+      correta: 1,
+      explicacao: 'O bug só muda o resultado exatamente no limite. Os casos de borda, um de cada lado (24h, sem multa, e 23h59, com multa), separam o código certo do errado; casos longe da borda passam com os dois.',
+    },
+    {
+      pergunta: 'Um teste parametrizado recebe objetos `Duration` e cada caso merece um nome descritivo no relatório. Qual fonte usar?',
+      opcoes: ['@ValueSource', '@EnumSource', '@MethodSource com Arguments.argumentSet("nome", ...)', '@NullAndEmptySource'],
+      correta: 2,
+      explicacao: '`@MethodSource` aceita qualquer objeto, e `argumentSet` dá um nome a cada caso, que aparece no relatório e documenta a intenção da linha.',
+    },
+    {
+      pergunta: 'Qual asserção falha se a lista de consultas vier fora da ordem de horário?',
+      opcoes: ['`containsExactlyInAnyOrder("C-2", "C-3", "C-1")`', '`hasSize(3)`', '`extracting(Consulta::id).containsExactly("C-2", "C-3", "C-1")`', '`contains("C-1")`'],
+      correta: 2,
+      explicacao: '`containsExactly` exige os mesmos elementos, na mesma ordem e nada mais. As outras aceitam qualquer ordem, e a mensagem de falha do `containsExactly` ainda aponta cada índice divergente.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **JUnit** descobre e executa; **AssertJ** descreve o que se espera. Classes e métodos de teste podem ter visibilidade de pacote; o nome da classe termina em `Test` para o Surefire encontrá-la.
+- **Ciclo de vida:** uma instância por teste; `@BeforeEach`/`@AfterEach` embrulham cada teste; `@BeforeAll`/`@AfterAll` rodam uma vez e são `static`. Não dependa da ordem dos testes nem de estado estático.
+- **`@Nested` + `@DisplayName`** transformam a classe de teste numa especificação legível, agrupada por regra; os `@BeforeEach` se empilham de fora para dentro.
+- **Exceções:** `assertThrows` devolve a exceção; `assertThatThrownBy` encadeia `isInstanceOf` e `hasMessage`. Verifique sempre a mensagem, e deixe na lambda só a chamada que deve lançar.
+- **Parametrizados:** `@CsvSource` para tabelas, `@ValueSource` para um argumento, `@NullAndEmptySource` para os vazios, `@EnumSource` para enums, `@MethodSource` para objetos e casos com nome. Escolha os casos por **partições e limites**, com os esperados calculados à mão.
+- **AssertJ:** `containsExactly`, `extracting` e `tuple` para coleções; `filteredOn(...).singleElement()`; `isEqualByComparingTo` para `BigDecimal`; `as(...)` para dar contexto; `assertSoftly` para vários campos de um resultado.
+- **Leia a falha antes do código:** `expected`/`but was`, os índices das diferenças, o `[n]` da linha parametrizada e a quantidade de falhas no relatório das soft assertions já apontam a causa.
+- **Tempo é dependência:** injete um `Clock`; use `Clock.fixed` ou um relógio de teste que avança. **`@Tag`** para separar suítes, **`@Disabled`** só com motivo e prazo.
+
+## Próximo passo
+
+No [exercício 10.01, Caça-mutantes: a calculadora de frete](../../../exercicios/10-testes/01-caca-mutantes-frete/), o código está pronto e quem escreve os testes é você. Onze versões da calculadora com bugs escondidos em bordas, arredondamentos e regras combinadas vão tentar passar pela sua suíte. Tudo desta aula entra em jogo: uma tabela `@ParameterizedTest` escolhida por partições e limites, `isEqualByComparingTo` para os valores e `assertThatThrownBy` para as validações. Depois, na [aula 10.03](../03-mockito/), a classe sob teste passa a ter dependências (gateway, repositórios, notificação), e você vai aprender a trocá-las por dublês com o Mockito.

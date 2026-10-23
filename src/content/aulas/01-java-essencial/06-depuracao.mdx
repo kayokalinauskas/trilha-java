@@ -1,0 +1,127 @@
+---
+titulo: Depuração e leitura de erros
+descricao: Como ler um stack trace, as exceções mais comuns de quem está começando, o debugger do IntelliJ (breakpoints, step, watches) e um método para caçar bugs.
+modulo: 01-java-essencial
+ordem: 6
+duracao: 45
+objetivos:
+  - Ler um stack trace e achar a linha responsável
+  - Reconhecer as exceções mais comuns e suas causas típicas
+  - Usar breakpoints, step over/into e avaliação de expressões no IntelliJ
+  - Seguir um método sistemático para encontrar bugs
+tags: [debug, exceções, IntelliJ]
+flashcards:
+  - frente: Em um stack trace, por onde começar a leitura?
+    verso: Pelo topo (tipo e mensagem da exceção) e depois pela primeira linha que aponta para o SEU código.
+  - frente: Qual a diferença entre Step Over e Step Into no debugger?
+    verso: Step Over executa a linha inteira (inclusive chamadas de método) e para na próxima; Step Into entra no método chamado na linha.
+  - frente: O que é um breakpoint condicional?
+    verso: Um breakpoint que só pausa quando uma expressão é verdadeira (ex. i == 999), útil em laços longos.
+  - frente: O que são os "Helpful NullPointerExceptions"?
+    verso: Desde o Java 14, a mensagem da NPE diz exatamente qual referência era null (ex. because "cliente" is null).
+---
+
+Você vai passar mais tempo **entendendo por que algo não funciona** do que escrevendo código novo. Isso é normal e vale para todos os níveis. O que muda com a experiência é o **método**: desenvolvedores experientes não adivinham, **investigam**.
+
+## Anatomia de um stack trace
+
+```text
+Exception in thread "main" java.lang.NullPointerException: Cannot invoke "String.strip()" because "nome" is null
+	at dev.trilhajava.m00.Saudacao.para(Saudacao.java:18)
+	at dev.trilhajava.app.Cadastro.boasVindas(Cadastro.java:42)
+	at dev.trilhajava.app.Main.main(Main.java:9)
+```
+
+1. **Primeira linha: o quê.** O tipo da exceção (`NullPointerException`) e a mensagem. Desde o Java 14, a mensagem da NPE diz **exatamente** o que era `null`: `because "nome" is null`.
+2. **Linhas `at`: onde.** A pilha de chamadas, da **mais recente (topo)** para a mais antiga. `main` chamou `boasVindas`, que chamou `para`, que quebrou na linha 18.
+3. **Procure o seu código.** Em aplicações Spring, o stack trace pode ter 80 linhas de framework. Procure a primeira linha com o **seu pacote** — quase sempre é ali que está a pista.
+
+<Callout tipo="dica" titulo="Caused by">
+Quando uma exceção embrulha outra, aparece `Caused by:` mais abaixo. **A causa raiz costuma estar no último `Caused by`.** Role até o fim antes de concluir qualquer coisa.
+</Callout>
+
+## As exceções que você mais vai ver
+
+| Exceção | Causa típica | Como prevenir |
+|---|---|---|
+| `NullPointerException` | Chamar método ou acessar campo de uma referência `null` | Validar entradas, não devolver `null` sem necessidade, `Objects.requireNonNull` |
+| `ArrayIndexOutOfBoundsException` | Índice fora de `0..length-1` | for-each, `i < length`, testar bordas |
+| `StringIndexOutOfBoundsException` | `substring`/`charAt` fora do tamanho | Checar o tamanho antes |
+| `NumberFormatException` | `parseInt("abc")`, `parseInt("")` | Validar/tratar entrada externa |
+| `ArithmeticException` | Divisão inteira por zero; `BigDecimal.divide` sem escala em dízima | Validar divisor; sempre informar escala |
+| `ClassCastException` | Cast para o tipo errado | Pattern matching com `instanceof` (módulo 02) |
+| `IllegalArgumentException` | Lançada **por você** para argumentos inválidos | É o jeito certo de recusar entradas ruins |
+| `ConcurrentModificationException` | Alterar uma coleção enquanto a percorre | `removeIf`, `Iterator.remove` |
+
+## O debugger do IntelliJ
+
+Espalhar `System.out.println` funciona, mas é lento e sujo. O debugger deixa você **pausar o programa** e inspecionar tudo.
+
+1. **Breakpoint:** clique na margem esquerda, ao lado do número da linha (aparece um círculo vermelho).
+2. **Rodar em modo debug:** clique no ícone de besouro (ou <kbd>Shift</kbd> + <kbd>F9</kbd>). Funciona com testes também: clique com o botão direito no teste → *Debug*.
+3. Quando a execução para no breakpoint, você vê **todas as variáveis** e seus valores no painel *Variables*.
+
+Os comandos de navegação:
+
+| Comando | Atalho (Win/Linux) | O que faz |
+|---|---|---|
+| Step Over | <kbd>F8</kbd> | Executa a linha atual e para na próxima |
+| Step Into | <kbd>F7</kbd> | Entra no método chamado na linha |
+| Step Out | <kbd>Shift</kbd> + <kbd>F8</kbd> | Termina o método atual e volta para quem chamou |
+| Resume | <kbd>F9</kbd> | Continua até o próximo breakpoint |
+| Evaluate Expression | <kbd>Alt</kbd> + <kbd>F8</kbd> | Executa qualquer expressão com os valores atuais |
+
+Dois recursos que economizam horas:
+
+- **Breakpoint condicional:** clique com o botão direito no breakpoint e escreva uma condição (`i == 9999` ou `cpf.equals("52998224725")`). O programa só pausa quando ela for verdadeira. Ideal para laços longos.
+- **Evaluate Expression:** com o programa pausado, teste hipóteses na hora — `digitos.length()`, `valor.scale()` — sem mudar o código.
+
+## Um método para caçar bugs
+
+1. **Reproduza.** Encontre uma entrada que causa o problema **sempre**. Melhor ainda: escreva um **teste que falha** com ela. Se você não consegue reproduzir, não consegue saber se corrigiu.
+2. **Leia a evidência.** Mensagem, stack trace, logs. Anote o que você **sabe**, não o que você acha.
+3. **Formule uma hipótese** específica: "o `split` está devolvendo um elemento vazio no final".
+4. **Teste a hipótese** com o debugger ou um teste. Uma hipótese por vez.
+5. **Corrija a causa, não o sintoma.** Um `try/catch` que engole a exceção não é correção.
+6. **Mantenha o teste** que reproduzia o bug. Ele garante que o bug não volte.
+
+<Callout tipo="dica" titulo="Explique para o pato de borracha">
+Explicar o código linha por linha, em voz alta, para alguém (ou para um pato de borracha na mesa) força você a verificar cada suposição. É surpreendente quantas vezes o bug aparece na metade da explicação. A técnica tem nome: *rubber duck debugging*.
+</Callout>
+
+<Callout tipo="entrevista">
+"Conte sobre um bug difícil que você resolveu" é uma pergunta comportamental muito comum. Estruture a resposta com esse método: **como reproduziu, qual evidência encontrou, quais hipóteses testou, qual era a causa raiz e o que fez para não acontecer de novo**. Os exercícios da trilha vão te dar histórias reais para contar.
+</Callout>
+
+<Quiz
+  id="01-depuracao"
+  questoes={[
+    {
+      pergunta: 'Em um stack trace, em que ordem aparecem as chamadas?',
+      opcoes: ['Da mais antiga (main) para a mais recente', 'Da mais recente (onde quebrou) para a mais antiga', 'Em ordem alfabética', 'Em ordem aleatória'],
+      correta: 1,
+      explicacao: 'O topo da pilha é o ponto exato da falha; descendo, você vê quem chamou quem.',
+    },
+    {
+      pergunta: 'Um laço processa 100 mil registros e falha só no registro de id 73512. Qual o melhor recurso do debugger?',
+      opcoes: ['Step Over 73 mil vezes', 'Breakpoint condicional (`registro.id() == 73512`)', 'println em cada volta', 'Reescrever o laço'],
+      correta: 1,
+      explicacao: 'O breakpoint condicional pausa só no caso de interesse.',
+    },
+    {
+      pergunta: 'Qual o PRIMEIRO passo ao receber um relato de bug?',
+      opcoes: ['Adicionar try/catch em volta do código suspeito', 'Reproduzir o problema de forma confiável, idealmente com um teste', 'Reescrever o módulo', 'Aumentar a memória do servidor'],
+      correta: 1,
+      explicacao: 'Sem reproduzir, você não consegue confirmar a causa nem verificar a correção.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Stack trace: **o quê** na primeira linha, **onde** nas linhas `at`, começando pelo topo e procurando o seu pacote; causa raiz no último `Caused by`.
+- Conheça as exceções clássicas e suas causas.
+- Use o debugger: breakpoints (inclusive condicionais), Step Over/Into e Evaluate Expression.
+- Método: reproduzir → ler evidências → hipótese → testar → corrigir a causa → manter o teste.
+
+Com isso, você fecha o módulo 01. Os quatro exercícios a seguir juntam tudo: tipos, decisões, laços, métodos, arrays e Strings.

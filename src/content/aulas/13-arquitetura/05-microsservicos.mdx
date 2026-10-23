@@ -1,0 +1,930 @@
+---
+titulo: "Microsserviços: quando, por que e a que custo"
+descricao: "Microsserviços com olhos de sênior: quando eles valem (times independentes, escala e deploy diferentes) e o que custam (rede, consistência, observabilidade, operação). Fronteiras por contexto delimitado, banco por serviço, HTTP com timeouts e eventos, gateway e descoberta de serviços, sagas com compensação, versionamento de APIs, o monólito distribuído e a migração com Strangler Fig, com dois serviços conversando de verdade num teste."
+modulo: 13-arquitetura
+ordem: 5
+duracao: 120
+objetivos:
+  - Decidir, com critérios organizacionais e técnicos, se um sistema deve ser dividido em serviços, e listar os custos que a divisão traz
+  - Traçar fronteiras de serviço a partir de contextos delimitados e justificar por que cada serviço é dono do seu banco
+  - Escrever um cliente HTTP declarativo com RestClient e HTTP interfaces, com timeout de conexão e de leitura configurados
+  - Implementar uma saga orquestrada com compensação idempotente e tratar o timeout como resultado incerto
+  - Publicar duas versões de um endpoint com o versionamento nativo do Spring Framework 7 e sinalizar a descontinuação com os cabeçalhos Deprecation e Sunset
+  - Reconhecer os sinais de um monólito distribuído e planejar uma migração incremental com o padrão Strangler Fig
+tags: [microsserviços, bounded context, banco por serviço, RestClient, HTTP interfaces, saga, versionamento de API, strangler fig, API gateway]
+flashcards:
+  - frente: Qual é o motivo mais forte para adotar microsserviços?
+    verso: Autonomia de times. Vários times precisam desenvolver, publicar e operar partes diferentes do sistema em ritmos diferentes, sem coordenar deploys. Escala independente e tecnologia diferente são motivos secundários; "o código está bagunçado" não é motivo.
+  - frente: O que é um monólito distribuído?
+    verso: Um sistema dividido em serviços que não conseguem ser publicados nem funcionar de forma independente (banco compartilhado, cadeias longas de chamadas síncronas, deploys combinados, biblioteca de domínio comum). Tem os custos dos microsserviços e nenhum dos ganhos.
+  - frente: Por que cada serviço deve ser dono do seu banco?
+    verso: Banco compartilhado acopla os serviços pelo esquema. Uma coluna renomeada quebra outro serviço, e os dois passam a publicar juntos. Com banco próprio, a integração acontece por um contrato explícito (API ou eventos), que pode ser versionado.
+  - frente: Numa saga, por que o timeout não pode ser tratado como "falhou"?
+    verso: Porque o outro serviço pode ter executado a operação e só a resposta se perdeu. Timeout significa "não sei". A saída é uma compensação idempotente (liberar pelo id do pedido), ou consultar o estado antes de decidir.
+  - frente: Qual a diferença entre saga orquestrada e coreografada?
+    verso: Na orquestrada, um serviço conduz os passos e chama as compensações; o fluxo fica num lugar só e é fácil de ler e monitorar. Na coreografada, cada serviço reage a eventos dos outros; há menos acoplamento a um coordenador, mas o fluxo fica espalhado e é mais difícil de depurar.
+  - frente: Para que servem os cabeçalhos Deprecation e Sunset?
+    verso: Deprecation (RFC 9745) avisa que uma versão da API está descontinuada desde uma data; Sunset (RFC 8594) informa quando ela deixará de responder. O Spring Framework 7 envia os dois com o StandardApiVersionDeprecationHandler.
+  - frente: Como funciona o padrão Strangler Fig?
+    verso: Um roteador fica na frente do sistema antigo e desvia, uma de cada vez, as rotas de uma funcionalidade para o serviço novo. O sistema antigo encolhe aos poucos, sem uma troca "big bang", e cada passo pode ser revertido no roteador.
+  - frente: Quais timeouts um cliente HTTP precisa ter?
+    verso: Pelo menos dois. O de conexão (quanto esperar para abrir a conexão TCP) e o de leitura ou resposta (quanto esperar pela resposta depois de enviar a requisição). Sem eles, uma dependência lenta prende as threads de quem chama e a falha se espalha.
+---
+
+A loja virtual da Torrefação Aurora vendia café em grãos, filtros e acessórios. O sistema era um monólito Spring Boot com quatro desenvolvedores, e funcionava. Um dia, numa conferência, alguém do time voltou convencido de que "monólito não escala", e em seis meses o sistema virou onze serviços: pedidos, estoque, pagamentos, catálogo, clientes, endereços, frete, cupons, notificações, avaliações e um "serviço de validação". Os mesmos quatro desenvolvedores agora mantinham onze pipelines, onze bancos e onze painéis de monitoramento.
+
+Na Black Friday, o serviço de estoque ficou lento por causa de uma consulta sem índice. O serviço de pedidos chamava o estoque sem timeout, e as threads de pedidos foram ficando presas, uma a uma, esperando uma resposta que não vinha. Em vinte minutos o site inteiro estava fora do ar, inclusive páginas que nem dependiam do estoque. Na mesma noite, uma cliente foi cobrada por um pedido cuja reserva de estoque tinha falhado: o pagamento estava num serviço, a reserva em outro, e não existia uma transação entre os dois. Quando o time foi investigar, os logs estavam espalhados em quatro serviços, sem um identificador comum. E para corrigir um campo de endereço, três times precisaram publicar no mesmo dia, na ordem certa, porque os serviços de pedidos, clientes e frete liam a mesma tabela.
+
+Nada disso é culpa dos microsserviços como ideia; é o resultado de adotá-los sem saber o que compram e o que cobram. Nesta aula você vai estudar o assunto como quem responde pela decisão: quando vale dividir, onde traçar fronteiras, como dois serviços conversam com timeouts, como manter a consistência sem transação distribuída, como evoluir uma API sem quebrar ninguém e como migrar sem reescrever tudo. E vai ver dois serviços conversando por HTTP de verdade, num teste, incluindo o caso mais traiçoeiro: o timeout em que o outro lado **fez** o trabalho.
+
+## A intuição: da cozinha do restaurante à praça de alimentação
+
+Pense num restaurante grande com uma única cozinha. Todos os cozinheiros dividem a mesma despensa, a mesma geladeira e o mesmo fogão. Quando um prato precisa de arroz, de carne e de salada, três pessoas trabalham lado a lado e o garçom leva tudo junto. Se faltar carne, o pedido nem sai: tudo ou nada, como numa transação de banco de dados. A coordenação é fácil porque está todo mundo no mesmo lugar. O problema aparece quando a cozinha cresce: trinta cozinheiros esbarram uns nos outros, uma mudança no cardápio exige reorganizar a despensa inteira, e reformar o fogão para a pizzaria fecha também a churrascaria. Isso é o **monólito**: simples de coordenar, difícil de crescer com muitos times.
+
+Agora pense numa praça de alimentação. Cada lanchonete tem o seu balcão, a sua geladeira, o seu estoque e o seu cardápio. A pizzaria pode trocar de forno num domingo sem pedir licença à lanchonete de sucos, e pode abrir duas filiais se a fila crescer, sem que a de sucos precise crescer junto. Isso é o que **microsserviços** compram: **autonomia** e **escala independente**.
+
+Só que a praça tem custos que a cozinha única não tinha. Para um combo de pizza, suco e sobremesa, você passa em três balcões; se pagou a pizza e o suco acabou, precisa pedir o estorno (uma **compensação**). A lanchonete de sucos não abre a geladeira da pizzaria; pergunta no balcão (a **API** e o **banco por serviço**). Se a fila de um balcão trava, só a sua paciência limitada (um **timeout**) salva a noite. E alguém precisa administrar a praça e dizer onde fica cada balcão (a **plataforma**, o **gateway**, a **descoberta de serviços**).
+
+Guarde essa imagem. Ao longo da aula, toda vez que uma decisão aparecer, pergunte: "isso é um problema de cozinha cheia de gente (que a divisão resolve) ou é um custo de praça de alimentação (que a divisão cria)?".
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Microsserviço** | Uma aplicação pequena o bastante para um time ser dono dela, publicada e operada de forma independente, com os próprios dados, e que se comunica com as outras pela rede |
+| **Contexto delimitado** (*bounded context*) | Uma fronteira dentro da qual um modelo e as palavras dele têm um significado único. É o melhor candidato a fronteira de serviço |
+| **Banco por serviço** | Cada serviço é o único que lê e escreve nos seus dados. Os outros só chegam a eles pela API ou por eventos |
+| **API gateway** | O ponto de entrada na frente dos serviços: roteia, autentica, limita a taxa de requisições, termina o TLS |
+| **Descoberta de serviços** (*service discovery*) | Como um serviço descobre o endereço atual de outro, que muda a cada deploy ou réplica |
+| **Saga** | Uma sequência de transações locais, uma em cada serviço, em que cada passo tem uma **compensação** que desfaz o efeito de negócio se um passo seguinte falhar |
+| **Monólito distribuído** | Serviços separados na rede, mas acoplados como um monólito: publicam juntos, compartilham banco, caem juntos |
+
+## Quando microsserviços valem a pena
+
+A pergunta certa não é "microsserviços são bons?", e sim "**que problema eu tenho, e microsserviços são a forma mais barata de resolvê-lo?**". A tabela abaixo resume os problemas que costumam motivar a divisão:
+
+| Problema | Microsserviços ajudam? | Alternativa mais barata, quando existe |
+|---|---|---|
+| Vários times pisando no mesmo código e esperando o mesmo deploy | Sim, é o motivo mais legítimo | Monólito modular com donos por módulo, até uns 3 ou 4 times |
+| Uma parte precisa escalar muito mais que o resto (busca, catálogo) | Sim | Escalar o monólito inteiro, que costuma ser barato até certo ponto |
+| Uma parte precisa de outro ritmo de deploy ou de outra disponibilidade | Sim | Separar só essa parte, não tudo |
+| Uma parte precisa de outra tecnologia (um modelo de ML em Python) | Sim | Um serviço só para isso, ao lado do monólito |
+| Isolar falhas: um bug em relatórios não pode derrubar o checkout | Sim, desde que haja timeouts, limites e degradação | Filas e processamento assíncrono dentro do monólito |
+| "O código está uma bagunça" | Não. Vira uma bagunça distribuída | Modularizar o monólito ([aula 13.04](../../13-arquitetura/04-monolito-modular/)) |
+| "O deploy demora uma hora" | Raramente | Build incremental, testes mais rápidos, pipeline melhor |
+| "Todo mundo usa" | Não | Nenhuma: isso não é um problema |
+
+O motivo mais forte é **organizacional**. Se você tem oito times e um único artefato, cada deploy é uma negociação: o time de pagamentos não pode publicar a correção urgente porque o time de catálogo deixou a `main` com uma funcionalidade pela metade. Com serviços, cada time desenvolve, testa, publica e opera o seu pedaço, e a coordenação passa a acontecer **pelo contrato** (a API), não pelo calendário. Um time de cinco pessoas com doze serviços não tem esse problema; tem só os custos.
+
+### A lei de Conway
+
+Em 1968, Melvin Conway observou que **organizações produzem sistemas que copiam a sua estrutura de comunicação**. Se o serviço de pagamentos é mantido por dois times que não conversam, ele vai ter a cara de dois sistemas costurados. Se três times dividem um serviço, cada mudança vira reunião. A consequência prática é que a fronteira de serviço deveria coincidir com a fronteira de um time. Muitas empresas fazem a **manobra inversa de Conway**: primeiro desenham os times pela arquitetura que querem ter, depois deixam a arquitetura seguir os times.
+
+### O que eles custam
+
+Toda chamada de método que vira chamada de rede traz junto as **falácias da computação distribuída** (Peter Deutsch e colegas, na Sun): supor que a rede é confiável, que a latência é zero, que a topologia não muda, e assim por diante. Os custos se agrupam em quatro famílias:
+
+1. **Rede.** Uma chamada de método leva nanossegundos e nunca "some". Uma chamada HTTP leva milissegundos, pode demorar segundos, pode falhar no meio e pode chegar duas vezes. Toda chamada precisa de timeout, e muitas precisam de retry, circuit breaker e limite de concorrência ([aula 13.06](../../13-arquitetura/06-resiliencia/)). E há latência somada: se o pedido chama o estoque, que chama o catálogo, que chama os preços, as latências se acumulam e a disponibilidade se multiplica (quatro serviços com 99,9% cada dão uns 99,6% para a cadeia).
+2. **Consistência.** Não existe transação ACID entre dois bancos de dois serviços. O que era um `@Transactional` vira uma **saga** com compensações, e a consistência entre serviços passa a ser **eventual**: por um tempo, o estoque pode dizer "reservado" enquanto o pedido ainda diz "aguardando pagamento".
+3. **Observabilidade.** Um erro atravessa vários processos. Sem logs estruturados com identificador de correlação, métricas por serviço e **rastreamento distribuído**, você não consegue responder "por que este pedido demorou 8 segundos?" ([aula 14.05](../../14-devops/05-observabilidade/)).
+4. **Operação.** Cada serviço tem pipeline, imagem, configuração, segredos, alertas, dono de plantão, atualizações de dependências e de segurança. Multiplique isso pelo número de serviços. Em escala, isso exige um time de plataforma.
+
+<Callout tipo="atencao" titulo="Os custos chegam no primeiro dia; os ganhos, só quando há times">
+Os custos de rede, consistência, observabilidade e operação começam com o segundo serviço. O ganho principal, a autonomia, só aparece quando existem times diferentes para usá-la. Por isso a recomendação mais comum para produtos novos e times pequenos é começar com um **monólito modular** e extrair serviços quando um motivo concreto aparecer.
+</Callout>
+
+## Onde traçar as fronteiras
+
+Se você decidiu dividir, a decisão mais cara de errar é **onde**. Fronteira errada não se conserta com código: cada mudança de negócio passa a atravessar vários serviços, e você ganha deploys coordenados.
+
+A pior fronteira é a **técnica**: um "serviço de banco de dados", um "serviço de validação", um "serviço de regras". Toda funcionalidade atravessa todos eles. A segunda pior é o **serviço de entidade** (*entity service*): um "serviço de clientes" que é só um CRUD da tabela de clientes, chamado por todos os outros para qualquer coisa. Ele vira gargalo e ponto único de falha, e toda mudança no modelo de cliente envolve todo mundo.
+
+A melhor fronteira é de **negócio**: o que o Domain-Driven Design chama de **contexto delimitado**. Dentro de um contexto, as palavras têm um significado único e o modelo é coerente. Entre contextos, a mesma palavra pode significar coisas diferentes, e isso é saudável:
+
+```text
+Contexto de VENDAS              Contexto de ESTOQUE              Contexto de FINANCEIRO
+- Pedido (itens, total)         - Produto = SKU + saldo          - Cobrança (valor, status)
+- Produto = nome, foto, preço   - Reserva (pedido, quantidade)   - Pedido = "algo a cobrar"
+- Cliente = quem compra         - Depósito, lote, validade       - Cliente = pagador, CPF, cartão
+```
+
+"Produto" em vendas tem foto e preço; em estoque tem saldo e lote. Tentar um único `Produto` com tudo isso é o que gera a classe de 80 campos que três times disputam. A [aula 13.07](../../13-arquitetura/07-domain-driven-design/) aprofunda como descobrir esses contextos; aqui, ficam as heurísticas práticas para validar uma fronteira:
+
+- **O que muda junto fica junto.** Se toda história do backlog de "frete" também mexe em "pedidos", os dois provavelmente são um contexto só, ou a fronteira está no lugar errado.
+- **O que precisa de consistência imediata fica junto.** Se duas informações precisam estar sempre de acordo, dentro da mesma transação (o saldo e os lançamentos de uma conta), separá-las em serviços vai te obrigar a uma saga onde antes bastava um `COMMIT`.
+- **Conversa demais é sinal de fronteira errada.** Se para responder uma requisição o serviço A faz vinte chamadas ao serviço B, eles estão separados por uma parede no meio da sala.
+- **Um time consegue ser dono.** Se ninguém consegue dizer quem é o dono de um serviço, ou se ele tem três donos, a fronteira não bate com a organização.
+
+Por isso tantos times experimentam as fronteiras primeiro como **módulos** ([aula 13.04](../../13-arquitetura/04-monolito-modular/)), onde errar custa um refactoring, e só depois as transformam em fronteiras de rede.
+
+## Banco por serviço
+
+Cada serviço é **dono dos seus dados**, e ninguém mais acessa o banco dele: nem para ler "só uma tabelinha". O motivo é simples: um banco compartilhado é um contrato **implícito** e **sem versão**. Se o serviço de estoque renomeia a coluna `saldo` para `quantidade_disponivel`, o relatório do serviço financeiro, que lia a tabela direto, quebra em produção. Os dois times passam a combinar deploys, e você está de volta ao monólito, agora com rede no meio.
+
+"Banco por serviço" não exige um servidor por serviço: um esquema próprio no mesmo PostgreSQL, com um usuário que só enxerga esse esquema, já resolve o acoplamento de dados (os serviços ainda disputam CPU e conexões). Servidores separados dão isolamento total, a um custo multiplicado. O que **não** pode é dois serviços com permissão nas mesmas tabelas.
+
+Banco por serviço tem consequências que você precisa planejar:
+
+- **Consultas que cruzam contextos** não podem ser um `JOIN`. Ou viram **composição de APIs** (o serviço de pedidos chama o de catálogo para montar a tela), ou viram uma **projeção local**: o serviço guarda uma cópia, só de leitura, dos dados de que precisa, alimentada por eventos. O serviço de notificações não pergunta ao de clientes qual é o e-mail a cada envio: ele assina o evento `ClienteAtualizado` e mantém a sua tabela.
+- **Dados duplicados** deixam de ser pecado. A cópia é do dono? Não: o dono continua sendo um só, e a cópia pode estar alguns segundos atrasada. O que você decide é o quanto de atraso o negócio tolera.
+- **Relatórios** que cruzam tudo vão para um lugar próprio (um *data warehouse* ou um banco de leitura alimentado por eventos ou por CDC), não para o banco transacional de um serviço.
+- **Transações que atravessam serviços** viram sagas, assunto de uma seção inteira mais adiante.
+
+## Síncrono ou assíncrono
+
+Dois serviços conversam de dois jeitos. Na comunicação **síncrona**, quem chama espera a resposta: HTTP com JSON (o mais comum), gRPC (binário, contratos em Protobuf, popular entre serviços internos). Na **assíncrona**, quem publica não espera: manda uma mensagem a um broker e segue a vida ([módulo 12](../../12-mensageria/01-por-que-mensageria/)).
+
+| | Síncrono (HTTP, gRPC) | Assíncrono (eventos, filas) |
+|---|---|---|
+| Use quando | quem chama **precisa** da resposta para continuar (o estoque reservou? o cartão foi aprovado?) | o que pode acontecer depois (e-mail, nota fiscal, pontos de fidelidade, analytics) |
+| Acoplamento no tempo | alto: o outro precisa estar no ar agora | baixo: o broker guarda a mensagem |
+| Consistência | o resultado vem na resposta | eventual |
+| Falhas típicas | timeout, conexão recusada, 5xx | mensagem duplicada, fora de ordem, envenenada |
+| Defesas | timeout, retry com idempotência, circuit breaker | outbox, consumidor idempotente, retry e DLQ |
+| Depuração | um trace mostra a cadeia | o fluxo fica espalhado no tempo |
+
+A maioria dos sistemas usa os dois. A regra prática: **síncrono para perguntas e comandos que precisam de resposta agora; eventos para avisar que algo aconteceu**. Uma cadeia síncrona longa (A chama B, que chama C, que chama D) é um cheiro: a disponibilidade de A passa a ser o produto das quatro, e a latência, a soma. Se B só precisa de dados de C para enriquecer a resposta, talvez B possa guardar uma projeção de C, alimentada por eventos.
+
+Do lado assíncrono, duas aulas do módulo 12 são pré-requisito para qualquer conversa séria entre serviços: o [transactional outbox](../../12-mensageria/04-transactional-outbox/), que garante que o evento sai se, e somente se, a transação local fez commit, e os [consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/), que garantem que processar a mesma mensagem duas vezes não cobra o cliente duas vezes.
+
+### O cliente HTTP no Spring Framework 7
+
+No ecossistema Spring atual, a chamada síncrona se faz com o **`RestClient`**, a API fluente e bloqueante que substituiu o `RestTemplate` como recomendação, e com as **HTTP interfaces**: você declara uma interface Java com anotações `@GetExchange`, `@PostExchange` e companhia, e o Spring gera a implementação. O resultado parece um repositório do Spring Data: a classe de negócio depende de uma interface, e não sabe nada de URLs, cabeçalhos ou JSON.
+
+No Spring Boot 4, essas interfaces podem ser registradas com `@ImportHttpServices` e configuradas por propriedades, por grupo: `spring.http.serviceclient.<grupo>.base-url`, `spring.http.serviceclient.<grupo>.read-timeout` e outras. Nesta aula montamos o cliente à mão, com `HttpServiceProxyFactory`, para que cada peça fique visível; numa aplicação real, a configuração por propriedades é o caminho mais curto e deixa os timeouts num lugar que a operação consegue ajustar.
+
+## O código que vamos construir
+
+Para ver os serviços conversando de verdade, sem Docker, o exemplo tem **dois serviços no mesmo projeto**, em pacotes que não se enxergam:
+
+- **`estoque`**: uma aplicação Spring Boot completa (`EstoqueAplicacao`), com uma API HTTP para reservar, liberar e consultar o saldo. No teste, ela sobe de verdade, com o Tomcat embutido, numa porta aleatória.
+- **`pedidos`**: o serviço que cria pedidos. Ele fala com o estoque **somente por HTTP**, por uma HTTP interface, e conduz uma **saga orquestrada**: reservar o estoque, cobrar o pagamento e, se a cobrança for recusada, liberar a reserva. O serviço de pagamentos é uma interface com um fake no teste.
+
+Tudo fica em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.microsservicos`, e roda no CI. Primeiro, os dados do serviço de estoque. Repare que as reservas são identificadas pelo **id do pedido**, e não por um id gerado pelo estoque. É essa escolha que torna a reserva e a liberação idempotentes:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/estoque/Estoque.java" semImports destacar="41-58, 60-66" />
+
+Três detalhes merecem atenção antes de seguir:
+
+- **Reservar duas vezes o mesmo pedido devolve a mesma reserva** (linhas 42 a 45). Se o serviço de pedidos repetir a chamada depois de um erro de rede, o saldo não cai duas vezes.
+- **Liberar uma reserva que não existe não é erro** (linhas 60 a 66). A compensação pode chegar antes, depois ou em duplicidade, e o resultado tem de ser o mesmo.
+- **Liberar deixa uma "lápide"** (`pedidosCancelados`, linha 65). Se uma reserva atrasada chegar **depois** da liberação, ela é recusada. Você vai entender por que isso importa no passo do timeout.
+
+A API do estoque expõe essas operações e, de quebra, duas versões do endpoint de saldo:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/estoque/EstoqueController.java" semImports destacar="33, 46, 51" />
+
+A linha 33 é um truque de aula: ela faz o serviço **reservar e só depois demorar a responder**, como acontece num dia ruim (uma pausa de coleta de lixo, uma rede congestionada, um banco lento no commit). E a configuração do versionamento fica na classe da aplicação:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/estoque/EstoqueAplicacao.java" semImports destacar="21-27" />
+
+Do lado de pedidos, o contrato do estoque é uma HTTP interface. Os records são **cópias locais**: o serviço de pedidos não importa nenhuma classe do pacote `estoque`. O que os dois compartilham é o formato do JSON, não o código:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/pedidos/EstoqueCliente.java" semImports />
+
+A fábrica do cliente concentra as decisões de infraestrutura: o endereço, os dois timeouts e o cabeçalho de versão:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/pedidos/ClientesHttp.java" semImports destacar="20, 23, 28" />
+
+E, por fim, a saga. Leia com calma os três `catch`: cada um representa uma situação diferente, com uma decisão de negócio diferente.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/microsservicos/pedidos/SagaDeCriacaoDePedido.java" semImports destacar="45-55, 67-77" />
+
+- **`HttpClientErrorException.Conflict` (409)**: o estoque respondeu, com clareza, "não tenho saldo". Nada foi reservado, então não há o que desfazer: o pedido é **rejeitado**.
+- **`ResourceAccessException`**: erro de E/S, que inclui timeout e conexão recusada. O estoque **pode ou não** ter reservado. A saga não tem como saber, então manda a compensação, que é segura nos dois casos porque é idempotente.
+- **`RestClientException` na compensação**: nem a liberação passou. A saga não pode fingir que está tudo certo: marca `COMPENSACAO_PENDENTE`. Em produção, esse estado fica salvo no banco do serviço de pedidos e um processo agendado tenta de novo.
+
+<Figura legenda="O serviço de pedidos conduz a saga: reserva o estoque, tenta cobrar e, com a cobrança recusada, compensa liberando a reserva. Cada passo é uma transação local em um serviço diferente">
+<svg viewBox="0 0 720 440" width="720" role="img" aria-labelledby="ms-saga-titulo ms-saga-desc">
+  <title id="ms-saga-titulo">Saga orquestrada com compensação</title>
+  <desc id="ms-saga-desc">Três colunas: serviço de pedidos, serviço de estoque e serviço de pagamentos. Pedidos envia POST /reservas ao estoque, que responde 200 reservado. Pedidos pede a cobrança de 12,50 reais a pagamentos, que responde recusado. Pedidos então envia DELETE /reservas/PED-2 ao estoque, a compensação, que responde 204. O pedido termina com status cancelado.</desc>
+  <defs><marker id="mk-ms-saga" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="40" y="12" width="170" height="46" rx="10" class="d-accent"/>
+  <text x="125" y="41" text-anchor="middle" class="d-title">Pedidos</text>
+  <rect x="275" y="12" width="170" height="46" rx="10" class="d-info"/>
+  <text x="360" y="41" text-anchor="middle" class="d-title">Estoque</text>
+  <rect x="510" y="12" width="170" height="46" rx="10" class="d-violet"/>
+  <text x="595" y="41" text-anchor="middle" class="d-title">Pagamentos</text>
+  <path d="M125 58 L125 400" class="d-line" stroke-dasharray="5 5"/>
+  <path d="M360 58 L360 400" class="d-line" stroke-dasharray="5 5"/>
+  <path d="M595 58 L595 400" class="d-line" stroke-dasharray="5 5"/>
+  <text x="242" y="88" text-anchor="middle" class="d-mono">POST /reservas</text>
+  <path d="M125 98 L356 98" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <text x="242" y="128" text-anchor="middle" class="d-label">200: reservado (1 x FILTRO-103)</text>
+  <path d="M360 138 L129 138" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <text x="478" y="176" text-anchor="middle" class="d-mono">cobrar(R$ 12,50)</text>
+  <path d="M125 186 L591 186" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <text x="478" y="216" text-anchor="middle" class="d-label">RECUSADO</text>
+  <path d="M595 226 L129 226" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <rect x="140" y="246" width="205" height="24" rx="6" class="d-ok"/>
+  <text x="242" y="263" text-anchor="middle" class="d-label">compensação</text>
+  <text x="242" y="292" text-anchor="middle" class="d-mono">DELETE /reservas/PED-2</text>
+  <path d="M125 302 L356 302" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <text x="242" y="332" text-anchor="middle" class="d-label">204: saldo devolvido</text>
+  <path d="M360 342 L129 342" class="d-line" marker-end="url(#mk-ms-saga)"/>
+  <rect x="40" y="360" width="170" height="34" rx="8" class="d-box"/>
+  <text x="125" y="382" text-anchor="middle" class="d-text">status: CANCELADO</text>
+  <text x="360" y="428" text-anchor="middle" class="d-label">Cada seta é uma chamada de rede; não há transação que envolva os três serviços</text>
+</svg>
+</Figura>
+
+## Mão na massa
+
+Os testes ficam em `java/m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/microsservicos/`. Eles sobem o serviço de estoque de verdade, com `@SpringBootTest(webEnvironment = RANDOM_PORT)`, e fazem o serviço de pedidos falar com ele por HTTP, pela porta que o Spring sorteou. Para rodar, entre na pasta do módulo:
+
+```bash
+cd java/m13-arquitetura/aulas
+mvn test -Dtest=SagaEntreServicosTest          # a saga
+mvn test -Dtest=VersionamentoDaApiTest         # as duas versões da API
+```
+
+### Passo 1: subir o serviço de estoque e apontar o cliente para ele
+
+**O que vamos fazer e por quê.** Antes de qualquer cenário, precisamos de dois "processos": o estoque, escutando numa porta, e o cliente do serviço de pedidos, apontando para ela. No teste, o Spring sobe o estoque e injeta a porta com `@LocalServerPort`; o cliente é montado com um timeout de leitura de **500 ms**.
+
+```java
+@SpringBootTest(classes = EstoqueAplicacao.class, webEnvironment = WebEnvironment.RANDOM_PORT,
+        properties = "logging.level.dev.trilhajava.m13.aulas.microsservicos=INFO")
+class SagaEntreServicosTest {
+
+    @LocalServerPort
+    int porta;
+
+    @Autowired
+    Estoque estoqueDoOutroServico;   // só para preparar cenários; pedidos não enxerga isto
+
+    EstoqueCliente estoque;
+
+    @BeforeEach
+    void montarClienteHttp() {
+        estoque = ClientesHttp.estoque("http://localhost:" + porta, Duration.ofMillis(500));
+    }
+
+    @AfterEach
+    void voltarAoNormal() {
+        estoqueDoOutroServico.simularLentidao(Duration.ZERO);
+    }
+```
+
+**O que acabou de acontecer.** `classes = EstoqueAplicacao.class` diz ao Spring qual aplicação subir: só o serviço de estoque, que faz *component scan* apenas no próprio pacote. `RANDOM_PORT` sobe o Tomcat de verdade numa porta livre, e `@LocalServerPort` entrega essa porta ao teste. O serviço de pedidos **não** está no contexto do Spring: ele é montado à mão, como se estivesse em outro processo, e só conhece uma URL. O bean `Estoque` é injetado no teste apenas para provocar situações (a lentidão) e conferir o "banco" do outro lado; o código de pedidos nunca o vê.
+
+O nível de log `INFO` para o pacote da aula existe porque o projeto deixa os testes em `WARN` por padrão. Assim, cada passo da saga aparece na saída do Maven.
+
+### Passo 2: o caminho feliz
+
+**O que vamos fazer e por quê.** Começamos pelo cenário em que tudo dá certo: há saldo, o pagamento é aprovado. O fake de pagamentos é uma lambda, porque `Pagamentos` tem um método só.
+
+```java
+    @Test
+    void caminhoFelizReservaECobra() {
+        Pagamentos aprovaTudo = (pedidoId, valor) -> Pagamentos.Resposta.APROVADO;
+        var saga = new SagaDeCriacaoDePedido(estoque, aprovaTudo);
+
+        Resultado resultado = saga.executar(new NovoPedido("PED-1", "CAFE-500G", 2, new BigDecimal("99.80")));
+
+        assertThat(resultado.status()).isEqualTo(Status.CONFIRMADO);
+        assertThat(estoque.saldo("CAFE-500G").reservado()).isEqualTo(2);
+    }
+```
+
+Rode:
+
+```bash
+mvn test -Dtest=SagaEntreServicosTest#caminhoFelizReservaECobra
+```
+
+Saída esperada (resumida; horários, PID e porta variam):
+
+```text
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-1] estoque reservado: 2 x CAFE-500G
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-1] pagamento aprovado: R$ 99.80
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-1] pedido confirmado
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** A chamada `estoque.reservar(...)` parece uma chamada de método, mas virou um `POST /reservas` com um corpo JSON, serializado pelo Jackson, enviado pelo `HttpClient` do JDK, recebido pelo Tomcat do outro lado, desserializado no `EstoqueController` e devolvido como JSON. A última asserção usa o endpoint de saldo **versão 2** (`@GetExchange(version = "2")`), que traz o campo `reservado`. Para a saga, `EstoqueCliente` é uma interface como outra qualquer. Isso ajuda a leitura e engana a intuição: **uma chamada remota não é uma chamada de método**, e o resto da aula é sobre o que muda.
+
+### Passo 3: pagamento recusado, compensação executada
+
+**O que vamos fazer e por quê.** Agora o pagamento é recusado **depois** de a reserva ter sido feita. Num monólito, um `@Transactional` desfaria tudo com um rollback. Aqui a reserva já foi gravada no banco de outro serviço, num commit que ninguém pode desfazer. A saga precisa de uma **compensação**: uma nova operação, de negócio, que anula o efeito da anterior.
+
+```java
+    @Test
+    void pagamentoRecusadoLiberaAReserva() {
+        Pagamentos recusaTudo = (pedidoId, valor) -> Pagamentos.Resposta.RECUSADO;
+        var saga = new SagaDeCriacaoDePedido(estoque, recusaTudo);
+        int antes = estoque.saldo("FILTRO-103").disponivel();
+
+        Resultado resultado = saga.executar(new NovoPedido("PED-2", "FILTRO-103", 1, new BigDecimal("12.50")));
+
+        assertThat(resultado.status()).isEqualTo(Status.CANCELADO);
+        assertThat(resultado.passos()).containsExactly(
+                "estoque reservado: 1 x FILTRO-103",
+                "pagamento recusado",
+                "compensação: reserva liberada");
+        assertThat(estoque.saldo("FILTRO-103").disponivel()).isEqualTo(antes);
+    }
+```
+
+```bash
+mvn test -Dtest=SagaEntreServicosTest#pagamentoRecusadoLiberaAReserva
+```
+
+Saída esperada:
+
+```text
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-2] estoque reservado: 1 x FILTRO-103
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-2] pagamento recusado
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-2] compensação: reserva liberada
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.** Foram três chamadas de rede (reservar, cobrar, liberar) e três transações locais independentes. Entre a primeira e a terceira, por alguns milissegundos, o estoque mostrou o filtro como reservado para um pedido que nunca seria pago. Qualquer outro cliente que consultasse o saldo nesse intervalo veria um filtro a menos. Isso é **consistência eventual** na prática, e é aceitável aqui porque o negócio tolera uma reserva temporária. O teste confere o efeito que importa: no final, o saldo disponível é o mesmo de antes.
+
+Repare também na **ordem dos passos**, que é uma decisão de design. Reservar antes de cobrar é o padrão em e-commerce porque a compensação de uma reserva é barata e invisível para o cliente, enquanto a compensação de uma cobrança é um estorno, que aparece na fatura do cartão, tem custo e gera reclamação. Em sagas, coloque primeiro os passos com compensação barata e por último os que são difíceis ou impossíveis de desfazer.
+
+### Passo 4: o timeout em que o outro lado fez o trabalho
+
+**O que vamos fazer e por quê.** Este é o cenário que separa quem já operou serviços de quem só leu sobre eles. O estoque **reserva** e depois demora 2 segundos para responder. O cliente desiste em 500 ms. Do ponto de vista do serviço de pedidos, a chamada "falhou"; do ponto de vista do estoque, a reserva existe. Se a saga simplesmente marcasse o pedido como falho e seguisse em frente, o filtro ficaria reservado para sempre, para um pedido que não existe.
+
+```java
+    @Test
+    void timeoutNaReservaTambemCompensa() {
+        estoqueDoOutroServico.simularLentidao(Duration.ofSeconds(2));
+        Pagamentos naoDeveriaSerChamado = (pedidoId, valor) -> {
+            throw new IllegalStateException("sem reserva confirmada, não se cobra");
+        };
+        var saga = new SagaDeCriacaoDePedido(estoque, naoDeveriaSerChamado);
+        int antes = estoque.saldo("CAFE-500G").disponivel();
+
+        Resultado resultado = saga.executar(new NovoPedido("PED-3", "CAFE-500G", 1, new BigDecimal("49.90")));
+
+        assertThat(resultado.status()).isEqualTo(Status.CANCELADO);
+        assertThat(resultado.passos().getFirst()).startsWith("sem resposta do estoque");
+        assertThat(estoqueDoOutroServico.reservaDo("PED-3")).isEmpty();   // o estoque tinha reservado!
+        assertThat(estoque.saldo("CAFE-500G").disponivel()).isEqualTo(antes);
+    }
+```
+
+```bash
+mvn test -Dtest=SagaEntreServicosTest#timeoutNaReservaTambemCompensa
+```
+
+Saída esperada (a porta varia):
+
+```text
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-3] sem resposta do estoque: I/O error on POST request for "http://localhost:61223/reservas": Request cancelled
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-3] compensação: reserva liberada
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer, peça por peça.**
+
+- O `JdkClientHttpRequestFactory` com `setReadTimeout(500 ms)` cancelou a requisição quando a resposta não chegou a tempo. O `RestClient` embrulhou o erro de E/S numa `ResourceAccessException`, com a mensagem `I/O error on POST request for ...: Request cancelled`. A mensagem não diz "timeout" com todas as letras; é por isso que o log da saga registra a mensagem inteira, com a URL.
+- A saga **não sabe** se a reserva aconteceu. Ela trata o timeout como **incerteza** e manda a compensação. Como a liberação é idempotente, isso é seguro nos dois mundos possíveis: se a reserva existe, ela é desfeita; se não existe, nada acontece.
+- A asserção `reservaDo("PED-3")).isEmpty()` olha o "banco" do estoque e prova que a reserva **existiu** e foi liberada. Sem a compensação, o saldo de café teria uma unidade a menos, para sempre.
+E a lápide? Neste teste o estoque reserva **antes** de dormir, então a liberação encontra a reserva. Mas existe a ordem inversa, mais rara e mais perigosa: a requisição de reserva fica presa numa fila do servidor, a saga desiste, a liberação chega primeiro (e não encontra nada), e só **depois** a reserva atrasada é processada. Sem a lápide, essa reserva órfã ficaria para sempre. Com ela, `reservar` encontra o pedido em `pedidosCancelados` e responde 409. É o tipo de detalhe que não aparece em diagrama de arquitetura e aparece no inventário do fim do mês.
+
+<Callout tipo="info" titulo="Por que a saga não tenta de novo antes de compensar?">
+Poderia. Com uma operação idempotente (reservar pelo id do pedido), repetir a reserva é seguro, e muitas sagas fazem uma ou duas tentativas antes de desistir. O que não pode é repetir sem limite, nem repetir uma operação que não é idempotente. A [aula 13.06](../../13-arquitetura/06-resiliencia/) trata de retry com backoff, de quando ele ajuda e de quando ele piora a situação. Aqui o exemplo foi direto para a compensação para deixar a incerteza à mostra.
+</Callout>
+
+### Passo 5: duas versões da mesma API no ar
+
+**O que vamos fazer e por quê.** O serviço de estoque mudou o formato da resposta de saldo: a versão 1 devolvia `saldo`; a versão 2 separa `disponivel` e `reservado`. O serviço de pedidos já usa a 2, mas o serviço de relatórios, de outro time, ainda usa a 1 e só vai migrar no próximo trimestre. As duas precisam conviver, e a 1 precisa avisar que vai acabar.
+
+O Spring Framework 7 traz versionamento de API nativo. Do lado do servidor, o método do controller declara `version = "1"` ou `version = "2"` no `@GetMapping`, e a configuração (já vista em `EstoqueAplicacao`) diz de onde ler a versão (o cabeçalho `API-Version`), qual usar quando o cliente não manda nenhuma (`1`, para não quebrar os clientes antigos) e quais datas anunciar para a versão 1. Do lado do cliente, o `RestClient` recebe um `ApiVersionInserter` que coloca a versão no cabeçalho, e a HTTP interface declara a versão com `@GetExchange(version = "2")`.
+
+```java
+    @Test
+    void v1ContinuaNoArComAvisoEV2TrazOFormatoNovo() {
+        RestClient cliente = RestClient.create("http://localhost:" + porta);
+
+        ResponseEntity<String> v1 = cliente.get().uri("/produtos/{sku}/saldo", "FILTRO-103")
+                .retrieve().toEntity(String.class);                  // cliente antigo: sem cabeçalho
+        String v2 = cliente.get().uri("/produtos/{sku}/saldo", "FILTRO-103")
+                .header("API-Version", "2")
+                .retrieve().body(String.class);
+
+        System.out.println("v1 -> " + v1.getBody() + " " + v1.getHeaders());
+        System.out.println("v2 -> " + v2);
+        assertThat(v1.getBody()).contains("\"saldo\"");
+        assertThat(v1.getHeaders().getFirst("Deprecation")).isNotNull();
+        assertThat(v1.getHeaders().getFirst("Sunset")).isNotNull();
+        assertThat(v2).contains("\"disponivel\"").contains("\"reservado\"");
+    }
+```
+
+```bash
+mvn test -Dtest=VersionamentoDaApiTest
+```
+
+Saída esperada (a data do cabeçalho `date` varia):
+
+```text
+v1 -> {"sku":"FILTRO-103","saldo":3} [content-length:"30", content-type:"application/json", date:"Tue, 06 Oct 2026 08:20:26 GMT", deprecation:"@1790812800", sunset:"Thu, 1 Apr 2027 00:00:00 GMT"]
+v2 -> {"sku":"FILTRO-103","disponivel":3,"reservado":0}
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.** O cliente antigo não mandou cabeçalho nenhum e recebeu a versão padrão, a 1, com o formato que ele conhece. Junto vieram dois cabeçalhos que ele pode registrar em log ou em métrica: `Deprecation: @1790812800` (o formato da RFC 9745: um `@` seguido do instante em segundos desde 1970, que corresponde a 1º de outubro de 2026) e `Sunset: Thu, 1 Apr 2027 00:00:00 GMT` (RFC 8594, a data a partir da qual a versão pode deixar de responder). Quem manda `API-Version: 2` recebe o formato novo. O mesmo caminho, `/produtos/FILTRO-103/saldo`, foi atendido por dois métodos diferentes do controller, escolhidos pela versão.
+
+### Passo 6: a suíte inteira, e o quarto cenário da saga
+
+A classe `SagaEntreServicosTest` tem um quarto teste, que é a solução do checkpoint no fim da aula (por isso ele não aparece aqui). Rode o módulo inteiro, como o CI faz, a partir da pasta `java`:
+
+```bash
+cd java
+mvn -pl m13-arquitetura/aulas -am verify
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.microsservicos.SagaEntreServicosTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.microsservicos.VersionamentoDaApiTest
+[INFO] BUILD SUCCESS
+```
+
+As duas classes reaproveitam o mesmo contexto do Spring, então o "banco" em memória do estoque é **compartilhado** entre os testes. Por isso cada teste usa um id de pedido próprio e confere diferenças de saldo, não valores absolutos, a mesma disciplina de um banco real compartilhado em testes de integração.
+
+## Quando dá errado
+
+Os erros abaixo foram copiados da execução do exemplo, provocando cada situação de propósito. Aprender a reconhecê-los pela mensagem economiza horas de plantão.
+
+### O outro serviço está fora do ar
+
+Apontando o cliente para uma porta onde nada escuta (`http://localhost:1`), a reserva falha imediatamente:
+
+```text
+org.springframework.web.client.ResourceAccessException: I/O error on POST request for "http://localhost:1/reservas": null
+```
+
+A mensagem termina em `null` porque a causa (`java.net.ConnectException`) não traz texto; o tipo da causa, no stack trace, é o que diz "conexão recusada". E a saga, rodando contra esse endereço, termina assim:
+
+```text
+Resultado[pedidoId=PED-6, status=COMPENSACAO_PENDENTE, passos=[sem resposta do estoque: I/O error on POST request for "http://localhost:1/reservas": null, compensação falhou, fica pendente: I/O error on DELETE request for "http://localhost:1/reservas/PED-6": null]]
+```
+
+Nem a compensação conseguiu chegar. Isso é esperado: se o serviço está fora, os dois passos falham. O que importa é que a saga **não mente**: o status `COMPENSACAO_PENDENTE` diz que existe algo a fazer. Em produção, esse estado precisa estar salvo no banco do serviço de pedidos, com um job que tenta de novo e um alerta se a fila de pendências crescer. Uma saga que só existe na memória de uma requisição perde esse estado no primeiro restart.
+
+### O timeout que não diz "timeout"
+
+```text
+org.springframework.web.client.ResourceAccessException: I/O error on POST request for "http://localhost:61223/reservas": Request cancelled
+```
+
+Com o `JdkClientHttpRequestFactory`, o timeout de leitura aparece como `Request cancelled`. Outras fábricas (Apache HttpClient, Reactor Netty) produzem mensagens diferentes para a mesma situação. Não escreva lógica que compara o texto da mensagem: trate `ResourceAccessException` como "resultado desconhecido" e registre a mensagem inteira, com a URL e o id de correlação.
+
+### 409 sem explicação
+
+```text
+org.springframework.web.client.HttpClientErrorException$Conflict: 409 Conflict: "{"timestamp":"2026-10-06T08:21:03.762Z","status":409,"error":"Conflict","path":"/reservas"}"
+```
+
+O estoque recusou a reserva (50 filtros, com 3 em estoque), mas o corpo não diz por quê: o Spring Boot, por padrão, não inclui a mensagem da exceção na resposta de erro, para não vazar detalhes internos. Entre serviços, isso atrapalha: quem chama precisa distinguir "saldo insuficiente" de "pedido já cancelado". A saída é desenhar o erro como parte do contrato: respostas no formato **Problem Details** (RFC 9457), com um campo `type` estável para cada motivo, que o cliente pode tratar sem ler texto livre. O Spring MVC tem suporte a isso com `ProblemDetail` e `ErrorResponseException`.
+
+### Versão que não existe
+
+```text
+org.springframework.web.client.HttpClientErrorException$BadRequest: 400 Bad Request: "{"timestamp":"2026-10-06T08:21:03.618Z","status":400,"error":"Bad Request","path":"/produtos/CAFE-500G/saldo"}"
+```
+
+Um cliente mandou `API-Version: 3`, que o estoque não declara. O Spring responde 400 (do lado do servidor, a exceção é `InvalidApiVersionException`). O mesmo 400 aparece para um valor que nem é versão, como `API-Version: abc`. Se você vir um pico de 400 logo depois de um deploy de um cliente, confira o cabeçalho de versão antes de qualquer outra coisa.
+
+### Cliente com versão, mas sem inserter
+
+```text
+java.lang.IllegalStateException: No ApiVersionInserter configured
+```
+
+A HTTP interface declara `@GetExchange(version = "2")`, mas o `RestClient` foi criado sem `apiVersionInserter(...)`. O Spring não tem como saber se a versão vai no cabeçalho, na query string, no caminho ou no tipo de mídia, e falha antes de enviar a requisição. A correção está em `ClientesHttp`, linha 28. Esse erro é bom: aparece no primeiro teste, não em produção.
+
+## API gateway, descoberta de serviços e configuração
+
+Até aqui, o serviço de pedidos sabia o endereço do estoque (`http://localhost:porta`). Em produção, nada é tão simples: há várias réplicas de cada serviço, os endereços mudam a cada deploy, o cliente externo não deveria conhecer a topologia interna, e a configuração muda por ambiente. Três peças resolvem isso, e é importante conhecer as ideias mesmo quando a plataforma já entrega as peças prontas.
+
+<Figura legenda="Uma visão típica: o gateway é a única porta de entrada; cada serviço tem o seu banco; pedidos chama o estoque e o pagamento de forma síncrona e publica eventos que outros serviços consomem">
+<svg viewBox="0 0 760 420" width="760" role="img" aria-labelledby="ms-arq-titulo ms-arq-desc">
+  <title id="ms-arq-titulo">Arquitetura de microsserviços da loja</title>
+  <desc id="ms-arq-desc">O aplicativo chama o API gateway, que roteia para o serviço de pedidos. Pedidos tem o seu banco e chama o estoque por HTTP com timeout e o serviço de pagamentos por HTTP. Pedidos publica um evento num broker, e o serviço de notificações assina esse evento. Estoque, pagamentos e notificações têm cada um o seu banco.</desc>
+  <defs><marker id="mk-ms-arq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="16" width="170" height="52" rx="10" class="d-box"/>
+  <text x="105" y="47" text-anchor="middle" class="d-title">Aplicativo</text>
+  <path d="M190 42 L246 42" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <rect x="250" y="16" width="230" height="52" rx="10" class="d-violet"/>
+  <text x="365" y="38" text-anchor="middle" class="d-title">API gateway</text>
+  <text x="365" y="57" text-anchor="middle" class="d-label">rotas, autenticação, limites</text>
+  <path d="M365 68 L365 126" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <rect x="250" y="130" width="230" height="60" rx="10" class="d-accent"/>
+  <text x="365" y="157" text-anchor="middle" class="d-title">Pedidos</text>
+  <text x="365" y="177" text-anchor="middle" class="d-label">orquestra a saga</text>
+  <rect x="20" y="140" width="170" height="40" rx="18" class="d-ok"/>
+  <text x="105" y="165" text-anchor="middle" class="d-label">banco de pedidos</text>
+  <path d="M250 160 L194 160" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <rect x="560" y="130" width="180" height="60" rx="10" class="d-box"/>
+  <text x="650" y="157" text-anchor="middle" class="d-title">Broker</text>
+  <text x="650" y="177" text-anchor="middle" class="d-label">Kafka ou RabbitMQ</text>
+  <path d="M480 160 L556 160" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <text x="518" y="150" text-anchor="middle" class="d-label">evento</text>
+  <rect x="20" y="270" width="200" height="60" rx="10" class="d-info"/>
+  <text x="120" y="305" text-anchor="middle" class="d-title">Estoque</text>
+  <rect x="280" y="270" width="200" height="60" rx="10" class="d-info"/>
+  <text x="380" y="305" text-anchor="middle" class="d-title">Pagamentos</text>
+  <rect x="540" y="270" width="200" height="60" rx="10" class="d-info"/>
+  <text x="640" y="305" text-anchor="middle" class="d-title">Notificações</text>
+  <path d="M300 190 L150 266" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <text x="168" y="226" text-anchor="middle" class="d-label">HTTP + timeout</text>
+  <path d="M380 190 L380 266" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <text x="412" y="232" text-anchor="middle" class="d-label">HTTP</text>
+  <path d="M650 190 L645 266" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <text x="685" y="232" text-anchor="middle" class="d-label">assina</text>
+  <rect x="35" y="360" width="170" height="40" rx="18" class="d-ok"/>
+  <text x="120" y="385" text-anchor="middle" class="d-label">banco do estoque</text>
+  <rect x="295" y="360" width="170" height="40" rx="18" class="d-ok"/>
+  <text x="380" y="385" text-anchor="middle" class="d-label">banco de pagamentos</text>
+  <rect x="555" y="360" width="170" height="40" rx="18" class="d-ok"/>
+  <text x="640" y="385" text-anchor="middle" class="d-label">banco de notificações</text>
+  <path d="M120 330 L120 356" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <path d="M380 330 L380 356" class="d-line" marker-end="url(#mk-ms-arq)"/>
+  <path d="M640 330 L640 356" class="d-line" marker-end="url(#mk-ms-arq)"/>
+</svg>
+</Figura>
+
+### API gateway
+
+O **API gateway** é a porta de entrada única para quem está fora: o aplicativo, o site, os parceiros. Ele recebe `https://api.torrefacaoaurora.com.br/pedidos/123` e encaminha para uma das réplicas do serviço de pedidos. Por estar na borda, ele concentra preocupações transversais que você não quer repetir em cada serviço:
+
+- **roteamento** por caminho, cabeçalho ou versão (é onde o Strangler Fig acontece, como você vai ver adiante);
+- **terminação de TLS** e validação do token de acesso (o serviço interno ainda deve validar o que precisa para autorizar, mas o gateway barra o tráfego obviamente inválido);
+- **limite de taxa** (*rate limiting*) por cliente, para proteger os serviços de abuso e de picos;
+- **observabilidade de borda**: gerar o id de correlação, registrar latência por rota.
+
+Uma variação comum é o **BFF** (*Backend for Frontend*): um gateway por tipo de cliente (um para o aplicativo, outro para o site), que também **agrega** chamadas, montando a tela inicial do aplicativo com dados de três serviços numa resposta só, para economizar idas e vindas pela rede móvel.
+
+O risco do gateway é virar um **monólito na borda**, acumulando regras de negócio. Gateway roteia, protege e observa; regra de negócio fica nos serviços. No ecossistema Spring existe o **Spring Cloud Gateway**; em Kubernetes e em nuvem, é comum usar o gateway do provedor ou do cluster.
+
+### Descoberta de serviços
+
+Com várias réplicas que nascem e morrem, o serviço de pedidos não pode ter um IP fixo do estoque na configuração. Há dois modelos:
+
+- **Descoberta no cliente**: cada réplica se registra num **registro de serviços** ao subir (o Eureka, do Spring Cloud Netflix, é o exemplo clássico), e o cliente consulta o registro e escolhe uma réplica, fazendo o balanceamento de carga ele mesmo.
+- **Descoberta no servidor (ou na plataforma)**: o cliente chama um nome estável, e a infraestrutura resolve para uma réplica saudável. No Kubernetes, cada *Service* ganha um nome DNS (como `estoque.loja.svc.cluster.local`), e o tráfego é distribuído entre os pods prontos. O código só conhece `http://estoque`.
+
+Hoje, em ambientes com Kubernetes, o segundo modelo é o padrão, e o registro no cliente perdeu espaço. Para a sua aplicação, o efeito prático é que a **URL base vem de configuração** (`spring.http.serviceclient.estoque.base-url=http://estoque`), e não do código. Veja a [aula 14.06](../../14-devops/06-kubernetes-e-cloud/) para o lado da plataforma.
+
+### Configuração
+
+URLs, timeouts e tamanhos de pool mudam por ambiente; senhas e chaves são segredos. O princípio do *Twelve-Factor App* resolve os dois: **a mesma imagem roda em todos os ambientes, só a configuração muda**. Ela chega por variáveis de ambiente ou arquivos montados pela plataforma (no Kubernetes, *ConfigMaps* e *Secrets*), por um servidor de configuração (como o Spring Cloud Config) ou por um cofre de segredos. E timeouts são configuração: quem opera precisa ajustá-los sem esperar um novo build.
+
+## Consistência entre serviços: sagas
+
+Você já viu uma saga funcionando. Agora, a visão completa, para desenhar as suas. Uma **saga** é uma sequência de transações locais, cada uma num serviço, em que cada passo que pode precisar ser desfeito tem uma **compensação**. A ideia é de Hector Garcia-Molina e Kenneth Salem (1987) e foi popularizada no mundo dos microsserviços porque é a alternativa realista à transação distribuída. O protocolo de *two-phase commit* (2PC), que coordena um commit atômico entre bancos, existe, mas segura bloqueios enquanto espera todos os participantes, depende de um coordenador disponível e quase nunca é suportado por brokers e APIs HTTP. Na prática, entre serviços, ele não é uma opção.
+
+### Compensação não é rollback
+
+Rollback desfaz como se nunca tivesse acontecido. Compensação é uma **nova ação de negócio** que anula o efeito da anterior, e o que aconteceu continua registrado: o estorno de um pagamento é um novo lançamento, não o apagamento do primeiro; o e-mail "seu pedido foi confirmado" não pode ser "desenviado", e a compensação é outro e-mail. Por isso, ao desenhar uma saga, para cada passo pergunte: "qual é a compensação de negócio, e ela é idempotente?". Passos que não têm compensação (enviar a nota fiscal à prefeitura, despachar a caixa no caminhão) devem ficar **por último**, depois do ponto de não retorno, que a literatura chama de **transação pivô**: daí em diante, a saga só segue em frente, com retries, nunca para trás.
+
+### Orquestrada ou coreografada
+
+<Comparar antes="Coreografia: cada serviço reage a eventos" depois="Orquestração: um coordenador conduz os passos">
+
+```text
+Pedidos   publica  PedidoCriado
+Estoque   ouve PedidoCriado      -> reserva -> publica EstoqueReservado
+Pagamento ouve EstoqueReservado  -> cobra   -> publica PagamentoRecusado
+Estoque   ouve PagamentoRecusado -> libera  -> publica ReservaLiberada
+Pedidos   ouve ReservaLiberada   -> cancela o pedido
+
+O fluxo está espalhado em quatro consumidores, em três serviços.
+```
+
+```text
+SagaDeCriacaoDePedido (no serviço de pedidos):
+  1. estoque.reservar(...)          falhou?  -> rejeita
+  2. pagamentos.cobrar(...)         recusou? -> estoque.liberar(...)
+  3. pedido confirmado
+
+O fluxo está num arquivo só, com o estado salvo pelo dono do pedido.
+```
+
+</Comparar>
+
+| | Coreografia | Orquestração |
+|---|---|---|
+| Onde está o fluxo | espalhado nos consumidores | numa classe (ou num motor de workflow) |
+| Acoplamento | cada serviço conhece eventos, não os outros serviços | o orquestrador conhece todos os participantes |
+| Entender e depurar | difícil: é preciso juntar eventos de vários serviços | fácil: o estado da saga está num lugar |
+| Mudar a ordem dos passos | mexe em vários serviços | mexe no orquestrador |
+| Risco típico | ciclos de eventos, ninguém sabe o fluxo completo | o orquestrador vira um "deus" que acumula regra de negócio dos outros |
+| Boa para | fluxos curtos, de 2 ou 3 passos, e reações independentes | fluxos com muitos passos, regras de compensação e prazos |
+
+Na prática, muitos sistemas misturam: a saga principal é orquestrada pelo dono do processo, e efeitos colaterais (notificar, pontuar fidelidade) são coreografados por eventos. Fluxos longos, com prazos de dias e passos humanos, costumam ir para um motor de workflow, decisão que vale um ADR próprio.
+
+### O que toda saga de produção precisa
+
+O exemplo da aula é propositalmente pequeno. Uma saga de produção precisa, além disso:
+
+1. **Estado persistido.** O estado da saga (em que passo está, o que já foi feito) fica salvo no banco do orquestrador, na mesma transação da mudança local. Se o processo reiniciar no meio, um job retoma do ponto onde parou.
+2. **Mensagens confiáveis.** Se os passos usam eventos, a publicação passa pelo [transactional outbox](../../12-mensageria/04-transactional-outbox/), para que o estado e o evento nunca divirjam.
+3. **Passos e compensações idempotentes.** Todos os passos podem ser repetidos (retries, mensagens duplicadas), então todos precisam de uma chave de idempotência, como o id do pedido usado aqui. Veja os [consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/).
+4. **Timeout como incerteza.** Como no passo 4: depois de um timeout, ou se consulta o estado no outro serviço, ou se manda uma compensação idempotente. Nunca se assume "não aconteceu". A [aula 15.05](../../15-system-design/05-escala-e-consistencia/) volta a esse ponto no caso de uma transferência entre bancos.
+5. **Estados intermediários visíveis e um fim para os casos sem fim.** O pedido fica `AGUARDANDO_PAGAMENTO` enquanto a saga corre (um "bloqueio semântico" que impede, por exemplo, despachar a mercadoria), e depois de N tentativas sem sucesso a saga vai para análise manual, com alerta.
+
+## Versionamento de APIs
+
+Num monólito, mudar a assinatura de um método é um refactoring: o compilador aponta todos os lugares que quebram. Entre serviços, o "compilador" é o incidente em produção. Por isso, uma API entre serviços é tratada como um **contrato público**, mesmo que só outro time da mesma empresa o use.
+
+### O que é compatível e o que quebra
+
+| Mudança | Para quem consome |
+|---|---|
+| Adicionar um campo novo na resposta | compatível, se o cliente ignora campos desconhecidos (**leitor tolerante**) |
+| Adicionar um parâmetro **opcional** na requisição | compatível |
+| Adicionar um endpoint | compatível |
+| Remover ou renomear um campo da resposta | **quebra** quem usa o campo |
+| Tornar obrigatório um campo da requisição | **quebra** quem não manda |
+| Mudar o tipo ou o significado de um campo (centavos para reais, dias corridos para dias úteis) | **quebra**, e a pior: nenhuma ferramenta de formato detecta |
+| Mudar códigos de status ou o formato de erro | **quebra** quem trata erros |
+
+A primeira estratégia é **evitar versões novas**: a maioria das evoluções pode ser feita só com mudanças compatíveis. Para remover um campo, use o roteiro **expandir e contrair**: adicione o novo, faça os consumidores migrarem, confirme que ninguém mais lê o antigo e só então o remova. Os [testes de contrato](../../10-testes/07-testes-de-contrato/) são a ferramenta que diz, com segurança, quando nenhum consumidor depende mais de um campo.
+
+Quando a mudança incompatível é inevitável, você publica uma **nova versão** e mantém a antiga por um período combinado, como fizemos com o endpoint de saldo. A versão pode ir no caminho (`/v2/...`, visível e fácil de rotear), num cabeçalho (`API-Version: 2`, URLs estáveis), na query string ou no tipo de mídia; o Spring Framework 7 suporta os quatro (`usePathSegment`, `useRequestHeader`, `useQueryParam`, `useMediaTypeParameter`). Não há resposta única. O que importa é **escolher uma convenção para a empresa inteira**, documentá-la e aplicar sempre igual. E sinalizar a descontinuação **no próprio protocolo**, com os cabeçalhos `Deprecation` e `Sunset`, além do comunicado por e-mail: um cliente pode registrar uma métrica sempre que receber `Deprecation`, e o time descobre que está usando uma versão em extinção pelo painel, não pelo incidente.
+
+Antes de desligar uma versão, saiba quem ainda a chama: registre a versão resolvida num rótulo da métrica de requisições ou no log estruturado, junto com a identidade do cliente.
+
+## Armadilhas e quando NÃO usar
+
+### O monólito distribuído
+
+O anti-padrão mais caro desta aula tem nome: **monólito distribuído**. São serviços separados na rede, mas que não conseguem viver separados. Você tem os custos de rede, consistência e operação, e nenhuma autonomia. Os sinais:
+
+- **deploys combinados**: "o serviço A só pode subir depois do B", com uma planilha de ordem de deploy;
+- **banco compartilhado**: dois ou mais serviços com acesso às mesmas tabelas;
+- **biblioteca de domínio compartilhada**: um `.jar` comum com as entidades (`Pedido`, `Cliente`) que todos importam; mudar um campo exige atualizar e publicar todos os serviços;
+- **cadeias síncronas longas**: uma requisição do usuário atravessa cinco serviços em sequência, e a queda de qualquer um derruba a funcionalidade;
+- **conversa excessiva**: um serviço faz dezenas de chamadas a outro para atender uma requisição;
+- **testes que só passam com todos os serviços no ar**: ninguém consegue testar o seu serviço isolado;
+- **um time mexe em vários serviços para entregar qualquer coisa**: a fronteira não bate com o time.
+
+<Comparar antes="Biblioteca de domínio comum: acoplamento disfarçado" depois="Contrato no formato, modelo de cada um">
+
+```java
+// comum-dominio-1.7.3.jar, importado por pedidos, estoque e financeiro
+public class Produto {
+    String sku; String nome; BigDecimal preco; int saldo;
+    String lote; LocalDate validade; String ncm; String cfop;
+    // um campo novo para o financeiro obriga os três serviços a atualizar
+}
+```
+
+```java
+// no serviço de pedidos: só o que pedidos precisa saber do estoque
+record Saldo(String sku, int disponivel, int reservado) {}
+
+// no serviço de estoque: o modelo completo, que só ele conhece
+record Reserva(String pedidoId, String sku, int quantidade) {}
+```
+
+</Comparar>
+
+Compartilhar bibliotecas **técnicas** (logging, cliente de métricas, utilitários de segurança) é razoável. Compartilhar o **modelo de domínio** é acoplar os serviços pelo código, que é exatamente o que a divisão queria evitar. Cada serviço tem a sua representação do que precisa, e o que se compartilha é o **contrato**, descrito por OpenAPI, por um esquema de eventos ou por testes de contrato.
+
+### Outras armadilhas frequentes
+
+- **Nanosserviços.** Serviços tão pequenos que o custo fixo de cada um (pipeline, monitoramento, plantão) supera o código dentro dele.
+- **Chamada sem timeout.** O padrão de alguns clientes HTTP é esperar indefinidamente, ou por muito tempo. Uma dependência lenta prende as threads de quem chama e a falha se espalha, como na Black Friday da abertura. Toda chamada remota tem timeout de conexão e de leitura, sempre.
+- **Retry de operação não idempotente.** Repetir um `POST /cobrancas` depois de um timeout pode cobrar duas vezes. Ou a operação aceita uma chave de idempotência, ou não se repete.
+
+### Quando NÃO usar microsserviços
+
+- **Produto novo, ainda procurando o encaixe com o mercado.** O domínio vai mudar muito, e as fronteiras que você traçar agora estarão erradas daqui a seis meses. Um monólito modular deixa você mover as fronteiras barato.
+- **Um time só, ou poucos times pequenos.** Não há autonomia a ganhar.
+- **Sem maturidade de operação.** Sem CI/CD automatizado, sem observabilidade, sem plantão organizado, cada serviço novo multiplica os problemas.
+- **Domínio com consistência forte em toda parte.** Se quase tudo precisa estar na mesma transação (um core bancário de lançamentos, por exemplo), dividir significa sagas em todo lugar.
+- **Problema de desempenho que um índice resolveria.** Antes de separar um serviço "para escalar", meça.
+
+## Migrando com Strangler Fig
+
+Se o seu monólito ficou grande demais para a organização, a tentação é reescrevê-lo do zero, "em seis meses, com a arquitetura certa". Esse é o caminho mais conhecido para projetos cancelados: o sistema antigo continua recebendo funcionalidades enquanto o novo tenta alcançá-lo, e o dia da troca nunca chega, ou chega com uma lista de comportamentos esquecidos.
+
+O padrão **Strangler Fig**, descrito por Martin Fowler e inspirado numa figueira que cresce em volta de uma árvore até substituí-la, migra **uma funcionalidade por vez**, sempre com o sistema em produção:
+
+<Figura legenda="Strangler Fig em três momentos: o roteador entra na frente do monólito, desvia uma funcionalidade para um serviço novo e, com o tempo, o monólito encolhe">
+<svg viewBox="0 0 770 300" width="770" role="img" aria-labelledby="ms-strangler-titulo ms-strangler-desc">
+  <title id="ms-strangler-titulo">Migração com o padrão Strangler Fig</title>
+  <desc id="ms-strangler-desc">Três painéis. No primeiro, um roteador encaminha todo o tráfego para o monólito, que contém pedidos, estoque e pagamentos. No segundo, o roteador manda as rotas de estoque para um serviço novo de estoque, e o resto continua no monólito. No terceiro, o monólito ficou pequeno, com pedidos, e estoque e pagamentos são serviços próprios.</desc>
+  <defs><marker id="mk-ms-strangler" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="125" y="22" text-anchor="middle" class="d-title">1. Roteador na frente</text>
+  <rect x="40" y="38" width="170" height="40" rx="10" class="d-violet"/>
+  <text x="125" y="63" text-anchor="middle" class="d-text">roteador</text>
+  <path d="M125 78 L125 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <rect x="20" y="120" width="210" height="150" rx="10" class="d-box"/>
+  <text x="125" y="150" text-anchor="middle" class="d-title">Monólito</text>
+  <text x="125" y="185" text-anchor="middle" class="d-label">pedidos</text>
+  <text x="125" y="210" text-anchor="middle" class="d-label">estoque</text>
+  <text x="125" y="235" text-anchor="middle" class="d-label">pagamentos</text>
+  <text x="385" y="22" text-anchor="middle" class="d-title">2. Desvia uma rota</text>
+  <rect x="300" y="38" width="170" height="40" rx="10" class="d-violet"/>
+  <text x="385" y="63" text-anchor="middle" class="d-text">roteador</text>
+  <path d="M350 78 L320 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <path d="M420 78 L450 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <rect x="265" y="120" width="120" height="150" rx="10" class="d-box"/>
+  <text x="325" y="150" text-anchor="middle" class="d-title">Monólito</text>
+  <text x="325" y="195" text-anchor="middle" class="d-label">pedidos</text>
+  <text x="325" y="220" text-anchor="middle" class="d-label">pagamentos</text>
+  <rect x="395" y="120" width="110" height="70" rx="10" class="d-info"/>
+  <text x="450" y="150" text-anchor="middle" class="d-title">Estoque</text>
+  <text x="450" y="172" text-anchor="middle" class="d-label">serviço novo</text>
+  <text x="450" y="215" text-anchor="middle" class="d-mono">/estoque/**</text>
+  <text x="645" y="22" text-anchor="middle" class="d-title">3. O monólito encolhe</text>
+  <rect x="560" y="38" width="170" height="40" rx="10" class="d-violet"/>
+  <text x="645" y="63" text-anchor="middle" class="d-text">roteador</text>
+  <path d="M600 78 L580 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <path d="M645 78 L645 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <path d="M690 78 L712 116" class="d-line" marker-end="url(#mk-ms-strangler)"/>
+  <rect x="535" y="120" width="76" height="70" rx="10" class="d-box"/>
+  <text x="573" y="150" text-anchor="middle" class="d-label">núcleo</text>
+  <text x="573" y="170" text-anchor="middle" class="d-label">pedidos</text>
+  <rect x="617" y="120" width="68" height="70" rx="10" class="d-info"/>
+  <text x="651" y="160" text-anchor="middle" class="d-label">estoque</text>
+  <rect x="691" y="120" width="76" height="70" rx="10" class="d-info"/>
+  <text x="729" y="160" text-anchor="middle" class="d-label" textLength="68" lengthAdjust="spacingAndGlyphs">pagamentos</text>
+  <text x="645" y="225" text-anchor="middle" class="d-label">cada passo pode ser</text>
+  <text x="645" y="245" text-anchor="middle" class="d-label">revertido no roteador</text>
+</svg>
+</Figura>
+
+1. **Coloque um roteador na frente do monólito** (o gateway, um proxy reverso). No começo, ele manda tudo para o monólito; ninguém percebe a diferença.
+2. **Escolha uma funcionalidade com fronteira clara** e valor de extrair (outro time, outra escala, outro ritmo). Escreva o serviço novo.
+3. **Migre os dados** dessa funcionalidade. É a parte mais difícil: por um período, os dados podem precisar existir nos dois lados, sincronizados por eventos ou por CDC, até o serviço novo virar o dono.
+4. **Desvie as rotas** no roteador, de preferência aos poucos: primeiro 1% do tráfego, depois 10%, depois tudo. Se algo der errado, voltar é mudar a regra do roteador.
+5. **Remova o código antigo** do monólito. Sem esse passo, você mantém duas implementações para sempre.
+6. **Repita** enquanto houver motivo. O monólito não precisa sumir: um núcleo estável e bem modularizado pode ficar para sempre.
+
+Duas técnicas costumam acompanhar o padrão: a **camada anticorrupção**, que traduz entre o modelo antigo e o novo para o serviço não herdar os vícios do monólito, e a **execução em paralelo**, que chama os dois lados, usa a resposta do antigo e registra as diferenças até ganhar confiança.
+
+Um monólito **modular** torna tudo isso muito mais simples: o módulo já tem fronteira, API pública e eventos definidos. Extrair um módulo bem isolado é, em boa parte, trocar uma chamada local por uma chamada HTTP e um evento interno por um evento no broker.
+
+### Registre a decisão
+
+Dividir ou não dividir, e onde, são decisões que parecem óbvias quando são tomadas e misteriosas dois anos depois. Registre-as num **ADR** (*Architecture Decision Record*): um arquivo curto, versionado junto do código, com o contexto, a decisão, as alternativas consideradas e as consequências, inclusive o critério para reavaliar ("rever quando houver mais de 3 times" ou "quando o catálogo passar de 2.000 requisições por segundo"). O exercício [13.05](../../../exercicios/13-arquitetura/05-adr-monolito-ou-microsservicos/) pede exatamente um ADR desses, e a [aula 13.08](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/) trata de como decisões de arquitetura são tomadas, registradas e revistas.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Até aqui, a aula tratou do "como". Esta seção é sobre o que muda quando a decisão é sua e o sistema está em produção, com pessoas, orçamento e plantão envolvidos.
+
+### O custo total, em pessoas e dinheiro
+
+O custo de um serviço não é o código dele. É o pipeline, a imagem, o ambiente de homologação, os alertas, os painéis, o banco (com backup, monitoramento e atualizações), os segredos, as dependências a atualizar quando sai uma correção de segurança, a documentação da API e, principalmente, **a pessoa de plantão** que acorda quando ele cai. Uma conta honesta, que vale fazer antes de propor a divisão: quantas horas por mês o time gasta hoje com a operação de um serviço? Multiplique pelo número de serviços propostos. Se a resposta consome metade da capacidade do time, a divisão está cara demais para o momento.
+
+Em nuvem, some o que só aparece na fatura: tráfego entre zonas, réplicas mínimas por serviço e o volume de logs e traces, que cresce a cada salto de rede. Coloque o custo base de um serviço novo no ADR.
+
+### Operação: observabilidade não é opcional
+
+Com um monólito, um stack trace costuma contar a história inteira. Com serviços, a história está espalhada. Antes do segundo serviço entrar em produção, garanta:
+
+- **id de correlação** gerado na borda e propagado em todas as chamadas e mensagens, presente em todos os logs (o Micrometer Tracing com a propagação W3C Trace Context faz isso nas chamadas HTTP feitas pelos clientes do Spring);
+- **rastreamento distribuído**, para ver a cadeia de chamadas de uma requisição com o tempo de cada salto;
+- **métricas por dependência**: latência e taxa de erro das chamadas que o serviço **faz**, não só das que ele recebe. O alerta útil é "a chamada ao estoque passou de 300 ms no p99", não "o pedido está lento";
+- **painéis de saga**: quantas sagas em andamento, quantas em `COMPENSACAO_PENDENTE`, há quanto tempo a mais antiga está parada.
+
+A [aula 14.05](../../14-devops/05-observabilidade/) mostra como montar isso com o Spring Boot.
+
+### Falhas: orçamento de tempo e degradação
+
+Timeouts precisam ser **coerentes ao longo da cadeia**. Se o gateway desiste em 2 segundos, não faz sentido o serviço de pedidos esperar 5 segundos pelo estoque: a resposta, quando vier, não tem mais para quem ir. Uma prática útil é o **orçamento de tempo** (*deadline*): a borda define quanto tempo a requisição tem, e cada salto usa uma parte, deixando margem para os seguintes. No exemplo, 500 ms para a reserva só fazem sentido se a requisição inteira tiver, por exemplo, 2 segundos.
+
+Também é decisão de produto **degradar** em vez de falhar: sem o serviço de avaliações, a página do produto aparece sem as estrelas. A [aula 13.06](../../13-arquitetura/06-resiliencia/) traz as ferramentas: retry com critério, circuit breaker, limite de concorrência e fallback.
+
+### Segurança entre serviços
+
+Com serviços, a rede interna também é superfície de ataque. Cada serviço se autentica para os outros (tokens OAuth2 de *client credentials* ou TLS mútuo); a identidade do usuário é propagada para que o serviço chamado possa autorizar a operação (lembre-se do BOLA, da [aula 11.04](../../11-seguranca/04-autorizacao-e-bola/)); e cada serviço tem credenciais próprias, com o menor privilégio possível. "Está na rede interna, então é confiável" é a premissa que transforma uma invasão pequena numa grande.
+
+### Como justificar a escolha para o time
+
+Uma proposta de dividir (ou de **não** dividir) se defende com dados e critérios, não com preferências. Um roteiro que funciona:
+
+1. **O problema concreto**, com números: "nos últimos 3 meses, 40% dos deploys de pagamentos atrasaram por causa de mudanças de outros times", "o catálogo recebe 30 vezes mais tráfego que o checkout".
+2. **As alternativas**, incluindo a mais barata: modularizar, mudar o processo de deploy, escalar o monólito.
+3. **Os custos** da opção escolhida, em pessoas, plataforma e dinheiro, e quem vai arcar com eles.
+4. **Como medir o sucesso**: as métricas DORA são um bom ponto de partida (frequência de deploy, tempo entre o commit e a produção, taxa de falha das mudanças e tempo de recuperação). Se a divisão não melhorar esses números para os times envolvidos, ela não cumpriu o que prometeu.
+5. **O critério de reavaliação**, registrado no ADR.
+
+### Quando trocar de abordagem (nos dois sentidos)
+
+Sinais de que é hora de **extrair** um serviço de um monólito modular: um módulo com um time dedicado que vive esperando o deploy dos outros; um módulo com perfil de carga muito diferente (picos sazonais, processamento pesado); requisitos de isolamento (dados de cartão que precisam de um escopo de auditoria menor, como no PCI DSS); um módulo que precisa de outra tecnologia.
+
+Sinais de que é hora de **juntar** serviços: dois serviços que sempre publicam juntos; sagas que existem só porque a fronteira separou dados que precisavam de consistência forte; um time pequeno cuidando de muitos serviços. Juntar serviços não é fracasso: é corrigir uma fronteira com informação que você não tinha no começo.
+
+<Callout tipo="entrevista">
+Perguntas que aparecem para Pleno e Sênior: **"Quando você usaria microsserviços, e quando não?"**, **"Como você mantém a consistência entre serviços sem transação distribuída?"**, **"Uma chamada a outro serviço deu timeout. O que você faz?"** e **"Como você evolui uma API usada por outros times sem quebrar ninguém?"**. Uma boa resposta mostra critério, não entusiasmo: o motivo principal é a autonomia de times, e escala ou tecnologia diferentes vêm depois; os custos são rede, consistência eventual, observabilidade e operação, e aparecem desde o segundo serviço; fronteiras vêm de contextos de negócio, com banco por serviço; síncrono só quando quem chama precisa da resposta, com timeouts de conexão e de leitura; consistência por sagas, com compensações idempotentes, estado persistido e outbox para os eventos; timeout é incerteza, então ou se consulta o estado ou se compensa de forma idempotente, nunca se assume que não aconteceu; APIs evoluem com mudanças compatíveis, leitor tolerante, expandir e contrair, testes de contrato e, quando inevitável, uma nova versão com `Deprecation` e `Sunset`. Pontos que impressionam: citar a lei de Conway, reconhecer os sinais do monólito distribuído, defender começar por um monólito modular e migrar com Strangler Fig, e falar do custo de plantão e da fatura da nuvem.
+</Callout>
+
+## Checkpoint: sem saldo, sem cobrança
+
+Um cliente tenta comprar 50 filtros, e o estoque tem só 3. Escreva, em `SagaEntreServicosTest`, um teste `faltaDeSaldoRejeitaSemCobrarNemCompensar` que prove três coisas:
+
+1. o pedido termina com status `REJEITADO` (e não `CANCELADO`, porque nada foi feito);
+2. o serviço de pagamentos **nunca** é chamado;
+3. a saga **não** manda compensação, e o único passo registrado é a recusa do estoque.
+
+Antes de escrever, responda: por que a saga trata o 409 de um jeito e o timeout de outro, se nos dois casos a reserva "não deu certo"?
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+O teste usa o mesmo truque do passo 4 para o pagamento: um fake que lança exceção se for chamado. Se a saga tentasse cobrar, o teste quebraria com `IllegalStateException`. A lista de passos com `containsExactly` garante que não houve compensação.
+
+```java
+    @Test
+    void faltaDeSaldoRejeitaSemCobrarNemCompensar() {
+        Pagamentos naoDeveriaSerChamado = (pedidoId, valor) -> {
+            throw new IllegalStateException("sem reserva, não se cobra");
+        };
+        var saga = new SagaDeCriacaoDePedido(estoque, naoDeveriaSerChamado);
+
+        Resultado resultado = saga.executar(new NovoPedido("PED-4", "FILTRO-103", 50, new BigDecimal("625.00")));
+
+        assertThat(resultado.status()).isEqualTo(Status.REJEITADO);
+        assertThat(resultado.passos()).containsExactly("estoque recusou a reserva (409)");
+    }
+```
+
+```bash
+mvn test -Dtest=SagaEntreServicosTest#faltaDeSaldoRejeitaSemCobrarNemCompensar
+```
+
+```text
+INFO 13012 --- [main] d.t.m.a.m.pedidos.SagaDeCriacaoDePedido  : [PED-4] estoque recusou a reserva (409)
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**Por que o 409 e o timeout são tratados de forma diferente.** O 409 é uma **resposta**: o estoque processou o pedido e disse, com certeza, "não reservei". Não há efeito a desfazer, então compensar seria só uma chamada a mais. O timeout é a **ausência de resposta**: o estoque pode ter reservado ou não. Só a compensação idempotente cobre os dois casos. A regra geral: respostas 4xx são decisões do outro lado (não repita, não compense o que não aconteceu); erros de rede e timeouts são incerteza (consulte ou compense de forma idempotente); 5xx ficam no meio, e dependem de o outro lado garantir que uma falha não deixa efeito parcial.
+
+</details>
+
+<Quiz
+  id="13-microsservicos"
+  questoes={[
+    {
+      pergunta: 'Um time de 5 pessoas mantém um produto novo, ainda mudando bastante a cada mês. Alguém propõe dividir o sistema em 8 microsserviços. Qual é a melhor resposta?',
+      opcoes: ['Aceitar: microsserviços escalam melhor desde o início', 'Recusar e manter um monólito sem nenhuma organização interna', 'Começar com um monólito modular, com fronteiras claras, e extrair serviços quando houver um motivo concreto', 'Dividir por camadas técnicas, que mudam menos que o negócio'],
+      correta: 2,
+      explicacao: 'Sem times independentes, a autonomia não tem a quem servir, e os custos de rede, consistência e operação chegam no primeiro dia. Com o domínio mudando, fronteiras de módulo são muito mais baratas de corrigir que fronteiras de rede.',
+    },
+    {
+      pergunta: 'O serviço de pedidos chamou POST /reservas no estoque e recebeu timeout depois de 500 ms. O que a saga deve fazer?',
+      opcoes: ['Marcar o pedido como falho e seguir: se deu timeout, nada foi reservado', 'Tratar o resultado como incerto e mandar uma compensação idempotente (ou consultar o estado da reserva)', 'Repetir o POST indefinidamente até receber uma resposta', 'Cobrar o pagamento mesmo assim, já que o estoque provavelmente reservou'],
+      correta: 1,
+      explicacao: 'Timeout significa "não sei". O estoque pode ter reservado e só a resposta se perdeu, como no passo 4. A compensação idempotente (liberar pelo id do pedido) é segura nos dois casos. Repetir sem limite piora a carga, e cobrar sem confirmação gera cobrança sem mercadoria.',
+    },
+    {
+      pergunta: 'Três serviços leem e escrevem nas mesmas tabelas de um PostgreSQL, e para mudar uma coluna é preciso publicar os três no mesmo dia. Como se chama esse cenário?',
+      opcoes: ['Banco por serviço', 'Monólito distribuído: os serviços estão acoplados pelo esquema', 'Saga coreografada', 'CQRS'],
+      correta: 1,
+      explicacao: 'Banco compartilhado é um contrato implícito e sem versão. Os serviços não conseguem evoluir nem publicar de forma independente, então ficam com os custos dos microsserviços e sem o ganho principal.',
+    },
+    {
+      pergunta: 'O endpoint de saldo vai trocar o campo `saldo` por `disponivel` e `reservado`. Um cliente de outro time ainda usa o formato antigo. O que faz mais sentido?',
+      opcoes: ['Trocar o formato e avisar por e-mail', 'Publicar a nova versão ao lado da antiga, manter a antiga como padrão por um período e sinalizar a descontinuação com os cabeçalhos Deprecation e Sunset', 'Criar um serviço novo só para o formato novo', 'Pedir que o outro time leia o banco do estoque diretamente'],
+      correta: 1,
+      explicacao: 'Remover ou renomear campo é mudança incompatível. Com duas versões convivendo, cada cliente migra no seu ritmo, e os cabeçalhos colocam o aviso no próprio protocolo. Métricas pela versão mostram quando ninguém mais usa a antiga.',
+    },
+    {
+      pergunta: 'Qual é a principal vantagem da saga orquestrada sobre a coreografada?',
+      opcoes: ['Não precisa de compensações', 'Garante consistência forte entre os serviços', 'O fluxo e o estado da saga ficam num lugar só, fáceis de ler, monitorar e mudar', 'Elimina a necessidade de mensagens idempotentes'],
+      correta: 2,
+      explicacao: 'As duas usam compensações, as duas são eventualmente consistentes e as duas exigem idempotência. A orquestração concentra o fluxo no dono do processo; a coreografia reduz o acoplamento a um coordenador, mas espalha o fluxo entre consumidores de vários serviços.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Microsserviços compram **autonomia de times** (e escala ou ritmo de deploy independentes) e pagam com **rede, consistência eventual, observabilidade e operação**. Os custos chegam no segundo serviço; o ganho, só quando há times para usá-lo.
+- Fronteiras vêm de **contextos delimitados** de negócio: o que muda junto e o que precisa de consistência imediata fica junto. Fronteiras técnicas e serviços de entidade geram acoplamento.
+- **Banco por serviço**: ninguém lê nem escreve no banco do outro. Consultas cruzadas viram composição de APIs ou projeções locais alimentadas por eventos.
+- **Síncrono** quando quem chama precisa da resposta, sempre com timeout de conexão e de leitura; **eventos** para avisar que algo aconteceu, com outbox e consumidores idempotentes.
+- No Spring Framework 7, `RestClient` com **HTTP interfaces** declara o contrato numa interface; os timeouts ficam na fábrica de requisições, e o Boot 4 permite configurá-los por propriedades.
+- Consistência entre serviços se faz com **sagas**: transações locais e **compensações idempotentes**, com estado persistido. **Timeout é incerteza**: consulte ou compense, nunca assuma que não aconteceu.
+- APIs evoluem com mudanças compatíveis, **leitor tolerante** e **expandir e contrair**; quando inevitável, uma nova versão (versionamento nativo do Spring 7) com `Deprecation` e `Sunset`.
+- **Gateway**, **descoberta de serviços** e **configuração externa** são peças de plataforma; em Kubernetes, boa parte delas já vem pronta.
+- Fuja do **monólito distribuído** (deploys combinados, banco ou biblioteca de domínio compartilhados, cadeias síncronas longas) e migre com **Strangler Fig**, uma funcionalidade por vez, registrando as decisões em ADRs.
+
+## Próximo passo
+
+Você viu que toda chamada remota pode demorar ou falhar, e que um único timeout ausente derrubou a loja inteira na Black Friday. Na [aula 13.06, Resiliência](../../13-arquitetura/06-resiliencia/), você vai construir as defesas em camadas que impedem uma falha de se espalhar: timeouts em toda chamada, retry só no que é transitório e idempotente, circuit breaker, limite de concorrência e fallback, com o suporte nativo do Spring Framework 7 e o Resilience4j.
+
+## Referências
+
+- [Spring Framework: REST Clients (RestClient e HTTP interfaces)](https://docs.spring.io/spring-framework/reference/integration/rest-clients.html)
+- [Spring Framework: API Versioning](https://docs.spring.io/spring-framework/reference/web/webmvc-versioning.html)
+- [Spring Boot: Calling REST Services (HTTP Service clients e propriedades `spring.http.serviceclient`)](https://docs.spring.io/spring-boot/reference/io/rest-client.html)
+- [Spring Boot: Servlet Web Applications (versionamento de API com `spring.mvc.apiversion`)](https://docs.spring.io/spring-boot/reference/web/servlet.html)
+- [Spring Cloud Gateway: documentação de referência](https://docs.spring.io/spring-cloud-gateway/reference/)
+- [Kubernetes: DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)
+- [RFC 9745: The Deprecation HTTP Response Header Field](https://www.rfc-editor.org/rfc/rfc9745)
+- [RFC 8594: The Sunset HTTP Header Field](https://www.rfc-editor.org/rfc/rfc8594)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)

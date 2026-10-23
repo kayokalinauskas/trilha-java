@@ -1,0 +1,1068 @@
+---
+titulo: TDD e testes de arquitetura
+descricao: "Duas redes de segurança que fecham o módulo: o ciclo vermelho, verde, refatorar aplicado passo a passo a um simulador de parcelamento, com cada falha real e cada estado intermediário do código; e as decisões de arquitetura de um time transformadas em testes com ArchUnit, das camadas ao congelamento de violações num sistema legado."
+modulo: 10-testes
+ordem: 6
+duracao: 105
+objetivos:
+  - Conduzir uma funcionalidade do zero pelo ciclo vermelho, verde, refatorar, escrevendo um teste por vez e lendo a falha antes de escrever código
+  - Aplicar baby steps, fake it e triangulação para decidir quanto código escrever em cada ciclo
+  - Explicar como escrever o teste primeiro leva a dependências injetadas (como o Clock) e reconhecer quando TDD não compensa
+  - Escrever regras ArchUnit de camadas, dependências proibidas, ciclos e convenções de nome e de anotação, importando as classes com @AnalyzeClasses e ImportOption
+  - Provar que cada regra consegue falhar, testando-a contra código que a viola, e interpretar a mensagem de violação
+  - Adotar regras num sistema legado com FreezingArchRule, sem quebrar o build pelas violações que já existem
+tags: [TDD, ArchUnit, arquitetura, refatoração, FreezingArchRule]
+flashcards:
+  - frente: Quais as três etapas do TDD e o objetivo de cada uma?
+    verso: "Vermelho: escrever UM teste que falha pelo motivo certo. Verde: o mínimo de código que o faz passar, mesmo feio. Refatorar: melhorar o código (e os testes) com tudo verde, sem mudar comportamento."
+  - frente: O que é triangulação no TDD?
+    verso: Escrever um segundo exemplo que a implementação falsa (fake it) não consegue satisfazer. Com 1 parcela, "devolva o total" passa; com 2 parcelas, só uma divisão de verdade passa. Dois pontos obrigam a generalizar.
+  - frente: Um teste novo passou de primeira. O que fazer?
+    verso: Desconfiar. Quebre o código de propósito (uma sabotagem temporária) e confira que o teste fica vermelho. Um teste que nunca falhou não provou nada.
+  - frente: Como o TDD empurra o design para a injeção de dependência?
+    verso: Para escrever o teste antes, você precisa controlar tudo que o código usa. "Vence daqui a um mês" pede um "hoje" controlado, e o jeito de entregá-lo é receber um Clock no construtor em vez de chamar LocalDate.now().
+  - frente: Para que servem layeredArchitecture() e slices() no ArchUnit?
+    verso: layeredArchitecture() define camadas por pacote e quem pode acessar quem. slices().matching("..dominio.(*)..") corta o código em fatias (uma por subpacote) para verificar, por exemplo, que não há ciclos entre elas.
+  - frente: Por que uma regra ArchUnit precisa ser testada contra código que a viola?
+    verso: Uma regra com um nome de pacote digitado errado na parte do should() aceita tudo e passa para sempre. Só vendo-a falhar num exemplo de violação você sabe que ela funciona.
+  - frente: O que o FreezingArchRule faz?
+    verso: Na primeira execução grava as violações existentes num store (versionado com o código) e passa. Nas seguintes, só acusa violações NOVAS. Serve para adotar uma regra num sistema legado sem parar o time.
+---
+
+Nas aulas anteriores você escreveu testes para código que já existia. Esta aula fecha o módulo com duas ideias que mudam **quando** e **o quê** você testa.
+
+A primeira é uma disciplina: **escrever o teste antes do código** (TDD, *Test-Driven Development*). O teste vira a especificação executável, cada linha de produção nasce para fazer um teste passar, e o design sai mais simples de usar, porque o primeiro cliente da classe é o próprio teste. A segunda é uma ferramenta: o **ArchUnit**, que transforma decisões de arquitetura ("controller não fala com o repositório", "o domínio não depende do Spring") em testes que quebram o build. As duas têm o mesmo espírito: **o que importa precisa ser verificado automaticamente, não lembrado**.
+
+Na parte 1, você constrói com TDD um **simulador de parcelamento** em sete ciclos, vendo a falha real de cada teste antes de escrever a linha que o faz passar. Na parte 2, escreve seis regras de arquitetura para a API de um **consultório**, prova que cada uma consegue falhar e aprende a adotá-las num sistema legado.
+
+## A intuição: a corda do alpinista e o fiscal da obra
+
+Um alpinista não sobe a parede inteira para só depois pensar na segurança: a cada poucos metros, prende a corda num grampo. Se escorregar, cai só até o último grampo. E o intervalo depende do trecho: curto onde é difícil, maior onde é fácil.
+
+TDD é isso. Cada teste é um grampo: você escreve um teste pequeno, faz o código passar e está preso de novo. Se a próxima mudança der errado, você volta só até o último verde. Nos trechos difíceis (centavos, virada de mês), os passos encurtam: são os **baby steps**.
+
+O ArchUnit é outra proteção. A planta do prédio diz que a fiação não passa pela coluna estrutural; com prazo apertado, alguém fura a coluna "só desta vez", e dez atalhos depois o prédio não é mais o da planta. O ArchUnit é o fiscal que confere a obra contra a planta a cada build e reprova a entrega que fura a coluna, dizendo onde e por quê.
+
+<Figura legenda="O ciclo do TDD: cada volta leva poucos minutos e termina com tudo verde. O próximo teste só é escrito depois da refatoração">
+<svg viewBox="0 0 720 300" width="720" role="img" aria-labelledby="tdd-ciclo-titulo tdd-ciclo-desc">
+  <title id="tdd-ciclo-titulo">O ciclo vermelho, verde, refatorar</title>
+  <desc id="tdd-ciclo-desc">Três etapas em círculo. Vermelho: escreva um teste que falha e leia a falha. A seta leva a Verde: escreva o mínimo de código que faz o teste passar. A seta leva a Refatorar: melhore código e testes sem mudar o comportamento, com tudo verde. Uma seta volta de Refatorar para Vermelho, com o rótulo próximo teste. Abaixo, três táticas para a etapa verde: fake it, triangulação e implementação óbvia.</desc>
+  <defs><marker id="mk-tdd-ciclo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="70" width="190" height="84" rx="14" class="d-accent"/>
+  <text x="115" y="98" text-anchor="middle" class="d-mono">1. VERMELHO</text>
+  <text x="115" y="120" text-anchor="middle" class="d-label">um teste que falha</text>
+  <text x="115" y="138" text-anchor="middle" class="d-label">(e você lê a falha)</text>
+  <rect x="265" y="12" width="190" height="84" rx="14" class="d-ok"/>
+  <text x="360" y="40" text-anchor="middle" class="d-mono">2. VERDE</text>
+  <text x="360" y="62" text-anchor="middle" class="d-label">o mínimo de código</text>
+  <text x="360" y="80" text-anchor="middle" class="d-label">que faz passar</text>
+  <rect x="510" y="70" width="190" height="84" rx="14" class="d-info"/>
+  <text x="605" y="98" text-anchor="middle" class="d-mono">3. REFATORAR</text>
+  <text x="605" y="120" text-anchor="middle" class="d-label">melhore o design</text>
+  <text x="605" y="138" text-anchor="middle" class="d-label">com tudo verde</text>
+  <path d="M170 70 L262 50" class="d-line" marker-end="url(#mk-tdd-ciclo)"/>
+  <path d="M458 50 L550 70" class="d-line" marker-end="url(#mk-tdd-ciclo)"/>
+  <path d="M560 156 Q360 250 160 156" class="d-line" marker-end="url(#mk-tdd-ciclo)"/>
+  <text x="360" y="186" text-anchor="middle" class="d-text">próximo teste</text>
+  <rect x="20" y="236" width="220" height="52" rx="10" class="d-box"/>
+  <text x="130" y="258" text-anchor="middle" class="d-title">fake it</text>
+  <text x="130" y="277" text-anchor="middle" class="d-label">devolva a constante</text>
+  <rect x="250" y="236" width="220" height="52" rx="10" class="d-box"/>
+  <text x="360" y="258" text-anchor="middle" class="d-title">triangulação</text>
+  <text x="360" y="277" text-anchor="middle" class="d-label">2º exemplo força o geral</text>
+  <rect x="480" y="236" width="220" height="52" rx="10" class="d-box"/>
+  <text x="590" y="258" text-anchor="middle" class="d-title">implementação óbvia</text>
+  <text x="590" y="277" text-anchor="middle" class="d-label">quando o passo é seguro</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **TDD** | Desenvolvimento guiado por testes: o teste é escrito **antes** do código que ele verifica, um de cada vez |
+| **Vermelho** | Existe um teste que falha. Não compilar também conta como vermelho |
+| **Verde** | Todos os testes passam, inclusive o novo |
+| **Refatorar** | Mudar a estrutura do código (nomes, extrações, duplicação) sem mudar o comportamento, com os testes verdes o tempo todo |
+| **Baby steps** | Passos pequenos: um teste por vez, o menor código possível. O tamanho do passo diminui quando o terreno fica difícil |
+| **Fake it** ("finja até conseguir") | No verde, devolver uma resposta fixa que faz o teste passar |
+| **Triangulação** | Um segundo exemplo que a resposta fixa não satisfaz, forçando a generalização |
+| **Implementação óbvia** | Quando a solução é clara e o passo é seguro, escrevê-la direto |
+| **ArchUnit** / **ArchRule** | Biblioteca que lê o bytecode e verifica regras de arquitetura como testes JUnit / uma dessas regras |
+| **Camada** e **fatia** (*layer*, *slice*) | Grupos de classes definidos por pacote, usados nas regras de acesso e de ciclos |
+| **FreezingArchRule** | Envoltório que grava as violações atuais de uma regra e passa a acusar só as novas |
+
+## Parte 1: TDD de verdade
+
+### A funcionalidade que vamos construir
+
+A loja do seu time vai mostrar, na página do produto, uma simulação de parcelamento: "R$ 100,00 em 3x de R$ 33,34 + R$ 33,33 + R$ 33,33, vencendo em 10/04, 10/05 e 10/06". O time de produto escreveu as regras:
+
+1. A compra pode ser à vista (1 parcela) ou parcelada em até **12** parcelas.
+2. As parcelas têm valor igual; os centavos que sobram da divisão vão para a **primeira** parcela. A soma das parcelas é **sempre** o total, nenhum centavo a mais ou a menos.
+3. A parcela N vence N meses depois da compra. Uma compra no dia 31 vence no último dia dos meses mais curtos (28/02, 30/04).
+4. Com mais de uma parcela, cada uma tem no mínimo **R$ 5,00**.
+
+Nada disso existe ainda. É o cenário ideal para TDD: regras claras, cheias de bordas e fáceis de expressar como exemplos.
+
+<Callout tipo="info" titulo="O que fica no projeto e o que não fica">
+O código final está em `java/m10-testes/aulas`, pacote `dev.trilhajava.m10.aulas.tdd`, e roda no CI. Os **estados intermediários** dos passos abaixo não ficam no projeto (cada um foi substituído pelo seguinte), mas todos foram executados, e as saídas foram copiadas dessas execuções. Para rodar:
+
+```bash
+cd java/m10-testes/aulas
+mvn test -Dtest=SimuladorDeParcelamentoTest
+```
+</Callout>
+
+### Passo 1 (ciclo 1, vermelho): o primeiro teste, antes de qualquer classe
+
+**O que vamos fazer e por quê.** O teste mais simples possível: à vista, uma parcela com o total. Parece bobo, e é de propósito: o primeiro teste serve para desenhar a **API** (nome da classe, do método, o que recebe e devolve) do ponto de vista de quem vai **usar** a classe.
+
+```java
+class SimuladorDeParcelamentoTest {
+
+    SimuladorDeParcelamento simulador = new SimuladorDeParcelamento();
+
+    @Test
+    void aVistaEhUmaParcelaComOTotal() {
+        List<Parcela> parcelas = simulador.simular(new BigDecimal("100.00"), 1);
+
+        assertThat(parcelas).extracting(Parcela::valor)
+                .containsExactly(new BigDecimal("100.00"));
+    }
+}
+```
+
+Decisões tomadas só por escrever o teste: a classe se chama `SimuladorDeParcelamento`; o método `simular` recebe o total como `BigDecimal` (dinheiro nunca é `double`) e a quantidade como `int`; e devolve uma lista de `Parcela`, com pelo menos um `valor`. Rode:
+
+```bash
+mvn test -Dtest=SimuladorDeParcelamentoTest
+```
+
+```text
+[ERROR] COMPILATION ERROR :
+[ERROR] /…/tdd/SimuladorDeParcelamentoTest.java:[11,5] cannot find symbol
+[ERROR]   symbol:   class SimuladorDeParcelamento
+[ERROR]   location: class dev.trilhajava.m10.aulas.tdd.SimuladorDeParcelamentoTest
+…
+[INFO] BUILD FAILURE
+```
+
+**O que acabou de acontecer.** Não compilar é o primeiro vermelho. Agora escreva **só o suficiente para compilar**: o `record Parcela(int numero, BigDecimal valor)` e uma classe cujo método devolve uma lista vazia.
+
+```java
+public class SimuladorDeParcelamento {
+
+    public List<Parcela> simular(BigDecimal total, int quantidade) {
+        return List.of();
+    }
+}
+```
+
+```text
+[ERROR] SimuladorDeParcelamentoTest.aVistaEhUmaParcelaComOTotal -- Time elapsed: 0.101 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+Expecting actual:
+  []
+to contain exactly (and in same order):
+  [100.00]
+but could not find the following elements:
+  [100.00]
+```
+
+Agora o teste falha **pelo motivo certo**: compilou, rodou, e o resultado está errado. Esse passo pega um problema real: um teste escrito errado, que passaria sem código nenhum (um `assertThat(x)` sem nada depois). Se ele não fica vermelho agora, não vai ficar quando o código quebrar.
+
+### Passo 2 (ciclo 1, verde): fake it
+
+**O que vamos fazer e por quê.** O mínimo para passar. Não "o que eu sei que vai ser necessário", mas o mínimo **para este teste**:
+
+```java
+public List<Parcela> simular(BigDecimal total, int quantidade) {
+    return List.of(new Parcela(1, total));
+}
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** O código ignora `quantidade`. Para a regra final, está errado; para a especificação escrita até agora (um teste), está completo. Esse é o *fake it*: a resposta fixa leva ao verde rápido e deixa a pergunta "como dividir?" para quando um teste a fizer.
+
+### Passo 3 (ciclo 2): triangulação
+
+**O que vamos fazer e por quê.** A resposta fixa só cai quando um **segundo exemplo** a contradiz. É isso que "triangular" quer dizer: com dois pontos, você é obrigado a traçar a reta.
+
+```java
+@Test
+void duasParcelasDividemOTotalAoMeio() {
+    List<Parcela> parcelas = simulador.simular(new BigDecimal("100.00"), 2);
+
+    assertThat(parcelas).extracting(Parcela::valor)
+            .containsExactly(new BigDecimal("50.00"), new BigDecimal("50.00"));
+}
+```
+
+```text
+[ERROR] SimuladorDeParcelamentoTest.duasParcelasDividemOTotalAoMeio -- Time elapsed: 0.021 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+Expecting actual:
+  [100.00]
+to contain exactly (and in same order):
+  [50.00, 50.00]
+but some elements were not found:
+  [50.00, 50.00]
+and others were not expected:
+  [100.00]
+```
+
+A mensagem do AssertJ diz tudo: veio uma parcela de 100,00, eram esperadas duas de 50,00. O verde agora exige dividir de verdade:
+
+```java
+public List<Parcela> simular(BigDecimal total, int quantidade) {
+    BigDecimal valor = total.divide(BigDecimal.valueOf(quantidade));
+    List<Parcela> parcelas = new ArrayList<>();
+    for (int numero = 1; numero <= quantidade; numero++) {
+        parcelas.add(new Parcela(numero, valor));
+    }
+    return parcelas;
+}
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** `100.00 / 2` deu `50.00`, com duas casas: numa divisão exata, o `divide` mantém a escala do dividendo. Isso importa porque `containsExactly` usa `equals`, e para `BigDecimal.equals` `50.0` e `50.00` são **diferentes**. E se a divisão não for exata? O próximo teste pergunta.
+
+### Passo 4 (ciclo 3): os centavos, e o verde que não chegou de primeira
+
+**O que vamos fazer e por quê.** A regra dos centavos é a parte difícil da funcionalidade, então o passo encurta. Um exemplo só, o clássico: R$ 100,00 em 3x.
+
+```java
+@Test
+void centavosQueSobramVaoParaAPrimeiraParcela() {
+    List<Parcela> parcelas = simulador.simular(new BigDecimal("100.00"), 3);
+
+    assertThat(parcelas).extracting(Parcela::valor).containsExactly(
+            new BigDecimal("33.34"), new BigDecimal("33.33"), new BigDecimal("33.33"));
+}
+```
+
+```text
+[ERROR] SimuladorDeParcelamentoTest.centavosQueSobramVaoParaAPrimeiraParcela -- Time elapsed: 0.005 s <<< ERROR!
+java.lang.ArithmeticException: Non-terminating decimal expansion; no exact representable decimal result.
+	at dev.trilhajava.m10.aulas.tdd.SimuladorDeParcelamentoTest.centavosQueSobramVaoParaAPrimeiraParcela(SimuladorDeParcelamentoTest.java:31)
+```
+
+Repare no `<<< ERROR!` em vez de `<<< FAILURE!`: o código **lançou uma exceção** antes da asserção. `divide` sem arredondamento exige resultado exato, e 100/3 é uma dízima. A tentação é arredondar para duas casas:
+
+```java
+BigDecimal valor = total.divide(BigDecimal.valueOf(quantidade), 2, RoundingMode.HALF_EVEN);
+```
+
+```text
+[ERROR] SimuladorDeParcelamentoTest.centavosQueSobramVaoParaAPrimeiraParcela -- Time elapsed: 0.021 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+Expecting actual:
+  [33.33, 33.33, 33.33]
+to contain exactly (and in same order):
+  [33.34, 33.33, 33.33]
+…
+```
+
+A exceção sumiu, mas o teste continua vermelho: três vezes 33,33 são 99,99, e **um centavo desapareceu** (em cada venda parcelada, até a contabilidade achar a diferença). Sem o teste, essa versão iria para produção, porque "parece certa".
+
+A saída é trabalhar em **centavos**, que são inteiros: 10.000 centavos divididos por 3 dão 3.333, com resto 1, que vai para a primeira parcela.
+
+```java
+public List<Parcela> simular(BigDecimal total, int quantidade) {
+    long centavos = total.movePointRight(2).longValueExact();
+    long base = centavos / quantidade;
+    long resto = centavos % quantidade;
+    List<Parcela> parcelas = new ArrayList<>();
+    for (int numero = 1; numero <= quantidade; numero++) {
+        long valor = numero == 1 ? base + resto : base;
+        parcelas.add(new Parcela(numero, BigDecimal.valueOf(valor).movePointLeft(2)));
+    }
+    return parcelas;
+}
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** `movePointRight(2)` transforma 100.00 em 10000; `longValueExact()` **lança exceção** se sobrar fração (100.005 não é dinheiro válido, e é melhor falhar alto do que truncar em silêncio). Divisão inteira (`/`) e resto (`%`) fazem o resto sem arredondamento. Os dois testes antigos continuam verdes: a rede confirmou que a troca de algoritmo não quebrou nada.
+
+### Passo 5 (ciclo 3, refatorar): com tudo verde, arrume a casa
+
+**O que vamos fazer e por quê.** O código funciona, mas lê mal: conversões misturadas com a regra, nomes vagos. E os testes repetem `new BigDecimal(...)` em toda linha. Refatorar é a etapa que mais se pula, e é a que paga o TDD.
+
+O código de produção depois da refatoração:
+
+```java
+public List<Parcela> simular(BigDecimal total, int quantidade) {
+    long centavos = emCentavos(total);
+    long valorBase = centavos / quantidade;
+    long sobra = centavos % quantidade;
+
+    List<Parcela> parcelas = new ArrayList<>(quantidade);
+    for (int numero = 1; numero <= quantidade; numero++) {
+        long valor = numero == 1 ? valorBase + sobra : valorBase;
+        parcelas.add(new Parcela(numero, emReais(valor)));
+    }
+    return List.copyOf(parcelas);
+}
+
+private static long emCentavos(BigDecimal valor) {
+    return valor.movePointRight(2).longValueExact();
+}
+
+private static BigDecimal emReais(long centavos) {
+    return BigDecimal.valueOf(centavos, 2);
+}
+```
+
+E os testes também, porque teste é código e merece o mesmo cuidado:
+
+```java
+@Test
+void centavosQueSobramVaoParaAPrimeiraParcela() {
+    assertThat(valoresDe("100.00", 3)).containsExactly(reais("33.34", "33.33", "33.33"));
+}
+
+private List<BigDecimal> valoresDe(String total, int quantidade) {
+    return simulador.simular(new BigDecimal(total), quantidade).stream()
+            .map(Parcela::valor)
+            .toList();
+}
+
+private static BigDecimal[] reais(String... valores) {
+    return Arrays.stream(valores).map(BigDecimal::new).toArray(BigDecimal[]::new);
+}
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Nenhum comportamento mudou, e os testes provam isso. `BigDecimal.valueOf(centavos, 2)` cria o valor com escala 2 (3334 vira 33.34); `List.copyOf` devolve uma lista imutável. Nos testes, cada caso virou uma linha que se lê como a regra. Regra de ouro: **rode os testes a cada mudancinha**; se algo ficar vermelho, você sabe qual foi.
+
+### Passo 6 (ciclo 4): o teste que nasce verde
+
+**O que vamos fazer e por quê.** A regra 2 diz que a soma das parcelas é **sempre** o total. Até aqui ela foi verificada em um exemplo. Vamos cobrir vários totais e quantidades de uma vez, com um teste parametrizado (aula 2):
+
+```java
+@ParameterizedTest(name = "{0} em {1}x")
+@CsvSource({"100.00, 3", "999.99, 7", "1500.00, 12", "10.01, 2", "59.99, 11"})
+void aSomaDasParcelasEhSempreOTotal(String total, int quantidade) {
+    BigDecimal soma = valoresDe(total, quantidade).stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+
+    assertThat(soma).isEqualByComparingTo(total);
+}
+```
+
+```text
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Passou de primeira, sem vermelho. Armadilha: **um teste que nunca falhou não provou que consegue falhar**. A saída é sabotar o código por um minuto: trocamos a linha do valor por `long valor = valorBase;` (a sobra some) e rodamos:
+
+```text
+[ERROR] Tests run: 8, Failures: 5, Errors: 0, Skipped: 0 <<< FAILURE!
+[ERROR] …aSomaDasParcelasEhSempreOTotal(String, int)[1] <<< FAILURE!
+expected: 100.00
+ but was: 99.99
+[ERROR] …aSomaDasParcelasEhSempreOTotal(String, int)[2] <<< FAILURE!
+expected: 999.99
+ but was: 999.95
+[ERROR] …aSomaDasParcelasEhSempreOTotal(String, int)[4] <<< FAILURE!
+expected: 10.01
+ but was: 10.00
+[ERROR] …aSomaDasParcelasEhSempreOTotal(String, int)[5] <<< FAILURE!
+expected: 59.99
+ but was: 59.95
+[ERROR] …centavosQueSobramVaoParaAPrimeiraParcela <<< FAILURE!
+```
+
+O teste pega a sabotagem. Repare que o caso `[3]`, 1500,00 em 12x, **não** aparece: a divisão não deixa resto, então ele passa mesmo com o bug. É por isso que a tabela tem vários casos. Desfaça a sabotagem e siga. Esse "quebrar para ver falhar" é o teste de mutação da aula 1, feito à mão.
+
+### Passo 7 (ciclo 5): validação, e três vermelhos diferentes
+
+**O que vamos fazer e por quê.** A regra 1: de 1 a 12 parcelas. Um teste parametrizado com as bordas de fora do intervalo:
+
+```java
+@ParameterizedTest(name = "{0} parcelas")
+@ValueSource(ints = {0, -1, 13})
+void recusaQuantidadeForaDe1a12(int quantidade) {
+    assertThatThrownBy(() -> simulador.simular(new BigDecimal("100.00"), quantidade))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessage("parcelas devem ser de 1 a 12, mas foram " + quantidade);
+}
+```
+
+Antes de escrever qualquer validação, rode. Os três casos falham, cada um por um motivo diferente, e vale ler os três:
+
+```text
+[ERROR] …recusaQuantidadeForaDe1a12(int)[1] -- Time elapsed: 0.020 s <<< FAILURE!
+java.lang.AssertionError:
+
+Expecting actual throwable to be an instance of:
+  java.lang.IllegalArgumentException
+but was:
+  java.lang.ArithmeticException: / by zero
+	at dev.trilhajava.m10.aulas.tdd.SimuladorDeParcelamento.simular(SimuladorDeParcelamento.java:11)
+
+[ERROR] …recusaQuantidadeForaDe1a12(int)[2] -- Time elapsed: 0.010 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+Expecting message to be:
+  "parcelas devem ser de 1 a 12, mas foram -1"
+but was:
+  "Illegal Capacity: -1"
+
+Throwable that failed the check:
+
+java.lang.IllegalArgumentException: Illegal Capacity: -1
+	at java.base/java.util.ArrayList.<init>(ArrayList.java:160)
+…
+[ERROR] …recusaQuantidadeForaDe1a12(int)[3] -- Time elapsed: 0.003 s <<< FAILURE!
+java.lang.AssertionError:
+
+Expecting code to raise a throwable.
+```
+
+**Como ler cada um.**
+
+- **Zero parcelas**: divisão por zero. Saiu uma exceção, do tipo errado.
+- **Menos uma parcela**: saiu uma `IllegalArgumentException`, o tipo **certo**, por acidente: foi o `ArrayList` reclamando da capacidade negativa. Se o teste conferisse só `isInstanceOf`, **ele passaria** sem a validação existir. Por isso ele confere a mensagem.
+- **Treze parcelas**: nada foi lançado; o simulador devolveu 13 parcelas.
+
+O verde é uma cláusula de guarda no começo do método:
+
+```java
+if (quantidade < 1 || quantidade > 12) {
+    throw new IllegalArgumentException("parcelas devem ser de 1 a 12, mas foram " + quantidade);
+}
+```
+
+```text
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+### Passo 8 (ciclo 6): o teste pede um relógio
+
+**O que vamos fazer e por quê.** A regra 3: a parcela N vence N meses depois da compra. Ao escrever o teste, surge a pergunta: **"depois de quando?"**. Um teste que depende do dia em que roda passa hoje e falha amanhã; ele precisa **controlar** o "hoje". A forma limpa é o simulador **receber** o relógio:
+
+```java
+static final ZoneId SAO_PAULO = ZoneId.of("America/Sao_Paulo");
+static final Clock DIA_10_DE_MARCO = Clock.fixed(Instant.parse("2026-03-10T15:00:00Z"), SAO_PAULO);
+
+SimuladorDeParcelamento simulador = new SimuladorDeParcelamento(DIA_10_DE_MARCO);
+
+@Test
+void cadaParcelaVenceUmMesDepoisDaAnterior() {
+    List<Parcela> parcelas = simulador.simular(new BigDecimal("300.00"), 3);
+
+    assertThat(parcelas).extracting(Parcela::vencimento).containsExactly(
+            LocalDate.of(2026, 4, 10), LocalDate.of(2026, 5, 10), LocalDate.of(2026, 6, 10));
+}
+```
+
+```text
+[ERROR] /…/tdd/SimuladorDeParcelamentoTest.java:[23,41] constructor SimuladorDeParcelamento in class dev.trilhajava.m10.aulas.tdd.SimuladorDeParcelamento cannot be applied to given types;
+[ERROR]   required: no arguments
+[ERROR]   found:    java.time.Clock
+[ERROR]   reason: actual and formal argument lists differ in length
+[ERROR]   cannot find symbol
+[ERROR]     symbol:   method vencimento()
+[ERROR]     location: class dev.trilhajava.m10.aulas.tdd.Parcela
+```
+
+**O que acabou de acontecer.** O vermelho traz duas decisões de design: o construtor recebe um `Clock` e a `Parcela` ganha `vencimento`. Só **uma linha** dos testes antigos mudou (o campo `simulador`), graças à refatoração do passo 5. O verde, do jeito que muita gente escreveria, avança um mês por volta do laço:
+
+```java
+LocalDate vencimento = LocalDate.now(relogio);
+for (int numero = 1; numero <= quantidade; numero++) {
+    long valor = numero == 1 ? valorBase + sobra : valorBase;
+    vencimento = vencimento.plusMonths(1);
+    parcelas.add(new Parcela(numero, emReais(valor), vencimento));
+}
+```
+
+```text
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+`LocalDate.now(relogio)` é a técnica do `ServicoDeReembolso` da aula 3: em produção, `Clock.systemDefaultZone()`; no teste, um relógio parado em 10/03/2026 ao meio-dia de Brasília.
+
+### Passo 9 (ciclo 7): a borda do fim do mês
+
+**O que vamos fazer e por quê.** A regra 3 cita uma borda famosa: compra no dia 31. Um teste com outro relógio, montado por um método auxiliar:
+
+```java
+@Test
+void compraNoDia31VenceNoUltimoDiaDosMesesMaisCurtos() {
+    var simuladorNoDia31 = new SimuladorDeParcelamento(relogioEm(LocalDate.of(2026, 1, 31)));
+
+    List<Parcela> parcelas = simuladorNoDia31.simular(new BigDecimal("300.00"), 3);
+
+    assertThat(parcelas).extracting(Parcela::vencimento).containsExactly(
+            LocalDate.of(2026, 2, 28), LocalDate.of(2026, 3, 31), LocalDate.of(2026, 4, 30));
+}
+```
+
+```text
+[ERROR] SimuladorDeParcelamentoTest.compraNoDia31VenceNoUltimoDiaDosMesesMaisCurtos -- Time elapsed: 0.022 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+Expecting actual:
+  [2026-02-28 (java.time.LocalDate),
+    2026-03-28 (java.time.LocalDate),
+    2026-04-28 (java.time.LocalDate)]
+to contain exactly (and in same order):
+  [2026-02-28 (java.time.LocalDate),
+    2026-03-31 (java.time.LocalDate),
+    2026-04-30 (java.time.LocalDate)]
+but some elements were not found:
+  [2026-03-31 (java.time.LocalDate), 2026-04-30 (java.time.LocalDate)]
+and others were not expected:
+  [2026-03-28 (java.time.LocalDate), 2026-04-28 (java.time.LocalDate)]
+```
+
+**O que acabou de acontecer.** Um bug real, pego antes de existir. `plusMonths(1)` em 31/01 dá 28/02, e o laço passa a somar meses **a partir de 28/02**: quem comprou no dia 31 pagaria sempre no dia 28. A correção é calcular cada vencimento **a partir da data da compra**, `dataDaCompra.plusMonths(numero)`; o `java.time` ajusta cada resultado ao último dia válido do mês, sem acumular o ajuste:
+
+```java
+LocalDate dataDaCompra = LocalDate.now(relogio);
+
+List<Parcela> parcelas = new ArrayList<>(quantidade);
+for (int numero = 1; numero <= quantidade; numero++) {
+    long valor = numero == 1 ? valorBase + sobra : valorBase;
+    parcelas.add(new Parcela(numero, emReais(valor), dataDaCompra.plusMonths(numero)));
+}
+return List.copyOf(parcelas);
+```
+
+```text
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+A suíte completa, na ordem em que os testes nasceram:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/tdd/SimuladorDeParcelamentoTest.java" semImports destacar="6-9, 42-44, 58-59" />
+
+Sete ciclos, treze execuções (os parametrizados contam uma por linha), e cada linha de produção existe porque um teste pediu. A regra 4 fica para o checkpoint.
+
+### TDD e design: o teste como primeiro cliente
+
+O passo 8 mostrou o efeito mais importante do TDD, e o menos comentado: **testabilidade força um design melhor**. Compare as duas versões do simulador:
+
+<Comparar antes="O código decide sozinho que dia é hoje" depois="O relógio chega de fora">
+```java
+public class SimuladorDeParcelamento {
+
+    public List<Parcela> simular(BigDecimal total, int n) {
+        LocalDate hoje = LocalDate.now();   // relógio do sistema
+        // ...
+    }
+}
+
+// No teste: qual data esperar?
+// Muda todo dia. Teste com data "calculada"
+// repete a lógica do código e prova nada.
+```
+
+```java
+public class SimuladorDeParcelamento {
+
+    private final Clock relogio;
+
+    public SimuladorDeParcelamento(Clock relogio) {
+        this.relogio = relogio;
+    }
+    // ... LocalDate.now(relogio)
+}
+
+// No teste: Clock.fixed(...) em 31/01/2026.
+// Em produção: um @Bean Clock do sistema.
+```
+</Comparar>
+
+Quem escreve o código primeiro chega naturalmente à versão da esquerda: funciona e é mais curta. Quem escreve o teste primeiro **não consegue** escrevê-la, porque o teste esbarra em "que dia é hoje?" antes da primeira linha de produção. O mesmo vale para o gateway, o repositório, o gerador de UUID: o teste força cada dependência a chegar pelo construtor. É a injeção de dependência do módulo 8, exigida pelo teste, não por um framework.
+
+Outros sinais de design que o TDD traz à tona:
+
+- **Teste difícil de escrever é um alarme.** Vinte linhas de cenário e oito mocks indicam uma classe fazendo coisas demais, e com TDD você sente isso **antes** de ela existir.
+- **A API nasce do uso**, do ponto de vista de quem chama, e não do lado de dentro.
+- **Nada de código especulativo.** Se nenhum teste pediu juros, não há juros.
+
+### Quando TDD ajuda e quando atrapalha
+
+| Ajuda muito | Atrapalha ou não compensa |
+|---|---|
+| Regras de negócio com casos claros: cálculos, estados, validações, datas | Exploração: você ainda não sabe o que está construindo (um *spike*, um protótipo) |
+| Correção de bug: primeiro o teste que reproduz o bug, depois a correção | Código de cola trivial: configuração, DTOs, mapeamentos campo a campo |
+| APIs que outras pessoas vão usar | Integração com um SDK que você ainda não entende: aprenda como ele se comporta primeiro |
+| Bordas perigosas: dinheiro, fusos, arredondamento | Interfaces visuais, em que o "certo" é decidido olhando |
+
+O protótipo exploratório **se joga fora**: quando você entende o problema, recomeça com TDD. E, mesmo sem TDD estrito, um hábito vale ouro: **todo bug corrigido ganha um teste que o reproduz**, escrito antes da correção. Ele falha (o bug existe), passa (a correção funciona) e impede que o bug volte.
+
+<Callout tipo="erro" titulo="As formas mais comuns de fazer TDD errado">
+- **Vários testes de uma vez**, depois todo o código: quando algo falha, você não sabe qual mudança causou.
+- **Pular o vermelho**: o teste nunca provou que consegue falhar (lembre do caso `-1` do passo 7).
+- **Pular a refatoração**: em um mês, a suíte protege um código que ninguém quer tocar.
+- **Testar a implementação**: um teste que verifica que `emCentavos` foi chamado quebraria na refatoração do passo 5 sem nenhum comportamento ter mudado.
+</Callout>
+
+### Checkpoint da parte 1: a parcela mínima
+
+Implemente a regra 4 com TDD: **com mais de uma parcela, cada uma tem no mínimo R$ 5,00**; abaixo disso, o simulador lança `IllegalArgumentException` com a mensagem `cada parcela deve ter no mínimo R$ 5,00`. À vista não há mínimo: R$ 3,00 à vista é válido.
+
+Crie `MeuTesteDeParcelaMinimaTest` no pacote `tdd` dos testes, parta do simulador **sem** a regra (o do passo 9) e faça pelo menos três ciclos, conferindo que cada teste novo fica vermelho antes de mexer no código. No fim, rode também `SimuladorDeParcelamentoTest`.
+
+<Dicas>
+<Dica nivel={1}>
+Pense nas bordas: qual é o menor total que ainda cabe em 3x? E o maior que já não cabe? Um par de testes, um de cada lado da borda, pega erros de `<` trocado por `<=`. E não esqueça a exceção à regra: à vista.
+</Dica>
+<Dica nivel={2}>
+R$ 15,00 em 3x dá exatamente R$ 5,00 por parcela (deve ser aceito). R$ 14,99 em 3x dá 4,99 de base (deve ser recusado). R$ 3,00 à vista deve ser aceito. Um desses três provavelmente passa de primeira: descubra qual e pense no que isso significa.
+</Dica>
+<Dica nivel={3}>
+A regra usa o valor **base** (sem a sobra), em centavos: depois de calcular `valorBase`, compare com 500. Escreva a condição de forma que a quantidade 1 não entre nela: `quantidade > 1 && valorBase < 500`. Na refatoração, dê nome ao 500 (e ao 12, já que está mexendo ali).
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint da parte 1">
+
+Os testes:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/tdd/ParcelaMinimaTest.java" semImports />
+
+Rodados contra o simulador do passo 9, dois passam e um falha:
+
+```text
+[ERROR] ParcelaMinimaTest.recusaQuandoAsParcelasFicariamAbaixoDeCincoReais -- Time elapsed: 0.071 s <<< FAILURE!
+java.lang.AssertionError:
+
+Expecting code to raise a throwable.
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0
+```
+
+**Por que dois nasceram verdes.** Eles descrevem comportamento que **já existia**. Não guiaram código novo, mas protegem as bordas: uma condição com `<=` recusaria os R$ 15,00 em 3x, e uma sem o `quantidade > 1` recusaria os R$ 3,00 à vista. Sabote cada um para confirmar.
+
+O simulador final, com a regra e as constantes nomeadas na refatoração:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/tdd/SimuladorDeParcelamento.java" destacar="21-22, 31-33" />
+
+**Por que a regra olha o `valorBase` e não a primeira parcela.** A primeira parcela recebe a sobra e pode passar do mínimo quando as outras não passam (14,99 em 3x daria 5,01 + 4,99 + 4,99). O que importa é a menor parcela, e a menor é sempre a base.
+
+</Solucao>
+
+## Parte 2: testes de arquitetura com ArchUnit
+
+### Por que a arquitetura se degrada
+
+Todo projeto começa com uma arquitetura limpa num quadro. Um ano depois, há um controller lendo o repositório direto, uma entidade do domínio importando o Spring e dois pacotes do domínio que dependem um do outro. Ninguém decidiu isso: aconteceu **um atalho de cada vez**.
+
+- **O atalho é local, a regra é global.** Quem escreve `agenda.todas()` no controller resolve a tarefa em uma linha; o custo aparece meses depois, para outra pessoa.
+- **O compilador não sabe a regra.** Uma classe `public` pode ser usada de qualquer pacote.
+- **O code review cansa.** Numa revisão de 40 arquivos, um `import` a mais passa.
+- **O documento envelhece.** A regra estava no wiki que ninguém abre.
+
+A solução é a da parte 1: transformar a regra em **teste**, que falha dizendo qual classe, qual linha e **por quê**.
+
+### O código que vamos verificar
+
+O consultório é uma pequena API em Spring com quatro camadas, cada uma num pacote de `dev.trilhajava.m10.aulas.arquitetura.consultorio`:
+
+<Figura legenda="As camadas do consultório. As setas cheias são as dependências permitidas; a tracejada é o atalho que as regras vão proibir">
+<svg viewBox="0 0 720 330" width="720" role="img" aria-labelledby="camadas-titulo camadas-desc">
+  <title id="camadas-titulo">Camadas do consultório e suas dependências</title>
+  <desc id="camadas-desc">No topo, a camada web com o ConsultaController. Ela aponta para a camada de aplicação, com o AgendamentoDeConsultas. A aplicação aponta para o domínio, que tem dois subpacotes: agenda, com Consulta e a interface Agenda, e paciente, com Paciente; agenda depende de paciente, nunca o contrário. À direita, a camada de persistência, com AgendaEmMemoria, aponta para o domínio porque implementa a interface Agenda. Uma seta tracejada da web para a persistência representa o atalho proibido.</desc>
+  <defs><marker id="mk-camadas" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="150" y="10" width="240" height="56" rx="10" class="d-info"/>
+  <text x="270" y="33" text-anchor="middle" class="d-title">web</text>
+  <text x="270" y="53" text-anchor="middle" class="d-mono">ConsultaController</text>
+  <rect x="150" y="106" width="240" height="56" rx="10" class="d-violet"/>
+  <text x="270" y="129" text-anchor="middle" class="d-title">aplicacao</text>
+  <text x="270" y="149" text-anchor="middle" class="d-mono">AgendamentoDeConsultas</text>
+  <rect x="20" y="202" width="500" height="118" rx="12" class="d-ok"/>
+  <text x="270" y="224" text-anchor="middle" class="d-title">dominio</text>
+  <rect x="40" y="236" width="220" height="70" rx="8" class="d-box"/>
+  <text x="150" y="258" text-anchor="middle" class="d-text">agenda</text>
+  <text x="150" y="278" text-anchor="middle" class="d-mono">Consulta</text>
+  <text x="150" y="296" text-anchor="middle" class="d-mono">Agenda (interface)</text>
+  <rect x="290" y="236" width="210" height="70" rx="8" class="d-box"/>
+  <text x="395" y="264" text-anchor="middle" class="d-text">paciente</text>
+  <text x="395" y="286" text-anchor="middle" class="d-mono">Paciente</text>
+  <path d="M260 271 L287 271" class="d-line" marker-end="url(#mk-camadas)"/>
+  <rect x="540" y="106" width="170" height="56" rx="10" class="d-accent"/>
+  <text x="625" y="129" text-anchor="middle" class="d-title">persistencia</text>
+  <text x="625" y="149" text-anchor="middle" class="d-mono">AgendaEmMemoria</text>
+  <path d="M270 66 L270 103" class="d-line" marker-end="url(#mk-camadas)"/>
+  <path d="M270 162 L270 199" class="d-line" marker-end="url(#mk-camadas)"/>
+  <path d="M625 162 L625 190 L500 214" class="d-line" marker-end="url(#mk-camadas)"/>
+  <text x="640" y="196" class="d-label">implementa</text>
+  <path d="M390 38 L620 38 L625 103" class="d-line" stroke-dasharray="6 5" marker-end="url(#mk-camadas)"/>
+  <text x="505" y="30" text-anchor="middle" class="d-label">atalho proibido</text>
+</svg>
+</Figura>
+
+O caso de uso recebe o `Clock`, como o simulador da parte 1, e fala com a persistência só pela interface `Agenda`, do domínio:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/arquitetura/consultorio/aplicacao/AgendamentoDeConsultas.java" semImports />
+
+No pacote `arquitetura.legado.consultorio` existe um **consultório legado** com a mesma estrutura e seis atalhos, um por regra: o controller que lê direto da persistência, a `Consulta` que valida com o `Assert` do Spring, o `LocalDateTime.now()` sem relógio, o `Paciente` que guarda o histórico de consultas (um ciclo com `Consulta`), um controller chamado `PacienteRecurso` e uma `AgendaJdbc` sem `@Repository`. Ele é o nosso "código com violação": prova que cada regra consegue falhar sem quebrar o build do consultório limpo. O atalho mais típico:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/arquitetura/legado/consultorio/web/ConsultaController.java" destacar="5, 17, 19, 24-27" />
+
+### Mão na massa
+
+A dependência (a versão vem do POM pai da trilha):
+
+```xml
+<dependency>
+  <groupId>com.tngtech.archunit</groupId>
+  <artifactId>archunit-junit5</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+Apesar do nome, `archunit-junit5` roda na plataforma JUnit e funciona com o JUnit 6 da trilha sem configuração extra.
+
+#### Passo 1: importar as classes com @AnalyzeClasses
+
+**O que vamos fazer e por quê.** O ArchUnit não lê o código-fonte: **importa o bytecode** e monta um modelo das classes, campos, métodos e de quem chama quem. `@AnalyzeClasses` diz o que importar:
+
+```java
+@AnalyzeClasses(
+        packages = "dev.trilhajava.m10.aulas.arquitetura.consultorio",
+        importOptions = ImportOption.DoNotIncludeTests.class)
+class ArquiteturaDoConsultorioTest {
+    // as regras vêm aqui, cada uma num campo @ArchTest
+}
+```
+
+**O que acabou de acontecer.**
+
+- `packages` importa o pacote e os subpacotes. O resto (o `legado`, as bibliotecas) só aparece como **destino** de dependências.
+- `ImportOption.DoNotIncludeTests` deixa de fora as classes de `src/test/java`: um teste que usa um repositório direto (normal num teste) não vira violação de camadas. Há outras opções prontas, como `DoNotIncludeJars`.
+- A importação é a parte cara, e o ArchUnit a guarda em cache para todas as regras da classe.
+- Cada regra é um campo `static final ArchRule` com `@ArchTest`; para o JUnit, cada campo vira um teste.
+
+#### Passo 2: a regra de camadas
+
+**O que vamos fazer e por quê.** A regra mais importante é a da figura: quem pode acessar quem. O arquivo completo já tem as seis regras; olhe por enquanto só as linhas destacadas.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/arquitetura/ArquiteturaDoConsultorioTest.java" semImports destacar="10-19" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- `consideringOnlyDependenciesInLayers()`: só contam as dependências **entre** as camadas declaradas; a web usar `java.time` ou o Spring não interessa a esta regra.
+- `.layer("Web").definedBy("..consultorio.web..")` nomeia uma camada por um padrão de pacote. Os dois pontos significam "qualquer quantidade de pacotes", então o padrão casa com `…arquitetura.consultorio.web` e seus subpacotes.
+- `mayNotBeAccessedByAnyLayer()` na web (quem a chama é o HTTP) e na persistência (quem a encontra é o Spring, que injeta a `AgendaEmMemoria` onde se pede uma `Agenda`); `mayOnlyBeAccessedByLayers("Web")` na aplicação. O domínio pode ser usado por todos.
+- `.because(...)` entra na mensagem de erro e transforma "o build quebrou" em "entendi o motivo".
+
+#### Passo 3: dependências proibidas
+
+**O que vamos fazer e por quê.** Algumas decisões dizem o que uma parte do código **nunca** deve usar. As linhas 21 a 33 do arquivo acima têm duas:
+
+- `DOMINIO_SEM_SPRING` se lê como uma frase: nenhuma classe do domínio deve depender de classes de `org.springframework..`. O domínio precisa sobreviver a uma troca de framework e ser testado sem nenhum.
+- `TEMPO_SO_PELO_RELOGIO`: `callMethod(LocalDate.class, "now")`, com `orShould()` para `LocalDateTime` e `Instant`. Depois do nome vêm os **tipos dos argumentos**; como não passamos nenhum, a regra casa só com o `now()` **sem argumentos**, e o `now(clock)` continua liberado. É o passo 8 da parte 1 virando regra do projeto.
+
+A espinha de quase toda regra é `classes()` ou `noClasses()` → `that()` (quais classes) → `should()` (o que devem ou não fazer). Há outros pontos de partida (`noMethods()`, `noFields()`...), e o autocompletar da IDE guia o resto.
+
+#### Passo 4: ciclos entre módulos com slices
+
+**O que vamos fazer e por quê.** `agenda` pode depender de `paciente`; o contrário criaria um **ciclo**, e nenhum dos dois poderia ser entendido ou extraído sem o outro. A regra das linhas 35 a 40 usa `slices().matching("..consultorio.dominio.(*)..")`: o `(*)` é um grupo de captura, e cada subpacote de `dominio` vira uma **fatia** (`agenda`, `paciente`). `beFreeOfCycles()` falha diante de qualquer ciclo entre fatias, de qualquer tamanho.
+
+#### Passo 5: convenções de nome e de anotação
+
+**O que vamos fazer e por quê.** Convenções permitem achar as coisas. As linhas 42 a 55:
+
+- `CONTROLLERS`: classes com `@RestController` devem terminar em `Controller` **e** morar no pacote `web` (o `andShould()` junta as duas exigências).
+- `REPOSITORIOS`: classes concretas da persistência devem ter `@Repository`, que também faz o Spring traduzir exceções do banco para `DataAccessException`.
+
+Rode a classe inteira contra o consultório limpo:
+
+```bash
+mvn test -Dtest=ArquiteturaDoConsultorioTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.arquitetura.ArquiteturaDoConsultorioTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.200 s
+[INFO] BUILD SUCCESS
+```
+
+Seis verdes. Mas, como no passo 6 da parte 1, **um verde aqui ainda não prova nada**.
+
+#### Passo 6: provar que cada regra consegue falhar
+
+**O que vamos fazer e por quê.** Trocamos temporariamente o pacote do `should()` de `DOMINIO_SEM_SPRING` por `"org.springframwork.."` (falta um "e") e aplicamos a regra ao legado, que **tem** o Spring no domínio. O teste que exigia a falha respondeu:
+
+```text
+[ERROR] …dominioSemSpringAcusaOAssertDoSpring -- Time elapsed: 1.050 s <<< FAILURE!
+java.lang.AssertionError:
+
+Expecting code to raise a throwable.
+```
+
+A regra com erro de digitação aceitou o domínio acoplado ao Spring, e contra o consultório limpo passaria para sempre. Por isso cada regra é testada contra o legado, exigindo que **falhe** e acuse a violação certa:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/arquitetura/RegrasContraOLegadoTest.java" semImports destacar="9-10, 14-18" />
+
+```bash
+mvn test -Dtest=RegrasContraOLegadoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.arquitetura.RegrasContraOLegadoTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.364 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `new ClassFileImporter().importPackages(...)` é a importação sem anotação (o que o `@AnalyzeClasses` faz por baixo); `regra.check(classes)` aplica a regra e lança `AssertionError` se houver violação.
+- `hasMessageContaining(...)` garante que a regra falhou **pelo motivo certo**: a de camadas precisa acusar o `ConsultaController` chamando `AgendaJdbc.todas()`.
+
+<Callout tipo="dica" titulo="O ArchUnit também se protege de erros de digitação">
+Um erro no `that()` o próprio ArchUnit pega. Com `resideInAPackage("..consultorio.domino..")`, nenhuma classe é selecionada e a regra falha com `Rule '…' failed to check any classes.`; uma camada com pacote errado gera `Layer 'Persistência' is empty`. O que ele **não** pega é o erro no `should()`, como o do passo 6. É para isso que serve o teste contra o legado.
+</Callout>
+
+### Lendo a mensagem de violação
+
+As mensagens abaixo são reais: saíram de uma classe temporária com `@AnalyzeClasses(packages = "…arquitetura.legado")` que reaproveitava as seis regras.
+
+**Camadas:**
+
+```text
+[ERROR] …TemporarioLegadoTest.CAMADAS -- Time elapsed: 1.455 s <<< FAILURE!
+java.lang.AssertionError:
+Architecture Violation [Priority: MEDIUM] - Rule 'Layered architecture considering only dependencies in layers, consisting of
+layer 'Web' ('..consultorio.web..')
+layer 'Aplicação' ('..consultorio.aplicacao..')
+layer 'Domínio' ('..consultorio.dominio..')
+layer 'Persistência' ('..consultorio.persistencia..')
+where layer 'Web' may not be accessed by any layer
+where layer 'Aplicação' may only be accessed by layers ['Web']
+where layer 'Persistência' may not be accessed by any layer, because a web fala com casos de uso, e a persistência só é alcançada pelas interfaces do domínio' was violated (3 times):
+Constructor <…legado.consultorio.web.ConsultaController.<init>(…AgendamentoDeConsultas, …persistencia.AgendaJdbc)> has parameter of type <…persistencia.AgendaJdbc> in (ConsultaController.java:0)
+Field <…legado.consultorio.web.ConsultaController.agenda> has type <…persistencia.AgendaJdbc> in (ConsultaController.java:0)
+Method <…legado.consultorio.web.ConsultaController.listar()> calls method <…persistencia.AgendaJdbc.todas()> in (ConsultaController.java:26)
+```
+
+**Como ler:** o cabeçalho repete a regra, com o `because` no fim; depois vêm a contagem e uma linha por violação: *origem* → *o que fez* → *destino* → *onde*. Um único atalho gerou três violações (parâmetro do construtor, tipo do campo, chamada do método), porque o ArchUnit conta cada dependência do bytecode. A linha `:0` aparece nas dependências de **declaração**, que não têm linha no bytecode; `:26` é a linha da chamada. **Como corrigir:** a listagem vira um caso de uso na aplicação, que usa a interface `Agenda` do domínio.
+
+**Tempo pelo relógio** (só as linhas de violação):
+
+```text
+… was violated (1 times):
+Method <…legado.consultorio.aplicacao.AgendamentoDeConsultas.agendar(…Paciente, java.time.LocalDateTime)> calls method <java.time.LocalDateTime.now()> in (AgendamentoDeConsultas.java:20)
+```
+
+**Ciclos:**
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching '..consultorio.dominio.(*)..' should be free of cycles, because módulos do domínio em ciclo não podem ser entendidos nem separados um sem o outro' was violated (1 times):
+Cycle detected: Slice agenda ->
+                Slice paciente ->
+                Slice agenda
+  1. Dependencies of Slice agenda
+    - Field <…dominio.agenda.Consulta.paciente> has type <…dominio.paciente.Paciente> in (Consulta.java:0)
+    …
+  2. Dependencies of Slice paciente
+    - Field <…dominio.paciente.Paciente.historico> has generic type <java.util.List<…dominio.agenda.Consulta>> with type argument depending on <…dominio.agenda.Consulta> in (Paciente.java:0)
+    …
+```
+
+**Como ler:** primeiro o ciclo; depois, para cada fatia, as dependências que formam a aresta. O ArchUnit enxerga até o **argumento genérico**: `List<Consulta>` conta como dependência. **Como corrigir:** escolher a direção. O histórico sai do `Paciente` e vira uma pergunta à `Agenda` ("consultas do paciente X").
+
+<Callout tipo="atencao" titulo="Acentos estranhos no terminal do Windows">
+No console do Windows, as mensagens podem aparecer como `layer 'Aplica��o'`. É a codificação do terminal, não a regra: na IDE a mensagem aparece com os acentos certos.
+</Callout>
+
+### Código legado: FreezingArchRule
+
+**O problema.** Adotar a regra de camadas num sistema com 300 violações quebra o build no mesmo dia, e ninguém vai parar o time para corrigir tudo. Desistir da regra deixa as violações virarem 400. O **FreezingArchRule** é o meio-termo: **as violações existentes ficam registradas e toleradas; qualquer violação nova quebra o build**. A dívida para de crescer no primeiro dia.
+
+#### Passo 1: congelar as regras do legado
+
+A regra congelada é a mesma regra, envolvida em `freeze(...)`:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/arquitetura/LegadoCongeladoTest.java" semImports destacar="12-16" />
+
+Na primeira execução, sem nenhuma configuração, o ArchUnit se recusa a continuar:
+
+```text
+[ERROR] …LegadoCongeladoTest.CAMADAS -- Time elapsed: 4.524 s <<< ERROR!
+com.tngtech.archunit.library.freeze.StoreInitializationFailedException: Creating new violation store is disabled (enable by configuration freeze.store.default.allowStoreCreation=true)
+```
+
+**O que isso significa.** As violações congeladas ficam num **store** (por padrão, uma pasta de arquivos de texto), e criar um store novo vem desligado de propósito: senão, um store apagado por engano seria recriado no CI com **todas** as violações atuais, em silêncio.
+
+#### Passo 2: configurar e criar o store
+
+A configuração fica em `archunit.properties`, na raiz do classpath de testes (`src/test/resources`). Na primeira execução, local, ligamos a criação e escolhemos o caminho:
+
+```properties
+freeze.store.default.path=src/test/resources/archunit_store
+freeze.store.default.allowStoreCreation=true
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.832 s -- in dev.trilhajava.m10.aulas.arquitetura.LegadoCongeladoTest
+[INFO] BUILD SUCCESS
+```
+
+A pasta `archunit_store` apareceu com um `stored.rules` (que liga a descrição de cada regra a um identificador) e um arquivo por regra, com uma violação por linha. O passo final é **commitar** a pasta e voltar `allowStoreCreation` para `false`. O arquivo do projeto:
+
+```properties
+# Configuração do ArchUnit (aula 10.06). O arquivo é lido da raiz do classpath de testes.
+# As violações congeladas (FreezingArchRule) ficam nesta pasta, versionadas com o código.
+freeze.store.default.path=src/test/resources/archunit_store
+# true só na primeira execução, para criar o store; depois de commitá-lo, fica false:
+# assim o CI nunca cria, em silêncio, um store novo que aceitaria todas as violações.
+freeze.store.default.allowStoreCreation=false
+```
+
+#### Passo 3: ver uma violação nova ser pega
+
+**O que vamos fazer e por quê.** O valor do congelamento está no que acontece **depois**. O `CongelamentoTest` usa um store em memória (`persistIn(store)` troca o padrão) e simula duas execuções: hoje, só o legado; amanhã, com um pull request que traz um `RelatorioController` novo repetindo o atalho antigo.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/arquitetura/CongelamentoTest.java" semImports destacar="19-30" />
+
+Na primeira versão deste teste, a asserção esperava `was violated (1 times)`, e a falha mostrou a mensagem real que a regra congelada produz no dia do pull request:
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'Layered architecture considering only dependencies in layers, consisting of
+…
+where layer 'Persistência' may not be accessed by any layer, because a web fala com casos de uso, e a persistência só é alcançada pelas interfaces do domínio' was violated (3 times):
+Constructor <…pullrequest.consultorio.web.RelatorioController.<init>(…persistencia.AgendaJdbc)> has parameter of type <…persistencia.AgendaJdbc> in (RelatorioController.java:0)
+Field <…pullrequest.consultorio.web.RelatorioController.agenda> has type <…persistencia.AgendaJdbc> in (RelatorioController.java:0)
+Method <…pullrequest.consultorio.web.RelatorioController.totalDeConsultas()> calls method <…persistencia.AgendaJdbc.todas()> in (RelatorioController.java:22)
+```
+
+**O que acabou de acontecer.** As três violações acusadas são todas do `RelatorioController`; as três do `ConsultaController` continuam no código, congeladas. (A asserção foi corrigida para `3 times`.) O pull request só entra depois de corrigido, e o legado segue funcionando.
+
+Três detalhes que evitam surpresas:
+
+- **Números de linha não importam.** Uma linha a mais acima do `listar()` muda `:26` para `:27`, e a violação continua reconhecida: o comparador padrão ignora os números.
+- **Violação corrigida sai do store.** Quando o `ConsultaController` for consertado, a execução seguinte apaga as linhas dele do arquivo; commite a mudança.
+- **O store é indexado pela descrição da regra**, `because` incluído. Editar a frase faz o ArchUnit tratar a regra como nova e congelar **em silêncio** todas as violações dela. Para o CI, existe `freeze.store.default.allowStoreUpdate=false`: qualquer mudança no store vira erro (`StoreUpdateFailedException: Updating frozen violations is disabled`), e a atualização passa a ser feita localmente e commitada.
+
+### Armadilhas e quando NÃO usar
+
+As regras de bolso:
+
+- **Toda regra precisa ter falhado uma vez**, num exemplo de violação mantido no projeto ou numa sabotagem antes do commit.
+- **Sempre `because`.** Regra sem motivo é contornada; regra com motivo é discutida.
+- **Poucas regras, e fortes.** Camadas, ciclos e o domínio sem framework dão a maior parte do valor; cinquenta regras de nome viram `@ArchIgnore`.
+- **Estrutura, não estilo.** Formatação é do formatador; vulnerabilidades, do scanner de dependências. ArchUnit é para quem depende de quem.
+- **Não congele regras em projeto novo.** `FreezingArchRule` é para legado; num projeto novo, a regra entra estrita no primeiro commit.
+- **Com Spring Modulith** (módulo 13), a verificação de módulos e ciclos vem pronta, construída sobre o ArchUnit.
+
+<Callout tipo="novidade" titulo="E cobertura e mutação no pipeline?">
+As ferramentas da aula 1 completam o quadro. O **JaCoCo** (configurado no marco 3 do projeto integrador) mostra código **sem teste nenhum**; não o use como meta de porcentagem. O **PIT** faz em escala a sabotagem do passo 6 da parte 1; é caro, então rode no domínio e fora do pipeline principal.
+</Callout>
+
+## Checkpoint da parte 2: a convenção dos casos de uso
+
+O time decidiu: **as classes do pacote `aplicacao` devem ter `@Service` e nomes que não terminem em `Service`** (nomes de caso de uso, como `AgendamentoDeConsultas`).
+
+Escreva essa regra num teste seu (`MinhaRegraDeAplicacaoTest`) e prove as duas coisas: ela **passa** no consultório limpo e **falha** na classe `ConsultaService`, que já está pronta no pacote `dev.trilhajava.m10.aulas.arquitetura.checkpoint.consultorio.aplicacao` (sem anotação e com o nome fora da convenção).
+
+<Dicas>
+<Dica nivel={1}>
+Comece por `classes().that().resideInAPackage("..consultorio.aplicacao..")`. São duas exigências na mesma regra: lembre do `andShould()` da regra `CONTROLLERS`.
+</Dica>
+<Dica nivel={2}>
+`beAnnotatedWith(Service.class)` e `haveSimpleNameNotEndingWith("Service")`. Importe cada conjunto de classes com `new ClassFileImporter().importPackages(...)` e aplique a regra com `check(...)`.
+</Dica>
+<Dica nivel={3}>
+No limpo, `assertThatCode(() -> regra.check(limpo)).doesNotThrowAnyException()`. No checkpoint, `assertThatThrownBy(...)` e espere **duas** violações da mesma classe: uma pela anotação, outra pelo nome.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint da parte 2">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/arquitetura/RegraDosCasosDeUsoTest.java" semImports destacar="6-10" />
+
+A mensagem real da regra aplicada ao `ConsultaService`:
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'classes that reside in a package '..consultorio.aplicacao..' should be annotated with @Service and should have simple name not ending with 'Service', because casos de uso são componentes do Spring com nome de negócio, não XxxService' was violated (2 times):
+Class <…checkpoint.consultorio.aplicacao.ConsultaService> has simple name ending with 'Service' in (ConsultaService.java:0)
+Class <…checkpoint.consultorio.aplicacao.ConsultaService> is not annotated with @Service in (ConsultaService.java:0)
+```
+
+**Por que assim.** A regra escolhe as classes pelo **pacote**, não pela anotação: se o `that()` fosse "classes anotadas com `@Service`", uma classe sem a anotação nem seria selecionada, e a exigência da anotação nunca falharia. É o erro clássico de regra que aceita tudo, e só o teste contra a violação o revela.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+"Você pratica TDD?" e "como vocês garantem a arquitetura?" aparecem em entrevistas de backend. Uma resposta honesta vale mais que um "sempre": "Uso TDD em regras de negócio e em correção de bugs: começo pelo teste que falha, faço passar com o mínimo e refatoro com tudo verde. Em código exploratório, prototipo e depois recomeço com TDD. O maior ganho é no design: o teste força as dependências a chegarem pelo construtor, como um `Clock` no lugar de `LocalDate.now()`. Para a arquitetura, uso ArchUnit com `because` em cada regra, testo cada regra contra um exemplo que a viola, e no legado congelo as violações atuais com `FreezingArchRule`." Citar "todo bug corrigido ganha um teste" mostra experiência de verdade.
+</Callout>
+
+<Quiz
+  id="10-tdd-arquitetura"
+  questoes={[
+    {
+      pergunta: 'No ciclo 1, o verde foi `return List.of(new Parcela(1, total))`, ignorando a quantidade. Por que isso é aceitável no TDD?',
+      opcoes: ['Não é: o verde deve ter o código final correto', 'É o mínimo que satisfaz a especificação escrita até ali; o próximo teste (triangulação) força a generalização', 'Porque o teste estava errado', 'Porque o compilador exige'],
+      correta: 1,
+      explicacao: 'Fake it leva ao verde com segurança. A generalização vem quando um segundo exemplo, como 2 parcelas, contradiz a resposta fixa.',
+    },
+    {
+      pergunta: 'No passo 7, o caso `-1` lançou `IllegalArgumentException: Illegal Capacity: -1`, vinda do `ArrayList`. O que teria acontecido se o teste conferisse só `isInstanceOf(IllegalArgumentException.class)`?',
+      opcoes: ['O teste falharia do mesmo jeito', 'O teste passaria por acidente, sem a validação existir', 'O Maven não compilaria', 'O AssertJ lançaria outra exceção'],
+      correta: 1,
+      explicacao: 'O tipo estava certo pelo motivo errado. Conferir a mensagem garante que a exceção vem da regra de negócio, não de um detalhe interno.',
+    },
+    {
+      pergunta: 'Qual regra ArchUnit detecta que `dominio.agenda` depende de `dominio.paciente` e vice-versa?',
+      opcoes: ['layeredArchitecture() com uma camada por subpacote', 'slices().matching("..dominio.(*)..").should().beFreeOfCycles()', 'noClasses().should().callMethod(...)', 'classes().should().haveSimpleNameEndingWith(...)'],
+      correta: 1,
+      explicacao: 'O `(*)` transforma cada subpacote de `dominio` numa fatia, e `beFreeOfCycles()` falha se as fatias formarem qualquer ciclo.',
+    },
+    {
+      pergunta: 'Uma regra de dependência proibida passa no projeto limpo. O que prova que ela funciona?',
+      opcoes: ['Nada além disso é necessário', 'Aplicá-la a um código que a viola e ver que ela falha acusando a violação certa', 'Rodá-la duas vezes', 'Aumentar a cobertura do JaCoCo'],
+      correta: 1,
+      explicacao: 'Um erro no `should()` (um pacote digitado errado) faz a regra aceitar tudo. Só vendo-a falhar num exemplo de violação você sabe que ela protege algo.',
+    },
+    {
+      pergunta: 'Você quer adotar a regra de camadas num sistema com 300 violações antigas, sem parar o time. O que usar?',
+      opcoes: ['@ArchIgnore na regra', 'FreezingArchRule.freeze(regra), com o store versionado e allowStoreCreation=false depois de criado', 'allowEmptyShould(true)', 'Desligar a regra até corrigir tudo'],
+      correta: 1,
+      explicacao: 'O congelamento aceita as violações existentes e acusa só as novas. O store vai para o controle de versão e diminui a cada correção.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **TDD**: vermelho (um teste que falha pelo motivo certo), verde (o mínimo para passar), refatorar (código e testes, com tudo verde), em ciclos de minutos.
+- **Fake it** leva ao verde rápido; **triangulação** força a generalização; **baby steps** encurtam no terreno difícil.
+- Teste que nasce verde deve ser **sabotado** uma vez. Confira a mensagem das exceções, não só o tipo.
+- Escrever o teste primeiro força **dependências explícitas** (o `Clock` no construtor). Teste difícil de escrever é alarme de design.
+- TDD brilha em regras de negócio, bugs e APIs; não compensa em exploração e cola trivial. Todo bug corrigido ganha um teste.
+- **ArchUnit** importa o bytecode (`@AnalyzeClasses`, `ImportOption`) e verifica camadas, dependências proibidas, ciclos (`slices`) e convenções, sempre com `because`.
+- A violação traz a regra, a contagem e uma linha por dependência. Toda regra precisa ter falhado contra um exemplo de violação.
+- **FreezingArchRule** adota regras no legado: aceita as violações antigas (store versionado) e acusa só as novas.
+
+## Próximo passo
+
+No [exercício 10.04, Regras de arquitetura com ArchUnit](../../../exercicios/10-testes/04-regras-de-arquitetura/), você transforma cinco decisões de um time de pagamentos em regras, e cada uma precisa **passar** num projeto limpo e **falhar** no projeto que a viola, como no passo 6. Depois, o [marco 3 do Fintech Core](../../../exercicios/10-testes/05-fintech-marco-3/) junta o módulo inteiro, com a arquitetura verificada por ArchUnit no build. Antes de fechar o módulo, a aula [Testes de contrato](../../10-testes/07-testes-de-contrato/) mostra como garantir que dois serviços continuem se entendendo quando cada time publica no seu ritmo.

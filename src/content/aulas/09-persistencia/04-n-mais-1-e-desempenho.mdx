@@ -1,0 +1,187 @@
+---
+titulo: O problema N+1 e o desempenho do JPA
+descricao: Como uma tela inocente dispara centenas de consultas, como enxergar isso (logs e estatísticas) e as quatro formas de resolver — JOIN FETCH, @EntityGraph, busca em lote e projeções — sem cair na armadilha da paginação em memória.
+modulo: 09-persistencia
+ordem: 4
+duracao: 60
+objetivos:
+  - Reconhecer o problema N+1 no código e nos logs
+  - Medir consultas com logs de SQL e estatísticas do Hibernate
+  - Resolver N+1 com JOIN FETCH, @EntityGraph, batch fetching ou projeções
+  - Paginar entidades com coleções sem carregar tudo em memória
+tags: [N+1, JOIN FETCH, EntityGraph, desempenho, Hibernate]
+flashcards:
+  - frente: O que é o problema N+1?
+    verso: Uma consulta traz N registros e, para cada um, o acesso a uma associação LAZY dispara mais uma consulta — N+1 no total. Com 500 pedidos, 501 idas ao banco.
+  - frente: Como o JOIN FETCH resolve o N+1?
+    verso: Traz a entidade e a associação na MESMA consulta (um JOIN), inicializando a associação sem SELECTs extras.
+  - frente: Por que JOIN FETCH de coleção com paginação é perigoso?
+    verso: O JOIN multiplica as linhas, então o LIMIT não pode ir para o SQL; o Hibernate carrega tudo e pagina em memória (aviso HHH90003004). Pagine os ids primeiro e busque os detalhes depois.
+  - frente: O que é batch fetching (default_batch_fetch_size)?
+    verso: O Hibernate carrega associações LAZY de várias entidades de uma vez com IN (...), transformando N consultas em N/tamanho_do_lote.
+  - frente: Como medir quantas consultas um trecho executa?
+    verso: Com spring.jpa.show-sql / logging de org.hibernate.SQL, com as Statistics do Hibernate (getPrepareStatementCount) ou com ferramentas como datasource-proxy e o tracing do módulo 14.
+---
+
+O problema de desempenho mais comum em aplicações Spring com JPA não é um algoritmo lento: é o **N+1**. Ele passa em todos os testes com 10 registros, chega à produção e transforma uma tela de 50 ms numa de 6 segundos. Entender e resolver o N+1 é praticamente obrigatório numa entrevista Pleno.
+
+## Anatomia do N+1
+
+```java
+@Transactional(readOnly = true)
+public List<ResumoDoPedido> ultimos(int quantidade) {
+    return pedidos.findAll(PageRequest.of(0, quantidade)).stream()     // 1 consulta: os pedidos
+            .map(p -> new ResumoDoPedido(
+                    p.getId(),
+                    p.getCliente().getNome(),                          // +1 por pedido: o cliente
+                    p.getItens().size(),                               // +1 por pedido: os itens
+                    p.getItens().stream().map(i -> i.getProduto().getNome()).toList()))  // +1 por produto
+            .toList();
+}
+```
+
+Para 25 pedidos: 1 consulta de pedidos + 25 de clientes (menos os repetidos, graças ao cache de primeiro nível) + 25 de itens + dezenas de produtos. Cada ida ao banco custa rede e parse — com latência de 2 ms, 100 consultas são 200 ms desperdiçados **por requisição**.
+
+<Figura legenda="Uma consulta pela lista e mais uma para cada item: N+1">
+<svg viewBox="0 0 660 190" width="660" role="img" aria-label="Uma consulta inicial retorna N pedidos; cada pedido dispara uma consulta extra para itens, totalizando N+1">
+  <defs><marker id="n1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="70" width="170" height="44" rx="8" class="d-accent"/><text x="95" y="97" text-anchor="middle" class="d-mono">SELECT pedidos (1)</text>
+  <rect x="260" y="10" width="170" height="36" rx="8" class="d-box"/><text x="345" y="33" text-anchor="middle" class="d-mono">SELECT itens (p1)</text>
+  <rect x="260" y="56" width="170" height="36" rx="8" class="d-box"/><text x="345" y="79" text-anchor="middle" class="d-mono">SELECT itens (p2)</text>
+  <rect x="260" y="102" width="170" height="36" rx="8" class="d-box"/><text x="345" y="125" text-anchor="middle" class="d-mono">SELECT itens (p3)</text>
+  <text x="345" y="162" text-anchor="middle" class="d-label">… uma por pedido (N)</text>
+  <path d="M180 85 L256 28" class="d-line" marker-end="url(#n1)"/><path d="M180 92 L256 74" class="d-line" marker-end="url(#n1)"/><path d="M180 99 L256 120" class="d-line" marker-end="url(#n1)"/>
+  <rect x="480" y="60" width="170" height="60" rx="10" class="d-ok"/><text x="565" y="86" text-anchor="middle" class="d-mono">JOIN FETCH / IN (…)</text><text x="565" y="106" text-anchor="middle" class="d-label">1 ou 2 consultas</text>
+</svg>
+</Figura>
+
+## Primeiro, enxergue
+
+Você não conserta o que não vê. Três formas:
+
+```properties
+# 1. Logar o SQL (desenvolvimento)
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+# ou, com os parâmetros: logging.level.org.hibernate.orm.jdbc.bind=TRACE
+
+# 2. Estatísticas do Hibernate
+spring.jpa.properties.hibernate.generate_statistics=true
+```
+
+```java
+// 3. Contar nos testes (como o exercício 09.02 faz)
+Statistics estatisticas = emf.unwrap(SessionFactory.class).getStatistics();
+estatisticas.clear();
+painel.ultimos(25);
+assertThat(estatisticas.getPrepareStatementCount()).isLessThanOrEqualTo(2);
+```
+
+Um teste que conta consultas é uma **rede de segurança**: ninguém reintroduz o N+1 sem quebrar o build. Em produção, o *tracing* (módulo 14) mostra dezenas de *spans* de banco dentro de uma requisição — o N+1 fica visível num gráfico.
+
+## Solução 1: `JOIN FETCH`
+
+```java
+@Query("select p from Pedido p join fetch p.cliente order by p.criadoEm desc, p.id desc")
+List<Pedido> recentesComCliente(Limit limite);
+```
+
+Traz o pedido e o cliente **na mesma consulta**. Para `@ManyToOne`, é a solução mais simples: o JOIN não multiplica linhas, então `LIMIT` e paginação continuam no banco.
+
+## Solução 2: `@EntityGraph`
+
+A mesma ideia, declarativa, sem escrever a JPQL:
+
+```java
+@EntityGraph(attributePaths = {"cliente", "itens", "itens.produto"})
+List<Pedido> findByStatus(StatusPedido status);
+```
+
+## Solução 3: busca em lote (*batch fetching*)
+
+```properties
+spring.jpa.properties.hibernate.default_batch_fetch_size=50
+```
+
+Quando você acessa a associação LAZY do primeiro pedido, o Hibernate carrega a mesma associação de **até 50** pedidos do contexto de uma vez, com `IN (...)`. N consultas viram N/50. É uma **rede de segurança global** excelente — muitos times ligam isso por padrão —, mas não substitui consultas pensadas para as telas críticas.
+
+## Solução 4: projeções
+
+Se a tela só mostra dados, nem carregue entidades: `select new ...Dto(...)` com os JOINs necessários traz tudo numa consulta (aula 3). Para agregações (totais, contagens), é a única resposta certa — `GROUP BY` no banco, não somas em Java sobre milhares de entidades.
+
+## A armadilha: JOIN FETCH de coleção + paginação
+
+```java
+@Query("select p from Pedido p join fetch p.itens where p.cliente.id = :id")
+Page<Pedido> doCliente(long id, Pageable pagina);   // ⚠️
+```
+
+Um pedido com 4 itens vira 4 linhas no resultado do JOIN. Paginar "10 pedidos" com `LIMIT 10` cortaria no meio de um pedido — então o Hibernate **não** põe o `LIMIT` no SQL: carrega **todos** os pedidos do cliente e pagina em memória, logando:
+
+```text
+HHH90003004: firstResult/maxResults specified with collection fetch; applying in memory
+```
+
+Com 50 mil pedidos, isso derruba a aplicação. A solução é paginar em **duas etapas**:
+
+```java
+// 1) só os ids da página — sem coleção, o LIMIT vai para o banco
+@Query(value = "select p.id from Pedido p where p.cliente.id = :clienteId order by p.criadoEm desc, p.id desc",
+       countQuery = "select count(p) from Pedido p where p.cliente.id = :clienteId")
+Page<Long> idsDoCliente(long clienteId, Pageable pageable);
+
+// 2) tudo o que a tela precisa, só para esses ids
+@Query("""
+        select distinct p from Pedido p
+          join fetch p.cliente join fetch p.itens i join fetch i.produto
+         where p.id in :ids""")
+List<Pedido> completos(Collection<Long> ids);
+```
+
+Três consultas (ids, contagem e detalhes), qualquer que seja o tamanho da página — e a ordem da página preservada reorganizando o resultado pelos ids.
+
+<Callout tipo="erro" titulo="Duas coleções no mesmo JOIN FETCH">
+`join fetch p.itens join fetch p.pagamentos` gera um **produto cartesiano** (itens × pagamentos linhas por pedido) e, com `List`, o Hibernate recusa (`MultipleBagFetchException`). Busque uma coleção por consulta, ou use batch fetching para a segunda.
+</Callout>
+
+## Outras otimizações que valem saber
+
+- **`@Transactional(readOnly = true)`** em leituras: o Hibernate pula o dirty checking e o driver pode usar réplicas de leitura.
+- **Batch de escrita**: `hibernate.jdbc.batch_size=50` + `order_inserts=true` agrupa INSERTs (não funciona com `IDENTITY` — um motivo para usar `SEQUENCE`).
+- **`open-in-view=false`** (aula 1): N+1 disparado pela serialização do JSON fica impossível.
+- **Índices** para as colunas de filtro e ordenação das consultas críticas (módulo 07, `EXPLAIN ANALYZE`).
+
+<Callout tipo="entrevista">
+"O que é N+1 e como você resolve?" Resposta completa: **o que é** (uma consulta + uma por item, por causa de associações LAZY acessadas num laço), **como detectar** (log de SQL, estatísticas, teste que conta consultas, tracing), **como resolver** (JOIN FETCH/EntityGraph, batch fetching, projeções) e **a pegadinha** (fetch de coleção com paginação → paginação em memória; pagine os ids primeiro). Isso cobre 100% do que o entrevistador espera.
+</Callout>
+
+<Quiz
+  id="09-n-mais-1"
+  questoes={[
+    {
+      pergunta: 'Uma tela lista 200 pedidos e mostra o nome do cliente de cada um. Há 201 SELECTs no log. A correção mais direta é:',
+      opcoes: ['Mudar @ManyToOne para EAGER', 'JOIN FETCH p.cliente na consulta dos pedidos', 'Aumentar o pool de conexões', 'Cachear os pedidos'],
+      correta: 1,
+      explicacao: 'O JOIN FETCH traz os clientes na mesma consulta. EAGER não resolve: só dispara as consultas sempre.',
+    },
+    {
+      pergunta: 'O log mostra HHH90003004 (applying in memory). O que está acontecendo?',
+      opcoes: ['Um índice faltando', 'Paginação com JOIN FETCH de coleção: o Hibernate carregou tudo e paginou em memória', 'Cache de segundo nível ativo', 'Deadlock'],
+      correta: 1,
+      explicacao: 'Com fetch de coleção, o LIMIT não vai para o SQL. Pagine os ids primeiro e busque os detalhes depois.',
+    },
+    {
+      pergunta: 'O que hibernate.default_batch_fetch_size=50 faz?',
+      opcoes: ['Limita os resultados a 50', 'Carrega associações LAZY de até 50 entidades por consulta, com IN (...)', 'Agrupa 50 INSERTs', 'Abre 50 conexões'],
+      correta: 1,
+      explicacao: 'Transforma N consultas de associação em N/50.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **N+1**: uma consulta pela lista e uma por item ao acessar associações LAZY num laço.
+- **Enxergue**: log de SQL, `Statistics`, testes que contam consultas, tracing.
+- **Resolva**: `JOIN FETCH`/`@EntityGraph` para `@ManyToOne`, **batch fetching** como rede de segurança, **projeções** para leitura e agregações no banco.
+- **Coleção + paginação**: pagine os **ids** e busque os detalhes com `IN`, preservando a ordem.

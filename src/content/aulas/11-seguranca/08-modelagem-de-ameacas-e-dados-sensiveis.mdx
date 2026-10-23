@@ -1,0 +1,921 @@
+---
+titulo: Modelagem de ameaças e proteção de dados sensíveis
+descricao: "Como um time sênior decide o que proteger antes de escrever código: diagrama de fluxo de dados, fronteiras de confiança e STRIDE numa sessão de uma hora; segurança no ciclo de desenvolvimento; e, na prática, proteção de dados pessoais conforme a LGPD, com cifra de campo AES-256-GCM, envelope com KMS, rotação de chave, blind index para buscar CPF cifrado e logs sem PII."
+modulo: 11-seguranca
+ordem: 8
+duracao: 120
+objetivos:
+  - Desenhar o diagrama de fluxo de dados (DFD) de um sistema real, marcando as fronteiras de confiança
+  - Aplicar STRIDE por elemento do DFD, priorizar as ameaças por risco e registrar as decisões como issues e ADRs
+  - Conduzir uma sessão de modelagem de ameaças de uma hora com o time, com papéis e saídas definidos
+  - Classificar dados (público, interno, confidencial, sensível) e relacionar a classificação às regras da LGPD
+  - Implementar cifra de campo com AES-256-GCM (nonce único, AAD e tag) com versão de chave no dado, e provar em teste que adulteração é detectada
+  - Rotacionar a chave de dados lendo com a chave antiga e regravando com a nova, em lotes
+  - Buscar por um campo cifrado usando blind index com HMAC-SHA256
+  - Manter CPF, e-mail e telefone fora de logs e traces com tipos que se mascaram sozinhos
+tags: [modelagem de ameaças, STRIDE, LGPD, criptografia, AES-GCM, KMS, blind index, PII]
+flashcards:
+  - frente: Quais são as quatro perguntas da modelagem de ameaças?
+    verso: "No que estamos trabalhando? O que pode dar errado? O que vamos fazer a respeito? Fizemos um bom trabalho? A primeira vira o DFD; a segunda, a lista STRIDE; a terceira, as mitigações priorizadas; a quarta, a revisão depois da entrega."
+  - frente: O que significa cada letra de STRIDE?
+    verso: "Spoofing (se passar por outro), Tampering (adulterar dados), Repudiation (negar que fez), Information disclosure (vazar informação), Denial of service (indisponibilizar) e Elevation of privilege (ganhar permissões que não tinha). Cada uma é o oposto de uma propriedade: autenticação, integridade, não repúdio, confidencialidade, disponibilidade e autorização."
+  - frente: O que é uma fronteira de confiança num DFD?
+    verso: Uma linha que os dados cruzam passando de um nível de confiança para outro (internet para a sua rede, aplicação para o banco gerenciado, sua empresa para um parceiro). É nas fronteiras que se concentram as ameaças e onde ficam as validações, a autenticação e a cifra.
+  - frente: Por que AES-GCM precisa de um nonce diferente a cada cifra com a mesma chave?
+    verso: Repetir o par chave e nonce revela o XOR dos dois textos claros e permite forjar a tag de autenticação. Com nonce aleatório de 96 bits, o NIST limita o uso a 2^32 cifras por chave. O Java recusa reusar o nonce no mesmo objeto Cipher.
+  - frente: Para que serve o AAD no AES-GCM?
+    verso: São dados autenticados, mas não cifrados (ex. o nome do campo e a versão da chave). Se o valor cifrado for copiado para outro campo ou o prefixo de versão for trocado, a tag não confere e a decifra falha com AEADBadTagException.
+  - frente: O que é envelope encryption?
+    verso: Os dados são cifrados com uma chave de dados (DEK), e a DEK é guardada cifrada por uma chave mestra (KEK) que nunca sai do KMS. A aplicação pede ao KMS para desembrulhar a DEK na subida. Rotacionar a KEK só re-embrulha as DEKs; rotacionar a DEK exige regravar os dados.
+  - frente: Como buscar por CPF se a coluna está cifrada com nonce aleatório?
+    verso: Com um blind index, uma segunda coluna com HMAC-SHA256 do CPF normalizado, calculado com uma chave própria. O mesmo CPF gera sempre o mesmo índice, então a busca vira WHERE cpf_indice = ?. Sem a chave, o índice não permite testar CPFs por força bruta.
+  - frente: Qual a diferença entre dado pessoal e dado pessoal sensível na LGPD?
+    verso: "Dado pessoal identifica ou torna identificável uma pessoa (nome, CPF, e-mail, IP). Dado sensível é a categoria do art. 5º, II: origem racial ou étnica, convicção religiosa, opinião política, filiação a sindicato, saúde, vida sexual, dado genético ou biométrico. Ele tem bases legais mais restritas (art. 11) e exige proteção reforçada."
+---
+
+Numa sexta-feira à tarde, alguém do time de uma rede de clínicas recebe uma mensagem de um pesquisador de segurança: um arquivo com o dump do banco de produção está num bucket público, acessível a quem tiver o link. O bucket foi criado meses antes por um script de migração e esquecido. O dump tem 380 mil pacientes: nome, CPF, telefone, e-mail e a lista de exames de cada um, com o nome do exame em texto claro ("sorologia para HIV", "beta-HCG"). A segurança da API estava em ordem: JWT validado, autorização por dono, limite de requisições, OWASP Top 10 revisado. Nada disso importou, porque o vazamento não passou pela API.
+
+O caso mostra dois pontos cegos. **Ninguém tinha perguntado, de forma sistemática, "o que pode dar errado?"**: num diagrama, o fluxo "backup → armazenamento de objetos" teria aparecido, junto com a pergunta "quem lê esse bucket?". E **o dado estava em claro em todo lugar**: com o CPF cifrado na aplicação e a chave num KMS, o dump seria um monte de `v2:Xq9...` ilegíveis, e o incidente, bem menor.
+
+Esta aula fecha o módulo de segurança com o que se espera de uma pessoa Pleno ou Sênior: **pensar segurança antes do código**, com modelagem de ameaças, e **proteger o dado em si**, não só a porta de entrada. Você vai modelar um fluxo real de upload de exames com STRIDE, ver como a segurança entra no ciclo de desenvolvimento e implementar, com testes, uma cifra de campo com versão de chave e rotação, um blind index para buscar CPF cifrado, um conversor JPA e logs sem dados pessoais.
+
+## A intuição: a planta do prédio e o cofre de cada sala
+
+Imagine que você foi contratado para cuidar da segurança de um prédio comercial. Um amador sai comprando câmeras. Um profissional pede **a planta**: onde ficam as entradas, por onde passam as pessoas, onde estão as coisas de valor, quais portas separam a recepção (onde qualquer pessoa entra) da área com crachá. Com a planta na mesa, ele percorre cada porta e pergunta: alguém pode entrar se passando por funcionário? Trocar um documento no caminho? Levar um papel embora? Só depois decide **onde** gastar: a fechadura cara vai na porta do arquivo, não na do almoxarifado.
+
+A **modelagem de ameaças** é esse trabalho com a planta. O diagrama de fluxo de dados é a planta do sistema; as **fronteiras de confiança** são as portas entre áreas com níveis de acesso diferentes; **STRIDE** é a lista de perguntas feita em cada porta.
+
+A segunda metade da analogia é o cofre. Um dia alguém entra: um funcionário mal-intencionado, uma chave copiada, uma janela esquecida (o bucket público do gancho). Por isso os documentos valiosos ficam **num cofre dentro da sala**, e a chave do cofre fica com o gerente, num cofre central (o **KMS**). Cada documento vai num **envelope lacrado**: se alguém abrir, o lacre rompido denuncia (a **tag** do AES-GCM). E o livro de visitas registra "documento terminado em 09", não o número inteiro (o **mascaramento** nos logs).
+
+A ordem importa: primeiro a planta, depois o cofre. Cifrar tudo sem modelar é comprar cofres e deixar a porta dos fundos aberta; modelar sem proteger o dado é ter a planta perfeita e os documentos sobre a mesa.
+
+## Vocabulário
+
+| Termo | O que é | No exemplo da clínica |
+|---|---|---|
+| **Ameaça** | Algo que pode dar errado e causar dano | Um atacante baixa o laudo de outra pessoa |
+| **Vulnerabilidade** | A falha concreta que permite a ameaça | O download não confere o dono do exame |
+| **Risco** | Probabilidade × impacto de uma ameaça | Probabilidade alta, impacto altíssimo |
+| **Mitigação** | O que reduz o risco | Autorização por dono e URL de 5 minutos |
+| **DFD** | Diagrama de fluxo de dados | Paciente, API, PostgreSQL, bucket |
+| **Fronteira de confiança** | Linha onde o nível de confiança muda | Internet / rede da clínica |
+| **STRIDE** | As seis categorias de ameaça | Spoofing, Tampering, Repudiation, Information disclosure, Denial of service, Elevation of privilege |
+| **PII** | Informação que identifica alguém; na LGPD, "dado pessoal" | CPF, nome, e-mail, telefone |
+| **AEAD** | Cifra autenticada: cifra e detecta adulteração na mesma operação | AES-GCM |
+| **DEK / KEK** | Chave que cifra os dados / chave que cifra as DEKs | DEK na memória da aplicação; KEK dentro do KMS |
+| **Blind index** | HMAC determinístico de um valor, para buscar sem decifrar | Coluna `cpf_indice` |
+
+Nonce, AAD, tag, KMS, tokenização e mascaramento aparecem explicados na Parte 3.
+
+## Parte 1: modelagem de ameaças na prática
+
+### As quatro perguntas
+
+O *Threat Modeling Manifesto*, escrito por um grupo de referências da área, resume a modelagem de ameaças em quatro perguntas. Elas são a melhor forma de começar, porque cabem num quadro branco:
+
+1. **No que estamos trabalhando?** Desenhe o sistema: o DFD.
+2. **O que pode dar errado?** Percorra o desenho com STRIDE.
+3. **O que vamos fazer a respeito?** Para cada ameaça: mitigar, transferir, aceitar ou eliminar a funcionalidade. Priorize por risco.
+4. **Fizemos um bom trabalho?** Confira se as mitigações viraram código e testes, e revise o modelo quando o sistema mudar.
+
+Uma página com um diagrama e uma tabela de quinze linhas, mantida no repositório e atualizada quando a arquitetura muda, vale mais que um documento de cinquenta páginas que ninguém abre.
+
+### O diagrama de fluxo de dados
+
+O DFD tem só cinco tipos de elemento, e é essa simplicidade que o torna útil numa conversa com o time:
+
+| Elemento | Desenho usual | O que representa | Exemplos |
+|---|---|---|---|
+| Entidade externa | retângulo | Quem está fora do seu controle e interage com o sistema | Paciente, laboratório parceiro, gateway de pagamento |
+| Processo | círculo ou retângulo arredondado | Código seu que roda e transforma dados | API, worker, job agendado |
+| Armazenamento | duas linhas paralelas ou retângulo | Onde dados ficam parados | Banco, bucket, fila, cache, **logs**, **backups** |
+| Fluxo de dados | seta | Dados em movimento entre dois elementos | Requisição HTTPS, consulta SQL, mensagem |
+| Fronteira de confiança | linha tracejada | Mudança de nível de confiança | Internet / VPC, aplicação / banco gerenciado |
+
+Três dicas: **logs, backups e filas são armazenamentos** e são os que mais vazam, porque ninguém os desenha; **numere os fluxos**, para a tabela citar "F4"; e faça **um DFD por funcionalidade**, não um para a empresa inteira.
+
+O fluxo que vamos modelar: pacientes e laboratórios enviam exames, a API guarda os metadados no PostgreSQL e o arquivo no armazenamento de objetos, e um worker processa o arquivo (antivírus e miniatura) a partir de um evento na fila.
+
+<Figura legenda="DFD do upload de exames. As linhas tracejadas são fronteiras de confiança; os fluxos F1 a F7 aparecem na tabela STRIDE logo abaixo">
+<svg viewBox="0 0 760 470" width="760" role="img" aria-labelledby="dfd-titulo dfd-desc">
+  <title id="dfd-titulo">Diagrama de fluxo de dados do upload de exames da clínica</title>
+  <desc id="dfd-desc">Três zonas separadas por duas fronteiras de confiança tracejadas: Internet à esquerda, rede da clínica no meio e serviços de dados à direita. Na Internet ficam as entidades externas Paciente (app no celular) e Laboratório (sistema parceiro). Na rede da clínica ficam o processo API de exames, a fila exame-recebido e o processo Worker de laudos. Nos serviços de dados ficam o PostgreSQL, com pacientes e exames e o CPF cifrado, e o armazenamento de objetos com PDFs e imagens. Fluxos: F1 do paciente para a API; F2 do laboratório para a API; F3 entre a API e o PostgreSQL, nos dois sentidos; F4 da API para o armazenamento de objetos; F5 da API para a fila; F6 da fila para o worker; F7 entre o worker e o armazenamento de objetos.</desc>
+  <defs><marker id="mk-dfd-exames" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="100" y="22" text-anchor="middle" class="d-label">Internet</text>
+  <text x="330" y="22" text-anchor="middle" class="d-label">Rede da clínica (VPC)</text>
+  <text x="608" y="22" text-anchor="middle" class="d-label">Serviços de dados gerenciados</text>
+  <path d="M200 34 L200 460" class="d-line" stroke-dasharray="7 5"/>
+  <path d="M455 34 L455 460" class="d-line" stroke-dasharray="7 5"/>
+  <rect x="20" y="90" width="160" height="56" rx="4" class="d-box"/>
+  <text x="100" y="114" text-anchor="middle" class="d-title">Paciente</text>
+  <text x="100" y="134" text-anchor="middle" class="d-label">app no celular</text>
+  <rect x="20" y="370" width="160" height="56" rx="4" class="d-box"/>
+  <text x="100" y="394" text-anchor="middle" class="d-title">Laboratório</text>
+  <text x="100" y="414" text-anchor="middle" class="d-label">sistema parceiro</text>
+  <rect x="230" y="110" width="200" height="64" rx="30" class="d-accent"/>
+  <text x="330" y="138" text-anchor="middle" class="d-title">API de exames</text>
+  <text x="330" y="158" text-anchor="middle" class="d-label">Spring Boot</text>
+  <rect x="240" y="236" width="180" height="50" rx="4" class="d-info"/>
+  <text x="330" y="258" text-anchor="middle" class="d-title">Fila</text>
+  <text x="330" y="276" text-anchor="middle" class="d-label">exame-recebido</text>
+  <rect x="230" y="350" width="200" height="64" rx="30" class="d-accent"/>
+  <text x="330" y="378" text-anchor="middle" class="d-title">Worker de laudos</text>
+  <text x="330" y="398" text-anchor="middle" class="d-label">antivírus + miniatura</text>
+  <rect x="480" y="70" width="260" height="64" rx="4" class="d-info"/>
+  <text x="610" y="96" text-anchor="middle" class="d-title">PostgreSQL</text>
+  <text x="610" y="118" text-anchor="middle" class="d-label">pacientes e exames (CPF cifrado)</text>
+  <rect x="480" y="290" width="260" height="64" rx="4" class="d-info"/>
+  <text x="610" y="316" text-anchor="middle" class="d-title">Armazenamento de objetos</text>
+  <text x="610" y="338" text-anchor="middle" class="d-label">PDFs e imagens (SSE-KMS)</text>
+  <path d="M180 118 L228 134" class="d-line" marker-end="url(#mk-dfd-exames)"/>
+  <text x="206" y="112" class="d-mono">F1</text>
+  <path d="M180 392 L234 174" class="d-line" marker-end="url(#mk-dfd-exames)"/>
+  <text x="206" y="320" class="d-mono">F2</text>
+  <path d="M430 132 L478 106" class="d-line" marker-start="url(#mk-dfd-exames)" marker-end="url(#mk-dfd-exames)"/>
+  <text x="440" y="106" class="d-mono">F3</text>
+  <path d="M424 162 L482 300" class="d-line" marker-end="url(#mk-dfd-exames)"/>
+  <text x="462" y="214" class="d-mono">F4</text>
+  <path d="M330 174 L330 234" class="d-line" marker-end="url(#mk-dfd-exames)"/>
+  <text x="338" y="210" class="d-mono">F5</text>
+  <path d="M330 286 L330 348" class="d-line" marker-end="url(#mk-dfd-exames)"/>
+  <text x="338" y="324" class="d-mono">F6</text>
+  <path d="M430 376 L478 340" class="d-line" marker-start="url(#mk-dfd-exames)" marker-end="url(#mk-dfd-exames)"/>
+  <text x="446" y="384" class="d-mono">F7</text>
+</svg>
+</Figura>
+
+O desenho já revela coisas. O laboratório (F2) é um **sistema**: a autenticação natural é mTLS ou OAuth 2.0 com *client credentials*, não senha. O worker lê um arquivo que veio da internet (F7), o lugar clássico de ataque por upload malicioso. E o banco e o bucket estão atrás de outra fronteira, com backups e credenciais de outro nível de confiança: é ali que a cifra de campo da Parte 3 faz sentido.
+
+### STRIDE por elemento
+
+STRIDE é um mnemônico criado na Microsoft. Cada letra é o oposto de uma propriedade de segurança:
+
+| Ameaça | Propriedade violada | Pergunta para fazer | Mitigações típicas |
+|---|---|---|---|
+| **S**poofing | Autenticação | Alguém pode se passar por outro usuário ou sistema? | Senhas fortes + MFA, OAuth 2.0, mTLS, validação de JWT |
+| **T**ampering | Integridade | Alguém pode alterar dados em trânsito ou em repouso? | TLS, AEAD (GCM), assinaturas, permissões de escrita mínimas |
+| **R**epudiation | Não repúdio | Alguém pode negar que fez algo, e você não consegue provar? | Log de auditoria com quem, o quê, quando, guardado fora do alcance de quem age |
+| **I**nformation disclosure | Confidencialidade | Dados podem chegar a quem não deveria? | Autorização por dono, cifra, mascaramento, mensagens de erro genéricas |
+| **D**enial of service | Disponibilidade | Alguém pode derrubar ou esgotar o serviço? | Limites de tamanho e de taxa, timeouts, filas, autoscaling com teto |
+| **E**levation of privilege | Autorização | Alguém pode fazer o que não tem permissão? | Autorização em toda operação, menor privilégio, validação de entrada |
+
+A técnica **STRIDE por elemento** evita a pergunta vaga "o que pode dar errado no sistema?" e substitui por perguntas concretas, elemento a elemento. Nem toda letra se aplica a todo tipo de elemento:
+
+| Tipo de elemento | S | T | R | I | D | E |
+|---|---|---|---|---|---|---|
+| Entidade externa | ✔ | | ✔ | | | |
+| Processo | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Armazenamento | | ✔ | ✔ (se guarda logs) | ✔ | ✔ | |
+| Fluxo de dados | | ✔ | | ✔ | ✔ | |
+
+Uma entidade externa pode ser imitada (S) e negar o que fez (R); um fluxo pode ser lido (I) e alterado (T); processos, que executam código, estão sujeitos a tudo.
+
+### O exemplo completo: STRIDE no upload de exames
+
+Esta tabela é o resultado de uma sessão real de uma hora sobre o DFD acima, já com a priorização. Probabilidade (P) e impacto (I) vão de 1 a 3, e o risco é o produto: 6 ou 9 é **alto**, 3 ou 4 é **médio**, 1 ou 2 é **baixo**.
+
+| # | Elemento | STRIDE | Ameaça | Mitigação | P | I | Risco |
+|---|---|---|---|---|---|---|---|
+| A1 | Paciente / F1 | S | Credenciais vazadas de outro site são testadas no login (*credential stuffing*) | MFA opcional para pacientes, limite de tentativas, senhas checadas contra listas de vazamento | 3 | 3 | **9 alto** |
+| A2 | API (download) | I / E | Paciente troca o id na URL e baixa o exame de outra pessoa (BOLA) | Autorização por dono em toda leitura; ids não sequenciais; teste da matriz de autorização | 3 | 3 | **9 alto** |
+| A3 | F7 / Worker | E / T | PDF malicioso explora o parser de PDF ou de imagem e executa código no worker | Antivírus antes de processar; worker isolado, sem credencial de banco, só leitura no bucket; bibliotecas atualizadas | 2 | 3 | **6 alto** |
+| A4 | PostgreSQL / backups | I | Dump ou backup acessível a quem não deveria (o caso do gancho) | Cifra de campo do CPF e do nome do exame com DEK no KMS; backups cifrados; bloqueio de acesso público na conta | 2 | 3 | **6 alto** |
+| A5 | Laboratório / F2 | S | Um sistema qualquer se passa pelo laboratório e envia resultados falsos | mTLS com certificado por laboratório, ou OAuth 2.0 *client credentials*; lista de laboratórios permitidos | 2 | 3 | **6 alto** |
+| A6 | Logs (armazenamento implícito) | I | CPF, e-mail e nome do exame aparecem em logs e traces, que têm retenção e acesso mais amplos que o banco | Tipos que se mascaram no `toString`; nunca logar corpo de requisição; revisão dos campos dos spans | 3 | 2 | **6 alto** |
+| A7 | F1 | D | Upload de arquivos de 5 GB esgota disco e banda | Limite de tamanho (20 MB) na borda e na aplicação; upload direto ao bucket com URL pré-assinada | 2 | 2 | 4 médio |
+| A8 | Armazenamento de objetos / F4 | I | Link do arquivo compartilhado vira acesso permanente | URLs pré-assinadas com validade de 5 minutos; bucket privado, sem ACL pública | 2 | 2 | 4 médio |
+| A9 | API | R | Paciente nega ter apagado um exame; atendente nega ter visto o laudo de alguém | Log de auditoria (quem, o quê, quando, de onde), separado do log técnico e só com escrita para a aplicação | 2 | 2 | 4 médio |
+| A10 | Fila / F5, F6 | T | Alguém com acesso à rede publica mensagens falsas de "exame recebido" | Credencial própria por produtor; fila sem acesso fora da VPC; worker revalida que o exame existe no banco | 1 | 2 | 2 baixo |
+| A11 | PostgreSQL / F3 | T / I | Tráfego entre API e banco interceptado dentro da nuvem | TLS obrigatório na conexão (`sslmode=verify-full`) | 1 | 3 | 3 médio |
+| A12 | Worker | D | Arquivo que trava o antivírus faz a fila acumular | Timeout por arquivo, DLQ depois de 3 tentativas, alerta de tamanho de fila | 2 | 1 | 2 baixo |
+
+Três lições dessa sessão. **A2 já estava "resolvido" na cabeça de todos** e mesmo assim entrou: a modelagem transforma "acho que está coberto" em "há um teste que prova" (a matriz da aula [Autorização e BOLA](../../11-seguranca/04-autorizacao-e-bola/)). **A6 apareceu porque alguém perguntou "onde mais esse dado é escrito?"**, a pergunta de ouro para dados sensíveis. E nenhuma linha diz "usar criptografia" de forma genérica: cada mitigação é **verificável** ("TLS com `verify-full`", "URL válida por 5 minutos"). Mitigação que não dá para testar é desejo. Aceitar um risco, como A10, também é legítimo, desde que registrado e com dono.
+
+<Callout tipo="info" titulo="E o DREAD, o CVSS, o OWASP Risk Rating?">
+A matriz 3 × 3 é a forma mais simples e cabe numa hora. O **DREAD** caiu em desuso por ser subjetivo; o **CVSS** pontua vulnerabilidades concretas (uma CVE), não ameaças de design; a **OWASP Risk Rating Methodology** serve para comparar riscos entre muitos times.
+</Callout>
+
+### Como conduzir uma sessão em uma hora
+
+A modelagem de ameaças falha quando vira um evento raro, longo e conduzido só pelo time de segurança. Ela funciona quando é **curta, frequente e feita pelo time que constrói**. Um roteiro que cabe numa hora:
+
+| Tempo | Etapa | O que acontece | Saída |
+|---|---|---|---|
+| 0–5 min | Escopo | A pessoa que conduz lê em voz alta a funcionalidade e o que está fora do escopo | Uma frase de escopo |
+| 5–20 min | DFD | Quem mais conhece o fluxo desenha no quadro (ou no Excalidraw); o grupo corrige; marcam-se fronteiras e numeram-se fluxos | O diagrama |
+| 20–45 min | STRIDE | Percorre-se elemento por elemento, uma letra de cada vez; toda ameaça vai para a lista **sem discussão de solução ainda** | 10 a 25 ameaças |
+| 45–55 min | Priorização | Cada ameaça recebe P e I; as de risco alto ganham mitigação e dono | A tabela priorizada |
+| 55–60 min | Fechamento | Combinam-se os registros (issues, ADR) e a data de revisão | Lista de próximos passos |
+
+Quatro papéis ajudam: a **condução**, que mantém o tempo e repete "anote e siga, resolvemos depois"; **quem conhece o fluxo**, que desenha; um **advogado do atacante**, papel que vale revezar para formar gente; e **produto**, que decide o impacto de negócio e aceita riscos em nome dele. Faça uma sessão no desenho de toda funcionalidade que toca dados sensíveis, dinheiro, autenticação ou terceiros, quando a arquitetura muda e, uma vez por ano, nos fluxos críticos.
+
+### Registrar: issue para cada mitigação, ADR para cada decisão
+
+O resultado da sessão só vale se entrar no fluxo normal de trabalho do time. Duas formas de registro, cada uma com um papel:
+
+**Uma issue por mitigação de risco alto ou médio**, com critério de aceite verificável e o rótulo `seguranca`:
+
+```text
+[SEG-A2] Download de exame confere o dono
+Ameaça: paciente troca o id na URL e baixa o exame de outra pessoa (BOLA). Risco 9 (P3 × I3).
+Critério de aceite:
+- GET /exames/{id}/arquivo devolve 404 quando o exame não é do paciente autenticado
+- Teste de integração da matriz de autorização cobre paciente, médico e atendente
+- Ids de exame são UUID, não sequenciais
+Modelo de ameaças: docs/ameacas/upload-de-exames.md (revisão de 2026-10)
+```
+
+**Um ADR (Architecture Decision Record) para cada decisão de arquitetura** que a sessão tomou, como "cifrar o CPF na aplicação com DEK no KMS" ou "aceitar o risco A10". O ADR registra o contexto, a decisão, as alternativas descartadas e as consequências; daqui a dois anos, alguém vai perguntar "por que o CPF está cifrado na aplicação se o disco já é cifrado?", e a resposta estará lá. O próprio modelo de ameaças (o DFD em texto ou imagem e a tabela) fica no repositório, em `docs/ameacas/`, e é revisado no pull request como qualquer código.
+
+## Parte 2: segurança no ciclo de desenvolvimento
+
+A modelagem de ameaças é uma das atividades de um ciclo de desenvolvimento seguro (o termo em inglês é *Secure SDLC*). A tabela resume as outras, em que momento entram e o que cada uma encontra. Nenhuma substitui as outras: cada técnica enxerga uma classe de problema.
+
+| Atividade | Quando | O que encontra | Ferramentas e exemplos |
+|---|---|---|---|
+| **Requisitos de segurança** | Refinamento | O que precisa existir: MFA, trilha de auditoria, retenção | OWASP ASVS 5.0 como catálogo de requisitos, por nível |
+| **Modelagem de ameaças** | Desenho | Falhas de design: fluxo sem autenticação, dado sem cifra | STRIDE, DFD, esta aula |
+| **Revisão de código** | Pull request | Autorização esquecida, log com PII, SQL concatenado | Checklist de segurança no template de PR |
+| **SAST** (*Static Application Security Testing*) | A cada commit, no CI | Padrões perigosos no código-fonte | CodeQL, Semgrep, SpotBugs com Find Security Bugs |
+| **SCA** (*Software Composition Analysis*) | A cada build e diariamente | Dependências com CVE conhecida, licenças | Dependabot, OWASP Dependency-Check, SBOM (aula [Defesas da API](../../11-seguranca/06-defesas-da-api/)) |
+| **Varredura de segredos** | *Pre-commit* e CI | Chaves e senhas no repositório | Gitleaks, *secret scanning* do GitHub |
+| **DAST** (*Dynamic Application Security Testing*) | Em homologação | Falhas visíveis de fora: headers, injeção, configuração | ZAP, varreduras autenticadas |
+| **Pentest** | Antes de lançamentos grandes e anualmente | O que as ferramentas não acham: lógica de negócio, encadeamento de falhas | Equipe interna ou empresa contratada |
+| **Bug bounty / VDP** | Em produção, contínuo | O que escapou de tudo | Programa de recompensa ou política de divulgação, com `security.txt` (RFC 9116) |
+
+Na prática: **SAST gera muito falso positivo**, então comece com poucas regras de alta confiança que quebram o build (SQL concatenado, segredos) e trate o resto como relatório. **DAST não entende regra de negócio**: BOLA aparece no pentest e nos testes de autorização que você escreve. **Bug bounty não é o primeiro passo**: antes, publique uma política de divulgação (VDP) com um canal e o compromisso de responder. E os **requisitos vêm primeiro**: o ASVS 5.0 (maio de 2025) tem cerca de 350 requisitos em três níveis; para uma API de saúde, o nível 2 é um bom ponto de partida.
+
+## Parte 3: proteção de dados sensíveis
+
+### Classificar antes de proteger
+
+Proteger tudo com o mesmo nível de cuidado é caro e acaba em proteção nenhuma: se tudo é "confidencial", nada é. O primeiro passo é **classificar**. Uma escala de quatro níveis cobre a maioria das empresas:
+
+| Nível | Exemplos na clínica | Quem acessa | Proteção mínima |
+|---|---|---|---|
+| **Público** | Endereço das unidades, lista de exames oferecidos | Qualquer pessoa | Integridade (ninguém altera sem autorização) |
+| **Interno** | Escala dos atendentes, métricas de uso | Funcionários | Autenticação; fora de repositórios públicos |
+| **Confidencial** | Nome, CPF, telefone e e-mail dos pacientes; contratos | Quem precisa para o trabalho | Autorização por função; TLS; disco cifrado; fora de logs |
+| **Sensível** (restrito) | Resultados de exames, diagnósticos, dados biométricos | Mínimo de pessoas, com auditoria | Tudo acima + cifra de campo, trilha de auditoria de leitura, retenção definida |
+
+A classificação é decisão de negócio e jurídica; no código, ela vira tipos (como o `Cpf` que se mascara), regras de revisão e de log.
+
+### LGPD em uma página (para quem desenvolve)
+
+A Lei Geral de Proteção de Dados (Lei 13.709/2018) não exige que você seja especialista em direito, mas exige que você saiba o suficiente para tomar decisões técnicas e chamar o encarregado (o DPO) na hora certa.
+
+- **Dado pessoal** (art. 5º, I) é informação relacionada a pessoa identificada ou identificável: nome, CPF, e-mail, IP, id de dispositivo e até um id interno que dê para ligar à pessoa.
+- **Dado pessoal sensível** (art. 5º, II): origem racial ou étnica, convicção religiosa, opinião política, filiação a sindicato ou a organização religiosa, filosófica ou política, saúde, vida sexual, dado genético ou biométrico. **Todo exame da clínica é dado sensível.**
+- **Anonimizado** (art. 12) deixa de ser dado pessoal se a reversão não for possível com meios razoáveis. CPF cifrado ou com hash **não** é anonimizado: é **pseudonimizado** (art. 13, § 4º) e continua dado pessoal.
+
+**Bases legais.** Todo tratamento precisa de uma hipótese do art. 7º: consentimento, obrigação legal ou regulatória, políticas públicas, pesquisa, execução de contrato, exercício regular de direitos, proteção da vida, tutela da saúde, legítimo interesse ou proteção do crédito. Para dados sensíveis, o art. 11 é mais restrito: consentimento específico e destacado, ou hipóteses como obrigação legal e tutela da saúde, sem legítimo interesse nem proteção do crédito. A base legal **define o uso permitido**: o CPF coletado para a nota fiscal não vai para marketing sem outra base.
+
+**Princípios que viram requisito técnico** (art. 6º): **necessidade** (minimização: o dado que você não coleta não vaza), **finalidade** (o dado serve ao propósito informado) e **segurança** (com o art. 46: cifra, controle de acesso, auditoria).
+
+**Direitos do titular** (art. 18) viram funcionalidade: acesso, correção, portabilidade, revogação do consentimento e **eliminação**. Eliminar um paciente é apagar do banco, réplicas, índices de busca, cache e eventos publicados. E nem tudo pode ser apagado: o art. 16 permite manter dados por obrigação legal, e a Lei 13.787/2018 manda guardar o prontuário por **no mínimo 20 anos** a partir do último registro. Eliminação é regra de negócio por categoria de dado, não um `DELETE` genérico.
+
+**Incidentes** (art. 48): incidentes que possam causar risco ou dano relevante são comunicados à ANPD e aos titulares. A Resolução CD/ANPD nº 15/2024 fixou o prazo de **três dias úteis** a partir do conhecimento (o dobro para agentes de pequeno porte).
+
+<Callout tipo="atencao" titulo="Isto não é orientação jurídica">
+Base legal, retenção e comunicação de incidentes são decisões do encarregado e do jurídico. O seu papel é torná-las **implementáveis**: dados classificados, eliminação que funciona, logs que não espalham PII.
+</Callout>
+
+### Criptografia em trânsito: TLS e mTLS
+
+Dado em trânsito é protegido por **TLS**. Na prática, para uma API:
+
+- **TLS 1.2 ou 1.3 em toda conexão externa**, terminado no balanceador ou no gateway, com HSTS (visto na aula [Defesas da API](../../11-seguranca/06-defesas-da-api/)).
+- **TLS também por dentro**: aplicação e banco (`sslmode=verify-full`, que confere certificado **e** nome do host), fila e serviços. "Dentro da VPC é seguro" é o que o modelo *zero trust* combate.
+- **mTLS** (*mutual TLS*): o cliente também apresenta certificado. É a forma natural de autenticar **sistemas** (o laboratório do F2): não há senha para vazar, e a chave privada fica no cliente.
+
+No Spring Boot, a configuração de certificados usa **SSL bundles**: um bundle nomeado com o par certificado e chave e o *truststore*, aplicado ao servidor ou a um cliente HTTP. Um servidor que exige certificado de cliente fica assim:
+
+```yaml
+spring:
+  ssl:
+    bundle:
+      pem:
+        api-exames:
+          keystore:
+            certificate: "file:/etc/certs/api-exames.crt"
+            private-key: "file:/etc/certs/api-exames.key"
+          truststore:
+            certificate: "file:/etc/certs/ca-laboratorios.crt"   # só a CA dos parceiros
+server:
+  ssl:
+    bundle: api-exames
+    client-auth: need          # sem certificado válido, a conexão nem abre
+```
+
+No lado cliente, o `RestClientSsl` do Spring Boot aplica um bundle a um `RestClient.Builder` com `ssl.fromBundle("nome")`. Com muitos serviços, um **service mesh** (Istio, Linkerd) ou SPIFFE emite e renova certificados curtos automaticamente, e o mTLS vira propriedade da plataforma.
+
+### Criptografia em repouso: em que nível cifrar
+
+"O banco é cifrado" pode significar coisas muito diferentes. A pergunta que decide é **contra quem** cada nível protege:
+
+| Nível | Como | Protege contra | Não protege contra |
+|---|---|---|---|
+| **Disco / volume** | Cifra do provedor (EBS, discos do Cloud SQL, LUKS) | Roubo do disco físico, descarte de hardware | Quem acessa o banco: DBA, aplicação comprometida, SQL injection, dump |
+| **Banco (TDE)** | Cifra transparente de arquivos de dados | O mesmo que o disco, mais cópia dos arquivos do banco | Qualquer um que faça `SELECT`; o dump sai em claro |
+| **Coluna no banco** | Funções do banco, como `pgp_sym_encrypt` do pgcrypto | Leitura dos arquivos e de backups físicos | DBA e logs do banco: a chave passa pela consulta SQL |
+| **Campo na aplicação** | A aplicação cifra antes de gravar; a chave vem de um KMS | Dump, backup, réplica, DBA, SQL injection de leitura, bucket público | Aplicação comprometida (ela tem a chave); quem acessa o KMS |
+
+Nos serviços gerenciados, a cifra de disco é praticamente grátis e deve estar sempre ligada (o PostgreSQL comunitário não tem TDE nativo). Mas **ela não teria evitado o vazamento do gancho**: o dump foi gerado por quem tinha acesso ao banco. Para dado sensível, a cifra na aplicação muda o jogo, ao custo de o banco não enxergar o conteúdo (sem `LIKE`, ordenação ou índice comum). Por isso se cifram **campos escolhidos**, não a tabela inteira.
+
+### AES-256-GCM: nonce, AAD e tag
+
+O padrão para cifra de campo é o **AES-GCM**, modo AEAD do AES. As peças:
+
+- **Chave**: 256 bits (32 bytes), gerada por um gerador seguro e guardada num KMS, nunca no código.
+- **Nonce** (também chamado de IV): 96 bits (12 bytes). **Nunca pode se repetir com a mesma chave.** Repetir o nonce no GCM é catastrófico: quem tem dois cifrados com o mesmo par chave e nonce obtém o XOR dos textos claros e consegue forjar tags. Com nonces aleatórios de 96 bits, o NIST (SP 800-38D) limita o uso a 2^32 cifras por chave, o que é bastante para campos de cadastro, mas é um número que entra na política de rotação.
+- **AAD**: dados que não são cifrados, mas entram na conta da tag. Use para **amarrar o cifrado ao seu contexto**: o nome do campo, a versão da chave, às vezes o id do registro. Se alguém copiar o CPF cifrado do paciente para o campo de outra tabela, ou trocar o prefixo de versão, a decifra falha.
+- **Tag**: 128 bits que o GCM anexa ao cifrado. Na decifra, o Java recalcula a tag e compara; se um único bit do cifrado, do nonce ou do AAD mudou, lança `AEADBadTagException` **e não devolve nenhum texto claro**. É o lacre do envelope.
+
+O formato que vamos gravar na coluna junta tudo o que é preciso para decifrar depois, com a versão da chave na frente:
+
+<Figura legenda="O valor gravado na coluna e de onde vem a chave que o abre">
+<svg viewBox="0 0 720 370" width="720" role="img" aria-labelledby="formato-titulo formato-desc">
+  <title id="formato-titulo">Formato do campo cifrado e envelope encryption</title>
+  <desc id="formato-desc">Em cima, o valor gravado na coluna cpf_cifrado, da esquerda para a direita: o prefixo v2, que é a versão da chave e entra no AAD; o nonce de 12 bytes, aleatório e único; o texto cifrado de 11 bytes, que é o CPF ilegível; e a tag de 16 bytes, o lacre que detecta adulteração. Nonce, cifrado e tag vão juntos em Base64. Embaixo, o envelope: a configuração guarda as chaves de dados v1 e v2 embrulhadas; na subida, a aplicação pede ao KMS para desembrulhá-las, recebe as chaves em claro e as mantém num chaveiro em memória; a aplicação cifra os campos e grava no banco. Rotacionar a chave mestra só re-embrulha as chaves de dados; rotacionar a chave de dados exige regravar os dados.</desc>
+  <defs><marker id="mk-formato-envelope" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="360" y="22" text-anchor="middle" class="d-title">O que fica na coluna cpf_cifrado</text>
+  <rect x="20" y="40" width="80" height="50" rx="6" class="d-violet"/>
+  <text x="60" y="70" text-anchor="middle" class="d-mono">v2:</text>
+  <rect x="100" y="40" width="150" height="50" rx="6" class="d-box"/>
+  <text x="175" y="70" text-anchor="middle" class="d-mono">nonce · 12 B</text>
+  <rect x="250" y="40" width="250" height="50" rx="6" class="d-accent"/>
+  <text x="375" y="70" text-anchor="middle" class="d-mono">texto cifrado · 11 B</text>
+  <rect x="500" y="40" width="200" height="50" rx="6" class="d-ok"/>
+  <text x="600" y="70" text-anchor="middle" class="d-mono">tag · 16 B</text>
+  <text x="60" y="112" text-anchor="middle" class="d-label">versão (no AAD)</text>
+  <text x="175" y="112" text-anchor="middle" class="d-label">aleatório e único</text>
+  <text x="375" y="112" text-anchor="middle" class="d-label">o CPF, ilegível</text>
+  <text x="600" y="112" text-anchor="middle" class="d-label">lacre: detecta adulteração</text>
+  <path d="M100 128 L700 128" class="d-line"/>
+  <text x="400" y="146" text-anchor="middle" class="d-label">nonce + cifrado + tag vão juntos em Base64</text>
+  <text x="360" y="182" text-anchor="middle" class="d-title">Envelope encryption: de onde vem a chave</text>
+  <rect x="20" y="200" width="180" height="64" rx="8" class="d-box"/>
+  <text x="110" y="226" text-anchor="middle" class="d-title">Configuração</text>
+  <text x="110" y="248" text-anchor="middle" class="d-label">DEKs v1 e v2 embrulhadas</text>
+  <rect x="270" y="200" width="180" height="64" rx="8" class="d-violet"/>
+  <text x="360" y="226" text-anchor="middle" class="d-title">KMS / HSM</text>
+  <text x="360" y="248" text-anchor="middle" class="d-label">a KEK nunca sai daqui</text>
+  <rect x="520" y="200" width="180" height="64" rx="8" class="d-accent"/>
+  <text x="610" y="226" text-anchor="middle" class="d-title">Aplicação</text>
+  <text x="610" y="248" text-anchor="middle" class="d-label">chaveiro em memória</text>
+  <path d="M200 232 L268 232" class="d-line" marker-end="url(#mk-formato-envelope)"/>
+  <text x="234" y="222" text-anchor="middle" class="d-mono">1</text>
+  <path d="M450 232 L518 232" class="d-line" marker-end="url(#mk-formato-envelope)"/>
+  <text x="484" y="222" text-anchor="middle" class="d-mono">2</text>
+  <rect x="520" y="300" width="180" height="50" rx="6" class="d-info"/>
+  <text x="610" y="330" text-anchor="middle" class="d-title">Banco</text>
+  <path d="M610 264 L610 298" class="d-line" marker-end="url(#mk-formato-envelope)"/>
+  <text x="620" y="286" class="d-mono">3</text>
+  <text x="20" y="300" class="d-text">1 desembrulhar · 2 DEK em claro · 3 cifrar campos</text>
+  <text x="20" y="326" class="d-text">Rotacionar a KEK: só re-embrulha as DEKs.</text>
+  <text x="20" y="350" class="d-text">Rotacionar a DEK: regravar os dados (v1 → v2).</text>
+</svg>
+</Figura>
+
+### Envelope encryption e rotação de chave
+
+Chamar o KMS para cifrar cada CPF funciona, mas cada operação vira uma chamada de rede com latência, custo e cota. O padrão da indústria é o **envelope encryption**:
+
+1. A **KEK** (chave mestra) mora no KMS, dentro de um HSM, e **nunca sai de lá**. Você não consegue exportá-la nem que queira.
+2. A aplicação pede ao KMS uma **DEK** nova (no AWS KMS, a operação `GenerateDataKey`). O KMS devolve a DEK em claro e a mesma DEK **embrulhada** (cifrada pela KEK).
+3. A versão embrulhada é guardada (na configuração, numa tabela de chaves); a versão em claro é usada e descartada.
+4. Na subida, a aplicação manda a DEK embrulhada ao KMS (`Decrypt`) e recebe a DEK em claro, que fica **só em memória**. Daí em diante, cifrar e decifrar campos é local e rápido.
+
+Quem rouba banco e configuração leva só DEKs embrulhadas, inúteis sem o KMS, cujo acesso é controlado por IAM, auditado e revogável.
+
+**Rotação.** Há duas rotações diferentes, e confundi-las é um erro comum em entrevista:
+
+- **Rotacionar a KEK** é barato: o KMS cria uma versão nova da chave mestra e passa a embrulhar com ela, mantendo as versões antigas para desembrulhar. Os dados não mudam; no máximo, você re-embrulha as DEKs. Os KMS de nuvem fazem isso automaticamente (por exemplo, uma vez por ano).
+- **Rotacionar a DEK** significa que os dados novos passam a ser cifrados com outra chave. Para isso funcionar sem parar o sistema, **a versão da chave precisa estar gravada junto com o dado**: é o prefixo `v2:`. A aplicação mantém um **chaveiro** com todas as versões ainda em uso; cifra sempre com a atual e decifra com a versão que o prefixo indicar. Um job regrava os dados antigos em lotes, e só quando nenhum dado (nem backup que você ainda precise ler) usa a v1, ela sai do chaveiro.
+
+Rotacione a DEK por **volume** (perto do limite de cifras), por **tempo** (política anual, por exemplo) e **imediatamente** sob suspeita de vazamento, o caso que justifica ter o mecanismo testado antes de precisar.
+
+### Blind index: buscar sem decifrar
+
+Com nonce aleatório, o mesmo CPF gera um valor diferente a cada vez: ótimo para segurança, mas `WHERE cpf_cifrado = ?` nunca encontra nada, e decifrar a tabela inteira não escala.
+
+A solução é guardar, numa segunda coluna, um **blind index**: o **HMAC-SHA256** do CPF normalizado, calculado com uma **chave própria**, diferente da DEK. O HMAC é determinístico (mesmo CPF e mesma chave, mesmo resultado), então a busca vira `WHERE cpf_indice = ?`, com índice normal do banco.
+
+Por que não SHA-256 simples? Há só 10^9 combinações de CPF (os dois últimos dígitos são verificadores): um computador comum calcula todas em minutos e reverte o índice. Com HMAC, seria preciso a chave, que está no KMS. O blind index ainda **vaza igualdade**, aceitável para CPF, mas fatal para campos de pouca variedade (tipo sanguíneo). Algumas implementações truncam o HMAC de propósito, aceitando falsos positivos que a aplicação filtra depois de decifrar.
+
+### Tokenização e mascaramento
+
+Cifra não é a única ferramenta. Duas outras aparecem muito em fintechs e em saúde:
+
+- **Tokenização** troca o dado por um **token** sem relação matemática com ele (`tok_8f3a91...`). O valor original fica num **cofre de tokens**, um serviço separado, pequeno, muito protegido e auditado. Os outros sistemas só veem o token. É o padrão para número de cartão: o PCI DSS reduz drasticamente o escopo de auditoria dos sistemas que só lidam com tokens. A diferença para a cifra é que, sem o cofre, o token não tem como ser revertido, nem com a chave.
+- **Mascaramento** esconde parte do dado para **exibição**: `***.***.***-09`, `m***@clinica.com.br`, cartão `**** **** **** 4242`. É irreversível e serve para telas de suporte, comprovantes e logs. Não é proteção de armazenamento: um campo mascarado no banco é um campo perdido.
+
+### Logs e traces sem PII
+
+Logs são o vazamento mais subestimado: retenção longa, cópia para ferramentas de terceiros e acesso de muito mais gente que o banco. Um `log.info("Cadastro: {}", paciente)` com o `toString` padrão de um `record` espalha o CPF por todos esses lugares.
+
+As defesas, da mais forte para a mais fraca:
+
+1. **Tipos que se mascaram sozinhos.** Um `record Cpf` com `toString()` que devolve `***.***.***-09`. Quem quiser os dígitos precisa pedir `cpf.digitos()` de propósito, e isso aparece na revisão de código. É a defesa que você vai implementar.
+2. **Não logar objetos de domínio inteiros nem corpos de requisição.** Logue ids e eventos: `paciente cadastrado: id=42`. O id basta para investigar; o resto está no banco, com controle de acesso.
+3. **Logs estruturados com campos controlados.** Com `logging.structured.format.console=ecs` (módulo 14), cada log vira JSON. O Spring Boot permite excluir e renomear membros (`logging.structured.json.exclude`, `logging.structured.json.rename`) e customizar o JSON com um `StructuredLoggingJsonMembersCustomizer`. Cuidado com o MDC: tudo que você coloca nele vai para todas as linhas daquela requisição.
+4. **Traces também são logs.** Atributos de spans (OpenTelemetry) com o CPF na URL (`GET /pacientes?cpf=...`) ou no `db.statement` vazam da mesma forma. CPF não vai em query string, nem em path; vai no corpo de um `POST` de busca.
+5. **Rede de segurança no texto livre.** Mensagens de exceção e campos de observação podem carregar um CPF sem que ninguém perceba. Um mascarador que procura padrões de CPF no texto pega o que escapou. É a última linha, não a primeira.
+
+### Retenção e expurgo
+
+Dado que não existe não vaza. Definir **por quanto tempo** cada categoria vive é parte do design:
+
+- **Uma tabela de retenção por categoria**, decidida com o jurídico: prontuário, 20 anos; logs técnicos, 30 a 90 dias; cadastro de quem nunca virou paciente, poucos meses.
+- **Expurgo automático**: job diário com métrica, regras de expiração no bucket e retenção na ferramenta de logs.
+- **Backups**: um backup de dois anos atrás contém pacientes que pediram eliminação. As opções são retenção curta de backups ou **crypto-shredding**: cifrar os dados de cada titular (ou de cada cliente, em sistemas multi-inquilino) com uma DEK própria e, para eliminar, **destruir a chave**. Os dados continuam no backup, mas viram ruído. É um padrão poderoso, com custo: um chaveiro por titular ou por inquilino.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.dados`, e roda no CI. São três camadas:
+
+| Camada | Classes | Papel |
+|---|---|---|
+| Criptografia | `ChaveiroDeDados`, `CifradorDeCampo`, `IndiceCego`, `ServicoDeChaves`, `KmsEmMemoria`, `FalhaAoDecifrarException` | AES-256-GCM com versão de chave, rotação, envelope com um KMS simulado e blind index |
+| Persistência | `Paciente`, `ConversorDeCpfCifrado`, `PacienteRepository`, `CadastroDePacientes`, `RotacaoDeChaves` | O CPF cifrado de forma transparente com um `AttributeConverter` do JPA, busca pelo índice e regravação em lotes |
+| Exibição | `Cpf`, `MascaradorDePii` | Tipos e funções que mantêm PII fora dos logs |
+
+Para a parte JPA, o `pom.xml` ganhou `spring-boot-starter-data-jpa`, o H2 em memória e `spring-boot-starter-data-jpa-test`, com o comentário da aula. A criptografia usa só a JCA (*Java Cryptography Architecture*) do JDK: `Cipher`, `Mac`, `KeyGenerator`, `SecureRandom`.
+
+<Callout tipo="erro" titulo="Não invente o seu algoritmo">
+Toda a criptografia desta aula usa primitivas prontas e padronizadas (AES-GCM e HMAC-SHA256 da JCA). O que você escreve é a **cola**: o formato do valor gravado, o chaveiro, a rotação. Inventar um "embaralhamento" próprio, usar AES no modo ECB ou reaproveitar o nonce são erros clássicos que ferramentas de SAST apontam e que um pentest explora. Se o seu time preferir uma biblioteca de mais alto nível, o Google Tink oferece a mesma ideia (AEAD, chaveiros com versão, integração com KMS) com menos espaço para erro.
+</Callout>
+
+## Mão na massa
+
+Os testes ficam em `java/m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/`. Para rodar um passo de cada vez, entre na pasta do módulo e filtre pela classe:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test -Dtest=CifradorDeCampoTest    # uma classe
+mvn test                               # o módulo inteiro
+```
+
+### Passo 1: o chaveiro, com versões
+
+**O que vamos fazer e por quê.** Antes de cifrar qualquer coisa, precisamos de um lugar para as chaves que já nasça preparado para a rotação. O chaveiro guarda as DEKs por número de versão e sabe qual é a atual.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/ChaveiroDeDados.java" semImports />
+
+**O que acabou de acontecer.**
+
+- O construtor recusa versão atual inexistente e chaves que não tenham 32 bytes: melhor **não subir** do que cifrar com a chave errada.
+- `versao(int)` lança `FalhaAoDecifrarException` para versão desconhecida: se alguém tirar a v1 antes da regravação terminar, o erro é alto, nunca um `null`.
+- `carregar(...)` é a porta do envelope, usada no passo 4.
+
+### Passo 2: cifrar e decifrar com AES-256-GCM
+
+**O que vamos fazer e por quê.** O coração da aula: cifrar um campo e produzir um texto que cabe numa coluna `varchar`, com tudo o que é preciso para decifrar depois.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/CifradorDeCampo.java" destacar="38-52, 54-70" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- Linhas 40–41: nonce de 12 bytes, novo, de `SecureRandom` (nunca `java.util.Random`, que é previsível).
+- Linha 43: o `Cipher` **não é thread-safe**, por isso é criado a cada chamada; criar é barato.
+- Linha 44: tag de 128 bits, o máximo; não encurte.
+- Linha 45: o AAD é `contexto|vN` (`paciente.cpf|v2`): não é gravado, mas entra na tag, e a decifra precisa do mesmo contexto.
+- Linhas 46–48: `doFinal` devolve o cifrado **com a tag no final**; o pacote `nonce | cifrado | tag` vai em Base64 com o prefixo da versão. O nonce não é segredo, só precisa ser único.
+- Linhas 55–65: o caminho inverso. A versão do prefixo escolhe a chave; se a tag não bater, a `AEADBadTagException` sobe embrulhada numa `FalhaAoDecifrarException`, com a causa preservada.
+
+Agora o primeiro teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/CifradorDeCampoTest.java" semImports />
+
+```bash
+mvn test -Dtest=CifradorDeCampoTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.CifradorDeCampoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 s
+[INFO] BUILD SUCCESS
+```
+
+**O que os testes provam.** `mesmoTextoGeraCifradosDiferentes` é a prova do nonce aleatório e, de quebra, de que a coluna cifrada **não serve para busca** (o passo 6 resolve). `tamanhoDoValorGravado` documenta a conta da coluna: 12 + 11 + 16 = 39 bytes, 52 caracteres em Base64, mais `v1:`, total 55. A entidade usa 120 de folga.
+
+### Passo 3: adulteração detectada
+
+**O que vamos fazer e por quê.** Sem autenticação (AES-CBC sem MAC, por exemplo), um bit trocado vira lixo silencioso ou uma alteração controlada pelo atacante. Com GCM, qualquer mudança é detectada.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/AdulteracaoTest.java" semImports />
+
+```bash
+mvn test -Dtest=AdulteracaoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.AdulteracaoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.179 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `umBitTrocadoNoCifradoEDetectado` troca **um único bit** do texto cifrado. A causa é `javax.crypto.AEADBadTagException` com a mensagem `Tag mismatch`, exatamente como o JDK 25 a produz.
+- `valorCopiadoParaOutroCampoNaoAbre` mostra o AAD: o valor é válido para `paciente.cpf`, mas copiado para `medico.cpf` a tag não confere. Sem AAD, a cópia funcionaria.
+- `versaoDeChaveDesconhecidaFalhaAlto` troca o prefixo para `v7`. Trocar para uma versão que **existe** também falharia, porque a versão está no AAD.
+
+### Passo 4: envelope com KMS
+
+**O que vamos fazer e por quê.** Até aqui as chaves foram criadas no próprio teste. Em produção, elas vêm embrulhadas e só o KMS abre. A interface `ServicoDeChaves` é o que a aplicação precisa de um KMS, e `KmsEmMemoria` é uma implementação de mentira para testes:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/ServicoDeChaves.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/KmsEmMemoria.java" destacar="29-44" />
+
+O `KmsEmMemoria` embrulha a DEK com a própria KEK usando AES-GCM; num KMS real, a KEK estaria num HSM e cada operação seria uma chamada autenticada por IAM. O teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/EnvelopeDeChavesTest.java" semImports />
+
+```bash
+mvn test -Dtest=EnvelopeDeChavesTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.EnvelopeDeChavesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** A DEK embrulhada tem 60 bytes (nonce, chave cifrada e tag), e é **só isso** que vai para a configuração. O segundo teste é o argumento do envelope: outro KMS, como o de um atacante com seu backup e sua configuração, não abre a chave.
+
+<Callout tipo="info" titulo="E num KMS de verdade?">
+Uma implementação real de `ServicoDeChaves` para o AWS KMS chamaria `GenerateDataKey` em `gerarChaveDeDados()` e `Decrypt` em `desembrulhar(...)`, com o SDK oficial do provedor. No Google Cloud KMS e no Vault Transit, os nomes mudam, mas o desenho é o mesmo. Por trás de uma interface sua, trocar de provedor ou testar sem nuvem fica simples, como você viu com o `GatewayDePagamento` na aula de Mockito.
+</Callout>
+
+### Passo 5: rotação de chave
+
+**O que vamos fazer e por quê.** Simular a rotação: dados gravados "no ano passado" com a v1, depois a v2 entra como atual. Precisamos ler o antigo, gravar o novo com a v2 e saber o que ainda falta regravar.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/RotacaoDeChaveTest.java" semImports />
+
+```bash
+mvn test -Dtest=RotacaoDeChaveTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.RotacaoDeChaveTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.034 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Com as duas versões no chaveiro, o valor `v1:` é lido, `precisaRecifrar` o aponta como desatualizado e `recifrar` abre com a v1 e fecha com a v2. A aplicação lê os dois formatos desde o primeiro minuto: rotação **sem janela de manutenção**. O passo 7 faz o mesmo no banco, em lotes.
+
+### Passo 6: blind index para buscar o CPF
+
+**O que vamos fazer e por quê.** Calcular um índice determinístico do CPF, com uma chave separada, para buscar sem decifrar. Primeiro o tipo `Cpf`, que normaliza a entrada (só os 11 dígitos) e se mascara sozinho:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/Cpf.java" semImports />
+
+E o índice:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/IndiceCego.java" semImports />
+
+A **normalização** acontece antes do HMAC (no construtor do `Cpf`); sem ela, `123.456.789-09` e `12345678909` gerariam índices diferentes. E o **contexto** entra no HMAC: o mesmo CPF em `paciente.cpf` e `medico.cpf` gera índices diferentes, e as tabelas não se cruzam.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/IndiceCegoTest.java" semImports />
+
+```bash
+mvn test -Dtest=IndiceCegoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.IndiceCegoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s
+[INFO] BUILD SUCCESS
+```
+
+`semAChaveNaoSeReproduzOIndice` é a diferença para um hash comum: sem a chave, ninguém monta a tabela "índice → CPF".
+
+### Passo 7: o conversor JPA, a busca e a rotação no banco
+
+**O que vamos fazer e por quê.** Juntar tudo numa entidade real. A regra é que o resto do código trabalhe com `Cpf` normalmente, e a cifra aconteça na fronteira com o banco. O JPA tem o lugar certo para isso: o `AttributeConverter`.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/ConversorDeCpfCifrado.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/Paciente.java" destacar="16, 26-28, 30-31" />
+
+A entidade tem **duas colunas**: `cpf_cifrado`, com o `@Convert`, para ler de volta, e `cpf_indice`, com índice único, para buscar e barrar duplicados. O conversor recebe o `CifradorDeCampo` pelo construtor porque o Spring Boot faz o Hibernate pedir conversores ao contêiner do Spring.
+
+O serviço calcula o índice e o repositório busca por ele:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/CadastroDePacientes.java" semImports />
+
+E a rotação no banco, em lotes, direto na coluna:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/RotacaoDeChaves.java" destacar="30-38, 40-47" />
+
+Por que JDBC? O *dirty checking* do Hibernate compara o valor **decifrado**: recarregar e salvar o paciente não gera `UPDATE`. A rotação muda a representação, não o dado, e na coluna é muito mais rápida. O `AND cpf_cifrado = :antigo` é uma trava otimista: se a aplicação regravou a linha no meio do lote, o valor velho não a sobrescreve.
+
+Os beans de chave dos testes vêm de uma configuração própria:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/ChavesDeTeste.java" semImports />
+
+E o teste de integração com o H2:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/PacienteCifradoJpaTest.java" semImports />
+
+```bash
+mvn test -Dtest=PacienteCifradoJpaTest
+```
+
+Saída esperada (resumida; o `@DataJpaTest` mostra o SQL gerado pelo Hibernate):
+
+```text
+Hibernate: create table paciente (id bigint not null, cpf_indice varchar(64) not null, cpf_cifrado varchar(120) not null, nome varchar(120) not null, primary key (id), constraint ux_paciente_cpf_indice unique (cpf_indice))
+Hibernate: select p1_0.id,p1_0.cpf_cifrado,p1_0.cpf_indice,p1_0.nome from paciente p1_0 where p1_0.cpf_indice=?
+Hibernate: insert into paciente (cpf_cifrado,cpf_indice,nome,id) values (?,?,?,?)
+...
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 12.07 s
+[INFO] BUILD SUCCESS
+```
+
+**O que os testes provam.**
+
+- `noBancoSoFicamOCifradoEOIndice` lê a coluna com SQL puro, como quem tem um dump: só `v2:...`. Pelo repositório, o `Cpf` volta inteiro.
+- `buscaPeloBlindIndex` cadastra com pontuação e busca sem: `where p1_0.cpf_indice=?`, sem decifrar nada.
+- `cpfRepetidoERecusadoSemExporONumero`: a mensagem de erro já sai mascarada, graças ao `toString` do `Cpf`.
+- `rotacaoRegravaEmLotesOQueFoiCifradoComAChaveAntiga` regrava três linhas `v1:` em lotes de 2 (2, 1, 0), e todas continuam legíveis e buscáveis.
+
+### Passo 8: logs sem PII
+
+**O que vamos fazer e por quê.** Garantir que o CPF não chega ao log nem quando alguém loga o objeto inteiro, e ter uma rede de segurança para texto livre.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/dados/MascaradorDePii.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/dados/MascaradorDePiiTest.java" semImports />
+
+```bash
+mvn test -Dtest=MascaradorDePiiTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.dados.MascaradorDePiiTest
+10:12:41.470 [main] INFO dev.trilhajava.m11.aulas.dados.CadastroDePacientes -- paciente cadastrado: id=42 cpf=***.***.***-09
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.077 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** O último teste prende um `ListAppender` do Logback e confere a **mensagem formatada**, o texto que iria para a ferramenta de observabilidade: o SLF4J chamou o `toString()` e o `Cpf` respondeu mascarado. Na rede de segurança, o pedido `202612345678` (12 dígitos) **não** foi mascarado: uma rede que estraga dados legítimos acaba desligada pelo time.
+
+### Passo 9: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.AdulteracaoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.CifradorDeCampoTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.EnvelopeDeChavesTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.IndiceCegoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.MascaradorDePiiTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.PacienteCifradoJpaTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.dados.RotacaoDeChaveTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Vinte e dois testes, nenhuma biblioteca de criptografia de terceiros, nenhuma nuvem. (Se outras aulas do módulo tiverem acrescentado testes ao mesmo projeto, o total será maior; os sete arquivos acima são os desta aula.)
+
+## Quando dá errado
+
+As mensagens abaixo são reais, geradas com o JDK 25 e o H2 do projeto, provocando cada erro de propósito.
+
+### Tag mismatch: a chave ou o dado não são os esperados
+
+Para gerar esta, a coluna foi gravada com uma DEK diferente da que está no chaveiro (o mesmo efeito de restaurar um backup com a configuração de outro ambiente), e o paciente foi lido pelo repositório:
+
+```text
+org.springframework.orm.jpa.JpaSystemException: Error attempting to apply AttributeConverter
+Caused by: jakarta.persistence.PersistenceException: Error attempting to apply AttributeConverter
+Caused by: dev.trilhajava.m11.aulas.dados.FalhaAoDecifrarException: não foi possível decifrar paciente.cpf
+Caused by: javax.crypto.AEADBadTagException: Tag mismatch
+```
+
+**Como ler:** de baixo para cima. `Tag mismatch` significa dado adulterado, chave errada, AAD diferente ou dado truncado; o GCM **não distingue** de propósito. **Como corrigir:** confira primeiro o chaveiro do ambiente (homologação lendo dados de produção é o caso mais comum). Se ele está certo, trate como possível adulteração, um incidente. Nunca capture a exceção para devolver vazio: isso esconde o que o GCM existe para revelar.
+
+### Cannot reuse iv for GCM encryption
+
+Tentando reaproveitar um objeto `Cipher` e o mesmo nonce para cifrar um segundo valor:
+
+```text
+java.lang.IllegalStateException: Must use either different key or  iv for GCM encryption
+java.security.InvalidAlgorithmParameterException: Cannot reuse iv for GCM encryption
+```
+
+A primeira vem de chamar `doFinal` de novo sem reinicializar; a segunda, de `init` com o mesmo nonce (o espaço duplo está na mensagem original). **Como ler:** o JDK só detecta o reuso **no mesmo objeto**; outro `Cipher` com nonce fixo passaria sem aviso. **Como corrigir:** nonce novo de `SecureRandom` e `Cipher` novo por operação.
+
+### Invalid AES key length
+
+```text
+java.security.InvalidKeyException: Invalid AES key length: 20 bytes
+```
+
+**Como ler:** alguém usou um texto como chave. **Como corrigir:** chaves vêm de `KeyGenerator` ou do KMS. O `ChaveiroDeDados` recusa na subida o que não tiver 32 bytes (`a chave v1 não tem 256 bits`).
+
+### Value too long for column
+
+Uma coluna `varchar(40)`, dimensionada para "um CPF com folga", recebendo o valor cifrado:
+
+```text
+org.springframework.dao.DataIntegrityViolationException: PreparedStatementCallback; SQL [insert into t_curta values (?)]; Value too long for column "C CHARACTER VARYING(40)": "'v1:+CQxPs7M7rGH7yVdSFHCE5+HtBuWjJzU5o/yrEiEPPr2pe99S10w' (55)"
+```
+
+**Como ler:** 55 caracteres numa coluna de 40. Repare que a mensagem do banco **mostra o valor**: se fosse o CPF em claro, iria para o log. **Como corrigir:** dimensione pela conta do passo 2, com folga. Para migrar uma coluna existente: criar a nova, preencher em lotes, mudar a leitura, remover a antiga.
+
+### Formato desconhecido: falta o prefixo de versão
+
+```text
+dev.trilhajava.m11.aulas.dados.FalhaAoDecifrarException: formato desconhecido: falta o prefixo de versão
+```
+
+**Como ler:** um CPF em claro sobrou da migração ou foi inserido à mão. **Como corrigir:** confira na migração que nenhuma linha ficou sem prefixo (`WHERE cpf_cifrado NOT LIKE 'v%'`). Não faça o conversor "aceitar texto claro por compatibilidade".
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Cifra caseira e chave no código" depois="AEAD, chave no KMS e versão no dado">
+```java
+// chave fixa, ECB implícito, sem versão, sem tag
+private static final byte[] CHAVE =
+        "clinica-2024-key".getBytes();
+
+String cifrar(String cpf) throws Exception {
+    Cipher c = Cipher.getInstance("AES");
+    c.init(Cipher.ENCRYPT_MODE,
+            new SecretKeySpec(CHAVE, "AES"));
+    return Base64.getEncoder()
+            .encodeToString(c.doFinal(cpf.getBytes()));
+}
+```
+
+```java
+// chaveiro carregado do KMS, GCM com nonce
+// novo, AAD com o contexto e versão no valor
+ChaveiroDeDados chaveiro = ChaveiroDeDados
+        .carregar(kms, dekEmbrulhadas, 2);
+CifradorDeCampo cifrador =
+        new CifradorDeCampo(chaveiro);
+
+String coluna = cifrador
+        .cifrar(cpf.digitos(), "paciente.cpf");
+// "v2:Xq9..." — muda a cada chamada
+```
+</Comparar>
+
+À esquerda, `Cipher.getInstance("AES")` usa, no provedor padrão do JDK, o modo **ECB**: o mesmo bloco claro gera sempre o mesmo bloco cifrado, e não há autenticação. A chave está **no código** (e em todo artefato), tem pouca entropia e não há **versão**, então rotacionar exige parar tudo.
+
+As armadilhas que aparecem em revisão de código:
+
+- **Cifrar sem modelar.** Cifrar o nome do paciente e deixar o nome do exame em claro na mesma tabela, ou cifrar o banco e logar o corpo da requisição.
+- **Nonce fixo ou derivado do dado** "para poder buscar": é reuso de nonce. Para buscar, use blind index.
+- **A mesma chave para cifra e para índice.** São duas chaves, ambas no KMS.
+- **Blind index em campo de baixa cardinalidade** (tipo sanguíneo): revela a distribuição inteira.
+- **Esquecer os outros armazenamentos**: cache, índice de busca, eventos, exportações para BI.
+- **Remover a versão antiga do chaveiro cedo demais**, com backups que ainda dependem dela.
+
+**Quando NÃO usar cifra de campo na aplicação:** para dados internos ou públicos (cifra de disco basta); quando o banco precisa operar sobre o valor (ordenação, faixa, `LIKE`), caso em que vale rediscutir o requisito ou registrar a decisão de aceitar a proteção de disco; quando outros sistemas leem a tabela direto (a chave se espalharia: exponha uma API ou uma visão mascarada); e para senhas, que não se cifram, se guardam com hash lento, como na aula [Autenticação e senhas](../../11-seguranca/01-autenticacao-e-senhas/).
+
+## Resposta a incidente de vazamento
+
+Mesmo com tudo isso, incidentes acontecem. A diferença entre um incidente controlado e uma crise é ter o roteiro **antes**, combinado com segurança, jurídico e comunicação:
+
+1. **Detectar e acionar**: alertas (bucket público, exfiltração incomum), relatos externos via `security.txt` e um plantão definido. O prazo da ANPD conta de quando a empresa **toma conhecimento**.
+2. **Conter** antes de investigar: fechar o bucket, revogar credenciais e tokens, desligar a funcionalidade.
+3. **Preservar evidências**: copiar logs antes que a retenção os apague, snapshots, linha do tempo. Sem log de auditoria (A9), não há como saber o que saiu.
+4. **Avaliar o impacto**: quais dados, de quantos titulares e **se estavam cifrados com a chave fora do alcance** de quem os levou. É aqui que a Parte 3 muda o desfecho.
+5. **Comunicar** à ANPD e aos titulares, quando houver risco relevante, em três dias úteis. O encarregado conduz; o time técnico fornece os fatos.
+6. **Erradicar e recuperar**: corrigir a causa e **rotacionar as chaves possivelmente expostas**, onde o mecanismo de versão se paga.
+7. **Aprender**: análise sem culpados, ações em issues e revisão do modelo de ameaças. Que armazenamento não estava no DFD?
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Institucionalizar a modelagem.** Uma sessão de uma hora com cinco pessoas custa cinco horas; uma falha de design achada em produção custa semanas, e uma achada por um atacante pode custar o negócio. O argumento para o time é o **custo de correção por fase**, não "segurança é importante". Quem tem senioridade transforma isso em processo: modelo de documento no repositório, um campo "modelo de ameaças" no template de *design doc* e a regra de que funcionalidades com dado sensível, dinheiro ou autenticação não começam sem ele. Na terceira sessão, outra pessoa conduz.
+
+**Quando a cifra de campo vale o custo.** Ela tira do banco a busca parcial, a ordenação e o relatório direto; complica migrações; impede o suporte de "olhar no banco"; e faz do KMS uma dependência da subida. A decisão que se defende bem: **cifra na aplicação para campos sensíveis e identificadores fortes** (CPF, resultado de exame), **cifra de disco para tudo**, e controle de acesso e auditoria para o resto. Registre em ADR, com a classificação de dados como argumento.
+
+**Desempenho.** AES-GCM usa instruções dedicadas da CPU (AES-NI); para campos curtos, o custo fica em microssegundos, dominado pela criação do `Cipher` e pelo Base64. O gargalo seria o KMS a cada operação, e é por isso que o envelope não é detalhe. Em listas grandes, decifre só o que a tela mostra (projeções).
+
+**Operação das chaves.** Quem pode chamar `Decrypt` no KMS é decisão de IAM tão importante quanto a cifra: produção sim, laptop não, homologação com **outra** KEK. Os logs de auditoria do KMS são ótima fonte de detecção. Rotação de KEK automática; rotação de DEK com job testado, métrica de "linhas por versão de chave" e alerta se uma versão antiga ainda tem dados depois do prazo. Se o KMS estiver fora na subida, a aplicação não sobe: melhor isso do que subir sem ler dados. Nunca grave a DEK em claro em disco "para acelerar".
+
+**Multi-inquilino.** Uma DEK por cliente permite *crypto-shredding* quando ele sai, limita o impacto de uma chave vazada e viabiliza que clientes grandes tragam a própria chave (*BYOK*), exigência comum de bancos e hospitais. O preço é gerenciar milhares de DEKs.
+
+**Quando trocar de abordagem.** Se muitos sistemas precisam do mesmo dado sensível, cifra em cada um espalha chaves: um **serviço de tokenização** centralizado fica melhor. Se o requisito é buscar por prefixo ou faixa sobre dado cifrado, as técnicas existentes vazam muito mais: a resposta sênior quase sempre é rediscutir o requisito.
+
+**Como justificar.** Três frases: "cifra de disco protege contra roubo de hardware, não contra quem acessa o banco"; "vazamento de dado de saúde em claro exige comunicar todos os titulares, e a cifra com chave fora do alcance muda essa avaliação"; "o custo é uma a duas semanas de engenharia e microssegundos por leitura".
+
+<Callout tipo="entrevista">
+Perguntas frequentes para Pleno e Sênior, e o que a boa resposta contém:
+
+- **"Como você modelaria as ameaças de uma funcionalidade nova?"** As quatro perguntas; DFD com fronteiras e com logs, backups e filas; STRIDE por elemento; P × I; mitigações verificáveis em issues e decisões em ADR.
+- **"O banco já é cifrado. Por que cifrar o CPF na aplicação?"** Cifra de disco não protege contra dump, backup, DBA ou SQL injection; a de campo, com chave no KMS, protege. Citar o custo (sem busca parcial nem ordenação).
+- **"Como buscar por um campo cifrado?"** Blind index com HMAC, chave separada e valor normalizado; por que não SHA-256 puro; o vazamento de igualdade.
+- **"Como rotacionar uma chave sem parar o sistema?"** Versão no dado, chaveiro com versões antigas para leitura, regravação em lotes; diferença entre rotacionar KEK e DEK.
+- **"O que é o nonce do GCM?"** Único por cifra com a mesma chave; repetir revela o XOR dos textos e permite forjar tags; limite de 2^32 cifras com nonce aleatório.
+- **"Houve um vazamento. E agora?"** Conter, preservar evidências, avaliar impacto (o dado estava cifrado?), encarregado e jurídico comunicam em três dias úteis, rotacionar chaves, análise sem culpados.
+</Callout>
+
+## Checkpoint
+
+A clínica vai permitir que o paciente **compartilhe um laudo com um médico de fora da rede**: ele informa o e-mail do médico, o sistema envia um link, e o médico abre o PDF no navegador, sem conta na clínica.
+
+**O desafio**, em no máximo 20 minutos: esboce o DFD; liste pelo menos cinco ameaças com a letra STRIDE, o elemento e uma mitigação **verificável**; dê nota P × I e escolha as duas primeiras; e diga quais dados são sensíveis pela LGPD.
+
+<details>
+<summary>Ver uma solução possível</summary>
+
+**DFD.** Entidades externas: paciente, médico externo, provedor de e-mail. Processo: serviço de compartilhamento. Armazenamentos: tabela `compartilhamento`, bucket do PDF, logs e **a caixa de e-mail do médico**, fora do seu controle, onde o link fica para sempre.
+
+| # | Elemento | STRIDE | Ameaça | Mitigação verificável | P × I |
+|---|---|---|---|---|---|
+| C1 | Link no e-mail | I | E-mail encaminhado ou invadido; terceiro abre o laudo | Link expira em 72 h; no máximo 5 aberturas; código de 6 dígitos que o paciente repassa ao médico | **9** |
+| C2 | Médico externo | S | Quem tem o link se passa pelo médico | O código fora de banda; IP e navegador de cada abertura registrados | **9** |
+| C3 | Serviço | E | Paciente compartilha laudo de outra pessoa trocando o id | Autorização por dono na criação; teste da matriz | 6 |
+| C4 | Logs | I | URL com o token no log de acesso do balanceador | Token trocado por cookie na primeira abertura; revisão dos logs de acesso | 6 |
+| C5 | Serviço | R | Paciente nega ter compartilhado | Auditoria de criação, abertura e revogação | 4 |
+| C6 | API pública | D | Força bruta no código de 6 dígitos | 5 tentativas por link, depois bloqueio | 4 |
+
+**Primeiro, C1 e C2**: mudam o desenho (link sozinho não basta) e viram ADR, porque afetam o produto. O token tem 128 bits de `SecureRandom` e fica no banco só como hash, como uma senha de uso único; o botão "revogar" fecha o ciclo.
+
+**Dados sensíveis:** o laudo (saúde, art. 5º, II) e o próprio fato de o paciente ter compartilhado um laudo com aquele médico. O e-mail do médico é dado pessoal dele e é candidato a cifra de campo.
+
+</details>
+
+<Quiz
+  id="11-ameacas-e-dados"
+  questoes={[
+    {
+      pergunta: 'Na técnica STRIDE por elemento, quais categorias se aplicam tipicamente a um FLUXO de dados (uma seta do DFD)?',
+      opcoes: ['Spoofing e Repudiation', 'Tampering, Information disclosure e Denial of service', 'Todas as seis', 'Só Elevation of privilege'],
+      correta: 1,
+      explicacao: 'Um fluxo pode ser alterado (T), lido (I) ou interrompido (D) no caminho. Spoofing e Repudiation se aplicam a quem age (entidades externas e processos), e elevação de privilégio, a processos.',
+    },
+    {
+      pergunta: 'O disco do banco já é cifrado pelo provedor de nuvem. Contra qual cenário a cifra de campo na aplicação protege, e a de disco não?',
+      opcoes: ['Roubo do disco físico do datacenter', 'Um dump do banco gerado por quem tem credencial de leitura e deixado num bucket público', 'Interceptação do tráfego entre o app e a API', 'Ataque de negação de serviço'],
+      correta: 1,
+      explicacao: 'A cifra de disco é transparente para quem acessa o banco: o dump sai em claro. Com cifra de campo e a DEK no KMS, o dump contém só valores `v2:...` ilegíveis.',
+    },
+    {
+      pergunta: 'Um teste troca um bit do valor cifrado com AES-GCM e chama decifrar. O que acontece?',
+      opcoes: ['Devolve um CPF com um dígito diferente', 'Devolve o CPF correto, porque o GCM corrige erros', 'Lança AEADBadTagException (Tag mismatch) e não devolve nenhum texto claro', 'Lança InvalidKeyException'],
+      correta: 2,
+      explicacao: 'O GCM é uma cifra autenticada: a tag é recalculada na decifra e, se não bater, `doFinal` lança `AEADBadTagException` sem liberar o texto. É o que o `AdulteracaoTest` prova.',
+    },
+    {
+      pergunta: 'Por que o blind index do CPF usa HMAC com uma chave própria em vez de SHA-256 puro?',
+      opcoes: ['Porque o SHA-256 é lento demais para busca', 'Porque há poucos CPFs possíveis: sem chave, um atacante calcula o hash de todos e reverte o índice', 'Porque o SHA-256 gera valores diferentes a cada chamada', 'Porque o banco não indexa colunas de 64 caracteres'],
+      correta: 1,
+      explicacao: 'Cerca de um bilhão de combinações é pouco para um computador: o SHA-256 de todas sai em minutos. Com HMAC, sem a chave, que fica no KMS, não há como montar essa tabela.',
+    },
+    {
+      pergunta: 'A empresa decidiu rotacionar a chave de dados (DEK) que cifra os CPFs. Qual sequência funciona sem parar o sistema?',
+      opcoes: ['Trocar a chave na configuração e reiniciar todas as instâncias ao mesmo tempo', 'Pedir ao KMS para rotacionar a chave mestra; os dados se ajustam sozinhos', 'Acrescentar a v2 ao chaveiro como atual mantendo a v1 para leitura, regravar em lotes os valores com prefixo v1 e só então remover a v1', 'Decifrar a tabela inteira numa migração e cifrar de novo numa única transação'],
+      correta: 2,
+      explicacao: 'Com a versão no dado, a aplicação lê os dois formatos desde o primeiro minuto e regrava em segundo plano. Rotacionar a KEK não regrava dados; trocar a chave de uma vez deixa os dados antigos ilegíveis.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Modelagem de ameaças** responde quatro perguntas: no que trabalhamos (DFD), o que pode dar errado (STRIDE), o que faremos (mitigações priorizadas por P × I) e se fizemos um bom trabalho.
+- O **DFD** marca fronteiras de confiança e inclui logs, backups e filas. **STRIDE por elemento** gera perguntas concretas; mitigações verificáveis viram issues, decisões viram ADR; uma hora com o time que constrói basta.
+- **Ciclo seguro**: requisitos (ASVS), modelagem, revisão, SAST, SCA, segredos, DAST, pentest, VDP ou bug bounty.
+- **Classifique** os dados. Dado de saúde é **sensível** na LGPD; hash e cifra são pseudonimização; minimização, retenção e eliminação são requisitos de design.
+- **TLS** em tudo, **mTLS** entre sistemas; cifra de disco sempre e **cifra de campo** para o que é sensível.
+- **AES-256-GCM**: nonce novo, AAD com contexto e versão, tag que detecta adulteração. **Envelope** com KMS e **versão no dado** para rotacionar sem parar.
+- **Blind index** com HMAC busca campo cifrado; **tipos que se mascaram** mantêm PII fora dos logs.
+- **Incidente**: conter, preservar, avaliar, comunicar em três dias úteis, rotacionar chaves e revisar o modelo.
+
+## Próximo passo
+
+Com isto, o módulo de segurança está completo: você sabe autenticar, autorizar, defender a API e, agora, pensar nas ameaças antes do código e proteger o dado em si. O módulo 12 muda de assunto, mas não de mentalidade: em [Por que mensageria](../../12-mensageria/01-por-que-mensageria/), você vai ver como sistemas se comunicam por eventos e filas. Repare que a fila do DFD desta aula, com as ameaças A10 e A12, vai voltar: mensagens também carregam dados pessoais, também precisam de autenticação entre produtor e consumidor, e também precisam de retenção definida.
+
+## Referências
+
+- [Threat Modeling Manifesto](https://www.threatmodelingmanifesto.org/)
+- [OWASP Threat Modeling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html)
+- [Microsoft: Threat Modeling Tool, categorias STRIDE](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats)
+- [OWASP Application Security Verification Standard (ASVS)](https://owasp.org/www-project-application-security-verification-standard/)
+- [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
+- [OWASP Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [NIST SP 800-38D: Galois/Counter Mode (GCM)](https://csrc.nist.gov/pubs/sp/800/38/d/final)
+- [Java SE 25: javax.crypto.Cipher](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/javax/crypto/Cipher.html)
+- [Java SE 25: Java Security Standard Algorithm Names](https://docs.oracle.com/en/java/javase/25/docs/specs/security/standard-names.html)
+- [Jakarta Persistence: AttributeConverter](https://jakarta.ee/specifications/persistence/3.2/apidocs/jakarta.persistence/jakarta/persistence/attributeconverter)
+- [Spring Boot: SSL (SSL bundles)](https://docs.spring.io/spring-boot/reference/features/ssl.html)
+- [Spring Boot: Logging (logs estruturados)](https://docs.spring.io/spring-boot/reference/features/logging.html)
+- [AWS KMS: conceitos de criptografia (envelope encryption)](https://docs.aws.amazon.com/kms/latest/developerguide/kms-cryptography.html)
+- [Google Cloud KMS: envelope encryption](https://cloud.google.com/kms/docs/envelope-encryption)
+- [Lei 13.709/2018 (LGPD)](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm)
+- [ANPD: comunicação de incidente de segurança](https://www.gov.br/anpd/pt-br/canais_atendimento/agente-de-tratamento/comunicado-de-incidente-de-seguranca-cis)
+- [RFC 9116: security.txt](https://www.rfc-editor.org/rfc/rfc9116)

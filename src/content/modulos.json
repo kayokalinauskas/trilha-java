@@ -1,0 +1,499 @@
+[
+  {
+    "id": "00-comece-aqui",
+    "numero": 0,
+    "titulo": "Comece aqui",
+    "resumo": "Como estudar com esta trilha, preparar o ambiente (JDK 25, IntelliJ, Maven, Git) e rodar seu primeiro programa e seu primeiro teste.",
+    "nivel": "base",
+    "status": "disponivel",
+    "horas": 4,
+    "requisitos": [],
+    "objetivos": [
+      "Entender o mapa da trilha e o método de estudo ativo (fazer antes de ver a solução)",
+      "Instalar e verificar JDK 25, Maven, Git e IntelliJ IDEA",
+      "Executar um programa Java pelo terminal e pela IDE",
+      "Rodar os testes de um exercício da trilha e ler o resultado"
+    ],
+    "topicos": [
+      "Método de estudo",
+      "JDK, JRE e JVM",
+      "SDKMAN / winget",
+      "IntelliJ IDEA",
+      "Terminal essencial",
+      "Git essencial",
+      "Primeiro teste com Maven"
+    ]
+  },
+  {
+    "id": "01-java-essencial",
+    "numero": 1,
+    "titulo": "Java essencial",
+    "resumo": "A ponte entre 'sei programar o básico' e 'escrevo Java de verdade': tipos, controle de fluxo, métodos, arrays, Strings e depuração.",
+    "nivel": "base",
+    "status": "disponivel",
+    "horas": 10,
+    "requisitos": [
+      "00-comece-aqui"
+    ],
+    "objetivos": [
+      "Escolher o tipo certo (int, long, double, BigDecimal, boolean, char, String)",
+      "Escrever métodos pequenos, com nomes claros e sem efeitos colaterais escondidos",
+      "Manipular arrays e Strings com segurança, entendendo imutabilidade",
+      "Depurar um programa com breakpoints em vez de adivinhar"
+    ],
+    "topicos": [
+      "Tipos primitivos e wrappers",
+      "Operadores e precedência",
+      "if / switch / laços",
+      "Métodos e escopo",
+      "Arrays",
+      "String e StringBuilder",
+      "var",
+      "Depuração"
+    ]
+  },
+  {
+    "id": "02-poo",
+    "numero": 2,
+    "titulo": "POO na prática",
+    "resumo": "Modelar o mundo em objetos que protegem suas regras: encapsulamento, composição, interfaces, polimorfismo, records e sealed types.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 12,
+    "requisitos": [
+      "01-java-essencial"
+    ],
+    "objetivos": [
+      "Criar classes que garantem suas invariantes desde o construtor",
+      "Decidir entre herança, composição e interfaces com argumentos",
+      "Usar polimorfismo para eliminar cadeias de if/instanceof",
+      "Modelar dados imutáveis com record e hierarquias fechadas com sealed"
+    ],
+    "topicos": [
+      "Classes e objetos",
+      "Encapsulamento e invariantes",
+      "Herança vs composição",
+      "Interfaces e classes abstratas",
+      "Polimorfismo",
+      "record",
+      "sealed interfaces",
+      "Construtores flexíveis (Java 25)"
+    ]
+  },
+  {
+    "id": "03-colecoes-generics-excecoes",
+    "numero": 3,
+    "titulo": "Coleções, Generics e Exceções",
+    "resumo": "As estruturas que você usa todo dia no backend: List, Set, Map e seus custos, equals/hashCode, generics seguros e tratamento de erros profissional.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 12,
+    "requisitos": [
+      "02-poo"
+    ],
+    "objetivos": [
+      "Escolher a coleção certa sabendo o custo (Big-O) de cada operação",
+      "Implementar equals/hashCode corretamente e explicar por que importa",
+      "Escrever APIs genéricas com bounded types e wildcards (PECS)",
+      "Projetar uma hierarquia de exceções de negócio e usar try-with-resources"
+    ],
+    "topicos": [
+      "List / Set / Map / Deque",
+      "Big-O das coleções",
+      "equals e hashCode",
+      "Comparable e Comparator",
+      "Sequenced Collections",
+      "Generics e PECS",
+      "Checked vs unchecked",
+      "try-with-resources"
+    ]
+  },
+  {
+    "id": "04-java-moderno",
+    "numero": 4,
+    "titulo": "Java moderno e funcional",
+    "resumo": "Lambdas, Streams, Collectors, Stream Gatherers, Optional bem usado e pattern matching com records e switch.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 10,
+    "requisitos": [
+      "03-colecoes-generics-excecoes"
+    ],
+    "objetivos": [
+      "Transformar laços imperativos em pipelines de Stream legíveis",
+      "Agrupar e agregar dados com Collectors",
+      "Usar Optional como tipo de retorno sem anti-patterns",
+      "Modelar regras com switch + record patterns"
+    ],
+    "topicos": [
+      "Lambdas e method references",
+      "Interfaces funcionais",
+      "Streams e Collectors",
+      "Stream Gatherers",
+      "Optional",
+      "Pattern matching",
+      "Imutabilidade"
+    ]
+  },
+  {
+    "id": "05-algoritmos",
+    "numero": 5,
+    "titulo": "Algoritmos para entrevistas",
+    "resumo": "Os padrões de problemas que mais aparecem em entrevistas no Brasil e fora: Big-O, two pointers, sliding window, hashing, recursão, BFS/DFS.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 16,
+    "requisitos": [
+      "04-java-moderno"
+    ],
+    "objetivos": [
+      "Estimar complexidade de tempo e espaço de uma solução",
+      "Reconhecer o padrão de um problema a partir do enunciado",
+      "Comunicar o raciocínio em voz alta durante o live coding"
+    ],
+    "topicos": [
+      "Big-O",
+      "Two pointers",
+      "Sliding window",
+      "Hashing",
+      "Recursão e backtracking",
+      "Ordenação e busca binária",
+      "Pilhas e filas",
+      "BFS / DFS"
+    ]
+  },
+  {
+    "id": "06-concorrencia",
+    "numero": 6,
+    "titulo": "Concorrência",
+    "resumo": "Threads, ExecutorService, CompletableFuture, virtual threads, structured concurrency e como evitar race conditions.",
+    "nivel": "pleno",
+    "status": "disponivel",
+    "horas": 12,
+    "requisitos": [
+      "04-java-moderno"
+    ],
+    "objetivos": [
+      "Explicar a diferença entre threads de plataforma e virtual threads",
+      "Identificar e corrigir race conditions e deadlocks",
+      "Compor chamadas paralelas com CompletableFuture e structured concurrency"
+    ],
+    "topicos": [
+      "Threads e memória compartilhada",
+      "synchronized, locks, atomics",
+      "ExecutorService",
+      "CompletableFuture",
+      "Virtual threads",
+      "Structured concurrency",
+      "Scoped values"
+    ]
+  },
+  {
+    "id": "07-sql",
+    "numero": 7,
+    "titulo": "Bancos relacionais e SQL",
+    "resumo": "Modelagem, normalização, PostgreSQL na prática, JOINs, índices com EXPLAIN e transações com níveis de isolamento.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 12,
+    "requisitos": [
+      "03-colecoes-generics-excecoes"
+    ],
+    "objetivos": [
+      "Modelar um domínio em tabelas normalizadas com chaves e constraints",
+      "Escrever consultas com JOIN, GROUP BY e subconsultas",
+      "Ler um plano de execução e criar o índice certo"
+    ],
+    "topicos": [
+      "Modelagem e normalização",
+      "DDL e constraints",
+      "JOINs",
+      "Agregações",
+      "Índices e EXPLAIN",
+      "Transações e isolamento",
+      "PostgreSQL com Docker"
+    ]
+  },
+  {
+    "id": "08-spring-boot",
+    "numero": 8,
+    "titulo": "HTTP, REST e Spring Boot 4",
+    "resumo": "HTTP de verdade, APIs REST bem desenhadas e Spring Boot 4: IoC/DI, MVC, Bean Validation, ProblemDetail (RFC 9457), versionamento, OpenAPI e RestClient.",
+    "nivel": "jr",
+    "status": "disponivel",
+    "horas": 16,
+    "requisitos": [
+      "04-java-moderno",
+      "07-sql"
+    ],
+    "objetivos": [
+      "Desenhar recursos, verbos e status HTTP corretos",
+      "Construir uma API com DTOs validados e erros padronizados",
+      "Explicar IoC/DI e o ciclo de vida de beans"
+    ],
+    "topicos": [
+      "HTTP e status codes",
+      "IoC e injeção por construtor",
+      "Spring MVC",
+      "Bean Validation",
+      "ProblemDetail (RFC 9457)",
+      "Versionamento de API",
+      "OpenAPI",
+      "RestClient e HTTP interfaces"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 1: API de contas"
+  },
+  {
+    "id": "09-persistencia",
+    "numero": 9,
+    "titulo": "Persistência com JPA",
+    "resumo": "Hibernate 7 e Spring Data sem mistério: mapeamentos, N+1, transações, locking, paginação e migrações com Flyway.",
+    "nivel": "jr-pleno",
+    "status": "disponivel",
+    "horas": 14,
+    "requisitos": [
+      "08-spring-boot"
+    ],
+    "objetivos": [
+      "Mapear relacionamentos sem cair no N+1",
+      "Controlar transações e concorrência com locking otimista/pessimista",
+      "Versionar o schema com Flyway"
+    ],
+    "topicos": [
+      "Ciclo de vida de entidades",
+      "Relacionamentos",
+      "N+1 e fetch",
+      "@Transactional",
+      "Locking",
+      "Paginação e Specifications",
+      "Projeções",
+      "Flyway"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 2: transferências atômicas"
+  },
+  {
+    "id": "10-testes",
+    "numero": 10,
+    "titulo": "Testes automatizados",
+    "resumo": "JUnit 6, AssertJ, Mockito, MockMvcTester, Testcontainers 2 e ArchUnit — e quando usar cada um.",
+    "nivel": "jr-pleno",
+    "status": "disponivel",
+    "horas": 22,
+    "requisitos": [
+      "08-spring-boot"
+    ],
+    "objetivos": [
+      "Escrever testes legíveis, rápidos e determinísticos",
+      "Testar a camada web e a de persistência com ferramentas reais",
+      "Aplicar TDD em uma regra de negócio"
+    ],
+    "topicos": [
+      "Pirâmide de testes",
+      "JUnit 6",
+      "AssertJ",
+      "Mockito e @MockitoBean",
+      "MockMvcTester",
+      "Testcontainers 2",
+      "ArchUnit",
+      "TDD",
+      "Testes de contrato (Spring Cloud Contract)",
+      "Desempenho e carga (JMH, Gatling)"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 3: suíte de testes"
+  },
+  {
+    "id": "11-seguranca",
+    "numero": 11,
+    "titulo": "Segurança",
+    "resumo": "Spring Security 7, OAuth2 Resource Server com JWT, senhas com BCrypt, autorização por dono (BOLA), OWASP Top 10:2025 e rate limiting.",
+    "nivel": "pleno",
+    "status": "disponivel",
+    "horas": 26,
+    "requisitos": [
+      "09-persistencia"
+    ],
+    "objetivos": [
+      "Configurar a SecurityFilterChain e entender o fluxo de filtros",
+      "Proteger uma API com JWT e autorização por papéis",
+      "Reconhecer e prevenir as vulnerabilidades do OWASP Top 10"
+    ],
+    "topicos": [
+      "Arquitetura do Spring Security 7",
+      "OAuth2 Resource Server + JWT",
+      "BCrypt / Argon2",
+      "RBAC e method security",
+      "OWASP Top 10",
+      "Rate limiting",
+      "OAuth 2 e OpenID Connect",
+      "Modelagem de ameaças e dados sensíveis"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 4: autenticação"
+  },
+  {
+    "id": "12-mensageria",
+    "numero": 12,
+    "titulo": "Mensageria e EDA",
+    "resumo": "RabbitMQ 4 e Kafka 4 (KRaft) na prática: roteamento, partições e chaves, Transactional Outbox, consumidores idempotentes, retry com backoff e DLQ.",
+    "nivel": "pleno",
+    "status": "disponivel",
+    "horas": 26,
+    "requisitos": [
+      "09-persistencia",
+      "10-testes"
+    ],
+    "objetivos": [
+      "Escolher entre fila e log de eventos",
+      "Garantir entrega confiável com Transactional Outbox",
+      "Construir consumidores idempotentes com DLQ"
+    ],
+    "topicos": [
+      "Event-driven architecture",
+      "RabbitMQ",
+      "Kafka 4 (KRaft)",
+      "Ordenação por partição",
+      "Outbox",
+      "Idempotência",
+      "DLQ e retry",
+      "Evolução de esquemas de eventos",
+      "Kafka em produção"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 5: eventos"
+  },
+  {
+    "id": "13-arquitetura",
+    "numero": 13,
+    "titulo": "Arquitetura",
+    "resumo": "SOLID sem dogma, padrões que realmente aparecem, arquitetura hexagonal, monólito modular com Spring Modulith 2, microsserviços com critério e resiliência com Spring Framework 7 e Resilience4j.",
+    "nivel": "pleno",
+    "status": "disponivel",
+    "horas": 24,
+    "requisitos": [
+      "09-persistencia",
+      "10-testes"
+    ],
+    "objetivos": [
+      "Refatorar código legado aplicando SOLID",
+      "Isolar o domínio com portas e adaptadores",
+      "Argumentar monólito modular vs microsserviços"
+    ],
+    "topicos": [
+      "SOLID",
+      "Strategy, Factory, Adapter, Decorator, Observer",
+      "Hexagonal",
+      "Spring Modulith",
+      "Microsserviços e ADRs",
+      "Timeout, retry e circuit breaker",
+      "Domain-Driven Design",
+      "ADRs e evolução da arquitetura"
+    ]
+  },
+  {
+    "id": "14-devops",
+    "numero": 14,
+    "titulo": "DevOps e observabilidade",
+    "resumo": "Git no time, Maven/Gradle, Docker multi-stage, Compose, GitHub Actions, OpenTelemetry, logs estruturados e noções de Kubernetes e AWS.",
+    "nivel": "jr-pleno",
+    "status": "disponivel",
+    "horas": 12,
+    "requisitos": [
+      "10-testes"
+    ],
+    "objetivos": [
+      "Empacotar e rodar a aplicação em containers enxutos",
+      "Montar um pipeline de CI que roda testes de integração",
+      "Instrumentar a aplicação com métricas, logs e traces"
+    ],
+    "topicos": [
+      "Git no time",
+      "Maven e Gradle",
+      "Docker multi-stage",
+      "Docker Compose",
+      "GitHub Actions",
+      "OpenTelemetry e Micrometer",
+      "Logs estruturados",
+      "Kubernetes e AWS (noções)"
+    ],
+    "marcoProjeto": "Fintech Core — Marco 6: produção"
+  },
+  {
+    "id": "15-system-design",
+    "numero": 15,
+    "titulo": "Cache, NoSQL e System Design",
+    "resumo": "Redis, MongoDB e o framework para responder entrevistas de system design: estimativas, CAP, particionamento, saga e o caso PIX.",
+    "nivel": "pleno",
+    "status": "disponivel",
+    "horas": 14,
+    "requisitos": [
+      "12-mensageria",
+      "13-arquitetura"
+    ],
+    "objetivos": [
+      "Aplicar cache-aside com invalidação consciente",
+      "Estruturar uma resposta de system design em 45 minutos",
+      "Discutir trade-offs de consistência e disponibilidade"
+    ],
+    "topicos": [
+      "Redis",
+      "MongoDB",
+      "Estimativas",
+      "CAP e PACELC",
+      "Sharding",
+      "Saga",
+      "Rate limiting",
+      "Caso: PIX"
+    ]
+  },
+  {
+    "id": "16-ia-backend",
+    "numero": 16,
+    "titulo": "IA no backend",
+    "resumo": "Spring AI (chat, RAG, tool calling) e como usar assistentes de código com responsabilidade — e revisar o que eles produzem.",
+    "nivel": "jr-pleno",
+    "status": "disponivel",
+    "horas": 8,
+    "requisitos": [
+      "08-spring-boot"
+    ],
+    "objetivos": [
+      "Integrar um LLM a uma API com Spring AI",
+      "Implementar RAG simples com embeddings",
+      "Revisar criticamente código gerado por IA"
+    ],
+    "topicos": [
+      "Spring AI",
+      "Prompts e structured output",
+      "RAG e embeddings",
+      "Tool calling / MCP",
+      "Assistentes de código",
+      "Riscos e revisão"
+    ]
+  },
+  {
+    "id": "17-carreira",
+    "numero": 17,
+    "titulo": "Carreira e entrevistas",
+    "resumo": "Portfólio, currículo que passa em ATS, LinkedIn, entrevistas no Brasil e no exterior, inglês técnico, formatos de contratação e negociação.",
+    "nivel": "todos",
+    "status": "disponivel",
+    "horas": 8,
+    "requisitos": [
+      "05-algoritmos",
+      "15-system-design"
+    ],
+    "objetivos": [
+      "Montar um portfólio que prova as habilidades da trilha",
+      "Preparar-se para cada etapa do processo seletivo",
+      "Comparar CLT, PJ e contratos internacionais"
+    ],
+    "topicos": [
+      "Portfólio e GitHub",
+      "Currículo e ATS",
+      "LinkedIn",
+      "Etapas do processo",
+      "Entrevistas internacionais",
+      "Inglês técnico",
+      "CLT, PJ e contractor",
+      "Negociação"
+    ]
+  }
+]

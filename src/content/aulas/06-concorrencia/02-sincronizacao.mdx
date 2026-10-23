@@ -1,0 +1,170 @@
+---
+titulo: Sincronização, locks e tipos atômicos
+descricao: synchronized, ReentrantLock, AtomicLong, LongAdder e ConcurrentHashMap — quando usar cada um —, deadlock e como evitá-lo.
+modulo: 06-concorrencia
+ordem: 2
+duracao: 55
+objetivos:
+  - Proteger seções críticas com synchronized e ReentrantLock
+  - Usar tipos atômicos e operações atômicas do ConcurrentHashMap
+  - Reconhecer e prevenir deadlocks
+  - Escolher a granularidade de lock adequada
+tags: [synchronized, ReentrantLock, atomics, ConcurrentHashMap, deadlock]
+flashcards:
+  - frente: O que synchronized garante?
+    verso: Exclusão mútua (uma thread por vez no bloco) e visibilidade (o que foi escrito antes de liberar o lock é visto por quem adquire depois).
+  - frente: Por que o unlock() de um ReentrantLock vai no finally?
+    verso: Para liberar o lock mesmo se uma exceção for lançada; senão, ele fica preso e todas as outras threads travam.
+  - frente: Quando usar LongAdder em vez de AtomicLong?
+    verso: Em contadores com muita escrita concorrente e leitura ocasional; ele espalha as somas em células e escala melhor sob disputa.
+  - frente: Quais as 4 condições para um deadlock?
+    verso: Exclusão mútua, segurar um recurso enquanto espera outro, não preempção e espera circular. Quebrar a espera circular (ordem fixa de aquisição) é a prevenção mais comum.
+  - frente: Por que usar computeIfAbsent/merge em um ConcurrentHashMap?
+    verso: Porque são operações atômicas; get seguido de put é check-then-act e sofre race condition mesmo num mapa concorrente.
+---
+
+Na aula anterior você viu **o que** dá errado. Agora, as ferramentas para impedir — e o custo de cada uma.
+
+## `synchronized`
+
+Todo objeto Java tem um **monitor** (um lock intrínseco). `synchronized` garante que só uma thread por vez execute o trecho protegido por aquele monitor:
+
+```java
+class Contador {
+    private long total;
+
+    synchronized void incrementar() { total++; }     // lock = this
+    synchronized long total() { return total; }       // a LEITURA também sincroniza (visibilidade!)
+}
+
+// ou em bloco, com um lock privado (ninguém de fora consegue "roubá-lo")
+private final Object lock = new Object();
+void incrementar() {
+    synchronized (lock) { total++; }
+}
+```
+
+`synchronized` dá duas garantias: **exclusão mútua** e **visibilidade** (tudo escrito antes de sair do bloco é visto por quem entrar depois). Esquecer de sincronizar a leitura é um erro comum: a escrita fica protegida, mas a leitura pode ver um valor desatualizado.
+
+## `ReentrantLock`
+
+`java.util.concurrent.locks.ReentrantLock` faz o mesmo, com mais recursos: `tryLock` com timeout, locks justos (*fair*), várias condições de espera.
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+
+boolean reservar(Set<Integer> assentos, String cliente) {
+    lock.lock();
+    try {
+        for (int a : assentos) if (ocupantes[a] != null) return false;   // check…
+        for (int a : assentos) ocupantes[a] = cliente;                     // …then act, JUNTOS
+        return true;
+    } finally {
+        lock.unlock();          // SEMPRE no finally
+    }
+}
+```
+
+<Callout tipo="erro" titulo="unlock fora do finally">
+Se uma exceção for lançada entre `lock()` e `unlock()`, o lock fica preso para sempre e todas as outras threads param. `try { ... } finally { lock.unlock(); }` não é estilo: é obrigatório.
+</Callout>
+
+## Tipos atômicos
+
+Para operações simples sobre **uma** variável, os tipos de `java.util.concurrent.atomic` são mais leves que locks. Eles usam instruções especiais da CPU (*compare-and-swap*):
+
+```java
+AtomicLong total = new AtomicLong();
+total.incrementAndGet();
+total.addAndGet(10);
+total.updateAndGet(x -> Math.max(x, novo));    // função aplicada atomicamente
+
+LongAdder acessos = new LongAdder();           // para contadores muito disputados
+acessos.increment();
+acessos.sum();
+```
+
+**`LongAdder`** espalha os incrementos em várias células (uma por thread, aproximadamente) e só soma na leitura. Sob muita disputa — um contador de acessos chamado por centenas de threads —, escala bem melhor que `AtomicLong`, em que todas as threads brigam pela mesma variável. O custo: a leitura (`sum`) é um pouco mais cara e não é um "instantâneo" exato durante escritas concorrentes.
+
+## `ConcurrentHashMap` e operações atômicas
+
+`ConcurrentHashMap` é thread-safe, mas **sequências** de operações não são:
+
+<Comparar antes="Race condition" depois="Atômico">
+```java
+Long atual = mapa.get(endpoint);
+if (atual == null) {
+    mapa.put(endpoint, 1L);
+} else {
+    mapa.put(endpoint, atual + 1);
+}
+```
+
+```java
+mapa.merge(endpoint, 1L, Long::sum);
+
+// ou, com contadores:
+mapa.computeIfAbsent(endpoint, k -> new LongAdder())
+    .increment();
+```
+</Comparar>
+
+`merge`, `compute`, `computeIfAbsent` e `putIfAbsent` executam atomicamente para a chave. É a combinação que o exercício 06.01 pede.
+
+<Callout tipo="dica">
+Nunca use `Collections.synchronizedMap` ou `Hashtable` em código novo: sincronizam o mapa inteiro a cada operação. `ConcurrentHashMap` trava só partes da estrutura e permite leituras sem lock.
+</Callout>
+
+## Granularidade: um lock grande ou vários pequenos?
+
+- **Um lock só** (grosso): simples e correto, mas serializa tudo que passa por ele.
+- **Locks finos** (um por assento, por conta…): mais paralelismo, mas mais complexidade — e risco de **deadlock** quando uma operação precisa de vários locks.
+
+Na reserva de assentos do exercício 06.02, uma reserva múltipla precisa enxergar **vários** assentos de forma consistente. Um lock único é a escolha certa: a disputa é baixa e o código fica simples. Otimize a granularidade só quando medições mostrarem contenção.
+
+## Deadlock
+
+```java
+// Thread 1: transferir(a, b)          // Thread 2: transferir(b, a)
+synchronized (a) {                     synchronized (b) {
+    synchronized (b) { ... }               synchronized (a) { ... }   // cada uma espera a outra
+}                                      }
+```
+
+Cada thread segura um lock e espera o outro: nenhuma avança, para sempre. As quatro condições para um deadlock são exclusão mútua, segurar e esperar, não preempção e **espera circular**. A prevenção mais usada quebra a última: **adquirir os locks sempre na mesma ordem** (por exemplo, pelo menor id primeiro). Outras defesas: `tryLock` com timeout e evitar chamar código externo enquanto segura um lock.
+
+<Callout tipo="info" titulo="E no banco de dados?">
+Em aplicações reais, a concorrência mais importante acontece no **banco**: duas requisições atualizando o mesmo saldo em instâncias diferentes da aplicação. Locks em memória não ajudam aí (cada instância tem os seus). A solução é transação com lock otimista/pessimista ou `UPDATE` condicional — você viu o `UPDATE ... WHERE saldo >= ?` no exercício 07.04 e verá o resto no módulo 09.
+</Callout>
+
+<Quiz
+  id="06-sincronizacao"
+  questoes={[
+    {
+      pergunta: 'Qual opção incrementa um contador por chave de forma atômica em um ConcurrentHashMap?',
+      opcoes: ['`mapa.put(k, mapa.get(k) + 1)`', '`mapa.merge(k, 1L, Long::sum)`', '`if (!mapa.containsKey(k)) mapa.put(k, 1L)`', '`synchronized (mapa.get(k)) { ... }`'],
+      correta: 1,
+      explicacao: 'merge é atômico por chave; get + put é check-then-act.',
+    },
+    {
+      pergunta: 'Duas threads transferem entre as contas A e B em sentidos opostos, cada uma travando primeiro a origem. O risco é…',
+      opcoes: ['Nenhum', 'Deadlock', 'Overflow', 'StackOverflowError'],
+      correta: 1,
+      explicacao: 'Espera circular. Solução: sempre travar na mesma ordem (ex.: menor id primeiro).',
+    },
+    {
+      pergunta: 'Um contador de requisições é incrementado por 500 threads e lido a cada minuto. Melhor escolha?',
+      opcoes: ['long com synchronized', 'AtomicLong', 'LongAdder', 'volatile long'],
+      correta: 2,
+      explicacao: 'Muita escrita concorrente e leitura rara: LongAdder reduz a disputa.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `synchronized`/`ReentrantLock`: exclusão mútua + visibilidade; `unlock` sempre no `finally`; sincronize também as leituras.
+- Tipos atômicos para uma variável; `LongAdder` para contadores disputados.
+- `ConcurrentHashMap` + `merge`/`computeIfAbsent`: sequências atômicas sem lock manual.
+- Deadlock = espera circular; previna com ordem fixa de aquisição.
+- Comece com um lock simples; refine só com medições.

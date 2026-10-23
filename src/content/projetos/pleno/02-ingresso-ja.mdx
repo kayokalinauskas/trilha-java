@@ -1,0 +1,1435 @@
+---
+titulo: Ingresso Já — venda de ingressos com alta concorrência
+resumo: "API de venda de ingressos para produtoras de eventos que aguenta a abertura de vendas com milhares de pessoas no mesmo segundo: reserva temporária de lugares sem overbooking, pagamento assíncrono idempotente, ingresso com QR assinado e check-in que nunca deixa o mesmo ingresso entrar duas vezes."
+nivel: pleno
+ordem: 2
+dominio: Eventos · ticketing
+horas: 138
+stack: [Java 25, Spring Boot 4, Spring Security 7, PostgreSQL 18, Flyway, Redis, RabbitMQ, Resilience4j, Micrometer, OpenTelemetry, Testcontainers 2, k6, Docker Compose, GitHub Actions]
+competencias:
+  - Consistência sob concorrência real provada com teste concorrente e teste de carga (0 venda duplicada, 0 overbooking com 500 usuários simultâneos)
+  - Decisões de locking comparadas e registradas em ADRs (FOR UPDATE, SKIP LOCKED, update condicional, lock otimista, Redis com TTL)
+  - Mensageria confiável com outbox, consumidores idempotentes, retry, DLQ e tratamento do pagamento tardio
+  - Máquina de estados explícita com transições atômicas e liberação automática de reservas expiradas sem condição de corrida
+  - Segurança de API com Spring Security 7, JWT, papéis, dono do recurso, rate limiting e token de ingresso assinado com HMAC
+  - Observabilidade de negócio (reservas ativas, conversão, motivos de erro) com métricas, tracing e logs estruturados
+  - Relatório de teste de carga com k6 como entregável, com metas numéricas e análise dos gargalos
+modulos: [04-java-moderno, 06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 12-mensageria, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - { id: fundacao, titulo: Fundação do repositório, resumo: "Repositório, Spring Initializr, Docker Compose com todos os serviços, CI verde e README inicial." }
+  - { id: identidade, titulo: Contas, JWT e papéis, resumo: "Cadastro, login com JWT, refresh, papéis e a regra do dono do recurso testada por matriz." }
+  - { id: catalogo, titulo: Catálogo e mapa de lugares, resumo: "Produtoras cadastram eventos, sessões, setores e lugares; o público consulta o catálogo e o mapa." }
+  - { id: reserva, titulo: Reserva concorrente sem overbooking, resumo: "Reserva de lugares marcados e de pista com cotas e limite por CPF, provada por testes concorrentes." }
+  - { id: pagamento, titulo: Pagamento assíncrono idempotente, resumo: "Gateway simulado, outbox, RabbitMQ, consumidor idempotente, retry e DLQ." }
+  - { id: expiracao-e-emissao, titulo: Expiração, pagamento tardio e emissão, resumo: "Job de expiração com SKIP LOCKED, estorno do pagamento tardio e ingresso com QR assinado." }
+  - { id: portaria, titulo: Check-in, reembolso e transferência, resumo: "Check-in idempotente com leitores simultâneos, lista offline, reembolso com prazos e transferência." }
+  - { id: abertura, titulo: Abertura de vendas sob carga, resumo: "Rate limit, sala de espera, métricas de negócio, painel e relatório do teste de carga com k6." }
+  - { id: entrega, titulo: Entrega e release v1.0.0, resumo: "Deploy de demonstração, README final, vídeo de 3 minutos, ADRs revisados e release." }
+---
+
+## Visão geral
+
+Toda abertura de vendas de um show grande repete a mesma cena: às 10h00min00s, milhares de pessoas clicam em "comprar" ao mesmo tempo, disputando os mesmos lugares. Sistemas ingênuos falham de dois jeitos. O primeiro é visível: o sistema cai. O segundo é pior porque aparece dias depois: **duas pessoas com ingresso para a mesma cadeira**, ou 15.312 ingressos vendidos para uma pista com capacidade para 15.000. O primeiro gera reclamação; o segundo gera processo, multa e manchete.
+
+Você vai construir a **Ingresso Já**, a API de uma plataforma de venda de ingressos. O difícil aqui não é o CRUD: é garantir as invariantes do negócio quando centenas de requisições chegam no mesmo milissegundo, quando mensagens chegam duplicadas ou atrasadas, e quando dois leitores de QR code na portaria leem o mesmo ingresso ao mesmo tempo.
+
+O que será construído:
+
+- **Catálogo** de eventos, sessões, setores com lugares marcados e pistas com capacidade, mantido por produtoras.
+- **Reserva temporária** de lugares por 10 minutos, sem nunca vender o mesmo lugar duas vezes e sem ultrapassar a capacidade da pista ou a cota de meia-entrada.
+- **Limites antiabuso:** ingressos por CPF por evento, uma reserva ativa por conta e sessão, rate limiting por conta e por IP e sala de espera virtual para a abertura.
+- **Pagamento assíncrono** com um gateway simulado (que você também escreve) via RabbitMQ, com outbox, consumidor idempotente, retry e DLQ.
+- **Expiração automática** das reservas não pagas e tratamento do pagamento que chega depois da expiração (estorno automático).
+- **Ingresso com código QR** contendo um token assinado com HMAC, verificável sem internet pela portaria.
+- **Check-in idempotente**, cancelamento com reembolso dentro do prazo e transferência de titularidade.
+- **Observabilidade e prova de carga:** métricas de negócio, tracing, logs estruturados e um relatório de teste de carga com k6.
+
+**Pitch de uma frase:** "Construí uma API de venda de ingressos que aguenta 500 usuários disputando 1.000 lugares no mesmo segundo sem vender nenhum lugar duas vezes, com pagamento assíncrono idempotente e check-in à prova de leitura dupla, e provei isso com testes concorrentes e um teste de carga."
+
+**Por que chama atenção num portfólio Pleno.** A diferença entre Júnior e Pleno, para quem contrata, é a pessoa saber o que acontece **quando as coisas acontecem ao mesmo tempo ou falham pela metade**. Este projeto obriga você a escolher uma estratégia de locking e defender a escolha, a lidar com entrega "pelo menos uma vez" de mensagens, a tratar a corrida entre um job e um evento externo e a medir o sistema sob carga. Tudo isso com provas no repositório: testes que disparam centenas de threads, um script k6 com metas e um relatório com números. Numa entrevista, você tem material para 40 minutos de conversa técnica de verdade.
+
+<Callout tipo="info" titulo="Como usar esta especificação">
+Leia tudo uma vez antes de começar, para entender o fim. Depois siga o **plano de execução**: cada marco entrega uma fatia que funciona de ponta a ponta e termina com um commit, um README atualizado e o marco marcado como concluído aqui na página. Os números (limites, prazos, metas) são parte do requisito: se você mudar algum, registre o motivo num ADR.
+</Callout>
+
+## Contexto de negócio
+
+A **Ingresso Já** é uma empresa fictícia de Recife que vende ingressos para teatros, casas de show e festivais do Nordeste. Ela cresceu com eventos pequenos (até 500 lugares) e acabou de fechar contrato com dois clientes grandes: o **Teatro Capiba**, com 1.200 lugares marcados, e o festival **Maré Alta**, com 15.000 pessoas na pista e 2.000 lugares marcados na arquibancada. O fornecedor anterior do festival vendeu 312 lugares em duplicidade na abertura do ano passado; a cláusula de multa do novo contrato é clara sobre isso.
+
+A diretoria pediu um sistema novo, com três compromissos: nenhuma venda duplicada, nenhuma pista acima da capacidade e fila justa na abertura.
+
+### Atores
+
+| Ator | Papel no sistema | O que faz |
+|---|---|---|
+| Pessoa compradora | `COMPRADOR` | Cria conta com CPF, consulta eventos, reserva, paga, recebe, transfere e pede reembolso de ingressos |
+| Produtora | `PRODUTORA` | Cadastra eventos, sessões, setores e lugares da própria produtora, publica o evento, acompanha as vendas e cria contas de portaria |
+| Portaria | `PORTARIA` | Lê o QR code na entrada do evento (online ou offline) e registra o check-in, só nas sessões da própria produtora |
+| Administração | `ADMIN` | Suporte da Ingresso Já: consulta reservas e pagamentos de qualquer conta, reprocessa mensagens da DLQ e aciona reconciliação |
+| Gateway de pagamento | sistema externo (simulado) | Recebe pedidos de cobrança e de estorno e responde com o resultado, de forma assíncrona |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **Evento** | O espetáculo em si ("Festival Maré Alta 2026"). Pertence a uma produtora e tem uma ou mais sessões. |
+| **Sessão** | Uma data e hora de um evento. Tem horário de abertura e de fim das vendas. |
+| **Setor** | Uma área da sessão com preço próprio. Pode ser de **lugares marcados** (cada lugar tem fila e número) ou **pista** (só capacidade). |
+| **Lugar** | Um assento de um setor marcado, identificado por fila e número (`A-12`). |
+| **Reserva** | A retenção temporária de lugares ou de vagas de pista enquanto a pessoa paga. Expira em 10 minutos. |
+| **Abertura de vendas** | O horário fixo em que a sessão passa a aceitar reservas. Gera o pico de acesso. |
+| **Sala de espera** | Fila virtual para a abertura: a pessoa entra antes, recebe uma posição e é admitida aos poucos. |
+| **Passe de compra** | Token de curta duração que a sala de espera entrega a quem foi admitido; exigido para reservar quando a sala está ativa. |
+| **Meia-entrada** | Ingresso com 50% de desconto para quem tem direito por lei; limitado a uma **cota** de 40% dos ingressos de cada setor. |
+| **Taxa de conveniência** | Valor cobrado pela plataforma sobre cada ingresso (10%). |
+| **Ingresso** | O direito de entrar numa sessão, emitido após o pagamento, com um **token** assinado no QR code. |
+| **Check-in** | O registro de que o ingresso foi usado na portaria. Um ingresso só entra uma vez. |
+| **Overbooking** | Vender mais ingressos do que a capacidade. Aqui é um defeito inaceitável, nunca uma estratégia. |
+| **Estorno** | Devolução do valor pago ao meio de pagamento, pedida ao gateway. |
+
+## Escopo
+
+**Dentro:**
+
+- API REST versionada em `/api/v1`, documentada com OpenAPI.
+- Contas, autenticação com JWT (access e refresh), papéis e verificação de dono do recurso.
+- Catálogo de eventos, sessões, setores (marcados e pista) e lugares; publicação de eventos.
+- Reserva com expiração, cotas de meia-entrada, limite por CPF, uma reserva ativa por conta e sessão.
+- Pagamento assíncrono via RabbitMQ com um **gateway fake** escrito por você (um segundo aplicativo Spring Boot no mesmo repositório).
+- Expiração automática, reconciliação de pagamentos sem resposta e estorno de pagamento tardio.
+- Emissão de ingresso com QR code (PNG) e token HMAC; lista de acesso para leitura offline.
+- Check-in online e sincronização de leituras offline; reembolso; transferência de titularidade.
+- Rate limiting, sala de espera virtual (desejável), notificações por e-mail para um servidor SMTP de testes (Mailpit).
+- Métricas, tracing, logs estruturados, painel no Grafana e teste de carga com k6.
+
+**Fora (vira extensão em "Para ir além"):**
+
+- Front-end (a demonstração usa arquivos `.http`, Swagger UI e o painel do Grafana).
+- Gateway de pagamento real, antifraude, nota fiscal, split de pagamento com a produtora.
+- Cancelamento do evento inteiro pela produtora com reembolso em massa.
+- Validação do documento de meia-entrada na portaria (o ingresso só indica "apresentar documento").
+- Múltiplas moedas, múltiplos idiomas, cupons de desconto, programa de fidelidade.
+- Aplicativo do leitor de QR (você simula a portaria com um cliente de linha de comando ou com o `.http`).
+- Alta disponibilidade real em nuvem (várias zonas, réplicas de banco).
+
+## Requisitos funcionais
+
+Convenções usadas em todas as regras:
+
+- **Dinheiro:** `BigDecimal` com escala 2 em Java, `numeric(12,2)` no banco e **string** no JSON (`"150.00"`). Arredondamento `HALF_UP` para centavos. Nunca `double`.
+- **Tempo:** `Instant` em UTC no banco (`timestamptz`) e no JSON (ISO-8601 com `Z`). Toda regra de prazo usa um `Clock` injetado, para os testes controlarem o tempo.
+- **Identificadores:** UUID v7 (ordenável por tempo; o PostgreSQL 18 tem `uuidv7()`).
+- **Configuração:** todo limite numérico abaixo é uma propriedade em `application.yml` sob `ingressoja.*`, com o valor indicado como padrão.
+
+### RF-01 · Contas e autenticação
+
+Qualquer pessoa cria uma conta de compradora com e-mail, nome, CPF e senha, e autentica-se para receber um access token (JWT) e um refresh token.
+
+**Regras:**
+
+- **RN-01 · E-mail único, normalizado.** O e-mail é gravado em minúsculas e sem espaços nas pontas; a unicidade vale após a normalização. Exemplo: com `Ana@Mail.com` cadastrada, `  ana@mail.com ` é recusado com `409 email-ja-cadastrado`.
+- **RN-02 · CPF válido e único.** O CPF chega com ou sem máscara, é gravado com 11 dígitos e precisa ter dígitos verificadores válidos; sequências repetidas (`11111111111`) são inválidas. Um CPF só pode ter uma conta. Exemplo: `529.982.247-25` é válido; `529.982.247-24` gera `400 validacao` no campo `cpf`; um CPF já usado gera `409 cpf-ja-cadastrado`.
+- **RN-03 · Senha.** Mínimo de 15 caracteres (code points; é o que a NIST SP 800-63B rev. 4 exige de senha usada como único fator), máximo de 64 e de 72 bytes em UTF-8 (limite do BCrypt), sem regra de composição; recusada se estiver numa lista de senhas vazadas (arquivo com pelo menos 1.000 senhas comuns). Hash com BCrypt (custo 12) via `DelegatingPasswordEncoder`.
+- **RN-04 · Tokens.** O access token dura **15 minutos** e carrega `sub` (id da conta), `papeis` e, para PRODUTORA e PORTARIA, `produtora`. O refresh token dura **7 dias**, é opaco (aleatório, 256 bits), guardado só como hash e **rotacionado** a cada uso: usar um refresh token já trocado revoga todos os refresh tokens da conta (sinal de roubo). Exemplo: o refresh `R1` gera `R2`; apresentar `R1` de novo devolve `401` e invalida `R2`.
+- **RN-05 · Login sem enumeração.** E-mail inexistente e senha errada devolvem a mesma resposta (`401 credenciais-invalidas`) em tempo equivalente. Após **5 falhas seguidas para o mesmo e-mail informado**, exista a conta ou não, novas tentativas com esse e-mail recebem `423 conta-bloqueada` por **15 minutos**, com `bloqueadaAte`. Se o bloqueio valesse só para contas existentes, o `423` revelaria quais e-mails têm cadastro.
+- **RN-06 · Dados pessoais.** O CPF nunca aparece completo em respostas nem em logs: respostas mostram `***.982.247-**`; logs não mostram nada do CPF.
+
+**Critérios de aceite:**
+
+- **CA-01.** Dado que não existe conta com `ana@mail.com`, quando `POST /api/v1/auth/cadastro` é chamado com dados válidos, então a resposta é `201` com `Location: /api/v1/contas/me`, o corpo não contém senha nem hash e o CPF vem mascarado.
+- **CA-02.** Dada uma conta válida, quando a pessoa erra a senha 5 vezes seguidas, então a 6ª tentativa, mesmo com a senha certa, devolve `423` até 15 minutos depois da 5ª falha.
+- **CA-03.** Dado um refresh token já rotacionado, quando ele é reapresentado, então a resposta é `401` e o refresh token mais recente da conta também deixa de funcionar.
+
+### RF-02 · Papéis, produtoras e dono do recurso
+
+**Regras:**
+
+- **RN-07 · Papéis.** Toda conta nova é `COMPRADOR`. Contas `PRODUTORA` são criadas pelo `ADMIN` e vinculadas a uma produtora. Contas `PORTARIA` são criadas por uma conta `PRODUTORA` e ficam vinculadas à mesma produtora. O `ADMIN` inicial vem de uma migration de dados só no perfil `dev`.
+- **RN-08 · Dono do recurso (anti-BOLA).** Uma compradora só enxerga as próprias reservas, pagamentos e ingressos; uma produtora só altera eventos da própria produtora; a portaria só faz check-in em sessões da própria produtora. Acesso a recurso de outra conta devolve **`404`** (não `403`), para não confirmar que o id existe. Exemplo: Bruno pedindo `GET /api/v1/reservas/{id}` de uma reserva de Ana recebe `404 recurso-nao-encontrado`.
+- **RN-09 · ADMIN lê, não compra.** O `ADMIN` consulta qualquer recurso, mas não cria reservas em nome de terceiros.
+
+**Critérios de aceite:**
+
+- **CA-04.** Dada a matriz papel × endpoint documentada no README (ver "Contrato da API"), quando o teste de autorização percorre todas as combinações, então cada uma devolve exatamente o status esperado (`200`/`201`/`401`/`403`/`404`).
+- **CA-05.** Dada uma conta PORTARIA da produtora X, quando ela tenta um check-in em sessão da produtora Y, então a resposta é `404` e nada é gravado.
+
+### RF-03 · Eventos e sessões
+
+A produtora cadastra eventos em rascunho, adiciona sessões e publica.
+
+**Regras:**
+
+- **RN-10 · Ciclo de vida do evento.** `RASCUNHO → PUBLICADO`. Só eventos publicados aparecem no catálogo público. Publicar exige pelo menos uma sessão com pelo menos um setor com capacidade maior que zero; senão `422 evento-incompleto`. Depois de publicado, não se removem sessões nem setores, e não se reduz capacidade (evita invalidar ingressos vendidos); preço pode mudar e vale só para reservas novas.
+- **RN-11 · Datas da sessão.** `abertura_vendas < fim_vendas <= inicio`. `inicio` precisa estar no futuro no momento do cadastro. `fim_vendas` padrão: `inicio - 2h`. Exemplo: sessão às `2026-12-12T23:00:00Z` com abertura às `2026-10-15T13:00:00Z` é válida; abertura depois do início gera `400 validacao`.
+- **RN-12 · Limite por CPF do evento.** Cada evento define `limitePorCpf` entre **1 e 10** (padrão **4**), somando todas as sessões do evento.
+- **RN-13 · Catálogo público paginado.** `GET /api/v1/eventos` filtra por `cidade`, `de`, `ate` e texto no título; página padrão de **20** itens, máximo **100** (`size=500` é tratado como 100). Ordenação padrão pela próxima sessão.
+
+**Critérios de aceite:**
+
+- **CA-06.** Dado um evento em rascunho sem setores, quando a produtora pede para publicar, então recebe `422 evento-incompleto` e o evento continua fora do catálogo.
+- **CA-07.** Dados 45 eventos publicados em Recife, quando o catálogo é consultado com `cidade=Recife&page=2&size=20`, então vêm 5 itens e os metadados de paginação indicam 45 elementos e 3 páginas.
+
+### RF-04 · Setores, lugares e mapa
+
+**Regras:**
+
+- **RN-14 · Tipos de setor.** `MARCADO` (lugares individuais) ou `PISTA` (só capacidade, de 1 a 50.000). Preço da inteira entre `"1.00"` e `"5000.00"`.
+- **RN-15 · Geração de lugares em lote.** Para setor marcado, a produtora envia filas e intervalo de números: `{"filas": ["A","B"], "de": 1, "ate": 30}` cria 60 lugares (`A-1` a `B-30`). Um setor marcado tem no máximo **5.000** lugares; `(setor, fila, numero)` é único. A capacidade do setor marcado é o número de lugares disponíveis para venda.
+- **RN-16 · Bloqueio de lugares.** Antes da publicação, a produtora pode marcar lugares como `BLOQUEADO` (cortesia, obstrução de visão); bloqueados não entram na capacidade à venda nem na cota de meia.
+- **RN-17 · Mapa da sessão.** `GET /api/v1/sessoes/{id}/mapa` devolve setores com preço, disponibilidade e, para setores marcados, cada lugar com estado `DISPONIVEL` ou `INDISPONIVEL` (reservado, vendido e bloqueado aparecem todos como indisponível: o público não precisa saber o motivo). O mapa pode estar **até 2 segundos desatualizado** (cache); a reserva é sempre validada no banco.
+
+**Critérios de aceite:**
+
+- **CA-08.** Dado um setor marcado com filas A a T e números 1 a 30, quando o mapa é consultado, então há 600 lugares e o tempo de resposta p95 fica abaixo de 150 ms no teste de carga.
+- **CA-09.** Dado um lugar vendido há 1 segundo, quando o mapa é consultado, então o lugar pode aparecer disponível por no máximo 2 segundos; uma tentativa de reservá-lo nesse intervalo recebe `409 lugar-indisponivel`.
+
+### RF-05 · Reserva de lugares marcados
+
+A pessoa escolhe lugares no mapa e cria uma reserva, que os retém por 10 minutos enquanto ela paga.
+
+**Regras:**
+
+- **RN-18 · Janela de vendas.** Só se reserva entre `abertura_vendas` (inclusive) e `fim_vendas` (exclusive). Fora dela: `422 vendas-fechadas`, com `aberturaVendas` no corpo. Exemplo: com abertura às 13:00:00Z, uma requisição às 12:59:59.900Z é recusada; às 13:00:00.000Z, aceita.
+- **RN-19 · Tamanho da reserva.** De **1 a 6** itens por reserva, todos da mesma sessão; o mesmo lugar não pode aparecer duas vezes no pedido (`400 validacao`).
+- **RN-20 · Tudo ou nada.** Se qualquer lugar pedido estiver indisponível, **nenhum** é reservado, e a resposta `409 lugar-indisponivel` lista os lugares indisponíveis. Exemplo: pedido de `A-10`, `A-11`, `A-12` com `A-11` vendido devolve `409` com `"indisponiveis": ["A-11"]`, e `A-10` e `A-12` continuam disponíveis.
+- **RN-21 · Nunca duas vezes.** Um lugar está em no máximo uma reserva ativa ou num ingresso válido/utilizado, **sob qualquer concorrência**. Garantia em duas camadas: a transição de estado do lugar é atômica (ver ADR-001) e o banco tem uma restrição que torna a duplicidade impossível mesmo com um bug no código (índice único parcial em `ingresso(lugar_id)` para estados `VALIDO` e `UTILIZADO`).
+- **RN-22 · Expiração.** `expira_em = criada_em + 10 min`. A resposta traz `expiraEm` para o cliente mostrar a contagem regressiva.
+- **RN-23 · Preço congelado.** O preço de cada item e a taxa de conveniência (10% de cada item, `HALF_UP`) são calculados e gravados na criação da reserva; mudanças de preço posteriores não afetam a reserva. Exemplo: inteira de `"150.00"` → taxa `"15.00"`; meia de `"75.00"` → taxa `"7.50"`; total de 1 inteira + 1 meia = `"247.50"`.
+- **RN-24 · Desistência.** A pessoa pode cancelar a própria reserva `ATIVA` (`DELETE /api/v1/reservas/{id}`); os lugares voltam a ficar disponíveis na mesma transação. Reserva em `AGUARDANDO_PAGAMENTO` não pode ser cancelada pela pessoa (`409 reserva-em-estado-invalido`).
+
+**Critérios de aceite:**
+
+- **CA-10.** Dada uma sessão com vendas abertas e o lugar `C-7` disponível, quando **200 requisições concorrentes** de 200 contas diferentes pedem `C-7`, então exatamente **1** recebe `201` e **199** recebem `409 lugar-indisponivel`, e o banco tem exatamente uma reserva ativa com `C-7`.
+- **CA-11.** Dados os lugares `A-1` a `A-50` disponíveis, quando 300 contas pedem concorrentemente combinações aleatórias de 1 a 4 desses lugares, então nenhum lugar aparece em duas reservas ativas e a soma de lugares reservados é no máximo 50.
+- **CA-12.** Dada uma reserva ativa de Ana, quando ela a cancela, então a resposta é `204` e os lugares aparecem disponíveis no mapa em até 2 segundos.
+
+### RF-06 · Pista e meia-entrada
+
+**Regras:**
+
+- **RN-25 · Pista por capacidade.** Um item de pista pede só `setorId` e `tipoPreco`. A soma de `reservados + vendidos` do setor nunca passa de `capacidade`. Exemplo: pista com capacidade 15.000, 14.998 vendidos e 1 reservado; um pedido de 2 recebe `409 capacidade-esgotada` (sobra 1), um pedido de 1 é aceito.
+- **RN-26 · Cota de meia-entrada.** Inspirada na Lei 12.933/2013: `cota_meia = floor(0,40 × capacidade à venda)` por setor. Exemplo: 1.200 lugares → cota de 480; 15.000 de pista → 6.000; 7 lugares → 2. Meias reservadas + vendidas nunca passam da cota; esgotada a cota, a pessoa ainda pode comprar inteira. Pedido que estoura a cota recebe `409 cota-meia-esgotada`.
+- **RN-27 · Preço da meia.** 50% da inteira, `HALF_UP`. Exemplo: inteira `"150.01"` → meia `"75.01"` (75,005 arredonda para cima).
+- **RN-28 · Declaração.** Item de meia exige `categoriaMeia` (`ESTUDANTE`, `IDOSO`, `PCD`, `JOVEM_BAIXA_RENDA`, `PROFESSOR`); o ingresso emitido traz o aviso "apresentar documento na entrada".
+- **RN-29 · Misto no mesmo pedido.** Uma reserva pode ter lugares marcados, pista, inteiras e meias juntos; a regra "tudo ou nada" (RN-20) vale para o conjunto.
+
+**Critérios de aceite:**
+
+- **CA-13.** Dada uma pista com capacidade 100, quando 300 contas pedem concorrentemente 1 vaga cada, então exatamente 100 reservas são criadas e 200 pedidos recebem `409 capacidade-esgotada`.
+- **CA-14.** Dado um setor com cota de meia 40 e 39 meias vendidas, quando duas contas pedem concorrentemente 1 meia cada, então uma recebe `201` e a outra `409 cota-meia-esgotada`.
+
+### RF-07 · Limite por CPF e uma reserva ativa
+
+**Regras:**
+
+- **RN-30 · Uma reserva ativa por conta e sessão.** Uma conta não pode ter duas reservas em `ATIVA` ou `AGUARDANDO_PAGAMENTO` na mesma sessão (`409 reserva-ativa-existente`, com o id da existente). Garantido por índice único parcial no banco, não por um `if`.
+- **RN-31 · Limite por CPF por evento.** Ingressos válidos ou utilizados + itens em reservas ativas, somando todas as sessões do evento, não passam de `limitePorCpf`. Exemplo: limite 4, Ana tem 3 ingressos válidos; um pedido de 2 recebe `422 limite-por-cpf` com `"disponivelParaVoce": 1`. Ingressos cancelados, reservas expiradas e ingressos transferidos para outra pessoa liberam o limite.
+- **RN-32 · Limite sob concorrência.** Duas reservas simultâneas da mesma conta em **sessões diferentes** do mesmo evento não podem, juntas, ultrapassar o limite. Exemplo: limite 4, zero ingressos, pedidos simultâneos de 3 (sessão 1) e 3 (sessão 2): exatamente um é aceito.
+
+**Critérios de aceite:**
+
+- **CA-15.** Dado o cenário do exemplo da RN-32, quando os dois pedidos são disparados 50 vezes em paralelo (com limpeza entre as rodadas), então em todas as rodadas o total reservado pela conta é no máximo 4.
+
+### RF-08 · Pagamento assíncrono
+
+A pessoa envia os dados de pagamento; a API responde na hora que o pagamento está em processamento e o resultado chega depois, via mensageria.
+
+**Regras:**
+
+- **RN-33 · Solicitação.** `POST /api/v1/reservas/{id}/pagamento` com `tokenCartao` (o gateway fake não recebe número de cartão; o token simula a tokenização do cliente) e o header obrigatório **`Idempotency-Key`** (UUID). Só para reserva `ATIVA` e não expirada. Na mesma transação: a reserva vai para `AGUARDANDO_PAGAMENTO`, grava-se o `pagamento` com status `PENDENTE` e grava-se na **outbox** o evento `pagamento.solicitado`. Resposta `202 Accepted`.
+- **RN-34 · Idempotência HTTP.** Mesma `Idempotency-Key` + mesma conta + mesmo corpo em até **24h** devolve a mesma resposta, sem criar outro pagamento. Mesma chave com corpo diferente: `422 chave-idempotencia-reutilizada`. Sem o header: `400`.
+- **RN-35 · Prorrogação curta.** Ao solicitar o pagamento, se faltarem menos de 3 minutos para `expira_em`, ela passa a `agora + 3 min`, **uma única vez por reserva** (dar tempo ao gateway sem permitir retenção indefinida).
+- **RN-36 · Tentativas.** Até **3** solicitações de pagamento por reserva. Recusa do gateway devolve a reserva para `ATIVA` (se ainda não expirou) e incrementa o contador; na 3ª recusa, a reserva vai para `CANCELADA` e libera os lugares.
+- **RN-37 · Confirmação atômica.** O resultado `APROVADO` só confirma a reserva por uma transição condicional (`AGUARDANDO_PAGAMENTO → CONFIRMADA`). Na mesma transação: lugares passam a `VENDIDO`, contadores de pista e meia passam de reservados para vendidos, os ingressos são criados e o evento `ingressos.emitidos` vai para a outbox.
+- **RN-38 · Mensagem duplicada.** Receber o mesmo `pagamento.processado` duas vezes (mesmo `idMensagem`) não tem efeito na segunda: nem ingresso a mais, nem e-mail a mais.
+- **RN-39 · Contrato do gateway fake.** O comportamento depende do `tokenCartao`, para que testes e demonstração sejam determinísticos:
+
+| `tokenCartao` | Comportamento do gateway fake |
+|---|---|
+| `tok_aprovado` | Responde `APROVADO` após `ingressoja-gateway.atraso` (padrão 2 s) |
+| `tok_recusado` | Responde `RECUSADO` com motivo `SALDO_INSUFICIENTE` |
+| `tok_duplicado` | Responde `APROVADO` **duas vezes** com o mesmo `idMensagem` |
+| `tok_lento` | Responde `APROVADO` só após 14 minutos (depois da expiração) |
+| `tok_mudo` | Nunca responde pela fila; o `GET` de consulta devolve `PENDENTE` |
+| `tok_instavel` | O `GET` de consulta falha com `503` em 50% das chamadas |
+| outro valor | Responde `RECUSADO` com motivo `CARTAO_INVALIDO` |
+
+O gateway também é idempotente: a mesma `idPagamento` recebida duas vezes gera um único resultado (a segunda entrega republica o mesmo resultado, com o mesmo `idMensagem`).
+
+**Critérios de aceite:**
+
+- **CA-16.** Dada uma reserva ativa, quando o pagamento é solicitado com `tok_aprovado`, então a resposta é `202` em menos de 200 ms e, em até 5 s, `GET /api/v1/reservas/{id}` mostra `CONFIRMADA` com os ingressos.
+- **CA-17.** Dada uma reserva ativa, quando o pagamento é solicitado com `tok_duplicado`, então existe exatamente 1 ingresso por item, exatamente 1 e-mail no Mailpit e a métrica de mensagens duplicadas descartadas aumenta em 1.
+- **CA-18.** Dada a mesma requisição de pagamento enviada 3 vezes com a mesma `Idempotency-Key`, então as 3 respostas são idênticas e só existe 1 pagamento.
+
+### RF-09 · Expiração e liberação automática
+
+**Regras:**
+
+- **RN-40 · Job de expiração.** A cada **10 segundos**, um job busca reservas com `expira_em < agora` em `ATIVA` ou `AGUARDANDO_PAGAMENTO`, em lotes de até **200**, e expira cada uma numa transação curta. Meta: nenhuma reserva continua segurando lugares mais de **30 s** depois de `expira_em`.
+- **RN-41 · Várias instâncias.** Com duas instâncias da API rodando, cada reserva é expirada uma única vez e nenhuma instância fica esperando lock da outra (`FOR UPDATE SKIP LOCKED`, ver ADR-003).
+- **RN-42 · Reconciliação antes de expirar.** Reserva em `AGUARDANDO_PAGAMENTO` vencida é antes conferida no gateway (`GET /pagamentos/{idPagamento}`, timeout de 2 s, com retry e circuit breaker). `APROVADO` → confirma (RN-37); `RECUSADO` → trata como recusa; `PENDENTE`, erro ou circuito aberto → expira e marca o pagamento como `SEM_RESPOSTA`.
+- **RN-43 · Corrida job × pagamento.** A expiração e a confirmação são **transições condicionais sobre o mesmo estado de origem**; quem fizer primeiro vence e o outro vê "0 linhas afetadas". Nunca há reserva expirada com lugares vendidos, nem reserva confirmada com lugares liberados.
+- **RN-44 · Pagamento tardio.** `APROVADO` que chega para uma reserva já `EXPIRADA` ou `CANCELADA` não emite ingresso: o pagamento vai para `ESTORNO_SOLICITADO`, a outbox recebe `estorno.solicitado` e a pessoa recebe e-mail explicando. Exemplo: `tok_lento` → a reserva expira aos 10 min, a aprovação chega aos 14 min, o estorno é pedido e concluído, e os lugares já podem estar com outra pessoa.
+
+**Critérios de aceite:**
+
+- **CA-19.** Dada uma reserva ativa e um relógio de teste avançado 10 min e 1 s, quando o job roda, então a reserva fica `EXPIRADA`, os lugares ficam disponíveis e contadores de pista, meia e CPF voltam ao valor anterior.
+- **CA-20.** Dada uma reserva em `AGUARDANDO_PAGAMENTO` vencida, quando o job de expiração e o consumidor do `APROVADO` executam ao mesmo tempo (teste que força a sobreposição com um `CountDownLatch`), então o resultado é **ou** `CONFIRMADA` com ingressos **ou** `EXPIRADA` com estorno solicitado, nunca uma mistura, em 100 repetições.
+
+### RF-10 · Emissão do ingresso e código QR
+
+**Regras:**
+
+- **RN-45 · Um ingresso por item.** Cada item de reserva confirmada gera um ingresso `VALIDO` com titular = conta compradora.
+- **RN-46 · Token assinado.** O QR contém o texto `IJ1.<payload>.<assinatura>`, com `payload` = Base64URL sem padding do JSON compacto `{"i":"<ingressoId>","s":"<sessaoId>","v":<versaoToken>}` e `assinatura` = Base64URL do HMAC-SHA256 do texto `IJ1.<payload>`. A chave usada é **derivada por sessão**: `chaveSessao = HMAC-SHA256(chaveMestra, sessaoId)`; a chave mestra vem de variável de ambiente (mínimo 32 bytes) e nunca sai da API.
+- **RN-47 · Verificação offline.** Com a chave da sessão e a lista de acesso (RF-11), um leitor valida o token sem internet: assinatura correta, sessão certa e `v` igual à versão vigente do ingresso. A comparação da assinatura é em tempo constante (`MessageDigest.isEqual`).
+- **RN-48 · Imagem.** `GET /api/v1/ingressos/{id}/qr` devolve um PNG 400×400 com correção de erro nível M (biblioteca ZXing). Só o titular acessa (RN-08).
+- **RN-49 · Notificação.** O consumidor de `ingressos.emitidos` envia um e-mail (Mailpit) com o resumo da compra e o link dos ingressos; e-mail nunca é enviado dentro da transação do banco.
+
+**Critérios de aceite:**
+
+- **CA-21.** Dado um token válido, quando um único caractere da assinatura ou do payload é alterado, então a verificação falha com `422 token-invalido`.
+- **CA-22.** Dado um token da sessão S1, quando é apresentado na portaria da sessão S2 do mesmo evento, então a resposta é `422 sessao-incorreta`.
+
+### RF-11 · Check-in na portaria
+
+**Regras:**
+
+- **RN-50 · Janela.** Check-in aceito de `inicio - 3h` até `inicio + 6h`. Fora dela: `422 fora-da-janela-de-entrada`.
+- **RN-51 · Uma entrada só.** A transição `VALIDO → UTILIZADO` é condicional e atômica. Com dois leitores lendo o mesmo ingresso no mesmo instante, exatamente um recebe `LIBERADO`; o outro recebe `409 ingresso-ja-utilizado` com `utilizadoEm` e `portao` da primeira leitura (para a equipe identificar a fraude ou o engano).
+- **RN-52 · Repetição do mesmo leitor.** O leitor envia `Idempotency-Key` por leitura. Reenvio da mesma leitura (rede instável) devolve o mesmo `LIBERADO`, não `409`. Exemplo: o leitor `PORTAO-2` envia a leitura `K1`, a resposta se perde, ele reenvia `K1`: recebe `200 LIBERADO` de novo.
+- **RN-53 · Ingressos inválidos.** Cancelado: `409 ingresso-cancelado`. Versão antiga (ingresso transferido): `409 token-substituido`. Todas as leituras, aceitas ou não, ficam registradas em `checkin` com resultado, leitor e horário.
+- **RN-54 · Lista de acesso offline.** `GET /api/v1/sessoes/{id}/lista-de-acesso` (PORTARIA) devolve a chave da sessão (Base64) e a lista `[ingressoId, versaoToken, estado]` de todos os ingressos, paginada de 5.000 em 5.000. O leitor valida offline e depois envia as leituras em lote (`POST /api/v1/checkins/lote`, até 500 por chamada); conflitos são resolvidos pela **leitura mais antiga** (`lidoEm`), e as demais voltam como `ingresso-ja-utilizado`.
+
+**Critérios de aceite:**
+
+- **CA-23.** Dado um ingresso válido, quando 2 leitores enviam o check-in em paralelo 100 vezes (um ingresso novo por rodada), então em todas as rodadas há exatamente 1 `LIBERADO` e 1 `409`.
+- **CA-24.** Dadas duas leituras offline do mesmo ingresso, às 20:01 no portão 1 e às 20:03 no portão 3, sincronizadas em ordem inversa, então o check-in válido é o do portão 1 às 20:01.
+
+### RF-12 · Cancelamento e reembolso
+
+**Regras (política comercial da empresa fictícia, inspirada no art. 49 do CDC; não é orientação jurídica):**
+
+- **RN-55 · Prazo.** A pessoa titular pode pedir reembolso de um ingresso `VALIDO` se o pedido ocorrer **até 7 dias corridos após a compra** **e** **até 48h antes do início** da sessão. Exemplo: compra em 01/10 10:00Z, sessão em 20/10 23:00Z: pedido em 08/10 09:59Z é aceito; em 08/10 10:01Z, `422 prazo-de-reembolso-encerrado`. Compra em 17/10 para sessão em 20/10 23:00Z: aceito até 18/10 23:00Z.
+- **RN-56 · Valor.** Reembolso integral do ingresso **e da taxa de conveniência** do item. Reembolso parcial de uma compra com vários ingressos é permitido (um por um).
+- **RN-57 · Não reembolsáveis.** Ingresso utilizado, cancelado ou recebido por transferência: `422 ingresso-nao-reembolsavel`.
+- **RN-58 · Efeitos.** Na mesma transação: ingresso `CANCELADO`, lugar ou vaga devolvidos à venda, cota de meia e limite por CPF liberados, `reembolso` com status `SOLICITADO` e `estorno.solicitado` na outbox. O estorno confirmado pelo gateway muda o reembolso para `CONCLUIDO`.
+
+**Critérios de aceite:**
+
+- **CA-25.** Dado o ingresso `A-12` válido dentro do prazo, quando o reembolso é pedido, então a resposta é `202`, o ingresso fica `CANCELADO`, o lugar `A-12` fica disponível e, em até 5 s, o reembolso fica `CONCLUIDO`.
+
+### RF-13 · Transferência de titularidade
+
+**Regras:**
+
+- **RN-59 · Quem e quando.** O titular transfere um ingresso `VALIDO` de **inteira** para outra conta existente (identificada por e-mail) até **24h antes do início**. Meia-entrada não é transferível (`422 meia-nao-transferivel`). Cada ingresso pode ser transferido no máximo **2 vezes**.
+- **RN-60 · Limite do destinatário.** O destinatário precisa ter limite por CPF disponível no evento (RN-31); o limite do remetente é liberado.
+- **RN-61 · Token novo.** A transferência incrementa `versao_token`: o QR antigo deixa de valer (RN-53) e o novo titular recebe e-mail com o novo ingresso. Destinatário inexistente devolve `422 destinatario-invalido`. Aqui a resposta revela que o e-mail não tem conta, porque a pessoa precisa corrigir o destino; a proteção contra enumeração é o rate limit de 10 transferências por hora (RN-62). Registre esse trade-off no README.
+
+**Critérios de aceite:**
+
+- **CA-26.** Dado um ingresso transferido de Ana para Bruno, quando o QR antigo de Ana é lido na portaria, então a resposta é `409 token-substituido`, e o QR de Bruno recebe `LIBERADO`.
+
+### RF-14 · Abertura de vendas: rate limit e proteção contra bots
+
+**Regras:**
+
+- **RN-62 · Limites.** Token bucket em Redis, compartilhado entre instâncias, com os limites da tabela abaixo. Acima do limite: `429 muitas-requisicoes` com header `Retry-After` (segundos) e os headers `RateLimit-Limit` e `RateLimit-Remaining`. Exemplo: a 4ª reserva da mesma conta no mesmo segundo recebe `429` com `Retry-After: 6`.
+
+| Rota | Chave | Limite |
+|---|---|---|
+| `POST /api/v1/reservas` | conta | 10 por minuto (rajada de 3) |
+| `POST /api/v1/reservas` | IP | 60 por minuto |
+| `POST /api/v1/auth/login` | IP + e-mail | 5 por minuto |
+| `POST /api/v1/ingressos/{id}/transferencia` | conta | 10 por hora |
+| `POST /api/v1/checkins` | leitor | 600 por minuto |
+
+- **RN-63 · Redis fora do ar.** Rate limit **falha aberto** com um limitador local em memória por instância (ver ADR-007) e registra a métrica `ingressoja.ratelimit.degradado`; a sala de espera **falha fechado** (`503`), porque liberar todo mundo de uma vez derrubaria o banco.
+- **RN-64 · Proteções básicas.** Além de RN-30, RN-31 e RN-62: `POST /reservas` exige conta criada há pelo menos 10 minutos antes da abertura quando a sessão tem sala de espera, e toda recusa por limite gera log estruturado com `motivo`, `contaId` e IP truncado (`200.10.30.0/24`).
+
+**Critérios de aceite:**
+
+- **CA-27.** Dada uma conta, quando ela envia 15 `POST /reservas` em 10 segundos, então no máximo 3 passam de imediato (rajada), as seguintes recebem `429` com `Retry-After` maior que zero, e a contagem é a mesma com duas instâncias da API atrás de um balanceador.
+
+### RF-15 · Sala de espera virtual (desejável)
+
+Faça depois dos requisitos obrigatórios; conta como "acima do nível" na rubrica.
+
+**Regras:**
+
+- **RN-65 · Entrada.** Quando o evento tem `salaDeEspera = true`, a pessoa entra na sala da sessão a partir de 60 minutos antes da abertura (`POST /api/v1/sessoes/{id}/sala-de-espera`). Quem entra **antes da abertura** recebe posição **sorteada** na abertura (chegar às 12h00 ou às 12h59 dá a mesma chance); quem entra depois vai para o fim da fila, por ordem de chegada.
+- **RN-66 · Admissão.** A partir da abertura, **100 pessoas por segundo** (configurável) são admitidas e recebem um **passe de compra**: token assinado, ligado à conta e à sessão, válido por **15 minutos**. Reservar exige o header `X-Passe-Compra` válido (`403 passe-invalido`).
+- **RN-67 · Posição.** `GET /api/v1/sessoes/{id}/sala-de-espera` devolve posição, estimativa de espera (`posição / taxa`) e, se admitida, o passe. Polling recomendado: a cada 5 s (o servidor informa em `proximaConsultaEmSegundos`).
+
+**Critérios de aceite:**
+
+- **CA-28.** Dadas 1.000 contas na sala antes da abertura, quando a abertura acontece, então a ordem de admissão não se correlaciona com a ordem de entrada e, após 10 s, cerca de 1.000 passes foram emitidos (±10%).
+
+### RF-16 · Relatório de vendas da produtora
+
+**Regras:**
+
+- **RN-68 · Números.** `GET /api/v1/eventos/{id}/vendas` (PRODUTORA dona, ADMIN) devolve, por sessão e setor: capacidade, vendidos, reservados agora, meias vendidas, receita bruta (preço dos ingressos), taxas, reembolsos e receita líquida; tudo calculado com agregação no banco, não em memória. Exemplo: 3 inteiras de `"150.00"` e 1 reembolsada → bruto `"450.00"`, reembolsos `"150.00"`, líquido `"300.00"`.
+
+**Critérios de aceite:**
+
+- **CA-29.** Dado um evento com 10.000 ingressos vendidos, quando o relatório é pedido, então responde em menos de 500 ms com uma única consulta agregada por sessão (conferido no log de SQL).
+
+## Requisitos não funcionais
+
+| Id | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Consistência na abertura | 0 lugar vendido em duplicidade, 0 setor acima da capacidade, 0 cota de meia estourada, 0 CPF acima do limite | Script SQL de verificação (`carga/verificacao.sql`) após o teste de carga; testes concorrentes CA-10 a CA-15 |
+| RNF-02 | Latência da reserva | `POST /reservas` p95 abaixo de 400 ms e p99 abaixo de 1 s com 500 usuários virtuais, localmente (máquina com 8 GB de RAM livres para o Docker) | Thresholds do k6 no relatório |
+| RNF-03 | Latência de leitura | Mapa p95 abaixo de 150 ms; check-in p95 abaixo de 100 ms | k6 |
+| RNF-04 | Erros sob carga | 5xx abaixo de 0,5% das requisições; `409`/`429` não contam como erro | k6 (`http_req_failed` com `responseCallback` que aceita 409 e 429) |
+| RNF-05 | Expiração | Lugares de reserva vencida liberados em até 30 s | Teste com relógio controlado + métrica `ingressoja.reserva.atraso.expiracao` |
+| RNF-06 | Confirmação | 95% dos pagamentos aprovados confirmados em até 5 s após o `202` | Métrica `ingressoja.pagamento.confirmacao` (timer) |
+| RNF-07 | Mensageria | Nenhuma mensagem perdida: outbox com publisher confirms; consumidores idempotentes; DLQ após 5 tentativas com backoff exponencial (1 s, 2 s, 4 s, 8 s, 16 s) | Teste de integração que derruba o RabbitMQ no meio e confere que tudo é entregue depois |
+| RNF-08 | Segurança | Senhas BCrypt; JWT de 15 min; nenhum segredo no repositório; CPF e tokens fora dos logs; headers de segurança; dependências sem CVE crítica | Teste que busca CPF nos logs capturados; `gitleaks` ou equivalente no CI; varredura de dependências no CI |
+| RNF-09 | Observabilidade | Todo request com `traceId` nos logs (JSON); traces que atravessam API → RabbitMQ → gateway → API; painel com as métricas de negócio | Print do painel e de um trace no README |
+| RNF-10 | Qualidade | Cobertura de linhas de pelo menos 80% nos pacotes de domínio e aplicação (JaCoCo); build do CI abaixo de 12 min | Relatório do JaCoCo no CI |
+| RNF-11 | Operação | `docker compose up` sobe tudo em até 2 min; `/actuator/health` com liveness e readiness; migrations Flyway versionadas; configuração por variáveis de ambiente | README + CI |
+| RNF-12 | Degradação | Com o pool do banco esgotado, a API devolve `503 servico-sobrecarregado` em até 2 s em vez de acumular requisições indefinidamente | Teste de carga com pool reduzido a 5 conexões |
+
+## Modelo de dados
+
+<Figura legenda="Entidades principais da Ingresso Já. Setor e lugar pertencem a uma sessão; a reserva agrupa itens (lugar marcado ou vaga de pista) e, confirmada, gera um ingresso por item">
+<svg viewBox="0 0 780 680" width="780" role="img" aria-labelledby="ij-er-titulo ij-er-desc">
+  <title id="ij-er-titulo">Modelo de dados da Ingresso Já</title>
+  <desc id="ij-er-desc">Na coluna da esquerda, a hierarquia do catálogo: produtora tem eventos, evento tem sessões, sessão tem setores. Setor tem lugares, na coluna do meio. Também no meio, reserva tem itens de reserva, e cada item aponta opcionalmente para um lugar. Na direita, conta faz reservas; reserva tem pagamentos; cada item gera no máximo um ingresso, cujo titular é uma conta. Uma caixa lista as tabelas de apoio: outbox, mensagem processada, idempotência HTTP, cota por conta e evento, check-in, transferência e reembolso.</desc>
+  <rect x="10" y="10" width="230" height="94" rx="8" class="d-box"/>
+  <text x="125" y="31" text-anchor="middle" class="d-title">produtora</text>
+  <text x="22" y="56" class="d-mono">id</text>
+  <text x="22" y="74" class="d-mono">nome</text>
+  <text x="22" y="92" class="d-mono">cnpj (único)</text>
+  <path d="M125 104 L125 140" class="d-line"/>
+  <text x="133" y="127" class="d-label">1:N</text>
+  <rect x="10" y="140" width="230" height="148" rx="8" class="d-box"/>
+  <text x="125" y="161" text-anchor="middle" class="d-title">evento</text>
+  <text x="22" y="186" class="d-mono">id · produtora_id</text>
+  <text x="22" y="204" class="d-mono">titulo · cidade</text>
+  <text x="22" y="222" class="d-mono">status</text>
+  <text x="22" y="240" class="d-mono">limite_por_cpf</text>
+  <text x="22" y="258" class="d-mono">sala_de_espera</text>
+  <text x="22" y="276" class="d-mono">criado_em</text>
+  <path d="M125 288 L125 324" class="d-line"/>
+  <text x="133" y="311" class="d-label">1:N</text>
+  <rect x="10" y="324" width="230" height="130" rx="8" class="d-box"/>
+  <text x="125" y="345" text-anchor="middle" class="d-title">sessao</text>
+  <text x="22" y="370" class="d-mono">id · evento_id</text>
+  <text x="22" y="388" class="d-mono">inicio</text>
+  <text x="22" y="406" class="d-mono">abertura_vendas</text>
+  <text x="22" y="424" class="d-mono">fim_vendas</text>
+  <text x="22" y="442" class="d-mono">status</text>
+  <path d="M125 454 L125 490" class="d-line"/>
+  <text x="133" y="477" class="d-label">1:N</text>
+  <rect x="10" y="490" width="230" height="166" rx="8" class="d-accent"/>
+  <text x="125" y="511" text-anchor="middle" class="d-title">setor</text>
+  <text x="22" y="536" class="d-mono">id · sessao_id · nome</text>
+  <text x="22" y="554" class="d-mono">tipo (MARCADO/PISTA)</text>
+  <text x="22" y="572" class="d-mono">preco_inteira</text>
+  <text x="22" y="590" class="d-mono">capacidade · cota_meia</text>
+  <text x="22" y="608" class="d-mono">reservados · vendidos</text>
+  <text x="22" y="626" class="d-mono">meia_reserv. · meia_vend.</text>
+  <text x="22" y="644" class="d-label">CHECK: reservados+vendidos ≤ cap.</text>
+  <rect x="275" y="10" width="230" height="148" rx="8" class="d-accent"/>
+  <text x="390" y="31" text-anchor="middle" class="d-title">reserva</text>
+  <text x="287" y="56" class="d-mono">id · conta_id · sessao_id</text>
+  <text x="287" y="74" class="d-mono">estado</text>
+  <text x="287" y="92" class="d-mono">expira_em · prorrogada</text>
+  <text x="287" y="110" class="d-mono">total · taxa</text>
+  <text x="287" y="128" class="d-mono">tentativas_pagamento</text>
+  <text x="287" y="146" class="d-label">único parcial: conta+sessão ativas</text>
+  <path d="M275 110 L262 110 L262 380 L240 380" class="d-line"/>
+  <text x="246" y="372" class="d-label">N:1</text>
+  <path d="M390 158 L390 250" class="d-line"/>
+  <text x="398" y="208" class="d-label">1:N</text>
+  <rect x="275" y="250" width="230" height="148" rx="8" class="d-box"/>
+  <text x="390" y="271" text-anchor="middle" class="d-title">item_reserva</text>
+  <text x="287" y="296" class="d-mono">id · reserva_id</text>
+  <text x="287" y="314" class="d-mono">setor_id</text>
+  <text x="287" y="332" class="d-mono">lugar_id (nulo na pista)</text>
+  <text x="287" y="350" class="d-mono">tipo_preco · categoria</text>
+  <text x="287" y="368" class="d-mono">preco · taxa</text>
+  <text x="287" y="386" class="d-mono">criado_em</text>
+  <path d="M390 398 L390 490" class="d-line"/>
+  <text x="398" y="448" class="d-label">N:0..1</text>
+  <path d="M240 560 L275 560" class="d-line"/>
+  <text x="244" y="552" class="d-label">1:N</text>
+  <rect x="275" y="490" width="230" height="148" rx="8" class="d-accent"/>
+  <text x="390" y="511" text-anchor="middle" class="d-title">lugar</text>
+  <text x="287" y="536" class="d-mono">id · setor_id</text>
+  <text x="287" y="554" class="d-mono">fila · numero</text>
+  <text x="287" y="572" class="d-mono">estado</text>
+  <text x="287" y="590" class="d-mono">reserva_id (nulo)</text>
+  <text x="287" y="608" class="d-mono">versao</text>
+  <text x="287" y="626" class="d-label">único: setor+fila+número</text>
+  <rect x="540" y="10" width="225" height="148" rx="8" class="d-box"/>
+  <text x="652" y="31" text-anchor="middle" class="d-title">conta</text>
+  <text x="552" y="56" class="d-mono">id</text>
+  <text x="552" y="74" class="d-mono">email (único)</text>
+  <text x="552" y="92" class="d-mono">cpf (único)</text>
+  <text x="552" y="110" class="d-mono">senha_hash</text>
+  <text x="552" y="128" class="d-mono">papeis</text>
+  <text x="552" y="146" class="d-mono">produtora_id (nulo)</text>
+  <path d="M540 84 L505 84" class="d-line"/>
+  <text x="509" y="77" class="d-label">1:N</text>
+  <path d="M505 130 L522 130 L522 262 L540 262" class="d-line"/>
+  <text x="526" y="200" class="d-label">1:N</text>
+  <rect x="540" y="200" width="225" height="130" rx="8" class="d-violet"/>
+  <text x="652" y="221" text-anchor="middle" class="d-title">pagamento</text>
+  <text x="552" y="246" class="d-mono">id · reserva_id</text>
+  <text x="552" y="264" class="d-mono">status</text>
+  <text x="552" y="282" class="d-mono">valor</text>
+  <text x="552" y="300" class="d-mono">token_cartao_final</text>
+  <text x="552" y="318" class="d-mono">id_transacao_gateway</text>
+  <path d="M505 330 L522 330 L522 450 L540 450" class="d-line"/>
+  <text x="528" y="354" class="d-label">1:0..1</text>
+  <rect x="540" y="370" width="225" height="166" rx="8" class="d-ok"/>
+  <text x="652" y="391" text-anchor="middle" class="d-title">ingresso</text>
+  <text x="552" y="416" class="d-mono">id · item_reserva_id</text>
+  <text x="552" y="434" class="d-mono">titular_id</text>
+  <text x="552" y="452" class="d-mono">sessao_id · lugar_id</text>
+  <text x="552" y="470" class="d-mono">tipo_preco</text>
+  <text x="552" y="488" class="d-mono">estado · versao_token</text>
+  <text x="552" y="506" class="d-mono">utilizado_em · portao</text>
+  <text x="552" y="524" class="d-label">único parcial: lugar válido</text>
+  <path d="M765 450 L774 450 L774 70 L765 70" class="d-line"/>
+  <text x="700" y="352" class="d-label">titular</text>
+  <rect x="540" y="560" width="225" height="110" rx="8" class="d-box"/>
+  <text x="652" y="581" text-anchor="middle" class="d-title">tabelas de apoio</text>
+  <text x="552" y="606" class="d-label">outbox · mensagem_processada</text>
+  <text x="552" y="624" class="d-label">idempotencia_http</text>
+  <text x="552" y="642" class="d-label">cota_conta_evento · checkin</text>
+  <text x="552" y="660" class="d-label">transferencia · reembolso</text>
+</svg>
+</Figura>
+
+### Estados
+
+| Entidade | Estados | Observação |
+|---|---|---|
+| `lugar` | `DISPONIVEL`, `RESERVADO`, `VENDIDO`, `BLOQUEADO` | `reserva_id` preenchido só em `RESERVADO` e `VENDIDO` |
+| `reserva` | `ATIVA`, `AGUARDANDO_PAGAMENTO`, `CONFIRMADA`, `EXPIRADA`, `CANCELADA` | Os três últimos são finais |
+| `pagamento` | `PENDENTE`, `APROVADO`, `RECUSADO`, `SEM_RESPOSTA`, `ESTORNO_SOLICITADO`, `ESTORNADO` | `SEM_RESPOSTA` pode virar `ESTORNO_SOLICITADO` se a aprovação chegar tarde |
+| `ingresso` | `VALIDO`, `UTILIZADO`, `CANCELADO` | Transferência não muda o estado; muda titular e `versao_token` |
+| `reembolso` | `SOLICITADO`, `CONCLUIDO`, `FALHOU` | `FALHOU` vai para a fila de atenção do ADMIN |
+
+### Restrições que o banco garante
+
+Invariantes críticas **não** ficam só no código Java. O banco é a última linha de defesa:
+
+```sql
+-- Um lugar vendido ou utilizado pertence a um único ingresso
+create unique index uq_ingresso_lugar_valido
+    on ingresso (lugar_id)
+    where lugar_id is not null and estado in ('VALIDO', 'UTILIZADO');
+
+-- Uma reserva ativa por conta e sessão (RN-30)
+create unique index uq_reserva_ativa_conta_sessao
+    on reserva (conta_id, sessao_id)
+    where estado in ('ATIVA', 'AGUARDANDO_PAGAMENTO');
+
+-- Capacidade e cota nunca estouradas (RN-25, RN-26)
+alter table setor add constraint ck_setor_capacidade
+    check (reservados >= 0 and vendidos >= 0 and reservados + vendidos <= capacidade);
+alter table setor add constraint ck_setor_meia
+    check (meia_reservadas >= 0 and meia_vendidas >= 0
+           and meia_reservadas + meia_vendidas <= cota_meia);
+
+-- Limite por CPF (RN-31): contador por conta e evento
+create table cota_conta_evento (
+    conta_id   uuid not null references conta (id),
+    evento_id  uuid not null references evento (id),
+    quantidade int  not null check (quantidade >= 0),
+    primary key (conta_id, evento_id)
+);
+```
+
+Índices obrigatórios além das chaves: `lugar (setor_id, estado)`, `reserva (estado, expira_em)` (o job de expiração), `ingresso (sessao_id)` (lista de acesso), `outbox (publicado_em) where publicado_em is null`, `checkin (ingresso_id)`. Justifique cada um com um `EXPLAIN ANALYZE` no ADR ou no README.
+
+### Migrations
+
+| Versão | O que cria |
+|---|---|
+| `V1__identidade.sql` | `produtora`, `conta`, `refresh_token` |
+| `V2__catalogo.sql` | `evento`, `sessao`, `setor` (com os `CHECK`), `lugar` e índices |
+| `V3__reservas.sql` | `reserva`, `item_reserva`, `cota_conta_evento`, índices únicos parciais |
+| `V4__pagamentos_e_mensageria.sql` | `pagamento`, `outbox`, `mensagem_processada`, `idempotencia_http` |
+| `V5__ingressos.sql` | `ingresso` (com o índice único parcial), `checkin`, `transferencia`, `reembolso` |
+| `R__dados_dev.sql` | Migration repetível carregada só no perfil `dev`: ADMIN, uma produtora, um evento de exemplo (localização em `db/dev`) |
+
+Migrations são imutáveis depois de commitadas na `main`: correção vira uma migration nova.
+
+## Contrato da API
+
+Base: `/api/v1`. JSON em UTF-8, nomes em `camelCase`, datas ISO-8601 em UTC. Autenticação por `Authorization: Bearer <access token>`. Listas paginadas com `page` (a partir de 0) e `size` (padrão 20, máximo 100), e resposta com `conteudo`, `pagina`, `tamanho`, `totalElementos` e `totalPaginas`. A especificação OpenAPI é gerada pelo código e servida em `/swagger-ui.html` no perfil `dev`.
+
+### Endpoints
+
+| Método | Caminho | Quem pode | O que faz | Respostas |
+|---|---|---|---|---|
+| POST | `/auth/cadastro` | público | Cria conta COMPRADOR | 201, 400, 409 |
+| POST | `/auth/login` | público | Devolve access e refresh token | 200, 401, 423, 429 |
+| POST | `/auth/refresh` | público (com refresh) | Rotaciona o refresh e emite novo access | 200, 401 |
+| POST | `/auth/logout` | autenticado | Revoga o refresh token atual | 204 |
+| GET | `/contas/me` | autenticado | Dados da própria conta (CPF mascarado) | 200, 401 |
+| POST | `/produtoras` | ADMIN | Cria produtora e a primeira conta PRODUTORA | 201, 400, 409 |
+| POST | `/produtoras/{id}/portaria` | PRODUTORA dona | Cria conta PORTARIA | 201, 400, 404 |
+| POST | `/eventos` | PRODUTORA | Cria evento em rascunho | 201, 400 |
+| PATCH | `/eventos/{id}` | PRODUTORA dona | Altera dados permitidos (RN-10) | 200, 400, 404, 422 |
+| POST | `/eventos/{id}/sessoes` | PRODUTORA dona | Cria sessão | 201, 400, 404 |
+| POST | `/sessoes/{id}/setores` | PRODUTORA dona | Cria setor MARCADO ou PISTA | 201, 400, 404, 422 |
+| POST | `/setores/{id}/lugares` | PRODUTORA dona | Gera lugares em lote (RN-15) | 201, 400, 404, 409 |
+| POST | `/eventos/{id}/publicar` | PRODUTORA dona | Publica o evento | 200, 404, 422 |
+| GET | `/eventos` | público | Catálogo paginado com filtros | 200 |
+| GET | `/eventos/{id}` | público | Detalhe com sessões e setores | 200, 404 |
+| GET | `/sessoes/{id}/mapa` | público | Mapa com disponibilidade (cache de até 2 s) | 200, 404 |
+| POST | `/sessoes/{id}/sala-de-espera` | COMPRADOR | Entra na sala de espera | 202, 404, 422 |
+| GET | `/sessoes/{id}/sala-de-espera` | COMPRADOR | Posição e passe | 200, 404 |
+| POST | `/reservas` | COMPRADOR | Cria reserva | 201, 400, 403, 409, 422, 429, 503 |
+| GET | `/reservas/{id}` | dono, ADMIN | Estado da reserva e ingressos | 200, 404 |
+| DELETE | `/reservas/{id}` | dono | Desiste da reserva ativa | 204, 404, 409 |
+| POST | `/reservas/{id}/pagamento` | dono | Solicita pagamento (`Idempotency-Key`) | 202, 400, 404, 409, 410, 422 |
+| GET | `/ingressos` | COMPRADOR | Meus ingressos, paginado | 200 |
+| GET | `/ingressos/{id}` | titular, ADMIN | Detalhe com o token | 200, 404 |
+| GET | `/ingressos/{id}/qr` | titular | PNG do QR code | 200, 404 |
+| POST | `/ingressos/{id}/transferencia` | titular | Transfere para outra conta | 200, 404, 409, 422, 429 |
+| POST | `/ingressos/{id}/reembolso` | titular | Cancela e pede estorno | 202, 404, 422 |
+| GET | `/sessoes/{id}/lista-de-acesso` | PORTARIA da produtora | Chave da sessão e lista para offline | 200, 404 |
+| POST | `/checkins` | PORTARIA da produtora | Check-in online (`Idempotency-Key`) | 200, 404, 409, 422, 429 |
+| POST | `/checkins/lote` | PORTARIA da produtora | Sincroniza leituras offline | 200, 400 |
+| GET | `/eventos/{id}/vendas` | PRODUTORA dona, ADMIN | Relatório de vendas | 200, 404 |
+| GET | `/admin/reservas` | ADMIN | Busca por estado, conta e sessão | 200 |
+| POST | `/admin/pagamentos/{id}/reconciliar` | ADMIN | Força a consulta ao gateway | 202, 404 |
+
+Essa tabela, com uma coluna por papel, é a **matriz de autorização** do CA-04: coloque-a no README e transforme-a num teste parametrizado.
+
+### Exemplos
+
+**Criar reserva** — `POST /api/v1/reservas`
+
+```http
+POST /api/v1/reservas HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+X-Passe-Compra: IJP1.eyJjIjoiMDE5M...
+Content-Type: application/json
+
+{
+  "sessaoId": "0199a1b2-7c3d-7e10-9a42-5b6c7d8e9f01",
+  "itens": [
+    { "lugarId": "0199a1b2-8000-7aa0-b1c2-000000000c07", "tipoPreco": "INTEIRA" },
+    { "lugarId": "0199a1b2-8000-7aa0-b1c2-000000000c08", "tipoPreco": "MEIA", "categoriaMeia": "ESTUDANTE" },
+    { "setorId": "0199a1b2-7f00-7bb0-8c1d-2e3f4a5b6c7d", "tipoPreco": "INTEIRA" }
+  ]
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /api/v1/reservas/0199a1c0-1111-7abc-8def-0123456789ab
+Content-Type: application/json
+
+{
+  "id": "0199a1c0-1111-7abc-8def-0123456789ab",
+  "estado": "ATIVA",
+  "sessaoId": "0199a1b2-7c3d-7e10-9a42-5b6c7d8e9f01",
+  "criadaEm": "2026-10-15T13:00:00.412Z",
+  "expiraEm": "2026-10-15T13:10:00.412Z",
+  "itens": [
+    { "id": "0199a1c0-1111-7abc-8def-0000000000a1", "setor": "Plateia A", "lugar": "C-7",
+      "tipoPreco": "INTEIRA", "preco": "150.00", "taxa": "15.00" },
+    { "id": "0199a1c0-1111-7abc-8def-0000000000a2", "setor": "Plateia A", "lugar": "C-8",
+      "tipoPreco": "MEIA", "categoriaMeia": "ESTUDANTE", "preco": "75.00", "taxa": "7.50" },
+    { "id": "0199a1c0-1111-7abc-8def-0000000000a3", "setor": "Pista", "lugar": null,
+      "tipoPreco": "INTEIRA", "preco": "90.00", "taxa": "9.00" }
+  ],
+  "subtotal": "315.00",
+  "taxas": "31.50",
+  "total": "346.50",
+  "tentativasDePagamentoRestantes": 3
+}
+```
+
+**Lugar indisponível** — a mesma requisição, com `C-8` já reservado por outra pessoa um milissegundo antes:
+
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://ingressoja.dev/erros/lugar-indisponivel",
+  "title": "Lugar indisponível",
+  "status": 409,
+  "detail": "1 dos lugares pedidos não está mais disponível. Nenhum lugar foi reservado.",
+  "instance": "/api/v1/reservas",
+  "codigo": "lugar-indisponivel",
+  "indisponiveis": ["C-8"],
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+**Solicitar pagamento** — `POST /api/v1/reservas/{id}/pagamento`
+
+```http
+POST /api/v1/reservas/0199a1c0-1111-7abc-8def-0123456789ab/pagamento HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+Idempotency-Key: 5f0c6c1e-3a7b-4a8e-9d0f-2c1b3a4d5e6f
+Content-Type: application/json
+
+{ "tokenCartao": "tok_aprovado", "parcelas": 1 }
+```
+
+```http
+HTTP/1.1 202 Accepted
+Location: /api/v1/reservas/0199a1c0-1111-7abc-8def-0123456789ab
+Content-Type: application/json
+
+{
+  "reservaId": "0199a1c0-1111-7abc-8def-0123456789ab",
+  "pagamentoId": "0199a1c1-2222-7abc-8def-0123456789cd",
+  "estadoReserva": "AGUARDANDO_PAGAMENTO",
+  "statusPagamento": "PENDENTE",
+  "valor": "346.50",
+  "expiraEm": "2026-10-15T13:10:00.412Z",
+  "consulteEmSegundos": 2
+}
+```
+
+**Check-in** — `POST /api/v1/checkins`
+
+```http
+POST /api/v1/checkins HTTP/1.1
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+Idempotency-Key: 9a8b7c6d-5e4f-4a3b-2c1d-0e9f8a7b6c5d
+Content-Type: application/json
+
+{
+  "token": "IJ1.eyJpIjoiMDE5OWExYzItMzMzMy03YWJjLThkZWYtMDAwMDAwMDAwMGIxIiwicyI6IjAxOTlhMWIyLTdjM2QtN2UxMC05YTQyLTViNmM3ZDhlOWYwMSIsInYiOjF9.m2yQ...",
+  "sessaoId": "0199a1b2-7c3d-7e10-9a42-5b6c7d8e9f01",
+  "leitor": "PORTAO-2",
+  "lidoEm": "2026-12-12T22:14:05Z"
+}
+```
+
+```json
+{
+  "resultado": "LIBERADO",
+  "ingressoId": "0199a1c2-3333-7abc-8def-0000000000b1",
+  "setor": "Plateia A",
+  "lugar": "C-7",
+  "tipoPreco": "INTEIRA",
+  "aviso": null
+}
+```
+
+A segunda leitura do mesmo ingresso, em outro portão:
+
+```json
+{
+  "type": "https://ingressoja.dev/erros/ingresso-ja-utilizado",
+  "title": "Ingresso já utilizado",
+  "status": 409,
+  "detail": "Este ingresso entrou às 22:14:05 pelo PORTAO-2.",
+  "codigo": "ingresso-ja-utilizado",
+  "utilizadoEm": "2026-12-12T22:14:05Z",
+  "portao": "PORTAO-2",
+  "traceId": "0af7651916cd43dd8448eb211c80319c"
+}
+```
+
+### Formato de erro
+
+Todo erro usa **Problem Details (RFC 9457)** com `Content-Type: application/problem+json` (o `ProblemDetail` do Spring) e três extensões: `codigo` (estável, para o cliente tratar), `traceId` e, em erros de validação, `erros` com `campo` e `mensagem`. Stack trace nunca vai para a resposta.
+
+| Status | `codigo` | Quando |
+|---|---|---|
+| 400 | `validacao` | Corpo ou parâmetros inválidos (lista `erros`) |
+| 400 | `idempotency-key-ausente` | Pagamento ou check-in sem `Idempotency-Key` |
+| 401 | `nao-autenticado` | Sem token, token expirado ou inválido |
+| 401 | `credenciais-invalidas` | Login com e-mail ou senha errados |
+| 403 | `acesso-negado` | Papel sem permissão para a rota |
+| 403 | `passe-invalido` | Sala de espera ativa e passe ausente, vencido ou de outra conta |
+| 404 | `recurso-nao-encontrado` | Não existe **ou** pertence a outra conta (RN-08) |
+| 409 | `email-ja-cadastrado`, `cpf-ja-cadastrado` | Cadastro duplicado |
+| 409 | `lugar-indisponivel` | Algum lugar pedido não está disponível (lista `indisponiveis`) |
+| 409 | `capacidade-esgotada` | Pista sem vagas suficientes |
+| 409 | `cota-meia-esgotada` | Cota de meia do setor esgotada |
+| 409 | `reserva-ativa-existente` | Já existe reserva ativa da conta na sessão |
+| 409 | `reserva-em-estado-invalido` | Operação não permitida no estado atual |
+| 409 | `ingresso-ja-utilizado`, `ingresso-cancelado`, `token-substituido` | Check-in recusado |
+| 410 | `reserva-expirada` | Pagamento de reserva já expirada |
+| 422 | `vendas-fechadas` | Fora da janela de vendas |
+| 422 | `limite-por-cpf` | Limite do evento atingido (`disponivelParaVoce`) |
+| 422 | `evento-incompleto` | Publicação sem sessão ou setor |
+| 422 | `chave-idempotencia-reutilizada` | Mesma chave com corpo diferente |
+| 422 | `token-invalido`, `sessao-incorreta`, `fora-da-janela-de-entrada` | Check-in recusado |
+| 422 | `prazo-de-reembolso-encerrado`, `ingresso-nao-reembolsavel` | Reembolso recusado |
+| 422 | `meia-nao-transferivel`, `destinatario-invalido`, `prazo-de-transferencia-encerrado` | Transferência recusada |
+| 423 | `conta-bloqueada` | Bloqueio por tentativas de login |
+| 429 | `muitas-requisicoes` | Rate limit (com `Retry-After`) |
+| 503 | `servico-sobrecarregado` | Pool do banco esgotado ou sala de espera sem Redis (com `Retry-After`) |
+
+### Catálogo de eventos
+
+Mensageria com **RabbitMQ 4** e filas do tipo *quorum*. Toda mensagem tem os headers `idMensagem` (UUID v7, usado na deduplicação), `tipo`, `versao` (do payload, começa em 1), `ocorridoEm` e `traceparent` (contexto de tracing W3C). Payloads em JSON; dinheiro como string.
+
+| Evento | Produtor | Consumidores | Exchange / routing key | Chave de negócio | Garantia |
+|---|---|---|---|---|---|
+| `pagamento.solicitado` | API (outbox) | gateway-fake | `ingressoja.pagamentos` / `pagamento.solicitado` | `idPagamento` | Pelo menos uma vez; o gateway deduplica por `idPagamento` |
+| `pagamento.processado` | gateway-fake | API (`pagamentos`) | `gateway.resultados` / `pagamento.processado` | `idPagamento` | Pelo menos uma vez; a API deduplica por `idMensagem` na mesma transação |
+| `estorno.solicitado` | API (outbox) | gateway-fake | `ingressoja.pagamentos` / `estorno.solicitado` | `idPagamento` | Pelo menos uma vez; o gateway deduplica |
+| `estorno.processado` | gateway-fake | API (`pagamentos`) | `gateway.resultados` / `estorno.processado` | `idPagamento` | Pelo menos uma vez; deduplicado |
+| `ingressos.emitidos` | API (outbox) | API (`notificacoes`) | `ingressoja.eventos` / `ingressos.emitidos` | `reservaId` | Pelo menos uma vez; e-mail deduplicado por `idMensagem` |
+| `reserva.expirada` | API (outbox) | API (`notificacoes`) | `ingressoja.eventos` / `reserva.expirada` | `reservaId` | Pelo menos uma vez |
+| `ingresso.transferido` | API (outbox) | API (`notificacoes`) | `ingressoja.eventos` / `ingresso.transferido` | `ingressoId` | Pelo menos uma vez |
+
+Cada fila tem retry com backoff (5 tentativas: 1, 2, 4, 8 e 16 s) e uma DLQ `<fila>.dlq`. Erro de desserialização ou versão desconhecida vai direto para a DLQ (é permanente: tentar de novo não resolve). A **ordem** das mensagens não é garantida entre chaves diferentes, e o código não depende dela: um `estorno.processado` que chega antes de o sistema registrar o `estorno.solicitado` é rejeitado para retry.
+
+Payloads de `pagamento.solicitado` e `pagamento.processado` (os demais seguem o mesmo estilo e ficam documentados no README):
+
+```json
+{
+  "idPagamento": "0199a1c1-2222-7abc-8def-0123456789cd",
+  "reservaId": "0199a1c0-1111-7abc-8def-0123456789ab",
+  "valor": "346.50",
+  "moeda": "BRL",
+  "tokenCartao": "tok_aprovado",
+  "parcelas": 1,
+  "solicitadoEm": "2026-10-15T13:03:10.001Z"
+}
+```
+
+```json
+{
+  "idPagamento": "0199a1c1-2222-7abc-8def-0123456789cd",
+  "status": "APROVADO",
+  "motivo": null,
+  "idTransacaoGateway": "gw_8f14e45fceea167a",
+  "processadoEm": "2026-10-15T13:03:12.050Z"
+}
+```
+
+O gateway fake também expõe `GET /pagamentos/{idPagamento}` (resposta com `idPagamento`, `status` e `processadoEm`), usado só pela reconciliação (RN-42).
+
+## Arquitetura
+
+Um **monólito modular** (a API) e um segundo aplicativo pequeno (o **gateway fake**), mais a infraestrutura em Docker Compose. A API não guarda estado em memória que importe para a correção: pode rodar com duas instâncias atrás de um balanceador, e isso faz parte da prova de carga "acima do nível".
+
+<Figura legenda="Containers do Ingresso Já no Docker Compose. A API é a única que escreve no PostgreSQL; o gateway fake conversa com ela só por mensagens (e por um GET de consulta usado na reconciliação)">
+<svg viewBox="0 0 780 460" width="780" role="img" aria-labelledby="ij-arq-titulo ij-arq-desc">
+  <title id="ij-arq-titulo">Arquitetura de containers do Ingresso Já</title>
+  <desc id="ij-arq-desc">No topo, três clientes: pessoa compradora ou k6, produtora e portaria. Todos chamam a API ingresso-ja por HTTPS com JWT. A API é um monólito modular com os módulos identidade, catálogo, reservas, pagamentos, ingressos, portaria e notificações, além do relay da outbox, do job de expiração, do rate limit e da sala de espera. Embaixo, a API usa PostgreSQL 18 com JDBC e Flyway, Redis 8 para rate limit, sala de espera e cache, RabbitMQ 4 via AMQP, o gateway fake por HTTP só para reconciliação, o Mailpit via SMTP e o otel-lgtm via OTLP. RabbitMQ e gateway fake trocam as mensagens de pagamento e estorno.</desc>
+  <defs><marker id="ij-arq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="12" width="220" height="50" rx="10" class="d-box"/>
+  <text x="130" y="34" text-anchor="middle" class="d-title">Compradora · k6</text>
+  <text x="130" y="52" text-anchor="middle" class="d-label">reserva, paga, transfere</text>
+  <rect x="280" y="12" width="220" height="50" rx="10" class="d-box"/>
+  <text x="390" y="34" text-anchor="middle" class="d-title">Produtora</text>
+  <text x="390" y="52" text-anchor="middle" class="d-label">catálogo e relatório</text>
+  <rect x="540" y="12" width="220" height="50" rx="10" class="d-box"/>
+  <text x="650" y="34" text-anchor="middle" class="d-title">Portaria</text>
+  <text x="650" y="52" text-anchor="middle" class="d-label">check-in online e offline</text>
+  <path d="M130 62 L130 112" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M390 62 L390 112" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M650 62 L650 112" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <text x="398" y="92" class="d-label">HTTPS + JWT</text>
+  <rect x="20" y="114" width="740" height="160" rx="12" class="d-accent"/>
+  <text x="390" y="140" text-anchor="middle" class="d-title">ingresso-ja · Spring Boot 4 · Java 25 (virtual threads)</text>
+  <rect x="34" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="82" y="179" text-anchor="middle" class="d-text">identidade</text>
+  <rect x="138" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="186" y="179" text-anchor="middle" class="d-text">catalogo</text>
+  <rect x="242" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="290" y="179" text-anchor="middle" class="d-text">reservas</text>
+  <rect x="346" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="394" y="179" text-anchor="middle" class="d-text">pagamentos</text>
+  <rect x="450" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="498" y="179" text-anchor="middle" class="d-text">ingressos</text>
+  <rect x="554" y="156" width="96" height="36" rx="8" class="d-box"/>
+  <text x="602" y="179" text-anchor="middle" class="d-text">portaria</text>
+  <rect x="658" y="156" width="92" height="36" rx="8" class="d-box"/>
+  <text x="704" y="179" text-anchor="middle" class="d-text">notificacoes</text>
+  <text x="390" y="220" text-anchor="middle" class="d-label">compartilhado: outbox + relay · idempotência HTTP · Problem Details · segurança</text>
+  <text x="390" y="242" text-anchor="middle" class="d-label">jobs: expiração (SKIP LOCKED) · reconciliação · limpeza de chaves de idempotência</text>
+  <text x="390" y="262" text-anchor="middle" class="d-label">borda: rate limit (Redis) · sala de espera (Redis) · cache do mapa</text>
+  <path d="M84 274 L84 322" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M208 274 L208 322" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M332 274 L332 322" class="d-line" marker-start="url(#ij-arq-seta)" marker-end="url(#ij-arq-seta)"/>
+  <path d="M456 274 L456 322" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M580 274 L580 322" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <path d="M704 274 L704 322" class="d-line" marker-end="url(#ij-arq-seta)"/>
+  <rect x="26" y="324" width="116" height="58" rx="10" class="d-info"/>
+  <text x="84" y="348" text-anchor="middle" class="d-title">PostgreSQL 18</text>
+  <text x="84" y="368" text-anchor="middle" class="d-label">JDBC · Flyway</text>
+  <rect x="150" y="324" width="116" height="58" rx="10" class="d-info"/>
+  <text x="208" y="348" text-anchor="middle" class="d-title">Redis 8</text>
+  <text x="208" y="368" text-anchor="middle" class="d-label">limites · sala · cache</text>
+  <rect x="274" y="324" width="116" height="58" rx="10" class="d-violet"/>
+  <text x="332" y="348" text-anchor="middle" class="d-title">RabbitMQ 4</text>
+  <text x="332" y="368" text-anchor="middle" class="d-label">AMQP · quorum</text>
+  <rect x="398" y="324" width="116" height="58" rx="10" class="d-ok"/>
+  <text x="456" y="348" text-anchor="middle" class="d-title">gateway-fake</text>
+  <text x="456" y="368" text-anchor="middle" class="d-label">GET de consulta</text>
+  <rect x="522" y="324" width="116" height="58" rx="10" class="d-box"/>
+  <text x="580" y="348" text-anchor="middle" class="d-title">Mailpit</text>
+  <text x="580" y="368" text-anchor="middle" class="d-label">SMTP · :8025</text>
+  <rect x="646" y="324" width="116" height="58" rx="10" class="d-box"/>
+  <text x="704" y="348" text-anchor="middle" class="d-title">otel-lgtm</text>
+  <text x="704" y="368" text-anchor="middle" class="d-label">OTLP · Grafana</text>
+  <path d="M332 382 L332 412 L456 412 L456 384" class="d-line" marker-start="url(#ij-arq-seta)" marker-end="url(#ij-arq-seta)"/>
+  <text x="394" y="434" text-anchor="middle" class="d-label">pagamento e estorno: solicitado → processado</text>
+</svg>
+</Figura>
+
+### Organização do repositório
+
+```text
+ingresso-ja/
+├── api/                          ← o monólito modular (Maven ou Gradle)
+│   └── src/main/java/dev/<voce>/ingressoja/
+│       ├── identidade/           ← contas, login, JWT, papéis
+│       ├── catalogo/             ← eventos, sessões, setores, lugares, mapa
+│       ├── reservas/             ← reserva, cotas, limite por CPF, expiração
+│       ├── pagamentos/           ← solicitação, consumidor do resultado, reconciliação, estorno
+│       ├── ingressos/            ← emissão, token HMAC, QR, transferência, reembolso
+│       ├── portaria/             ← check-in online, lista de acesso, lote offline
+│       ├── notificacoes/         ← e-mails a partir dos eventos
+│       └── compartilhado/        ← outbox, idempotência, erros, segurança, relógio
+├── gateway-fake/                 ← Spring Boot pequeno: consome solicitações, publica resultados
+├── carga/                        ← scripts k6, dados de carga, verificacao.sql, relatório
+├── docs/
+│   ├── adr/                      ← 0001-concorrencia-na-reserva.md, ...
+│   └── diagramas/                ← os SVG/PNG do README
+├── http/                         ← arquivos .http da demonstração
+├── compose.yaml
+└── .github/workflows/ci.yml
+```
+
+Dentro de cada módulo, separe `api` (controllers e DTOs), `aplicacao` (casos de uso, transações), `dominio` (entidades, regras, estados) e `infra` (repositórios, mensageria). Um módulo só acessa outro pela interface pública dele (um serviço de aplicação ou um evento), nunca pelos repositórios do outro. Se quiser verificar isso automaticamente, o Spring Modulith ou o ArchUnit fazem esse teste (opcional).
+
+### O fluxo crítico: estados da reserva
+
+<Figura legenda="Máquina de estados da reserva. Toda seta é uma transição condicional no banco (UPDATE ... WHERE estado = origem): quando o job e o pagamento disputam a mesma reserva, só um vence">
+<svg viewBox="0 0 780 380" width="780" role="img" aria-labelledby="ij-est-titulo ij-est-desc">
+  <title id="ij-est-titulo">Estados da reserva</title>
+  <desc id="ij-est-desc">A reserva nasce ATIVA com POST de reservas. De ATIVA vai para AGUARDANDO_PAGAMENTO quando o pagamento é solicitado, para CANCELADA quando a pessoa desiste, ou para EXPIRADA quando o prazo passa. De AGUARDANDO_PAGAMENTO vai para CONFIRMADA quando o pagamento é aprovado, volta para ATIVA quando é recusado e ainda há tentativas, ou vai para EXPIRADA quando não há resposta até o prazo. Uma aprovação que chega para uma reserva EXPIRADA gera estorno automático.</desc>
+  <defs><marker id="ij-est-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <circle cx="120" cy="36" r="8" class="d-arrow"/>
+  <path d="M120 44 L120 128" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="130" y="92" class="d-mono">POST /reservas</text>
+  <rect x="30" y="130" width="180" height="54" rx="12" class="d-accent"/>
+  <text x="120" y="154" text-anchor="middle" class="d-title">ATIVA</text>
+  <text x="120" y="173" text-anchor="middle" class="d-label">lugares retidos · 10 min</text>
+  <rect x="300" y="130" width="230" height="54" rx="12" class="d-violet"/>
+  <text x="415" y="154" text-anchor="middle" class="d-title">AGUARDANDO_PAGAMENTO</text>
+  <text x="415" y="173" text-anchor="middle" class="d-label">outbox: pagamento.solicitado</text>
+  <rect x="610" y="30" width="160" height="54" rx="12" class="d-ok"/>
+  <text x="690" y="54" text-anchor="middle" class="d-title">CONFIRMADA</text>
+  <text x="690" y="73" text-anchor="middle" class="d-label">ingressos emitidos</text>
+  <rect x="610" y="246" width="160" height="54" rx="12" class="d-box"/>
+  <text x="690" y="270" text-anchor="middle" class="d-title">EXPIRADA</text>
+  <text x="690" y="289" text-anchor="middle" class="d-label">lugares liberados</text>
+  <rect x="30" y="300" width="180" height="54" rx="12" class="d-box"/>
+  <text x="120" y="324" text-anchor="middle" class="d-title">CANCELADA</text>
+  <text x="120" y="343" text-anchor="middle" class="d-label">lugares liberados</text>
+  <path d="M210 148 L298 148" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="254" y="140" text-anchor="middle" class="d-label">paga</text>
+  <path d="M330 184 C 300 226, 240 226, 196 186" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="262" y="234" text-anchor="middle" class="d-label">recusado (até 3 vezes)</text>
+  <path d="M500 130 L608 68" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="520" y="88" class="d-label">aprovado</text>
+  <path d="M500 184 L608 256" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="560" y="208" class="d-label">sem resposta</text>
+  <path d="M170 184 L170 272 L608 272" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="390" y="264" text-anchor="middle" class="d-label">expira_em passou (job a cada 10 s)</text>
+  <path d="M70 184 L70 298" class="d-line" marker-end="url(#ij-est-seta)"/>
+  <text x="78" y="246" class="d-label">desiste</text>
+  <text x="690" y="324" text-anchor="middle" class="d-label">aprovação tardia</text>
+  <text x="690" y="342" text-anchor="middle" class="d-label">→ estorno automático</text>
+</svg>
+</Figura>
+
+<Figura legenda="Sequência da compra: a API responde 202 na hora e o resultado do pagamento chega por mensagem. Cada seta que atravessa a rede pode ser repetida; por isso há outbox de um lado e deduplicação do outro">
+<svg viewBox="0 0 780 520" width="780" role="img" aria-labelledby="ij-seq-titulo ij-seq-desc">
+  <title id="ij-seq-titulo">Sequência da compra com pagamento assíncrono</title>
+  <desc id="ij-seq-desc">A compradora envia o pagamento à API. A API grava, numa transação, o novo estado da reserva, o pagamento e a outbox, e responde 202. O relay publica pagamento.solicitado no RabbitMQ, que entrega ao gateway fake. O gateway decide e publica pagamento.processado. O RabbitMQ entrega à API, que numa transação registra o id da mensagem, confirma a reserva com update condicional, cria os ingressos e grava ingressos.emitidos na outbox. A compradora consulta a reserva e recebe CONFIRMADA com os ingressos.</desc>
+  <defs><marker id="ij-seq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="110" height="38" rx="8" class="d-box"/>
+  <text x="65" y="34" text-anchor="middle" class="d-title">Compradora</text>
+  <rect x="165" y="10" width="110" height="38" rx="8" class="d-accent"/>
+  <text x="220" y="34" text-anchor="middle" class="d-title">API</text>
+  <rect x="365" y="10" width="110" height="38" rx="8" class="d-info"/>
+  <text x="420" y="34" text-anchor="middle" class="d-title">PostgreSQL</text>
+  <rect x="535" y="10" width="110" height="38" rx="8" class="d-violet"/>
+  <text x="590" y="34" text-anchor="middle" class="d-title">RabbitMQ</text>
+  <rect x="660" y="10" width="110" height="38" rx="8" class="d-ok"/>
+  <text x="715" y="34" text-anchor="middle" class="d-title">Gateway</text>
+  <path d="M65 48 L65 510" class="d-line" stroke-dasharray="4 5"/>
+  <path d="M220 48 L220 510" class="d-line" stroke-dasharray="4 5"/>
+  <path d="M420 48 L420 510" class="d-line" stroke-dasharray="4 5"/>
+  <path d="M590 48 L590 510" class="d-line" stroke-dasharray="4 5"/>
+  <path d="M715 48 L715 510" class="d-line" stroke-dasharray="4 5"/>
+  <path d="M65 84 L218 84" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="72" y="77" class="d-label">POST …/pagamento</text>
+  <path d="M220 118 L418 118" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="228" y="111" class="d-label">tx: AGUARDANDO + outbox</text>
+  <path d="M220 150 L67 150" class="d-line" stroke-dasharray="5 4" marker-end="url(#ij-seq-seta)"/>
+  <text x="80" y="143" class="d-label">202 Accepted</text>
+  <path d="M220 190 L588 190" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="228" y="183" class="d-label">relay da outbox: pagamento.solicitado (confirm)</text>
+  <path d="M590 224 L713 224" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="598" y="217" class="d-label">entrega</text>
+  <rect x="660" y="240" width="110" height="30" rx="6" class="d-box"/>
+  <text x="715" y="260" text-anchor="middle" class="d-label">decide (2 s)</text>
+  <path d="M715 290 L592 290" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="600" y="283" class="d-label">processado</text>
+  <path d="M590 326 L222 326" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="300" y="319" class="d-label">pagamento.processado (pode vir 2 vezes)</text>
+  <path d="M220 362 L418 362" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="228" y="355" class="d-label">tx: dedupe + CONFIRMADA</text>
+  <text x="228" y="382" class="d-label">+ ingressos + outbox</text>
+  <path d="M220 412 L588 412" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="300" y="405" class="d-label">ingressos.emitidos → e-mail</text>
+  <path d="M65 452 L218 452" class="d-line" marker-end="url(#ij-seq-seta)"/>
+  <text x="72" y="445" class="d-label">GET /reservas/:id</text>
+  <path d="M220 486 L67 486" class="d-line" stroke-dasharray="5 4" marker-end="url(#ij-seq-seta)"/>
+  <text x="72" y="479" class="d-label">CONFIRMADA + ingressos</text>
+</svg>
+</Figura>
+
+### Decisões para registrar em ADRs
+
+Cada decisão abaixo vira um arquivo em `docs/adr/` (formato curto: contexto, opções, decisão, consequências, como foi verificado). As recomendações são uma base sólida; você pode decidir diferente, desde que prove com teste e explique.
+
+**ADR-001 · Como impedir que o mesmo lugar marcado seja reservado duas vezes?**
+
+| Opção | Como funciona | A favor | Contra |
+|---|---|---|---|
+| `SELECT ... FOR UPDATE` e depois `UPDATE` | Trava as linhas dos lugares pedidos (em ordem de id), confere o estado em Java e atualiza | Fácil de raciocinar; a regra fica no Java | Duas idas ao banco; quem chega depois **espera** o lock; sem ordem fixa, deadlock |
+| `FOR UPDATE SKIP LOCKED` | Igual, mas pula linhas travadas | Ninguém espera | Serve para "qualquer vaga livre", não para "este lugar": pular `C-7` travado faria a reserva parecer ter sucesso parcial |
+| **Update condicional atômico** | `UPDATE lugar SET estado='RESERVADO', reserva_id=? WHERE id = ANY(?) AND estado='DISPONIVEL'` e conferir se o número de linhas afetadas é igual ao pedido; senão, rollback | Uma ida ao banco; o banco decide; nenhum estado lido fica velho | A regra fica no SQL; precisa de um `SELECT` extra só no caminho de erro para listar os indisponíveis |
+| Lock otimista (`@Version`) | Lê, altera, grava conferindo a versão; conflito lança exceção | Ótimo para pouca disputa | Na abertura, **todo mundo** disputa os mesmos lugares: tempestade de conflitos e retentativas |
+| Reserva no Redis (`SET NX` com TTL) e confirmação no banco | O Redis retém o lugar por 10 min; o banco só recebe a venda | Muito rápido; TTL faz a expiração sozinho | Duas fontes de verdade; se o Redis reinicia ou falha, o banco precisa impedir a duplicidade de qualquer jeito |
+
+**Recomendação:** update condicional atômico, com os ids **ordenados** no pedido, numa transação curta (o `READ COMMITTED` padrão do PostgreSQL basta: o `UPDATE` reavalia o `WHERE` depois de esperar a linha travada). Defesa em profundidade: índice único parcial em `ingresso(lugar_id)`. Trate o erro de deadlock do PostgreSQL (SQLState `40P01`) e o de serialização (`40001`) como conflito, com **uma** retentativa numa transação nova. Prove com os testes CA-10 e CA-11 e com o k6.
+
+```sql
+-- Reserva de lugares marcados: tudo ou nada
+update lugar
+   set estado = 'RESERVADO', reserva_id = :reservaId, versao = versao + 1
+ where id = any(:lugaresOrdenados)
+   and setor_id in (select id from setor where sessao_id = :sessaoId)
+   and estado = 'DISPONIVEL';
+-- linhas afetadas != quantidade pedida  →  rollback e 409 lugar-indisponivel
+```
+
+**ADR-002 · Como controlar capacidade da pista, cota de meia e limite por CPF?**
+
+Opções: (a) contador no setor com update condicional (`UPDATE setor SET reservados = reservados + :q WHERE id = ? AND reservados + vendidos + :q <= capacidade`); (b) uma linha por vaga da pista e `FOR UPDATE SKIP LOCKED LIMIT :q` (espalha a disputa, mas cria 15.000 linhas por setor); (c) `DECRBY` atômico no Redis e reconciliação com o banco. **Recomendação:** (a) para pista e meia (o `CHECK` do banco é a rede de proteção) e o mesmo padrão para o limite por CPF em `cota_conta_evento` (com `INSERT ... ON CONFLICT DO NOTHING` antes do update, para a linha existir). Mencione no ADR o custo: a linha do setor da pista vira um ponto quente, e todas as reservas de pista se enfileiram nela; meça no k6 quanto tempo cada transação segura o lock e explique por que a transação precisa ser curta (nada de chamada de rede dentro dela). A opção (b) fica como evolução se a medição mostrar gargalo.
+
+**ADR-003 · Como expirar reservas sem condição de corrida?**
+
+Opções: (a) job agendado com `SELECT ... FOR UPDATE SKIP LOCKED` em lotes; (b) mensagem atrasada no RabbitMQ (TTL + dead-letter) por reserva; (c) expiração de chave do Redis com notificação (keyspace notifications não têm garantia de entrega). **Recomendação:** (a), porque o estado já está no banco e o job é simples de testar com `Clock`; várias instâncias dividem o trabalho sem se bloquear. A proteção contra a corrida com o pagamento **não** é o lock do job: é a transição condicional (RN-43). Registre a sequência de passos da transação de expiração: travar a reserva, mudar o estado condicionalmente, devolver lugares, contadores e cota, gravar `reserva.expirada` na outbox.
+
+**ADR-004 · Como pedir o pagamento sem perder nem duplicar?**
+
+Opções: (a) chamada HTTP síncrona ao gateway dentro do request; (b) publicar no RabbitMQ direto do serviço após o commit; (c) **outbox transacional** + relay com publisher confirms + consumidor idempotente. **Recomendação:** (c). Explique no ADR os quatro jeitos de dar errado de (b) (publica e o commit falha; commita e a publicação falha; etc.) e por que (a) acopla a latência da abertura à do gateway. O relay pode ser um job de polling a cada 200 ms (bom o suficiente aqui; CDC fica em "Para ir além").
+
+**ADR-005 · Que token vai no QR code?**
+
+Opções: (a) um id aleatório, validado só online; (b) **HMAC-SHA256 com chave derivada por sessão**; (c) assinatura assimétrica (Ed25519, nativa no Java desde a versão 15): o leitor só precisa da chave pública. **Recomendação:** (b), porque atende ao requisito offline com uma primitiva simples, e a derivação por sessão limita o estrago se um leitor for comprometido (a chave dele só serve para aquela sessão). Registre que (c) é superior quando os leitores não são confiáveis, e por que não foi escolhida agora.
+
+**ADR-006 · Cache do mapa de lugares**
+
+Na abertura, milhares de pessoas atualizam o mapa sem parar. Opções: sem cache (toda leitura no banco), cache local (Caffeine) de 1 s por instância, cache no Redis de 1 s compartilhado. **Recomendação:** cache com TTL de 1 s (local ou Redis; justifique), aceitando até 2 s de atraso (RN-17), porque a reserva é validada no banco de qualquer forma. Meça a diferença no k6 (com e sem cache) e coloque os números no ADR.
+
+**ADR-007 · Rate limit, sala de espera e o que fazer quando o Redis cai**
+
+Opções para o limitador: em memória por instância (errado com duas instâncias), Redis com script Lua próprio, ou a biblioteca Bucket4j com backend Redis. **Recomendação:** Redis (Lua ou Bucket4j), com as chaves da RN-62. Para falhas do Redis, decida explicitamente *fail-open* (limite) e *fail-closed* (sala de espera), como em RN-63, protegendo as chamadas com timeout de 50 ms e circuit breaker do Resilience4j (confira na documentação do Resilience4j o artefato compatível com o Spring Boot 4).
+
+**ADR-008 · Monólito modular, virtual threads e o pool do banco**
+
+Por que não microsserviços: um time de uma pessoa, uma transação que precisa tocar reserva, lugares e contadores juntos, e nenhuma necessidade de escala independente comprovada. Virtual threads (`spring.threads.virtual.enabled=true`) deixam a API aceitar milhares de requisições concorrentes, **mas o banco continua tendo um pool finito** (Hikari, por exemplo 20 conexões): o gargalo muda de lugar, não some. Configure `connection-timeout` de 2 s e transforme o timeout em `503 servico-sobrecarregado` com `Retry-After` (RNF-12). Meça no k6 com pools de 10, 20 e 40 conexões e registre o resultado.
+
+## Plano de execução
+
+O plano tem **começo, meio e fim**. O começo (marcos 1 e 2) monta um repositório que qualquer pessoa clona e sobe com um comando, com CI verde e segurança desde o primeiro endpoint. O meio (marcos 3 a 7) entrega o produto em **fatias verticais**: cada marco termina com uma funcionalidade que funciona de ponta a ponta (HTTP, regra, banco, mensagem, teste) e pode ser demonstrada. O fim (marcos 8 e 9) prova o sistema sob carga e o embala para quem vai avaliá-lo: painel, relatório, README, vídeo e release. Ao fechar cada marco: commit pequeno e descritivo (ou PR para a sua própria `main`), README atualizado e o marco marcado aqui na página.
+
+<Marco id="fundacao" numero={1} titulo="Fundação do repositório" horas={12}>
+
+**Objetivo.** Ter um esqueleto profissional rodando: duas aplicações, toda a infraestrutura em Docker Compose, CI verde e um README que explica o que vem por aí.
+
+**Tarefas.**
+
+- Criar o repositório público `ingresso-ja` com `.gitignore`, licença MIT, `README.md` e `docs/adr/0000-registro-de-decisoes.md` (o modelo dos ADRs).
+- Gerar `api` e `gateway-fake` no Spring Initializr (Java 25, Spring Boot 4.x): Web, Validation, Data JPA, PostgreSQL Driver, Flyway, Actuator, Security (só na `api`), AMQP, Data Redis (só na `api`), Testcontainers.
+- `compose.yaml` com `postgres:18`, `redis:8`, `rabbitmq:4-management`, `axllent/mailpit`, `grafana/otel-lgtm`, a `api` e o `gateway-fake` (com `Dockerfile` multi-stage ou imagem gerada pelo plugin do Spring Boot), healthchecks e `depends_on` com `condition: service_healthy`.
+- `V1__identidade.sql` vazio de regras, só para provar o Flyway; perfil `dev` com logs em JSON.
+- GitHub Actions: build, testes (com Docker disponível no runner para o Testcontainers), JaCoCo e cache de dependências.
+- Um primeiro teste de integração `@SpringBootTest` que sobe com Testcontainers (PostgreSQL, RabbitMQ e Redis) e chama `/actuator/health`.
+
+**Entregáveis.** Repositório público, `compose.yaml`, workflow do CI, README inicial com objetivo, stack, como rodar e o roadmap (os 9 marcos).
+
+**Definição de pronto.** `git clone` + `docker compose up -d` sobe os 7 containers saudáveis em até 2 minutos; `curl localhost:8080/actuator/health` devolve `{"status":"UP"}`; o Mailpit abre em `localhost:8025` e o Grafana em `localhost:3000`; o CI da `main` está verde e o badge aparece no README.
+
+**Aulas de apoio.** [Docker](../../../aulas/14-devops/03-docker/) · [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/) · [Maven e Gradle](../../../aulas/14-devops/02-maven-e-gradle/) · [Testcontainers](../../../aulas/10-testes/05-testcontainers/) · [Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/#flyway-o-schema-como-código) · [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/)
+
+<Callout tipo="erro" titulo="Armadilhas do começo">
+Senha do banco e chave do JWT commitadas no `application.yml`: use variáveis de ambiente com um `.env.example` (o `.env` real fica no `.gitignore`). E não deixe o `spring.jpa.hibernate.ddl-auto=update` ligado: quem cria o schema é o Flyway, e o Hibernate só valida (`validate`).
+</Callout>
+
+</Marco>
+
+<Marco id="identidade" numero={2} titulo="Contas, JWT e papéis" horas={12}>
+
+**Objetivo.** Implementar RF-01 e RF-02: qualquer endpoint criado daqui em diante já nasce protegido e com o dono do recurso verificado.
+
+**Tarefas.**
+
+- Cadastro com validação de CPF (dígitos verificadores, percorrendo os caracteres), e-mail normalizado e política de senha (RN-01 a RN-03).
+- Login, refresh com rotação e detecção de reuso, logout, bloqueio após 5 falhas (RN-04, RN-05), tudo com `Clock` injetado.
+- Spring Security 7 como resource server JWT; conversão dos claims `papeis` em autoridades; `@PreAuthorize` nos casos de uso.
+- Tratamento global de erros com `ProblemDetail` e as extensões `codigo` e `traceId`.
+- Teste da matriz de autorização parametrizado (CA-04), mesmo que hoje só existam poucos endpoints: ele cresce a cada marco.
+- ADR do formato de token (HS256 com segredo de 256 bits, por que basta para uma única API, quando migrar para RS256).
+
+**Entregáveis.** Endpoints de `/auth` e `/contas/me`, `http/01-identidade.http`, matriz de autorização no README.
+
+**Definição de pronto.** CA-01, CA-02 e CA-03 passam como testes automatizados; um teste captura os logs da aplicação durante o cadastro e confirma que o CPF não aparece; o access token decodificado em jwt.io mostra só `sub`, `papeis`, `produtora`, `iat`, `exp` e `iss`.
+
+**Aulas de apoio.** [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/) · [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/) · [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/) · [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/) · [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/) · [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/)
+
+<Callout tipo="erro" titulo="403 em vez de 404">
+O teste de BOLA mais comum de falhar: Bruno pede a reserva de Ana e recebe `403`. Isso confirma que o id existe. Busque sempre "reserva por id **e** dono" no repositório; se não achar, é `404`.
+</Callout>
+
+</Marco>
+
+<Marco id="catalogo" numero={3} titulo="Catálogo e mapa de lugares" horas={14}>
+
+**Objetivo.** Implementar RF-03 e RF-04: a produtora monta um evento completo e o público o encontra e vê o mapa.
+
+**Tarefas.**
+
+- Migration `V2__catalogo.sql` com os `CHECK` do setor e os índices.
+- Endpoints da produtora (evento, sessão, setor, lugares em lote, bloqueio, publicação) com verificação de produtora dona.
+- Catálogo público paginado com filtros (RN-13) e detalhe do evento sem N+1 (confira a quantidade de SQL no log).
+- Mapa da sessão com cache de 1 s (ADR-006); geração de 5.000 lugares com `saveAll` em lote ou `INSERT` em lote via JDBC, medindo o tempo.
+- Seed de desenvolvimento: o "Teatro Capiba" com 1.200 lugares e o "Maré Alta" com pista de 15.000.
+
+**Entregáveis.** `http/02-catalogo.http` com o roteiro completo de cadastro e publicação; ADR-006.
+
+**Definição de pronto.** CA-06, CA-07 e CA-08 (funcional) passam; criar um setor de 5.000 lugares leva menos de 2 s; o detalhe do evento executa no máximo 3 consultas SQL, conferido em teste com contagem de statements (por exemplo, com as estatísticas do Hibernate).
+
+**Aulas de apoio.** [Modelagem](../../../aulas/07-sql/01-modelagem/) · [DDL e constraints](../../../aulas/07-sql/02-ddl-e-constraints/) · [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/) · [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/) · [Cache](../../../aulas/15-system-design/01-cache/)
+
+<Callout tipo="erro" titulo="Gerar lugares um por um">
+5.000 `save` individuais com `GenerationType.IDENTITY` viram 5.000 idas ao banco. Use ids gerados na aplicação (UUID v7) e inserção em lote (`hibernate.jdbc.batch_size`) ou JDBC direto.
+</Callout>
+
+</Marco>
+
+<Marco id="reserva" numero={4} titulo="Reserva concorrente sem overbooking" horas={22}>
+
+**Objetivo.** O coração do projeto: RF-05, RF-06 e RF-07, com a decisão de concorrência registrada e **provada**.
+
+**Tarefas.**
+
+- Migration `V3__reservas.sql` com os índices únicos parciais e `cota_conta_evento`.
+- Caso de uso `CriarReserva` numa transação curta, nesta ordem: validar janela e itens, reservar a cota do CPF (update condicional), reservar lugares marcados (update condicional ordenado), reservar pista e meia (update condicional no setor), gravar a reserva e os itens. Qualquer falha desfaz tudo.
+- Tradução das falhas para os códigos do contrato (`lugar-indisponivel` com a lista, `capacidade-esgotada`, `cota-meia-esgotada`, `limite-por-cpf`, `reserva-ativa-existente`); violação de índice único também vira `409`, não `500`.
+- Uma retentativa para deadlock e falha de serialização, numa transação nova.
+- Desistência (RN-24) devolvendo tudo na mesma transação.
+- **Testes concorrentes** com Testcontainers: um utilitário que dispara N tarefas em virtual threads, todas liberadas ao mesmo tempo por um `CountDownLatch`, e confere o banco no fim (CA-10, CA-11, CA-13, CA-14, CA-15).
+- Escrever o ADR-001 e o ADR-002 com o resultado dos testes, inclusive de uma tentativa com `@Version` (quantos conflitos e retentativas com 200 threads).
+
+**Entregáveis.** `POST /reservas`, `GET` e `DELETE /reservas/{id}`, testes concorrentes, ADR-001 e ADR-002, `http/03-reserva.http`.
+
+**Definição de pronto.** Os testes concorrentes passam 20 vezes seguidas (`mvn test -Dsurefire.rerunFailingTestsCount=0` num laço, ou `@RepeatedTest`); trocar o update condicional por "ler, conferir em Java e gravar" sem lock faz o CA-10 **falhar** (deixe esse experimento descrito no ADR: é a prova de que o teste testa algo).
+
+**Aulas de apoio.** [Transações e isolamento](../../../aulas/07-sql/06-transacoes-e-jdbc/#isolamento-e-anomalias) · [Três formas de evitar o lost update](../../../aulas/07-sql/06-transacoes-e-jdbc/#três-formas-de-evitar-o-lost-update) · [Lock otimista](../../../aulas/09-persistencia/06-locking-e-flyway/#lock-otimista-com-version) · [Lock pessimista](../../../aulas/09-persistencia/06-locking-e-flyway/#lock-pessimista) · [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/) · [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/) · [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/)
+
+<Callout tipo="erro" titulo="O teste concorrente que nunca concorre">
+Criar 200 threads num laço e chamar o serviço logo em seguida faz as primeiras terminarem antes de as últimas começarem: o teste passa com qualquer código. Segure todas num `CountDownLatch` e libere de uma vez; e use um pool de conexões do tamanho da disputa que você quer provocar. Outro clássico: `synchronized` no serviço "resolve" no teste e não resolve nada com duas instâncias da API.
+</Callout>
+
+<Callout tipo="erro" titulo="Transação longa">
+Chamar Redis, RabbitMQ ou qualquer coisa de rede dentro da transação da reserva mantém os locks das linhas quentes (setor da pista) presos durante a chamada. Na abertura, isso derruba a vazão inteira. Dentro da transação, só SQL.
+</Callout>
+
+</Marco>
+
+<Marco id="pagamento" numero={5} titulo="Pagamento assíncrono idempotente" horas={20}>
+
+**Objetivo.** RF-08: pagar sem perder nem duplicar nada, mesmo com mensagens repetidas e com o RabbitMQ fora do ar por um tempo.
+
+**Tarefas.**
+
+- `gateway-fake`: consumidor de `pagamento.solicitado` e `estorno.solicitado`, comportamento por `tokenCartao` (RN-39), deduplicação por `idPagamento`, publicação dos resultados e `GET /pagamentos/{idPagamento}`.
+- Na API: `V4__pagamentos_e_mensageria.sql`, endpoint de pagamento com `Idempotency-Key` (RN-34), outbox gravada na mesma transação e relay com publisher confirms.
+- Consumidor de `pagamento.processado` com deduplicação em `mensagem_processada` na mesma transação da confirmação, transição condicional (RN-37) e recusa com volta para `ATIVA` (RN-36).
+- Topologia declarada no código: exchanges, filas quorum, retry com backoff e DLQs.
+- Propagação do contexto de tracing nas mensagens (header `traceparent`).
+- ADR-004.
+
+**Entregáveis.** Fluxo de compra completo com `tok_aprovado`, `tok_recusado` e `tok_duplicado`; `http/04-pagamento.http`.
+
+**Definição de pronto.** CA-16, CA-17 e CA-18 passam; num teste de integração, o RabbitMQ é parado (`container.stop()` ou pausa) depois do `202`, religado 30 s depois, e a reserva termina `CONFIRMADA` sem intervenção; uma mensagem com JSON inválido vai para a DLQ sem retry.
+
+**Aulas de apoio.** [Por que mensageria](../../../aulas/12-mensageria/01-por-que-mensageria/) · [RabbitMQ](../../../aulas/12-mensageria/02-rabbitmq/) · [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/#a-solução-a-outbox-na-mesma-transação) · [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/#deduplicação-na-mesma-transação) · [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/) · [Testes de contrato](../../../aulas/10-testes/07-testes-de-contrato/) · [Evolução de esquemas de eventos](../../../aulas/12-mensageria/07-evolucao-de-esquemas-de-eventos/)
+
+<Callout tipo="erro" titulo="Deduplicar fora da transação">
+Gravar o `idMensagem` como processado **depois** do commit da confirmação (ou num Redis à parte) deixa uma janela em que a falha entre os dois passos faz a mensagem ser reprocessada. O registro de deduplicação e o efeito vão na mesma transação, e o e-mail só sai depois do commit, a partir de outro evento.
+</Callout>
+
+</Marco>
+
+<Marco id="expiracao-e-emissao" numero={6} titulo="Expiração, pagamento tardio e emissão" horas={16}>
+
+**Objetivo.** RF-09 e RF-10: reservas abandonadas devolvem os lugares sozinhas, a corrida com o pagamento tardio é resolvida e o ingresso nasce com um QR que a portaria consegue validar.
+
+**Tarefas.**
+
+- Job de expiração a cada 10 s com `FOR UPDATE SKIP LOCKED` em lotes de 200 (RN-40, RN-41), com a métrica de atraso da expiração.
+- Reconciliação com o gateway antes de expirar reservas em `AGUARDANDO_PAGAMENTO`, com timeout, retry e circuit breaker (RN-42).
+- Pagamento tardio vira estorno (RN-44); consumidor de `estorno.processado`.
+- `V5__ingressos.sql`; emissão dos ingressos na confirmação; token `IJ1` com HMAC e chave derivada por sessão (RN-46, RN-47); `GET /ingressos/{id}/qr` com ZXing.
+- Módulo de notificações: e-mails de ingressos emitidos, reserva expirada e estorno, enviados ao Mailpit.
+- ADR-003 e ADR-005.
+
+**Entregáveis.** Demonstração com `tok_lento` (expira e estorna) e `tok_mudo` (expira por falta de resposta); PNG do QR lido com o celular mostrando o texto `IJ1...`.
+
+**Definição de pronto.** CA-19, CA-20, CA-21 e CA-22 passam; o CA-20 roda 100 repetições sem nenhum estado misto; com duas instâncias da API no Compose, um teste com 1.000 reservas vencidas confere que cada uma foi expirada exatamente uma vez (contagem de `reserva.expirada` na outbox).
+
+**Aulas de apoio.** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/) · [Locking](../../../aulas/09-persistencia/06-locking-e-flyway/) · [Sagas e consistência](../../../aulas/15-system-design/05-escala-e-consistencia/#sagas) · [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/)
+
+<Callout tipo="erro" titulo="Ler o estado e decidir em Java">
+"Se `reserva.getEstado() == AGUARDANDO_PAGAMENTO` então confirma" é exatamente a condição de corrida da RN-43: entre a leitura e a escrita, o job expirou a reserva. A decisão tem de estar no `WHERE` do `UPDATE` (ou sob lock da linha), e o código age conforme o número de linhas afetadas.
+</Callout>
+
+</Marco>
+
+<Marco id="portaria" numero={7} titulo="Check-in, reembolso e transferência" horas={16}>
+
+**Objetivo.** RF-11, RF-12 e RF-13: o ciclo de vida do ingresso depois da compra.
+
+**Tarefas.**
+
+- Check-in online com transição condicional, `Idempotency-Key` por leitura e registro de toda leitura (RN-50 a RN-53).
+- Lista de acesso paginada e sincronização em lote das leituras offline, com a regra da leitura mais antiga (RN-54).
+- Um leitor de linha de comando simples (um `main` ou um teste) que baixa a lista, valida tokens offline e sincroniza depois: é a prova do requisito offline.
+- Reembolso com as regras de prazo (testadas com `Clock`), devolução de lugar, cota e limite, e estorno via outbox (RN-55 a RN-58).
+- Transferência com novo `versao_token`, limite do destinatário e e-mail (RN-59 a RN-61).
+
+**Entregáveis.** `http/05-portaria.http` e `http/06-pos-venda.http`; o leitor offline no repositório (pasta `ferramentas/leitor`).
+
+**Definição de pronto.** CA-23, CA-24, CA-25 e CA-26 passam; a tabela de casos de prazo da RN-55 (os quatro horários do exemplo) é um teste parametrizado; o leitor offline valida 10.000 tokens em menos de 1 s.
+
+**Aulas de apoio.** [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/) · [JUnit e AssertJ](../../../aulas/10-testes/02-junit-e-assertj/) · [Java moderno na prática](../../../aulas/04-java-moderno/05-java-moderno-na-pratica/) · [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/)
+
+<Callout tipo="erro" titulo="Idempotência que vira bug">
+Se o reenvio da mesma leitura (mesma `Idempotency-Key`) devolve `409 ingresso-ja-utilizado`, o porteiro barra uma pessoa que acabou de entrar legitimamente porque a rede oscilou. Distinga "a mesma leitura repetida" de "outra leitura do mesmo ingresso".
+</Callout>
+
+</Marco>
+
+<Marco id="abertura" numero={8} titulo="Abertura de vendas sob carga" horas={16}>
+
+**Objetivo.** RF-14, RF-15 (desejável) e os RNF de desempenho: simular a abertura, medir e escrever o relatório.
+
+**Tarefas.**
+
+- Rate limit em Redis com as chaves da RN-62, headers de resposta e o comportamento de falha da RN-63.
+- Sala de espera com sorteio na abertura, admissão por segundo e passe de compra (RN-65 a RN-67), se for fazer o desejável.
+- Métricas de negócio com Micrometer (tabela abaixo), painel no Grafana exportado em JSON para `docs/grafana/`.
+- Script k6 em `carga/abertura.js` e dados de carga: 500 contas, uma sessão com 1.000 lugares (800 marcados e uma pista de 200).
+- `carga/verificacao.sql`: consultas que devem devolver zero linhas (lugar em dois ingressos válidos, setor acima da capacidade, meia acima da cota, conta acima do limite).
+- Rodadas com pool de 10, 20 e 40 conexões, com e sem cache do mapa; relatório `carga/RELATORIO.md`.
+
+| Métrica | Tipo | Tags (baixa cardinalidade) |
+|---|---|---|
+| `ingressoja.reservas.ativas` | gauge | nenhuma |
+| `ingressoja.reservas.criadas` | contador | `resultado` (`sucesso`, `lugar_indisponivel`, `capacidade_esgotada`, `limite_cpf`, ...) |
+| `ingressoja.reserva.desfecho` | timer (criação até o fim) | `desfecho` (`confirmada`, `expirada`, `cancelada`) |
+| `ingressoja.pagamento.confirmacao` | timer | `status` |
+| `ingressoja.mensagens.duplicadas` | contador | `fila` |
+| `ingressoja.outbox.pendentes` | gauge | nenhuma |
+| `ingressoja.checkins` | contador | `resultado` |
+| `ingressoja.ratelimit.bloqueios` | contador | `chave` (`conta`, `ip`) |
+
+A conversão (confirmadas ÷ criadas) é calculada no painel, não no código. Nunca use id de evento, conta ou reserva como tag.
+
+O esqueleto do cenário no k6:
+
+```javascript
+export const options = {
+  scenarios: {
+    abertura: { executor: 'per-vu-iterations', vus: 500, iterations: 1, maxDuration: '5m' },
+  },
+  thresholds: {
+    'http_req_duration{nome:criar-reserva}': ['p(95)<400', 'p(99)<1000'],
+    'http_req_duration{nome:mapa}': ['p(95)<150'],
+    http_req_failed: ['rate<0.005'],
+  },
+};
+// Cada VU: faz login, espera o horário de abertura, lê o mapa, escolhe 1 a 4 lugares
+// livres, tenta reservar (até 5 tentativas em caso de 409), paga com tok_aprovado
+// e consulta a reserva até CONFIRMADA. Marque 409 e 429 como esperados com
+// http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 409, 429)).
+```
+
+**Entregáveis.** Painel do Grafana, script k6, `verificacao.sql` e `carga/RELATORIO.md` com: ambiente (CPU, RAM, versões), cenário, tabela de resultados por rodada (p50, p95, p99, vazão, erros, lugares vendidos), as consultas de verificação com zero linhas, prints do painel e de um trace, gargalo encontrado e o que foi mudado por causa dele.
+
+**Definição de pronto.** Os thresholds do k6 passam na configuração escolhida; `verificacao.sql` devolve zero linhas em **todas** as rodadas; nenhum dos 1.000 lugares é vendido mais de uma vez; CA-27 passa com duas instâncias da API; o relatório explica pelo menos um gargalo com números.
+
+**Aulas de apoio.** [Redis: rate limit distribuído](../../../aulas/15-system-design/02-redis/#rate-limit-distribuído) · [Rate limiting](../../../aulas/11-seguranca/06-defesas-da-api/#limite-de-requisições-rate-limiting) · [Observabilidade](../../../aulas/14-devops/05-observabilidade/) · [Cardinalidade](../../../aulas/14-devops/05-observabilidade/#cardinalidade-a-regra-mais-importante) · [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/) · [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/)
+
+<Callout tipo="erro" titulo="Carga que mede o k6, não a API">
+Rodar k6, API, banco e Grafana na mesma máquina com pouca memória mede a disputa por CPU entre eles. Registre os recursos no relatório, limite a CPU dos containers de forma igual entre as rodadas e compare rodadas entre si, não com números da internet. E o p95 sozinho mente se metade das requisições for `429`: mostre a distribuição por status.
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Entrega e release v1.0.0" horas={10}>
+
+**Objetivo.** Transformar o repositório em portfólio: alguém de fora entende, roda e avalia em 10 minutos.
+
+**Tarefas.**
+
+- Revisar os 8 ADRs com os números finais; conferir que o README segue o modelo da seção "Entregáveis do portfólio".
+- Deploy de demonstração: uma VM pequena com Docker Compose num plano gratuito (vários provedores oferecem) ou uma plataforma de containers com banco gerenciado no plano gratuito; HTTPS, perfil `prod`, segredos em variáveis de ambiente, dados de demonstração. Se não houver opção gratuita viável, o vídeo e o `docker compose up` local bastam: diga isso no README.
+- Gravar a demonstração de até 3 minutos (roteiro abaixo).
+- Tag `v1.0.0` com release notes no GitHub (o que faz, como rodar, limites conhecidos) e o `CHANGELOG.md`.
+- Post no LinkedIn.
+
+**Entregáveis.** README final, link da demonstração em vídeo, release `v1.0.0`, URL do deploy (se houver), post publicado.
+
+**Definição de pronto.** Uma pessoa que nunca viu o projeto clona, sobe com `docker compose up` e executa o roteiro do `.http` sem pedir ajuda (peça a alguém e cronometre); o CI está verde na tag; nenhum segredo no histórico (varredura do `gitleaks` limpa).
+
+**Aulas de apoio.** [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/) · [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/) · [Git no time](../../../aulas/14-devops/01-git-no-time/) · [Processo seletivo](../../../aulas/17-carreira/03-processo-seletivo/)
+
+<Callout tipo="erro" titulo="README que só explica como rodar">
+Quem avalia lê o começo do README e decide em 30 segundos se continua. Os números do teste de carga, o diagrama e o link para o ADR-001 vêm antes do "como rodar".
+</Callout>
+
+</Marco>
+
+## Estratégia de testes
+
+| Nível | O que cobre | Ferramentas | Exemplos obrigatórios |
+|---|---|---|---|
+| Unidade | Regras puras do domínio: preço, taxa, meia, prazos, transições permitidas, token HMAC, CPF | JUnit 6, AssertJ, `Clock` fixo | Arredondamento da RN-27; tabela de prazos da RN-55; adulteração do token (CA-21) |
+| Fatia | Controllers (status, Problem Details, validação, segurança) e repositórios | `@WebMvcTest` com Mockito, `@DataJpaTest` com Testcontainers | Matriz de autorização (CA-04); `400` com a lista `erros`; `404` em BOLA |
+| Integração | Caso de uso completo com PostgreSQL, Redis e RabbitMQ de verdade | `@SpringBootTest` + Testcontainers 2 | Compra de ponta a ponta com o gateway fake; RabbitMQ fora do ar e de volta; DLQ |
+| Concorrência | Invariantes sob disputa real | Virtual threads + `CountDownLatch` + Testcontainers | CA-10, CA-11, CA-13, CA-14, CA-15, CA-20, CA-23 |
+| Contrato | Formato das mensagens entre API e gateway | Testes que serializam e desserializam exemplos JSON versionados em `src/test/resources/contratos` nos dois projetos | Payloads do catálogo de eventos |
+| Carga | Metas de desempenho e consistência sob carga | k6 + `verificacao.sql` | Cenário da abertura (marco 8) |
+
+Cenários obrigatórios, além dos critérios de aceite: reserva no milissegundo exato da abertura (RN-18); reserva com lugar duplicado no pedido; limite por CPF somando duas sessões; recusa três vezes seguidas e liberação dos lugares; pagamento após expiração (`410`); mensagem duplicada; mensagem envenenada; expiração com duas instâncias; check-in fora da janela; token de outra sessão; QR antigo após transferência; reembolso no último segundo do prazo; `429` com `Retry-After`; pool esgotado devolvendo `503`.
+
+Regra para o CI: testes de concorrência rodam em toda build (são parte da prova); o k6 roda manualmente ou num workflow separado (`workflow_dispatch`), porque depende da máquina.
+
+## Entregáveis do portfólio
+
+**Modelo de README:**
+
+```markdown
+# Ingresso Já
+
+API de venda de ingressos que aguenta a abertura de vendas sem vender nenhum lugar duas vezes.
+[badge CI] [badge cobertura] [badge licença]
+
+> 500 usuários disputando 1.000 lugares: 0 venda duplicada, 0 overbooking,
+> p95 da reserva = 212 ms (relatório: carga/RELATORIO.md)   ← os seus números
+
+## O problema
+3 parágrafos: abertura de vendas, concorrência, pagamento assíncrono.
+
+## Arquitetura
+[diagrama de containers]  [máquina de estados da reserva]
+Monólito modular + gateway fake + PostgreSQL, Redis, RabbitMQ. Por quê: docs/adr/.
+
+## Decisões técnicas (ADRs)
+| # | Decisão | Resumo em uma linha |
+
+## Como provei que funciona
+- Testes concorrentes (links para as classes)
+- Teste de carga (link para o relatório) e prints do Grafana
+
+## Rodando localmente
+docker compose up -d   →  http/ (roteiro da demonstração)  →  Swagger, Mailpit, Grafana
+
+## Contrato da API e eventos
+Link para o OpenAPI e para o catálogo de eventos.
+
+## Limites conhecidos e próximos passos
+```
+
+**Também entregue:** os diagramas (ER, containers, estados e sequência) em `docs/diagramas/`; os arquivos `.http` numerados na ordem da demonstração; o JSON do painel do Grafana; o relatório de carga; a release `v1.0.0`.
+
+**Roteiro da demonstração (até 3 minutos):**
+
+1. (0:00–0:20) O problema em uma frase e o diagrama de arquitetura.
+2. (0:20–1:00) Compra feliz: mapa, reserva, pagamento `202`, confirmação, e-mail no Mailpit, QR.
+3. (1:00–1:40) O k6 rodando a abertura com o painel do Grafana ao lado; `verificacao.sql` com zero linhas.
+4. (1:40–2:20) Os casos difíceis: `tok_duplicado` (1 ingresso só), `tok_lento` (expira e estorna), dois leitores no mesmo QR (um `LIBERADO`, um `409`).
+5. (2:20–3:00) Um trace atravessando API → RabbitMQ → gateway → API, e o ADR-001 em uma frase.
+
+**Post para o LinkedIn (estrutura):** o problema (vendas duplicadas na abertura), a pergunta técnica (como garantir que um lugar seja vendido uma vez só com 500 pessoas no mesmo segundo), as opções que você comparou, o que escolheu e o número que prova; link para o repositório e para o vídeo. Sem jargão no primeiro parágrafo.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível (Pleno) | Acima do nível |
+|---|---|---|---|
+| Concorrência na reserva | Checa disponibilidade em Java e grava depois; sem teste concorrente | Update condicional ou lock com ordem fixa, restrição no banco e testes concorrentes que falham se a proteção for removida | Compara duas estratégias com medição e mostra o efeito de cada uma no k6 |
+| Capacidade, cotas e limite por CPF | Contagem com `SELECT count(*)` antes de inserir | Contadores com update condicional e `CHECK` no banco, testados sob disputa | Avalia o ponto quente da pista e mede uma alternativa (linhas de vaga ou contadores particionados) |
+| Mensageria | Publica direto após o commit; consumidor não idempotente | Outbox, publisher confirms, deduplicação na transação, retry e DLQ | Teste de caos (broker fora do ar), versionamento de payload e ferramenta para reprocessar a DLQ |
+| Corrida expiração × pagamento | Não tratada ou tratada com `synchronized` | Transições condicionais, estorno do tardio e teste que força a sobreposição | Reconciliação com circuit breaker medida e documentada; métrica de pagamentos tardios no painel |
+| Segurança | Endpoints abertos ou `403` revelando ids alheios | JWT, papéis, dono do recurso com `404`, matriz de autorização testada, rate limit | Detecção de reuso de refresh, sala de espera, varredura de segredos e dependências no CI |
+| Check-in e token | Token é só o id; leitura dupla possível | HMAC com chave por sessão, transição condicional, idempotência por leitura, lista offline | Leitor offline funcional e sincronização com conflito resolvido e testado |
+| Modelo de dados | Sem restrições; schema pelo Hibernate | Migrations Flyway, índices justificados com `EXPLAIN`, invariantes no banco | Plano de evolução sem downtime (*expand and contract*) para uma mudança real |
+| API | Erros genéricos `500`/`400` sem corpo | Problem Details com `codigo` estável, paginação, idempotência, OpenAPI | Exemplos do OpenAPI gerados a partir dos testes; versionamento documentado |
+| Testes | Só testes de unidade ou só caminho feliz | Pirâmide da estratégia de testes, Testcontainers, cobertura de 80% no domínio | Testes de contrato entre API e gateway; testes de mutação em regras críticas |
+| Carga e desempenho | Sem teste de carga ou só "aguentou" | k6 com thresholds, `verificacao.sql`, relatório com p95, p99 e um gargalo explicado | Várias rodadas comparando configurações (pool, cache, instâncias) com conclusões |
+| Observabilidade | Logs em texto sem correlação | Logs JSON com `traceId`, métricas de negócio sem alta cardinalidade, painel, trace ponta a ponta | Alertas definidos (SLO de reserva) e um runbook para DLQ e outbox acumulada |
+| Documentação e entrega | README só com "como rodar" | README com números, diagramas, 8 ADRs, vídeo e release `v1.0.0` | Deploy público funcionando e post com discussão técnica |
+
+## Como apresentar na entrevista
+
+**Pitch (60 a 90 segundos):**
+
+> "O Ingresso Já é uma API de venda de ingressos pensada para o momento mais difícil desse negócio: a abertura de vendas, quando milhares de pessoas disputam os mesmos lugares no mesmo segundo. O requisito central era nunca vender o mesmo lugar duas vezes nem passar da capacidade da pista. Eu comparei cinco estratégias de concorrência — lock pessimista, SKIP LOCKED, update condicional, lock otimista e reserva no Redis — e escolhi o update condicional no PostgreSQL, com índices únicos parciais como última defesa. Provei com testes que disparam 200 threads no mesmo lugar e com um teste de carga no k6: 500 usuários, 1.000 lugares, zero duplicidade, p95 de [seu número] na reserva. O pagamento é assíncrono via RabbitMQ, com outbox e consumidores idempotentes, e eu tratei o caso chato do pagamento que chega depois de a reserva expirar: vira estorno automático. O ingresso tem um QR com token HMAC que a portaria valida offline, e o check-in é atômico, então dois leitores no mesmo QR liberam uma pessoa só. Tudo tem métricas de negócio, tracing e as decisões estão em ADRs."
+
+**Perguntas prováveis e pontos-chave da resposta:**
+
+1. **"Por que update condicional e não `SELECT FOR UPDATE`?"** Uma ida ao banco, o banco decide sobre o estado atual, nada lido fica velho; `FOR UPDATE` também funciona, mas faz quem chega depois esperar e exige ordem fixa para evitar deadlock. Mostre o número que você mediu.
+2. **"E o lock otimista?"** Bom com pouca disputa; na abertura, todo mundo disputa os mesmos lugares, então vira tempestade de exceções e retentativas. Cite quantos conflitos o seu experimento gerou.
+3. **"Por que não fazer tudo no Redis?"** Seria mais rápido, mas cria duas fontes de verdade; se o Redis reinicia, o banco precisa garantir a invariante de qualquer jeito. Use o Redis para o que tolera perda (rate limit, cache, sala).
+4. **"Como você sabe que seu teste concorrente testa alguma coisa?"** Latch para liberar todas as threads juntas, pool de conexões suficiente, e o experimento de remover a proteção e ver o teste falhar.
+5. **"O que acontece se o pagamento for aprovado depois que a reserva expirou?"** Transições condicionais sobre o mesmo estado de origem; quem chega depois vê zero linhas afetadas; aprovação tardia vira estorno, o cliente é avisado; métrica de tardios.
+6. **"Como garante que a mensagem de pagamento não se perde?"** Outbox na mesma transação, relay com publisher confirms, entrega pelo menos uma vez; o outro lado deduplica. Explique por que publicar direto após o commit falha.
+7. **"E se a mesma mensagem chegar duas vezes?"** Tabela de mensagens processadas na mesma transação do efeito; efeitos externos (e-mail) só depois do commit, a partir de outro evento.
+8. **"Como o QR funciona offline? E se alguém copiar o QR?"** HMAC com chave derivada por sessão; cópia passa na assinatura, mas o check-in atômico só libera a primeira leitura; offline, conflito resolvido pela leitura mais antiga na sincronização. Mencione Ed25519 como evolução.
+9. **"O que limitou o desempenho no teste de carga?"** Fale do gargalo real que você encontrou (pool de conexões, linha quente da pista, mapa sem cache) e do que mudou; virtual threads não aumentam o número de conexões do banco.
+10. **"Como você escalaria para 100 mil pessoas na abertura?"** Sala de espera controlando a vazão de entrada, várias instâncias sem estado, cache do mapa, particionar o contador da pista, réplicas de leitura para o catálogo; o banco de escrita continua sendo a fonte de verdade.
+11. **"Por que monólito e não microsserviços?"** A reserva precisa de uma transação que toca lugares, contadores e cota; separar exigiria saga onde hoje há um commit; os módulos já têm fronteiras para extrair no futuro, se uma necessidade real aparecer.
+12. **"Como você protege a compra contra bots?"** Rate limit por conta e IP compartilhado no Redis, limite por CPF, uma reserva ativa por sessão, sala de espera com sorteio; e o que você não fez (CAPTCHA, antifraude) e por quê.
+
+**Trade-offs para mencionar sem esperar a pergunta:** o mapa pode ficar até 2 s desatualizado de propósito; o rate limit falha aberto e a sala de espera falha fechada; o destinatário da transferência pode ser enumerado, mitigado por limite; a linha do setor da pista é um ponto quente aceito e medido; os números de carga são locais e servem para comparar configurações, não para prometer capacidade em produção.
+
+## Para ir além
+
+- **Notificações em tempo real:** Server-Sent Events para a página de pagamento, no lugar do polling.
+- **CDC no lugar do polling da outbox:** Debezium lendo o WAL do PostgreSQL e publicando no broker.
+- **Kafka 4 no lugar do RabbitMQ:** particionado por `reservaId`, comparando garantias e operação num ADR.
+- **Cancelamento do evento pela produtora:** reembolso em massa em lotes, com acompanhamento de progresso e idempotência por ingresso.
+- **Assinatura assimétrica (Ed25519)** no token do ingresso, com rotação de chaves por `kid`.
+- **Contador da pista particionado** (N linhas por setor, escolhidas aleatoriamente) e a medição antes e depois.
+- **Front-end mínimo** do mapa de lugares, para a demonstração ficar mais visual.
+- **Testes de mutação** (PIT) nas regras de preço, prazo e transição de estado.
+- **Na AWS:** RabbitMQ trocado por SQS/SNS (ou Amazon MQ) num ADR que compare garantias e custo, com a infraestrutura descrita em Terraform ou OpenTofu; para testar sem gastar, LocalStack com Testcontainers.
+- **Kubernetes local** (kind ou k3d) com duas réplicas da API, probes e HPA, e o k6 rodando de dentro do cluster.

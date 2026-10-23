@@ -1,0 +1,87 @@
+---
+titulo: Janelas deslizantes em métricas de negócio
+codigo: "05.02"
+resumo: Médias móveis, maior sequência de produtos vistos sem repetição, menor janela que bate a meta de vendas e maior período dentro do orçamento — todas em O(n).
+modulo: 05-algoritmos
+ordem: 2
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [janela deslizante, dois ponteiros, HashMap, análise amortizada]
+aulas: [05-algoritmos/03-janela-deslizante]
+java:
+  modulo: m05-algoritmos
+  teste: JanelasTest
+---
+
+## Contexto
+
+O time de dados de um e-commerce quer quatro indicadores novos no painel de operações, calculados em tempo real a partir de séries de milhões de pontos:
+
+1. **média móvel** de vendas de k dias;
+2. o **maior trecho de navegação** em que o cliente viu produtos sem repetir nenhum (sinal de interesse amplo);
+3. o **menor número de horas seguidas** em que a loja bateu a meta de vendas;
+4. o **maior período de dias seguidos** em que o gasto com marketing ficou dentro do orçamento.
+
+## Requisitos
+
+| Método | Retorna |
+|---|---|
+| `mediasMoveis(valores, k)` | Média de cada janela de `k` consecutivos; `k < 1` → `IllegalArgumentException`; menos de `k` valores → array vazio |
+| `maiorSequenciaSemRepetir(produtos)` | Tamanho do maior trecho contíguo sem elementos repetidos |
+| `menorJanelaQueAtinge(vendasPorHora, meta)` | Menor tamanho de trecho contíguo com soma ≥ meta (valores positivos); `0` se impossível |
+| `maiorPeriodoNoOrcamento(gastos, orcamento)` | Maior tamanho de trecho contíguo com soma ≤ orçamento (valores ≥ 0) |
+
+## Exemplos
+
+```text
+mediasMoveis([10, 20, 30, 40, 50], 3)                    → [20, 30, 40]
+maiorSequenciaSemRepetir([a, b, c, a, b, b, d])          → 3
+menorJanelaQueAtinge([2, 3, 1, 2, 4, 3], 7)              → 2     ([4, 3])
+maiorPeriodoNoOrcamento([3, 1, 2, 7, 1, 1, 1], 6)        → 3
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `JanelasTest` passam.
+- [ ] Nenhum método recalcula a soma da janela do zero a cada passo.
+- [ ] Os três métodos de janela variável seguem o mesmo molde: expandir pelo fim, encolher pelo início.
+
+## Desafios opcionais
+
+- `menorJanelaQueContemTodos(pedidos, categorias)`: o menor trecho que contém pelo menos um pedido de cada categoria (o clássico *Minimum Window Substring*).
+- Versão de `mediasMoveis` com `Gatherers.windowSliding` (Java 24+) e comparação de legibilidade.
+
+<Dicas>
+<Dica nivel={1}>
+Janela fixa: mantenha uma soma corrente, some quem entra e subtraia quem sai (`valores[i - k]`). Janela variável: dois índices, `inicio` e `fim`; o `fim` avança no `for`, e o `inicio` avança num `while` quando a janela precisa encolher.
+</Dica>
+<Dica nivel={2}>
+Sem repetir: um `Map<String, Integer>` com a última posição de cada produto. Ao reencontrar um produto **dentro** da janela (`anterior >= inicio`), mova o início para `anterior + 1`.
+</Dica>
+<Dica nivel={3}>
+Meta: `soma += v[fim]; while (soma >= meta) { menor = min(menor, fim - inicio + 1); soma -= v[inicio++]; }`. Orçamento: `soma += g[fim]; while (soma > orcamento) soma -= g[inicio++]; maior = max(maior, fim - inicio + 1);`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/Janelas.java" />
+
+### Por que é O(n)
+
+Nos três métodos variáveis, `inicio` e `fim` **só avançam**, cada um no máximo n vezes. Somando todas as iterações do `while` ao longo da execução, o total é no máximo n. Tempo: O(n). Memória: O(1), exceto o `HashMap` de `maiorSequenciaSemRepetir` — O(k), com k produtos distintos.
+
+### Pontos de atenção
+
+- **`long` para somas**: somas de muitos valores `int` podem estourar.
+- **`Integer.MAX_VALUE` como "infinito"** em `menorJanelaQueAtinge`, com a conversão para 0 no final.
+- **A premissa de valores não negativos** é o que torna o "encolher" seguro. Com gastos negativos (estornos), seria preciso soma de prefixos.
+
+### Avalie sua solução
+
+- Seu `maiorPeriodoNoOrcamento([0, 0, 0], 0)` devolve 3?
+- Em `maiorSequenciaSemRepetir`, você voltou o `inicio` para trás em algum momento? (Nunca deveria.)
+
+</Solucao>

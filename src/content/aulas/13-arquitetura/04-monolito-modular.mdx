@@ -1,0 +1,876 @@
+---
+titulo: Monólito modular com Spring Modulith
+descricao: "A alternativa que a maioria dos sistemas deveria considerar antes dos microsserviços: módulos por capacidade de negócio, fronteiras verificadas no CI, comunicação por eventos que não se perdem, testes por módulo com Scenario, documentação gerada do código e o caminho de um módulo até virar serviço, se um dia for preciso."
+modulo: 13-arquitetura
+ordem: 4
+duracao: 110
+objetivos:
+  - Organizar uma aplicação Spring Boot em módulos por pacote de topo, separando API pública, interfaces nomeadas e pacotes internos
+  - Declarar dependências permitidas com @ApplicationModule e verificar as fronteiras num teste com detectViolations().throwIfPresent()
+  - Integrar módulos por eventos com @ApplicationModuleListener e explicar o que cada uma das três anotações combinadas garante
+  - Configurar o registro de publicações em JDBC, provocar uma falha de ouvinte e reenviar só a publicação incompleta
+  - Testar um módulo isolado com @ApplicationModuleTest e Scenario, sem Thread.sleep
+  - Ler as mensagens de violação do Spring Modulith (dependência não permitida, tipo não exposto, ciclo) e corrigir a causa
+  - Justificar, com critérios concretos, quando um monólito modular é melhor que microsserviços e como extrair um módulo depois
+tags: [monólito modular, Spring Modulith, módulos, eventos, event publication registry, ApplicationModuleTest, arquitetura]
+flashcards:
+  - frente: O que é um monólito modular?
+    verso: Uma aplicação implantada como uma peça só, mas dividida em módulos com fronteiras explícitas e verificadas (API pública, internos escondidos, sem ciclos). Tem a simplicidade operacional do monólito e boa parte do isolamento dos microsserviços.
+  - frente: Como o Spring Modulith define um módulo?
+    verso: Por padrão, cada pacote logo abaixo do pacote da classe @SpringBootApplication é um módulo. O pacote base do módulo é a API pública; os sub-pacotes são internos, a não ser que sejam declarados como @NamedInterface.
+  - frente: O que faz @ApplicationModuleListener?
+    verso: "É a combinação de @TransactionalEventListener, @Async e @Transactional(propagation = REQUIRES_NEW): o ouvinte roda depois do commit de quem publicou, em outra thread e numa transação própria."
+  - frente: Para que serve o Event Publication Registry?
+    verso: Grava cada publicação de evento, uma por ouvinte, numa tabela, na transação de quem publica, e a marca como concluída quando o ouvinte termina. Se o ouvinte falhar, a publicação fica incompleta e pode ser reenviada. O evento não se perde.
+  - frente: ApplicationModules.verify() × detectViolations()
+    verso: verify() executa as verificações uma vez por instância (e ApplicationModules.of guarda instâncias em cache). detectViolations().throwIfPresent() sempre executa. Use-o quando vários testes verificam os mesmos módulos.
+  - frente: "O que significa \"Allowed targets: agenda :: eventos\" numa violação?"
+    verso: O módulo declarou em @ApplicationModule(allowedDependencies) que só pode depender da interface nomeada "eventos" do módulo agenda, e alguma classe dele usou outro tipo da agenda (por exemplo, o serviço do pacote base).
+  - frente: Por que o ouvinte de um evento do registro precisa ser idempotente?
+    verso: O registro garante entrega pelo menos uma vez. No reenvio, um ouvinte que falhou no meio do caminho roda de novo; se ele já tiver feito parte do trabalho, precisa reconhecer isso e não repetir o efeito (cobrar duas vezes, por exemplo).
+  - frente: Qual o primeiro passo para extrair um módulo como serviço?
+    verso: Garantir que ele já só conversa por eventos e pela API pública, com dados próprios. Depois, externalizar os eventos para um broker (@Externalized), subir o serviço novo ouvindo o broker e desligar o módulo no monólito.
+---
+
+Uma rede de clínicas tem um sistema Spring Boot de seis anos. Ele marca consultas, cobra os convênios, manda lembretes por WhatsApp, guarda o prontuário e gera relatórios para a diretoria. Tudo num processo só, o que nunca foi o problema. O problema é outro: a classe `ConsultaService` tem 2.300 linhas, chama o repositório de faturas direto, e o relatório da diretoria faz `JOIN` em onze tabelas de quatro áreas diferentes. Na semana passada, alguém mudou o cálculo de coparticipação do convênio e os lembretes de retorno pararam de sair. Ninguém sabia que uma coisa dependia da outra.
+
+Na reunião de arquitetura, alguém propõe: "vamos quebrar em microsserviços". Parece a solução, porque microsserviços impõem fronteiras: um serviço não consegue chamar a classe interna do outro, porque estão em processos diferentes. Mas o time tem oito pessoas, um único banco PostgreSQL e nenhuma experiência com tracing distribuído, filas, versionamento de contratos e deploy independente de quinze serviços. Vão trocar um problema de **acoplamento** por um problema de **acoplamento mais rede**.
+
+A pergunta "monólito ou microsserviços?" costuma estar mal formulada. O que deu errado nesse sistema não foi ele ser um processo só: foi ele ser uma **bola de lama**, em que qualquer classe chama qualquer outra. Nesta aula você vai construir a alternativa que resolve o problema certo: um **monólito modular**, com fronteiras **dentro do código**, verificadas a cada build. A ferramenta é o **Spring Modulith 2.1**, o projeto oficial do ecossistema Spring para isso, compatível com o Spring Boot 4.1. No fim, você vai saber também quando essa escolha deixa de bastar e como um módulo bem cortado vira um serviço sem reescrever o resto.
+
+## A intuição: um prédio de consultórios
+
+Pense num prédio comercial cheio de consultórios: cardiologia no 3º andar, laboratório no 5º, faturamento no 8º. O prédio é **um só**: uma portaria, um elevador, uma conta de luz, um zelador. Isso é barato e simples de operar. Construir um prédio separado para cada especialidade seria caríssimo e exigiria carros indo e voltando entre eles.
+
+Mesmo dividindo o prédio, cada consultório tem **uma recepção** e **portas internas trancadas**. Quem vem do laboratório não entra na sala de exames da cardiologia para pegar um prontuário na gaveta: pede na recepção, que entrega o que pode ser entregue. E quando a cardiologia termina um atendimento, ela não sobe até o 8º andar para cobrar. Ela coloca um aviso no **quadro de avisos do prédio** ("consulta da Marina realizada, retorno de cardiologia, R$ 180,00"), e quem tiver interesse (o faturamento, a central de lembretes) lê e age. A cardiologia nem sabe quem leu.
+
+Agora imagine que o quadro de avisos é um **livro de protocolo**: cada aviso é registrado com uma linha para cada setor que precisa agir, e o setor rubrica quando terminou. Se o faturamento estava sem sistema na hora, a linha dele fica em branco, e no dia seguinte alguém olha o livro e reentrega o aviso só para quem não rubricou. Ninguém cobra duas vezes, nenhum aviso some.
+
+Essa é a aula inteira em quatro ideias:
+
+- **Um prédio**: um deploy, um processo, um banco. Simplicidade operacional.
+- **Consultórios com recepção**: módulos com uma API pública pequena e o resto escondido.
+- **Quadro de avisos**: os módulos se comunicam por eventos e não se conhecem.
+- **Livro de protocolo**: o registro de publicações garante que nenhum evento se perde, mesmo quando um setor falha.
+
+E se um dia o laboratório crescer tanto que precise de um prédio próprio? Como ele já só se comunicava pela recepção e pelo quadro de avisos, a mudança é de endereço, não de processo de trabalho. É o caminho de um módulo até virar serviço.
+
+<Figura legenda="A clínica como monólito modular: um processo, três módulos. Cada módulo expõe uma API pequena (em verde), esconde o resto (em cinza) e conversa com os outros por eventos">
+<svg viewBox="0 0 760 430" width="760" role="img" aria-labelledby="modular-titulo modular-desc">
+  <title id="modular-titulo">Os três módulos da clínica dentro de um único processo</title>
+  <desc id="modular-desc">Um retângulo grande representa o processo único da ClinicaApplication. Dentro dele, à esquerda, o módulo agenda, com a API pública ServicoDeAgenda, a interface nomeada eventos com o record ConsultaRealizada e o pacote internal com Consultas. À direita, os módulos cobranca e notificacoes. A agenda publica ConsultaRealizada; uma seta tracejada leva o evento à cobrança e às notificações. Abaixo, uma faixa representa o banco único com a tabela event_publication.</desc>
+  <defs><marker id="mk-modular" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="8" y="8" width="744" height="340" rx="12" class="d-box"/>
+  <text x="24" y="34" class="d-title">ClinicaApplication · um processo, um deploy</text>
+  <rect x="28" y="52" width="300" height="276" rx="10" class="d-accent"/>
+  <text x="178" y="76" text-anchor="middle" class="d-title">agenda</text>
+  <rect x="44" y="90" width="268" height="52" rx="8" class="d-ok"/>
+  <text x="178" y="112" text-anchor="middle" class="d-mono">ServicoDeAgenda</text>
+  <text x="178" y="131" text-anchor="middle" class="d-label">API pública (pacote base)</text>
+  <rect x="44" y="154" width="268" height="66" rx="8" class="d-ok"/>
+  <text x="178" y="176" text-anchor="middle" class="d-mono">eventos.ConsultaRealizada</text>
+  <text x="178" y="196" text-anchor="middle" class="d-label">@NamedInterface("eventos")</text>
+  <text x="178" y="212" text-anchor="middle" class="d-label">o contrato com os outros módulos</text>
+  <rect x="44" y="232" width="268" height="80" rx="8" class="d-box"/>
+  <text x="178" y="256" text-anchor="middle" class="d-mono">internal.Consultas</text>
+  <text x="178" y="276" text-anchor="middle" class="d-mono">internal.Consulta</text>
+  <text x="178" y="298" text-anchor="middle" class="d-label">interno: ninguém de fora usa</text>
+  <rect x="452" y="52" width="280" height="132" rx="10" class="d-info"/>
+  <text x="592" y="76" text-anchor="middle" class="d-title">cobranca</text>
+  <text x="592" y="100" text-anchor="middle" class="d-mono">Cobrancas · Cobranca</text>
+  <text x="592" y="120" text-anchor="middle" class="d-mono">OperadoraDeConvenio</text>
+  <text x="592" y="144" text-anchor="middle" class="d-label">ouvinte package-private:</text>
+  <text x="592" y="164" text-anchor="middle" class="d-mono">GeracaoDeCobranca</text>
+  <rect x="452" y="204" width="280" height="124" rx="10" class="d-violet"/>
+  <text x="592" y="228" text-anchor="middle" class="d-title">notificacoes</text>
+  <text x="592" y="254" text-anchor="middle" class="d-mono">AvisosAoPaciente</text>
+  <text x="592" y="280" text-anchor="middle" class="d-label">só pode usar</text>
+  <text x="592" y="300" text-anchor="middle" class="d-mono">agenda :: eventos</text>
+  <path d="M312 187 L450 118" class="d-line" stroke-dasharray="6 4" marker-end="url(#mk-modular)"/>
+  <path d="M312 187 L450 266" class="d-line" stroke-dasharray="6 4" marker-end="url(#mk-modular)"/>
+  <text x="381" y="182" text-anchor="middle" class="d-label">publica</text>
+  <rect x="8" y="362" width="744" height="60" rx="10" class="d-box"/>
+  <text x="380" y="388" text-anchor="middle" class="d-title">Banco único (H2 na aula, PostgreSQL em produção)</text>
+  <text x="380" y="410" text-anchor="middle" class="d-mono">event_publication · uma linha por evento e por ouvinte</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+| Termo | O que é | Na clínica |
+|---|---|---|
+| **Monólito modular** | Uma aplicação implantada como unidade, dividida em módulos com fronteiras explícitas e verificadas | A `ClinicaApplication` |
+| **Módulo de aplicação** (*application module*) | Uma unidade de funcionalidade de negócio; no Spring Modulith, por padrão, um pacote logo abaixo do pacote da aplicação | `agenda`, `cobranca`, `notificacoes` |
+| **API do módulo** | Os tipos que outros módulos podem usar. Por padrão, os tipos públicos do pacote base | `ServicoDeAgenda`, `Cobrancas` |
+| **Pacote interno** | Qualquer sub-pacote do módulo. Os tipos podem ser `public` por necessidade do Java, mas são proibidos para outros módulos | `agenda.internal` |
+| **Interface nomeada** (`@NamedInterface`) | Um sub-pacote que o módulo expõe explicitamente, com um nome, além do pacote base | `agenda.eventos`, nome `eventos` |
+| **Dependências permitidas** | A lista declarada do que um módulo pode usar dos outros, em `@ApplicationModule(allowedDependencies = ...)` | `cobranca` só pode usar `agenda :: eventos` |
+| **Evento de domínio** | Um fato que já aconteceu, no passado, publicado por quem é dono dele | `ConsultaRealizada` |
+| **Ouvinte de módulo** | Um método anotado com `@ApplicationModuleListener` que reage a um evento de outro módulo | `GeracaoDeCobranca.quandoRealizada` |
+| **Registro de publicações** (*Event Publication Registry*) | A tabela `event_publication`, em que cada publicação, por ouvinte, é gravada na transação de quem publica e marcada como concluída quando o ouvinte termina | Uma linha para a cobrança, outra para o aviso |
+| **Publicação incompleta** | Uma publicação cujo ouvinte ainda não terminou com sucesso. Pode ser reenviada | A cobrança, quando a operadora estava fora do ar |
+| **Capacidade de negócio** | Algo que a empresa faz e que tem valor por si: agendar, cobrar, notificar. É o melhor critério para cortar módulos | Cada módulo é uma |
+| **Bola de lama** (*big ball of mud*) | Sistema sem fronteiras, em que tudo depende de tudo | O sistema de seis anos do começo da aula |
+
+Dois detalhes que confundem no começo. Primeiro: "público" aqui tem **dois sentidos**. Um é o do Java (`public`, visível fora do pacote). O outro é o da arquitetura (faz parte da API do módulo). `Consultas` é `public` no Java, porque o `ServicoDeAgenda`, em outro pacote, precisa dela, mas é **interna** para a arquitetura. O Java não consegue expressar "público só dentro deste módulo" sem o sistema de módulos do JDK (JPMS), que pouca aplicação Spring usa. O Spring Modulith preenche essa lacuna com uma verificação no build.
+
+Segundo: o Spring Modulith **não muda nada em tempo de execução** para impor as fronteiras. Uma violação compila e roda normalmente. Quem a pega é o teste de verificação, que analisa o bytecode com o ArchUnit. Por isso o teste de verificação tem de estar no CI desde o primeiro dia: sem ele, as fronteiras são só uma intenção.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula existe no projeto Maven da trilha, em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.modular`, e roda no CI:
+
+```text
+dev.trilhajava.m13.aulas.modular
+├── ClinicaApplication.java              ← @SpringBootApplication: os módulos ficam logo abaixo
+├── agenda                               ← módulo: marca e registra consultas
+│   ├── package-info.java                (@ApplicationModule)
+│   ├── ServicoDeAgenda.java             API pública
+│   ├── eventos
+│   │   ├── package-info.java            (@NamedInterface("eventos"))
+│   │   └── ConsultaRealizada.java       o evento: o contrato com os outros módulos
+│   └── internal
+│       ├── Consulta.java                interno
+│       └── Consultas.java               interno: os dados da agenda
+├── cobranca                             ← módulo: cobra o convênio
+│   ├── package-info.java                (allowedDependencies = "agenda :: eventos")
+│   ├── Cobranca.java, Cobrancas.java    API pública (consulta)
+│   ├── OperadoraDeConvenio.java         API pública (o sistema externo, uma interface)
+│   ├── GeracaoDeCobranca.java           package-private: o ouvinte do evento
+│   └── OperadoraSimulada.java           package-private: a operadora de mentira
+└── notificacoes                         ← módulo: avisa o paciente
+    ├── package-info.java                (allowedDependencies = "agenda :: eventos")
+    └── AvisosAoPaciente.java            API pública + ouvinte
+```
+
+Repare que os três módulos usam **dois estilos** de esconder o que é interno, e os dois são válidos:
+
+- A **agenda** usa um sub-pacote `internal`. É o estilo para módulos maiores, com muitas classes: o pacote base fica limpo, só com a API.
+- A **cobrança** e as **notificações** não têm sub-pacotes: o que é interno é **package-private** (sem `public`). É o estilo para módulos pequenos, e tem uma vantagem: o próprio compilador já impede o uso de fora, antes do Spring Modulith.
+
+O fluxo de negócio é curto. A recepção agenda a consulta; quando o atendimento termina, a agenda registra e publica `ConsultaRealizada`. A cobrança pede a autorização à operadora do convênio e registra a cobrança. As notificações avisam o paciente. A agenda não conhece nenhum dos dois.
+
+## Mão na massa
+
+Os comandos partem da pasta `java/` do repositório. Para rodar só os testes desta aula:
+
+```bash
+cd java
+mvn -pl m13-arquitetura/aulas -am verify
+```
+
+### Passo 1: as dependências
+
+**O que vamos fazer e por quê.** O Spring Modulith não vem no Spring Boot: ele tem um BOM próprio, que alinha as versões de todos os artefatos do projeto. Importamos o BOM e escolhemos três starters: o núcleo, o registro de publicações em JDBC e o de testes. O registro precisa de um banco; na aula usamos o H2 em memória.
+
+```xml
+<properties>
+  <spring-modulith.version>2.1.1</spring-modulith.version>
+</properties>
+
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.modulith</groupId>
+      <artifactId>spring-modulith-bom</artifactId>
+      <version>${spring-modulith.version}</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-jdbc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>com.h2database</groupId>
+    <artifactId>h2</artifactId>
+    <scope>runtime</scope>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.modulith</groupId>
+    <artifactId>spring-modulith-starter-core</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.modulith</groupId>
+    <artifactId>spring-modulith-starter-jdbc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.modulith</groupId>
+    <artifactId>spring-modulith-starter-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+```
+
+**O que acabou de acontecer.** Com o BOM importado, nenhum artefato `spring-modulith-*` precisa de `<version>`. A linha 2.x do Spring Modulith é a que acompanha o Spring Boot 4 e o Spring Framework 7; a 1.x é para o Boot 3. Misturar as duas é a causa mais comum de erros estranhos de inicialização, então confira a tabela de compatibilidade da documentação sempre que atualizar o Boot.
+
+O `spring-modulith-starter-jdbc` traz a implementação do registro de publicações em JDBC; existem também `-jpa` e `-mongodb`. Escolha a que combina com o que a aplicação já usa para persistir: o registro precisa gravar **na mesma transação** que o resto, e isso só funciona se ele usar o mesmo gerenciador de transações.
+
+### Passo 2: a aplicação e os módulos por pacote
+
+**O que vamos fazer e por quê.** Nenhuma anotação diz "isto é um módulo". O Spring Modulith olha o pacote da classe `@SpringBootApplication` e considera **cada sub-pacote direto** um módulo. Então a primeira decisão de arquitetura de um monólito modular é, literalmente, a lista de pacotes logo abaixo da aplicação.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/ClinicaApplication.java" />
+
+Duas anotações além do básico:
+
+- `@EnableAsync` liga a execução assíncrona do Spring. Ela é obrigatória aqui: os ouvintes de módulo são `@Async`, e sem ela eles rodariam na mesma thread de quem publica, sem avisar nada.
+- `@PropertySource` carrega a configuração desta aula de um arquivo próprio (`clinica-modular.properties`), porque o módulo `aulas` é compartilhado com outras aulas. Numa aplicação de verdade, isso fica no `application.properties`.
+
+Para ver como o Spring Modulith enxerga a aplicação, basta montar o modelo e imprimir. É a primeira linha do teste de verificação, que você vai escrever no passo 4:
+
+```java
+ApplicationModules modulos = ApplicationModules.of(ClinicaApplication.class);
+modulos.forEach(System.out::println);
+```
+
+Saída real (os nomes dos pacotes são abreviados pelo próprio Spring Modulith):
+
+```text
+# Agenda
+> Logical name: agenda
+> Base package: dev.trilhajava.m13.aulas.modular.agenda
+> Excluded packages: none
+> Named interfaces:
+  + NamedInterface: name=<<UNNAMED>>, types=[ d.t.m.a.m.a.ServicoDeAgenda ]
+  + NamedInterface: name=eventos, types=[ d.t.m.a.m.a.e.ConsultaRealizada ]
+> Spring beans:
+  + ….ServicoDeAgenda
+  o ….internal.Consultas
+
+# Cobrança
+> Logical name: cobranca
+> Base package: dev.trilhajava.m13.aulas.modular.cobranca
+> Excluded packages: none
+> Spring beans:
+  + ….Cobrancas
+  o ….GeracaoDeCobranca
+  o ….OperadoraSimulada
+
+# Notificações
+> Logical name: notificacoes
+> Base package: dev.trilhajava.m13.aulas.modular.notificacoes
+> Excluded packages: none
+> Spring beans:
+  + ….AvisosAoPaciente
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- O título de cada bloco (`# Agenda`, `# Cobrança`) é o `displayName` que vamos declarar no passo 3; o *logical name* é o nome do pacote, e é ele que se usa nas referências entre módulos (`agenda :: eventos`).
+- **Named interfaces** da agenda: a `<<UNNAMED>>` é o pacote base (a API "padrão", com o `ServicoDeAgenda`) e a `eventos` é o sub-pacote que expusemos. A `Consulta` e a `Consultas` não aparecem em nenhuma: são internas.
+- Em **Spring beans**, o `+` marca beans que fazem parte da API e o `o` marca beans internos. Repare que `Consultas` é `public` no Java e aparece com `o`: para a arquitetura, é interna.
+- A cobrança e as notificações não mostram *Named interfaces* porque só têm o pacote base. Os beans package-private (`GeracaoDeCobranca`, `OperadoraSimulada`) aparecem com `o`.
+
+Essa listagem é a melhor forma de conferir se o Spring Modulith entendeu a estrutura que você imaginou. Se um pacote que você considera "utilitário" aparecer como módulo, é hora de decidir se ele é mesmo um módulo (veja as armadilhas) ou se pertence a algum outro.
+
+### Passo 3: API pública, internos e dependências permitidas
+
+**O que vamos fazer e por quê.** Por padrão, um módulo pode usar a API (o pacote base) de qualquer outro, desde que não forme ciclo. Isso já é muito melhor que a bola de lama, mas ainda é permissivo: nada impede a cobrança de chamar `ServicoDeAgenda.agendar(...)`. Queremos uma regra mais forte, que expresse a intenção de design: **a cobrança e as notificações só conhecem os eventos da agenda**.
+
+Primeiro, a agenda expõe o sub-pacote `eventos` como interface nomeada:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/agenda/eventos/package-info.java" />
+
+E o próprio evento é um `record` só com dados:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/agenda/eventos/ConsultaRealizada.java" />
+
+Depois, a cobrança declara do que pode depender:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/cobranca/package-info.java" />
+
+**O que acabou de acontecer.**
+
+- `@NamedInterface("eventos")` num `package-info.java` transforma o sub-pacote, que seria interno, numa API com nome. O pacote base **continua** sendo API: as interfaces nomeadas se somam a ele, não o substituem. Foi o que a listagem do passo 2 mostrou (`<<UNNAMED>>` e `eventos`).
+- `allowedDependencies = "agenda :: eventos"` diz: deste módulo, só a interface `eventos` da agenda. A sintaxe tem três formas: `"agenda"` (só o pacote base), `"agenda :: eventos"` (só aquela interface nomeada) e `"agenda :: *"` (todas as interfaces nomeadas). Várias dependências vão separadas por vírgula, num array.
+- Quando um módulo declara `allowedDependencies`, **qualquer** dependência fora da lista vira violação, inclusive de módulos que não aparecem nela. Um módulo sem a declaração (como a agenda) pode usar a API de todos, só sem ciclos.
+- O `displayName` é o nome legível usado na listagem e na documentação gerada.
+
+Por que separar os eventos num sub-pacote, em vez de deixá-los no pacote base? Porque são **contratos de natureza diferente**. O `ServicoDeAgenda` é uma API de **comando** ("agende", "registre"): quem a usa passa a depender do comportamento da agenda e do momento em que ela responde. O evento é um **fato publicado**: quem o consome depende só do formato dos dados. Separar os dois permite a regra "pode ouvir a agenda, mas não pode mandar nela", que é exatamente a direção de dependência que queremos entre agenda e cobrança.
+
+<Callout tipo="info" titulo="E o tipo OPEN?">
+`@ApplicationModule(type = Type.OPEN)` marca um módulo como **aberto**: os outros podem usar até os internos dele. Existe para migrar sistemas legados aos poucos (você declara os módulos antes de conseguir esconder tudo) e não deveria aparecer num módulo novo. Se precisar dele, registre no ADR o motivo e o prazo para fechar.
+</Callout>
+
+### Passo 4: verificando as fronteiras a cada build
+
+**O que vamos fazer e por quê.** Declarar regras sem verificá-las é escrever documentação que vai ficar desatualizada. O teste de verificação monta o modelo dos módulos e confere três coisas: **sem ciclos** entre módulos, **ninguém usa internos** de outro módulo e **as dependências declaradas são respeitadas**. Ele roda em milissegundos, sem subir o Spring, e por isso pode rodar em todo build.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/modular/ModulosDaClinicaTest.java" semImports />
+
+```bash
+mvn -pl m13-arquitetura/aulas -am verify -Dtest=ModulosDaClinicaTest -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.modular.ModulosDaClinicaTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** `ApplicationModules.of(ClinicaApplication.class)` analisa o bytecode do pacote da aplicação com o ArchUnit e monta o modelo. `detectViolations()` devolve um objeto `Violations` com tudo o que encontrou, e `throwIfPresent()` lança a exceção se a lista não estiver vazia. A mensagem da exceção é a lista completa das violações, cada uma com a classe, o campo ou a chamada que a causou (você vai ler várias em "Quando dá errado").
+
+O segundo teste, `documentacaoGerada`, fica para o passo 8.
+
+<Callout tipo="erro" titulo="verify() roda uma vez só">
+O jeito mais comum de escrever esse teste, inclusive na documentação, é `ApplicationModules.of(App.class).verify()`. Só que o `verify()` executa as verificações **uma vez por instância**, e `ApplicationModules.of(...)` devolve instâncias de um **cache**. Um `@ApplicationModuleTest` que rodou antes na mesma JVM (ele verifica automaticamente) já "gastou" a verificação, e o seu teste passa mesmo com violações. Descobrimos isso escrevendo o exercício 13.03: o teste passava no código acoplado. Use `detectViolations().throwIfPresent()`, que sempre executa.
+</Callout>
+
+### Passo 5: a comunicação entre módulos, por eventos
+
+**O que vamos fazer e por quê.** No sistema antigo, registrar o atendimento chamava a cobrança e o envio de mensagens diretamente:
+
+```java
+@Transactional
+public void registrarAtendimento(UUID id) {
+    // ...
+    cobrancaService.cobrar(consulta);          // se a operadora cair, o atendimento não é registrado
+    whatsappService.avisar(consulta.paciente());
+}
+```
+
+Três problemas num método. A agenda **conhece** a cobrança e as mensagens: qualquer módulo novo interessado no atendimento (fidelidade, pesquisa de satisfação) exige mudar a agenda. A **falha** de um sistema externo (a operadora do convênio) impede o registro do atendimento, que não tem nada a ver com ela. E tudo roda **na mesma transação**, segurando a conexão com o banco enquanto se espera a operadora responder.
+
+Com eventos, a agenda **anuncia um fato** e não conhece ninguém:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/agenda/ServicoDeAgenda.java" semImports destacar="36-43" />
+
+E cada interessado reage no seu módulo. A cobrança, com um ouvinte package-private:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/cobranca/GeracaoDeCobranca.java" semImports destacar="23-29" />
+
+E as notificações, com outro:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/modular/notificacoes/AvisosAoPaciente.java" semImports />
+
+**O que acabou de acontecer.** `ApplicationEventPublisher` é o publicador de eventos do próprio Spring Framework; não há broker nenhum aqui. O que muda tudo é o `@ApplicationModuleListener`, que é uma anotação composta. Ela combina três anotações, e cada uma tem um motivo de negócio:
+
+| Parte | Efeito | Por que, na clínica |
+|---|---|---|
+| `@TransactionalEventListener` | O ouvinte roda **depois do commit** da transação de quem publicou (fase padrão `AFTER_COMMIT`) | Não cobrar uma consulta cujo registro foi desfeito por um rollback |
+| `@Async` | Roda em **outra thread** | O registro do atendimento não espera a operadora do convênio responder |
+| `@Transactional(propagation = REQUIRES_NEW)` | Roda numa **transação própria** | Uma falha na cobrança não desfaz o aviso ao paciente, e vice-versa |
+
+O resultado: a operadora fora do ar **não impede** o registro do atendimento. A consulta é marcada como realizada, o paciente recebe o aviso, e a cobrança sai depois. Em vez de um sistema em que tudo funciona ou tudo falha, você tem partes que falham **independentemente**.
+
+Esse desenho tem um preço que precisa ficar claro desde já: a consistência entre módulos passa a ser **eventual**. Logo depois de `registrarAtendimento` retornar, a cobrança ainda **não existe**. Telas e relatórios precisam conviver com isso ("cobrança em processamento"). Se uma regra de negócio exige que duas mudanças aconteçam juntas ou não aconteçam (debitar e creditar numa transferência), elas pertencem ao **mesmo módulo**, não a dois módulos ligados por evento.
+
+<Callout tipo="atencao" titulo="Sem transação, sem evento">
+`@TransactionalEventListener` só dispara se a publicação acontecer **dentro de uma transação**. Publicar `ConsultaRealizada` num método sem `@Transactional` faz o evento ser descartado em silêncio, porque não há commit para esperar. É por isso que `registrarAtendimento` é `@Transactional`, mesmo guardando os dados num `Map`: a transação é o que liga a publicação ao commit e ao registro de publicações.
+</Callout>
+
+## O registro de publicações: eventos que não se perdem
+
+"A cobrança sai depois." Mas e se a aplicação cair entre o commit e a execução do ouvinte? Ou se o ouvinte lançar exceção? Com eventos de aplicação comuns, o evento **se perde**: ele só existia em memória, numa fila de tarefas assíncronas que morre com o processo. Num sistema de clínicas, isso é uma consulta realizada que nunca foi cobrada, e ninguém percebe até o fechamento do mês.
+
+O **Event Publication Registry** resolve isso com a mesma ideia do [transactional outbox](../../12-mensageria/04-transactional-outbox/): cada publicação, **por ouvinte**, é gravada numa tabela **na transação de quem publica**. Se o commit acontece, a publicação está gravada; se há rollback, ela some junto com o resto. Quando o ouvinte termina com sucesso, a publicação é marcada como concluída. Se ele falha, ela fica **incompleta** e pode ser reenviada.
+
+<Figura legenda="O caminho de ConsultaRealizada pelo registro de publicações: gravado na transação da agenda, entregue a cada ouvinte e reenviado só para quem falhou">
+<svg viewBox="0 0 760 400" width="760" role="img" aria-labelledby="registro-titulo registro-desc">
+  <title id="registro-titulo">O ciclo de vida das publicações de um evento</title>
+  <desc id="registro-desc">À esquerda, a transação da agenda salva a consulta e publica ConsultaRealizada; no mesmo commit, o registro grava duas linhas na tabela event_publication, uma para GeracaoDeCobranca e outra para AvisosAoPaciente. Depois do commit, cada ouvinte roda em outra thread. O aviso termina e a linha dele vira COMPLETED. A cobrança falha porque a operadora está fora do ar e a linha dela vira FAILED. Mais tarde, o reenvio das publicações incompletas entrega o evento só para a cobrança, que agora termina, e a linha vira COMPLETED com duas tentativas.</desc>
+  <defs><marker id="mk-registro" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="8" y="20" width="220" height="150" rx="10" class="d-accent"/>
+  <text x="118" y="46" text-anchor="middle" class="d-title">Transação da agenda</text>
+  <text x="118" y="74" text-anchor="middle" class="d-mono">salvar(consulta)</text>
+  <text x="118" y="98" text-anchor="middle" class="d-mono">publishEvent(...)</text>
+  <text x="118" y="126" text-anchor="middle" class="d-label">+ 2 linhas no registro</text>
+  <text x="118" y="152" text-anchor="middle" class="d-title">COMMIT</text>
+  <path d="M228 95 L276 95" class="d-line" marker-end="url(#mk-registro)"/>
+  <rect x="278" y="20" width="230" height="64" rx="10" class="d-violet"/>
+  <text x="393" y="46" text-anchor="middle" class="d-mono">AvisosAoPaciente</text>
+  <text x="393" y="68" text-anchor="middle" class="d-label">outra thread · ok</text>
+  <rect x="278" y="106" width="230" height="64" rx="10" class="d-info"/>
+  <text x="393" y="132" text-anchor="middle" class="d-mono">GeracaoDeCobranca</text>
+  <text x="393" y="154" text-anchor="middle" class="d-label">operadora fora do ar · exceção</text>
+  <path d="M508 52 L552 52" class="d-line" marker-end="url(#mk-registro)"/>
+  <path d="M508 138 L552 138" class="d-line" marker-end="url(#mk-registro)"/>
+  <rect x="554" y="20" width="198" height="64" rx="10" class="d-ok"/>
+  <text x="653" y="46" text-anchor="middle" class="d-mono">COMPLETED</text>
+  <text x="653" y="68" text-anchor="middle" class="d-label">1 tentativa</text>
+  <rect x="554" y="106" width="198" height="64" rx="10" class="d-box"/>
+  <text x="653" y="132" text-anchor="middle" class="d-mono">FAILED</text>
+  <text x="653" y="154" text-anchor="middle" class="d-label">incompleta · pendente</text>
+  <path d="M653 170 L653 236" class="d-line" stroke-dasharray="6 4" marker-end="url(#mk-registro)"/>
+  <text x="663" y="208" class="d-label">reenvio</text>
+  <rect x="278" y="238" width="474" height="64" rx="10" class="d-info"/>
+  <text x="515" y="264" text-anchor="middle" class="d-mono">resubmitIncompletePublications(filtro)</text>
+  <text x="515" y="288" text-anchor="middle" class="d-label">entrega de novo só a ConsultaRealizada da cobrança</text>
+  <path d="M515 302 L515 334" class="d-line" marker-end="url(#mk-registro)"/>
+  <rect x="278" y="336" width="474" height="56" rx="10" class="d-ok"/>
+  <text x="515" y="360" text-anchor="middle" class="d-mono">GeracaoDeCobranca · COMPLETED · 2 tentativas</text>
+  <text x="515" y="382" text-anchor="middle" class="d-label">o aviso ao paciente não roda de novo</text>
+  <rect x="8" y="238" width="220" height="154" rx="10" class="d-box"/>
+  <text x="118" y="264" text-anchor="middle" class="d-title">event_publication</text>
+  <text x="118" y="292" text-anchor="middle" class="d-label">listener_id · event_type</text>
+  <text x="118" y="314" text-anchor="middle" class="d-label">serialized_event (JSON)</text>
+  <text x="118" y="336" text-anchor="middle" class="d-label">status · completion_date</text>
+  <text x="118" y="358" text-anchor="middle" class="d-label">completion_attempts</text>
+  <text x="118" y="380" text-anchor="middle" class="d-label">uma linha por ouvinte</text>
+</svg>
+</Figura>
+
+### Passo 6: ligando o registro e provocando uma falha
+
+**O que vamos fazer e por quê.** Com o `spring-modulith-starter-jdbc` no classpath, o registro já está ativo. Falta a tabela. Em produção ela vem de uma migration do Flyway; na aula, deixamos o Spring Modulith criá-la na subida:
+
+```properties
+spring.modulith.events.jdbc.schema-initialization.enabled=true
+```
+
+O teste a seguir sobe a aplicação inteira, troca a operadora por um mock que **falha na primeira chamada e funciona na segunda**, registra um atendimento e confere três momentos: logo depois do registro, depois da falha e depois do reenvio.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/modular/RegistroDePublicacoesTest.java" semImports />
+
+```bash
+mvn -pl m13-arquitetura/aulas -am verify -Dtest=RegistroDePublicacoesTest -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+Saída real (resumida; o log da exceção aparece porque ela acontece de propósito):
+
+```text
+ERROR 15800 --- [task-1] .a.i.SimpleAsyncUncaughtExceptionHandler : Unexpected exception occurred invoking async method: void dev.trilhajava.m13.aulas.modular.cobranca.GeracaoDeCobranca.quandoRealizada(dev.trilhajava.m13.aulas.modular.agenda.eventos.ConsultaRealizada)
+
+java.lang.IllegalStateException: operadora indisponível (HTTP 503)
+	at dev.trilhajava.m13.aulas.modular.cobranca.GeracaoDeCobranca.quandoRealizada(GeracaoDeCobranca.java:28)
+
+-- event_publication depois da falha
+GeracaoDeCobranca.quandoRealizada   FAILED     1 (pendente)
+AvisosAoPaciente.quandoRealizada    COMPLETED  1 concluída
+-- event_publication depois do reenvio
+GeracaoDeCobranca.quandoRealizada   COMPLETED  2 concluída
+AvisosAoPaciente.quandoRealizada    COMPLETED  1 concluída
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- `@SpringBootTest(classes = ClinicaApplication.class)` sobe os três módulos. `@MockitoBean OperadoraDeConvenio` troca a `OperadoraSimulada` por um mock programado com `willThrow(...).willReturn("AUT-77120")`: a primeira chamada lança, a segunda devolve a autorização.
+- `agenda.registrarAtendimento(consulta)` faz o commit e retorna **imediatamente**: a consulta já está realizada (`isTrue()`), mesmo com a operadora fora do ar.
+- Os ouvintes rodam em outra thread, então o teste **espera** com o Awaitility (`await().atMost(...).until(...)`), que vem junto com o `spring-modulith-starter-test`. Nada de `Thread.sleep` com um número mágico: o teste segue assim que a condição é verdadeira e falha com mensagem clara se o tempo acabar.
+- A tabela mostra **duas linhas para um único evento**, uma por ouvinte. O aviso terminou (`COMPLETED`); a cobrança falhou (`FAILED`, sem data de conclusão). Os estados possíveis na linha 2.x são `PUBLISHED`, `PROCESSING`, `COMPLETED`, `FAILED` e `RESUBMITTED`.
+- O log de erro vem do `SimpleAsyncUncaughtExceptionHandler`: como o método é `@Async` e `void`, ninguém recebe a exceção, e o Spring só a registra no log. É **esse** log que você vai ver em produção quando um ouvinte falhar, e é por isso que o registro de publicações importa: sem ele, a exceção estaria no log e o evento, perdido.
+- `incompletas.resubmitIncompletePublications(filtro)` reenvia as publicações incompletas que passam pelo filtro. Aqui o filtro escolhe só as desta consulta (`publicacao.getEvent() instanceof ConsultaRealizada evento && ...`), um cuidado útil em produção, quando há milhares de pendências de causas diferentes.
+- Depois do reenvio, a cobrança tem `completion_attempts = 2` e a autorização é a da segunda chamada. O aviso ao paciente **não rodou de novo**: a lista `enviados()` continua com um item. Cada ouvinte tem a sua publicação, e só as incompletas são reenviadas.
+
+<Callout tipo="dica" titulo="Três formas de reenviar">
+Além do reenvio por filtro, a interface `IncompleteEventPublications` tem `resubmitIncompletePublicationsOlderThan(Duration)` e uma variante que recebe `ResubmissionOptions` (tamanho de lote, idade mínima, filtro). Existe também a propriedade `spring.modulith.events.republish-outstanding-events-on-restart=true`, que reenvia tudo o que está pendente quando a aplicação sobe. Ela é prática com **uma** instância; com várias, cada instância que sobe reenvia as mesmas pendências. Veja a seção de decisões.
+</Callout>
+
+#### Por que o ouvinte precisa ser idempotente
+
+O registro garante entrega **pelo menos uma vez**, não **exatamente uma vez**. Pense no pior momento possível: a operadora autorizou, a cobrança foi gravada, e a aplicação caiu **antes** de a publicação ser marcada como concluída. No reenvio, `GeracaoDeCobranca` recebe o mesmo evento de novo. Se ela simplesmente pedisse outra autorização, o convênio seria cobrado duas vezes.
+
+Por isso a primeira linha do ouvinte confere se a cobrança daquela consulta já existe. É a mesma ideia da aula de [consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/), com uma vantagem: o evento traz o identificador da consulta, que é uma chave natural de deduplicação. Em produção, a garantia forte vem de uma **restrição única** no banco (`unique (consulta_id)` na tabela de cobranças), porque duas threads podem passar pelo `if` ao mesmo tempo.
+
+### Passo 7: testando um módulo isolado
+
+**O que vamos fazer e por quê.** O teste do passo 6 sobe a aplicação inteira. Ele é valioso, mas cresce mal: com vinte módulos, cada teste de integração sobe tudo, fica lento e quebra por motivos que não têm nada a ver com o que ele testa. O `@ApplicationModuleTest` sobe **só um módulo** e é, ao mesmo tempo, um teste de acoplamento: se o módulo precisar de um bean de outro módulo, o contexto não sobe.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/modular/cobranca/ModuloDeCobrancaTest.java" semImports />
+
+```bash
+mvn -pl m13-arquitetura/aulas -am verify -Dtest=ModuloDeCobrancaTest -Dsurefire.failIfNoSpecifiedTests=false
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.modular.cobranca.ModuloDeCobrancaTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- O teste está **no pacote do módulo** (`...modular.cobranca`). Sem atributos, o `@ApplicationModuleTest` deduz o módulo pelo pacote da classe de teste e acha a `ClinicaApplication` subindo na hierarquia de pacotes. No contexto ficam só os beans da cobrança, mais a autoconfiguração do Spring Boot (banco, transações, registro).
+- O **modo de inicialização** padrão é `STANDALONE`: só o módulo. Existem também `DIRECT_DEPENDENCIES` (o módulo e os que ele usa diretamente) e `ALL_DEPENDENCIES` (a árvore inteira). Use `mode = BootstrapMode.DIRECT_DEPENDENCIES` quando o módulo depende da API de outro e você quer testar a integração real; use `extraIncludes` para acrescentar um módulo específico.
+- `Scenario` é injetado como parâmetro do método. `cenario.publish(evento)` publica o evento **dentro de uma transação**, para que o ouvinte `AFTER_COMMIT` dispare, como em produção.
+- `andWaitForStateChange(() -> cobrancas.daConsulta(consulta))` espera até a função devolver um resultado "conclusivo". Por padrão, isso é um valor não nulo ou um `Optional` não vazio, o que encaixa exatamente com `daConsulta`. Há uma variante com um predicado, para condições como "o saldo diminuiu 3".
+- `andVerify(...)` recebe o resultado e faz as asserções. Se a mudança nunca acontecer, o teste falha por tempo esgotado (o padrão do Awaitility; ajuste com `customize(...)`).
+- O `@ApplicationModuleTest` também verifica os módulos ao subir (atributo `verifyAutomatically`, verdadeiro por padrão). Um teste de módulo falha se houver violação em **qualquer** módulo, o que é útil, mas é a causa do problema do `verify()` em cache do passo 4.
+
+O evento publicado no teste foi criado à mão: a agenda nem está no contexto. É isso que torna o teste estável. O contrato entre os módulos é o `record` `ConsultaRealizada`, e o teste da cobrança depende só dele, não do comportamento da agenda.
+
+<Callout tipo="dica" titulo="Scenario também para eventos de saída">
+Quando o módulo testado **publica** um evento em resposta, troque `andWaitForStateChange` por `andWaitForEventOfType(Tipo.class).matching(...).toArriveAndVerify(...)`. E quando o estímulo é uma chamada à API, e não um evento, use `cenario.stimulate(() -> servico.metodo(...))`. As mudanças de estado feitas no cenário **não são desfeitas** no fim do teste; limpe com `andCleanup(...)` se outro teste depender do estado inicial.
+</Callout>
+
+### Passo 8: a documentação gerada a partir do código
+
+**O que vamos fazer e por quê.** Diagramas de arquitetura desenhados à mão envelhecem na semana seguinte. O `Documenter` gera os diagramas **a partir do mesmo modelo** que a verificação usa, então eles nunca mentem. O segundo teste do passo 4 faz isso:
+
+```java
+new Documenter(modulos).writeDocumentation();
+```
+
+Depois do build, a pasta `target/spring-modulith-docs` tem:
+
+```text
+all-docs.adoc            ← documento que junta tudo
+components.puml          ← diagrama C4 de componentes com todos os módulos
+module-agenda.puml       ← um diagrama por módulo, com as dependências diretas
+module-agenda.adoc       ← o "canvas" do módulo: beans, eventos publicados e ouvidos
+module-cobranca.puml
+module-cobranca.adoc
+module-notificacoes.puml
+module-notificacoes.adoc
+```
+
+O `components.puml` é PlantUML com a biblioteca C4. As relações entre os módulos saem assim:
+
+```text
+Rel(ClinicaApplication.ClinicaApplication.Notificações, ClinicaApplication.ClinicaApplication.Agenda, "listens to", ...)
+Rel(ClinicaApplication.ClinicaApplication.Cobrança, ClinicaApplication.ClinicaApplication.Agenda, "listens to", ...)
+```
+
+E o canvas da cobrança (`module-cobranca.adoc`) lista os beans, a interface `OperadoraDeConvenio` com a implementação, e os eventos ouvidos: `ConsultaRealizada (async)`.
+
+**O que acabou de acontecer.** O tipo da relação diz muito: `listens to` é dependência por evento, a mais fraca; `uses` é dependência de um bean de outro módulo, mais forte. Num monólito modular saudável, a maioria das setas é `listens to`. Um diagrama em que tudo é `uses` é um sinal de que os módulos ainda conversam por chamadas diretas. Com `DiagramOptions.defaults().withStyle(DiagramStyle.UML)` você troca o estilo C4 pelo UML clássico.
+
+Para publicar, o caminho mais comum é o CI gerar a documentação e anexá-la ao build, ou um site de documentação (Asciidoctor) incluir o `all-docs.adoc`. O ponto é que ninguém precisa lembrar de atualizar o diagrama.
+
+### Passo 9: a suíte inteira
+
+```bash
+mvn -pl m13-arquitetura/aulas -am verify
+```
+
+Saída esperada (resumida, só as classes desta aula):
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.modular.cobranca.ModuloDeCobrancaTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.modular.ModulosDaClinicaTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.modular.RegistroDePublicacoesTest
+[INFO] BUILD SUCCESS
+```
+
+São quatro testes, e cada um protege uma coisa diferente: a **estrutura** (verificação), a **documentação**, o **módulo isolado** e a **garantia de entrega** com falha e reenvio. Essa é uma boa base para qualquer monólito modular: um teste de verificação, um `@ApplicationModuleTest` por módulo e poucos testes da aplicação inteira para os fluxos que atravessam módulos.
+
+## Quando dá errado
+
+As mensagens abaixo foram copiadas de execuções reais, com o código da aula alterado de propósito.
+
+### Dependência fora das permitidas e tipo não exposto
+
+Alguém precisava de um "lembrete de retorno" e escreveu, no módulo de notificações, uma classe que usa o serviço da agenda e o repositório interno dela:
+
+```java
+@Component
+class LembreteDeRetorno {
+    private final ServicoDeAgenda agenda;
+    private final Consultas consultas;   // agenda.internal
+    // ...
+    boolean precisaLembrar(UUID consulta) {
+        return agenda.realizada(consulta) && consultas.buscar(consulta).isPresent();
+    }
+}
+```
+
+Compila, sobe e funciona. O teste de verificação falha:
+
+```text
+org.springframework.modulith.core.Violations:
+- Module 'notificacoes' depends on module 'agenda' via dev.trilhajava.m13.aulas.modular.notificacoes.LembreteDeRetorno -> dev.trilhajava.m13.aulas.modular.agenda.ServicoDeAgenda. Allowed targets: agenda :: eventos.
+- Module 'notificacoes' depends on non-exposed type dev.trilhajava.m13.aulas.modular.agenda.internal.Consultas within module 'agenda'!
+LembreteDeRetorno declares constructor LembreteDeRetorno(ServicoDeAgenda, Consultas) in (LembreteDeRetorno.java:0)
+- Module 'notificacoes' depends on non-exposed type dev.trilhajava.m13.aulas.modular.agenda.internal.Consultas within module 'agenda'!
+Method <dev.trilhajava.m13.aulas.modular.notificacoes.LembreteDeRetorno.precisaLembrar(java.util.UUID)> calls method <dev.trilhajava.m13.aulas.modular.agenda.internal.Consultas.buscar(java.util.UUID)> in (LembreteDeRetorno.java:20)
+```
+
+**Como ler.** São dois tipos de violação. A primeira (`Allowed targets: agenda :: eventos`) diz que o `ServicoDeAgenda` é API da agenda, mas não está entre as dependências que **este** módulo declarou. A segunda (`non-exposed type`) diz que `Consultas` é interna: nenhum módulo pode usá-la, com ou sem declaração. O Spring Modulith lista **cada uso** (construtor, campo, chamada de método) com a linha do arquivo, o que ajuda a medir o tamanho da correção.
+
+**Como corrigir.** Não é afrouxar a regra. A pergunta é: de que **dado** o lembrete precisa? Se for "a consulta foi realizada", o evento `ConsultaRealizada` já entrega isso: o lembrete pode ouvir o evento e agendar o próprio lembrete. Se ele precisar de algo que o evento não traz, a correção é a agenda expor uma consulta na API (um método no `ServicoDeAgenda`) **e** a notificação declarar `"agenda"` em `allowedDependencies`, uma decisão consciente que aparece na revisão de código.
+
+### Ciclo entre módulos
+
+Outra pessoa quis bloquear o agendamento de pacientes com cobranças em aberto e colocou, na agenda, uma classe que consulta a cobrança:
+
+```java
+@Component
+class BloqueioPorInadimplencia {          // agenda.internal
+    private final Cobrancas cobrancas;    // API da cobrança
+    // ...
+}
+```
+
+A agenda não declara `allowedDependencies`, então usar a API da cobrança seria permitido. Mas a cobrança já depende da agenda (pelo evento). O resultado:
+
+```text
+org.springframework.modulith.core.Violations:
+- Cycle detected: Slice agenda ->
+                Slice cobranca ->
+                Slice agenda
+  1. Dependencies of Slice agenda
+    - Constructor <dev.trilhajava.m13.aulas.modular.agenda.internal.BloqueioPorInadimplencia.<init>(dev.trilhajava.m13.aulas.modular.cobranca.Cobrancas)> has parameter of type <dev.trilhajava.m13.aulas.modular.cobranca.Cobrancas> in (BloqueioPorInadimplencia.java:0)
+    - Method <dev.trilhajava.m13.aulas.modular.agenda.internal.BloqueioPorInadimplencia.cobrada(java.util.UUID)> calls method <dev.trilhajava.m13.aulas.modular.cobranca.Cobrancas.daConsulta(java.util.UUID)> in (BloqueioPorInadimplencia.java:17)
+  2. Dependencies of Slice cobranca
+    - Method <dev.trilhajava.m13.aulas.modular.cobranca.GeracaoDeCobranca.quandoRealizada(dev.trilhajava.m13.aulas.modular.agenda.eventos.ConsultaRealizada)> has parameter of type <dev.trilhajava.m13.aulas.modular.agenda.eventos.ConsultaRealizada> in (GeracaoDeCobranca.java:0)
+```
+
+**Como ler.** A mensagem vem do ArchUnit (por isso "Slice"): ela mostra o ciclo (`agenda -> cobranca -> agenda`) e, para cada lado, as dependências que o formam. Repare que **depender de um evento também conta** como dependência: a cobrança depende da agenda porque recebe `ConsultaRealizada` como parâmetro.
+
+**Como corrigir.** Ciclos significam que dois módulos estão, na prática, misturados. Publicar um evento no sentido contrário não resolve, porque o tipo do evento também pertence a um módulo. As saídas reais são inverter a dependência (a agenda define uma interface com a pergunta que precisa fazer, e a cobrança a implementa), mover a regra para um terceiro módulo de que nenhum dos dois dependa de volta, ou concluir que as duas coisas são uma capacidade só e juntá-las. O Checkpoint desta aula resolve exatamente este caso.
+
+### A exceção do ouvinte só aparece no log
+
+```text
+ERROR --- [task-1] .a.i.SimpleAsyncUncaughtExceptionHandler : Unexpected exception occurred invoking async method: void dev.trilhajava.m13.aulas.modular.cobranca.GeracaoDeCobranca.quandoRealizada(...)
+java.lang.IllegalStateException: operadora indisponível (HTTP 503)
+```
+
+**Como ler.** Não é um bug do Spring: é o comportamento esperado de um método `@Async` `void`. Ninguém espera o retorno, então a exceção vai para o tratador padrão, que só registra no log. A informação que importa está no registro: a publicação daquele ouvinte ficou incompleta. Em produção, esse log precisa de **alerta** (contagem de erros por ouvinte) e as publicações incompletas precisam de **monitoramento** (quantas, há quanto tempo). Veja a seção de decisões.
+
+### O teste de verificação passa com violações
+
+Não há mensagem de erro, e esse é o problema. Se a suíte tem um `@ApplicationModuleTest` e um teste com `ApplicationModules.of(App.class).verify()`, e o de módulo roda antes, o `verify()` não executa de novo. É o quadro do passo 4. A correção é `detectViolations().throwIfPresent()`. Um jeito de confirmar que o seu teste realmente verifica: introduza uma violação de propósito (como a `LembreteDeRetorno` acima), rode a suíte inteira e veja o teste falhar.
+
+### O evento nunca chega ao ouvinte
+
+Também sem mensagem. As três causas mais comuns, em ordem:
+
+1. A publicação aconteceu **fora de uma transação** (método sem `@Transactional`, ou chamado de dentro da própria classe, o que ignora o proxy do Spring). O `@TransactionalEventListener` descarta o evento.
+2. A transação de quem publicou sofreu **rollback**. É o comportamento correto: o fato não aconteceu.
+3. O ouvinte está num bean que o contexto não carregou (num `@ApplicationModuleTest`, por exemplo, o módulo dele não está incluído).
+
+Para diagnosticar, olhe a tabela `event_publication`: se não há linha para o ouvinte, o evento nunca foi registrado para ele (causas 1 e 3); se há linha incompleta, o ouvinte foi chamado e falhou.
+
+## Fronteiras por capacidade de negócio
+
+Tudo o que você viu até aqui é mecânica. A parte difícil de um monólito modular, a que decide se ele vai durar, é **onde cortar**.
+
+O erro mais comum é cortar por **camada técnica** ou por **entidade**: um módulo `controllers`, um `services`, um `repositories`; ou um módulo `paciente`, um `consulta`, um `medico`. O primeiro não é modularização nenhuma: toda funcionalidade atravessa todos os módulos. O segundo parece melhor, mas quase toda operação de negócio envolve várias entidades ("marcar consulta" mexe em paciente, médico, agenda e convênio), e os módulos passam a se chamar o tempo todo.
+
+O critério que funciona é **capacidade de negócio**: algo que a empresa faz, que tem valor por si e que tem um "dono" na organização. Na clínica: **agendar** (a recepção), **cobrar** (o faturamento), **notificar** (o relacionamento com o paciente), **manter o prontuário** (a equipe clínica). Três testes rápidos para saber se o corte está bom:
+
+- **O teste da conversa.** Para a maioria das funcionalidades novas, quantos módulos você precisa mudar? Se a resposta comum é "um", o corte está bom. Se é "todos", ele está errado.
+- **O teste da linguagem.** A palavra "consulta" significa a mesma coisa em todos os módulos? Para a agenda, consulta é um horário com um médico; para a cobrança, é um item faturável com código de procedimento e coparticipação. Quando a mesma palavra tem significados diferentes, cada módulo deve ter o **seu** modelo, e é isso que a [aula de Domain-Driven Design](../../13-arquitetura/07-domain-driven-design/) deste módulo chama de contexto delimitado.
+- **O teste do evento.** Dá para descrever a relação entre dois módulos como "quando X acontece em A, B faz Y"? Se sim, um evento é a integração natural. Se a relação é "A precisa da resposta de B para continuar", ela é uma chamada à API, e vale perguntar se A e B não são uma coisa só.
+
+Repare que a `Cobranca` da aula guarda `paciente` e `valor`, copiados do evento. Ela **não** guarda uma referência à `Consulta` da agenda. Isso é proposital: cada módulo tem o seu modelo, e o que atravessa a fronteira são **dados**, nunca objetos de outro módulo.
+
+## Dados por módulo
+
+Fronteiras no código não adiantam se o banco não tem fronteira nenhuma. Se o módulo de cobrança faz `SELECT` direto na tabela de consultas da agenda, ele depende do esquema dela, e uma migration da agenda quebra a cobrança, exatamente como no sistema do começo da aula. O Spring Modulith não verifica isso (ele analisa o bytecode, não o SQL), então a regra precisa ser de time:
+
+1. **Cada tabela tem um módulo dono.** Só o dono escreve, e só o dono lê diretamente. No PostgreSQL, um **schema por módulo** (`agenda.consulta`, `cobranca.cobranca`) torna a regra visível, e um usuário de banco por módulo com permissão só no próprio schema a torna obrigatória, se o time quiser ir tão longe.
+2. **Sem chave estrangeira entre módulos.** A cobrança guarda o `consulta_id` como um valor (um UUID), sem `FOREIGN KEY` para a tabela da agenda. Uma FK entre schemas é um acoplamento de esquema que impede extrair um módulo depois.
+3. **Sem `JOIN` entre módulos.** Um relatório que precisa de dados de três módulos tem duas saídas: consultar a API de cada um e combinar em memória, ou manter uma **projeção de leitura** (um módulo `relatorios` que ouve os eventos e monta as próprias tabelas, desnormalizadas, otimizadas para consulta).
+4. **Migrations por módulo.** Com o Flyway, uma pasta de migrations por módulo (e, se preciso, uma tabela de histórico por schema) deixa claro quem mudou o quê.
+
+Isso parece burocracia para um processo só, e às vezes é. Mas é exatamente o que separa um monólito modular de um monólito com pacotes bonitos. E é o que vai permitir, um dia, mover um módulo para outro banco sem reescrever os outros.
+
+O registro de publicações é a exceção natural: a tabela `event_publication` é **compartilhada** e pertence à infraestrutura, não a um módulo. Ela precisa estar no mesmo banco (e, no PostgreSQL, idealmente acessível na mesma transação) que os dados de quem publica, ou a garantia de gravação atômica se perde.
+
+## Da classe ao serviço: extraindo um módulo
+
+Um dia, o módulo de notificações começa a mandar 400 mil mensagens por dia, com picos às 7h, e a fila de envio disputa CPU com o registro de atendimentos. Agora há um **motivo concreto** para separá-lo: escala diferente. Como o módulo foi bem cortado, a extração tem um roteiro:
+
+1. **Confirme que o módulo já é um "serviço dentro do monólito".** Só conversa por eventos e pela API pública, tem dados próprios, sem FK nem `JOIN` com outros módulos. A verificação passa. Se isso não é verdade, a extração começa por aqui, ainda dentro do monólito, onde refatorar é barato.
+2. **Externalize os eventos que ele ouve.** O Spring Modulith publica eventos também num broker, pelo mesmo registro de publicações (com `spring-modulith-events-kafka` ou `-amqp`). Basta anotar o evento:
+
+   ```java
+   @Externalized("clinica.consultas::#{#this.consulta()}")
+   public record ConsultaRealizada(UUID consulta, String paciente, String procedimento, BigDecimal valor) { }
+   ```
+
+   A parte antes de `::` é o destino (o tópico do Kafka) e a depois é a chave da mensagem, uma expressão SpEL sobre o evento. A chave por consulta mantém a ordem dos eventos de uma mesma consulta numa partição.
+3. **Suba o serviço novo ouvindo o broker**, em paralelo ao módulo, primeiro sem efeito (só registrando o que faria), para comparar. É o padrão Strangler Fig da próxima aula.
+4. **Troque a chave:** desligue o ouvinte no monólito e ligue o envio no serviço. Os outros módulos não mudam nada: continuam publicando o mesmo evento.
+5. **Mova os dados.** Como o schema `notificacoes` não tinha FK para ninguém, ele é copiado para o banco do serviço novo.
+6. **Apague o módulo** do monólito.
+
+O passo 2 é o que torna o monólito modular um bom ponto de partida: o contrato entre os módulos (o evento) é o mesmo antes e depois da extração. O que muda é o transporte. Mas atenção: a partir do passo 2, `ConsultaRealizada` é um **contrato público entre sistemas**, com tudo o que a [aula de evolução de esquemas de eventos](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/), no módulo 12, discute (compatibilidade, versões, campos opcionais). Dentro do monólito, renomear um campo do `record` é uma refatoração do IntelliJ; fora dele, é uma migração coordenada.
+
+## Armadilhas e quando NÃO usar
+
+**Módulo "comum" que vira lixeira.** Todo projeto cria um pacote `shared` ou `common`, que o Spring Modulith trata como mais um módulo, do qual todos dependem. Em seis meses, ele tem DTOs de três módulos, utilitários de data e uma classe `Constantes` com 400 linhas. Mantenha o compartilhado mínimo e técnico (um tipo `Dinheiro`, por exemplo) e, se for mesmo compartilhado por todos, declare-o explicitamente; o que é de negócio pertence a algum módulo.
+
+**Eventos que carregam entidades.** Publicar `new ConsultaRealizada(consulta)`, com a entidade interna da agenda dentro, faz todos os ouvintes dependerem do modelo interno da agenda. Além de violar a fronteira (a `Consulta` é interna, e a verificação acusa), o evento serializado no registro passa a ter o formato da entidade, que muda a cada refatoração. Eventos levam **dados** em tipos próprios e estáveis.
+
+**Eventos que são comandos disfarçados.** `GerarCobrancaSolicitada`, publicado pela agenda para que a cobrança gere a cobrança, é uma chamada de método com mais passos. A agenda continua "sabendo" da cobrança, só que de forma escondida. Eventos são **fatos no passado**, do ponto de vista de quem publica: `ConsultaRealizada`, não `CobrarConsulta`.
+
+**Consistência eventual onde o negócio não aceita.** Se a regra é "não pode agendar sem autorização prévia do convênio", a autorização faz parte do agendamento, e um evento depois do commit chega tarde demais. Ou a agenda chama a API de autorização de forma síncrona (uma dependência explícita, declarada), ou a autorização vira parte do módulo de agenda.
+
+**Ouvinte lento sem limite.** Os ouvintes rodam no executor assíncrono do Spring Boot. Um ouvinte que chama uma operadora lenta, multiplicado por centenas de eventos, ocupa todas as threads. Configure o executor (tamanho, fila) ou use threads virtuais (`spring.threads.virtual.enabled=true`), e ponha tempos limite nas chamadas externas, como na aula de [resiliência](../../13-arquitetura/06-resiliencia/).
+
+**`@EventListener` comum onde precisava de garantia.** Um `@EventListener` simples roda **dentro** da transação de quem publica, na mesma thread: se ele falhar, desfaz o registro do atendimento. E ele não passa pelo registro de publicações. Use `@ApplicationModuleListener` para integração entre módulos; reserve `@EventListener` para reações locais e síncronas, dentro do próprio módulo.
+
+**Quando NÃO usar o Spring Modulith (ou um monólito modular).**
+
+- **Aplicações pequenas, com uma capacidade de negócio só.** Um serviço de emissão de boletos com dez classes não tem módulos para separar. A estrutura do Spring Modulith vira cerimônia.
+- **Times e cadências realmente independentes.** Se cinco times de dez pessoas mexem no mesmo repositório e cada um precisa publicar várias vezes por dia sem coordenar com os outros, o deploy único vira gargalo. Aí microsserviços (ou pelo menos alguns serviços extraídos) resolvem um problema real.
+- **Requisitos de escala ou de isolamento muito diferentes.** Um módulo de processamento de imagens que precisa de GPU, ou um de pagamentos que precisa de certificação PCI isolada, justificam um processo separado desde o início.
+- **Tecnologias diferentes.** Se uma parte do sistema é melhor resolvida em Python (um modelo de machine learning), ela não cabe no monólito Java.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+### Monólito modular ou microsserviços: o que realmente muda
+
+| Aspecto | Monólito modular | Microsserviços |
+|---|---|---|
+| Deploy | Um artefato, um pipeline. Uma mudança em qualquer módulo republica tudo | Um por serviço. Independência, ao custo de N pipelines |
+| Comunicação | Chamada de método ou evento em memória; latência de nanossegundos | Rede: latência, timeouts, retries, serialização, versionamento |
+| Consistência | Transação local dentro do módulo; eventual entre módulos, com registro no mesmo banco | Eventual quase sempre; sagas para fluxos longos |
+| Falhas | Um módulo pode derrubar o processo (memória, threads) | Isolamento de falha por processo, mas com falhas parciais de rede |
+| Observabilidade | Um log, um stack trace, um profiler | Tracing distribuído obrigatório |
+| Refatorar uma fronteira | Mover classes; o compilador ajuda | Mudar contratos entre equipes e versões |
+| Escala | Tudo junto (réplicas da aplicação inteira) | Por serviço |
+| Custo de infraestrutura | Baixo | Alto: broker, service discovery, gateway, observabilidade |
+
+A frase que resume para o time: **microsserviços compram independência de deploy e de escala com complexidade operacional**. Se o problema atual é acoplamento de código, o monólito modular resolve o problema e não cobra a complexidade. Se o problema é independência de times ou de escala, aí sim a conta pode fechar para serviços.
+
+Uma consequência menos óbvia: **fronteiras erradas custam muito menos num monólito modular**. No começo de um produto, você ainda não sabe onde as fronteiras estão. Se descobrir que "convênio" e "cobrança" eram uma coisa só, num monólito modular é mover pacotes numa tarde; em dois microsserviços, é migrar dados, juntar repositórios e coordenar deploys. Por isso a recomendação de muitos arquitetos, incluindo o time do Spring Modulith, é começar modular e extrair depois, quando a fronteira estiver comprovada.
+
+### Operando o registro de publicações
+
+O registro é uma tabela que **cresce** com cada evento, multiplicado pelo número de ouvintes. Decisões que alguém precisa tomar antes de ir para produção:
+
+- **O que fazer com as concluídas.** `spring.modulith.events.completion-mode` tem três valores: `UPDATE` (padrão: marca a data de conclusão e mantém a linha), `DELETE` (apaga ao concluir) e `ARCHIVE` (move para uma tabela de arquivo). Com `UPDATE`, programe uma limpeza com `CompletedEventPublications.deletePublicationsOlderThan(Duration)`, ou a tabela cresce sem fim. `DELETE` é o mais simples; `ARCHIVE` serve quando a auditoria precisa do histórico.
+- **Como reenviar.** O reenvio na subida (`republish-outstanding-events-on-restart`) é perigoso com várias instâncias: cada uma que reinicia reenvia as mesmas pendências, e um ouvinte que ainda estava rodando noutra instância pode ser executado duas vezes. Em produção, prefira um **agendador único** (um `@Scheduled` protegido por um lock distribuído, como ShedLock, ou um job) que chama `resubmitIncompletePublicationsOlderThan(Duration.ofMinutes(5))` periodicamente. A idade mínima evita reenviar o que ainda está em processamento.
+- **Publicações presas.** As propriedades `spring.modulith.events.staleness.published`, `.processing` e `.resubmitted` definem quanto tempo uma publicação pode ficar em cada estado antes de ser marcada como `FAILED`. Por padrão estão desligadas. Ligue-as quando instâncias podem morrer no meio do processamento (deploys, autoescala).
+- **Falhas permanentes.** Uma publicação que falha sempre (um evento com dado inválido, um bug no ouvinte) vai ser reenviada para sempre. Monitore `completion_attempts` e defina um limite a partir do qual a publicação vai para análise humana, como uma DLQ (veja a aula de [retry e DLQ](../../12-mensageria/06-retry-e-dlq/)).
+- **Formato serializado.** O evento fica gravado como JSON na coluna `serialized_event`. Se você renomear um campo do `record` com publicações pendentes na tabela, o reenvio não consegue desserializá-las. Trate a mudança de um evento como mudança de contrato, mesmo dentro do monólito: deploy com a tabela sem pendências daquele tipo, ou campos novos opcionais.
+
+### Observabilidade dos módulos
+
+O `spring-modulith-starter-insight` junta duas peças. A primeira é um endpoint do Actuator, `/actuator/modulith`, que expõe a estrutura dos módulos e as dependências em JSON. A segunda cria spans do Micrometer para cada chamada à API de um módulo e para cada ouvinte, com atributos como `module.name` e `module.invocation-type`, e conta os eventos publicados (`module.events.published`). Com isso, um trace mostra "a requisição passou pela agenda, que publicou um evento, que a cobrança tratou em 1,2 s", o mesmo tipo de visão que se teria entre microsserviços, sem a rede. Junte isso a dois alertas: erros por ouvinte e número de publicações incompletas acima de um limite por mais de alguns minutos.
+
+### Segurança e fronteiras
+
+Um módulo não é uma fronteira de segurança. Todos rodam no mesmo processo, com as mesmas permissões, e um bug de injeção num módulo expõe o banco inteiro. Se um módulo precisa de isolamento forte (dados de saúde sensíveis, pagamentos), as opções são, em ordem de custo: schema e usuário de banco próprios (o módulo só consegue acessar os próprios dados, mesmo com um bug), criptografia de colunas sensíveis, e, no limite, extrair o módulo para um processo com credenciais próprias. Na clínica, o prontuário é um candidato natural a esse cuidado, por causa da LGPD.
+
+### Como justificar a escolha para o time
+
+Um ADR (*Architecture Decision Record*) curto, com o contexto, as opções e os critérios mensuráveis que fariam a decisão ser revista, funciona melhor que qualquer discussão. Por exemplo: "Adotamos monólito modular com Spring Modulith. Revisaremos se: (a) um módulo precisar de mais de 3 vezes as réplicas dos outros; (b) mais de dois times precisarem publicar independentemente mais de uma vez por dia; (c) o tempo de build passar de 15 minutos". O [exercício 13.05](../../../exercicios/13-arquitetura/05-adr-monolito-ou-microsservicos/) pede exatamente esse ADR.
+
+E prepare a resposta para a objeção mais comum: "monólito não escala". Um monólito com dez réplicas atrás de um balanceador escala horizontalmente como qualquer serviço sem estado. O que ele não faz é escalar **partes** de forma diferente, e isso só importa quando as partes têm cargas muito diferentes, o que se mede antes de decidir.
+
+### Quando trocar de abordagem
+
+Sinais de que um módulo está pronto (ou precisando) de virar serviço: a carga dele cresce numa curva diferente das outras; um time inteiro trabalha só nele e espera o deploy dos outros; ele tem requisitos de disponibilidade diferentes (precisa ficar de pé quando o resto cai); ou ele precisa de outra tecnologia. Sinais de que o problema **não** é esse e extrair seria um erro: os módulos ainda mudam juntos na maioria das funcionalidades; a verificação vive com exceções ou módulos `OPEN`; os eventos são comandos disfarçados. Nesse caso, extrair só leva o acoplamento para a rede. Conserte as fronteiras primeiro.
+
+<Callout tipo="entrevista">
+**"Monólito ou microsserviços para um sistema novo?"** Uma boa resposta não escolhe um lado de cara. Ela pergunta pelo tamanho do time, pela previsibilidade do domínio e pela carga, e propõe começar com um **monólito modular**: módulos por capacidade de negócio, fronteiras verificadas no CI (Spring Modulith), dados por módulo sem FK nem `JOIN` cruzado, e comunicação por eventos com o registro de publicações. Termina com os critérios concretos para extrair um módulo: escala diferente, time independente, isolamento.
+
+**"Como você garante que um evento entre módulos não se perde?"** Cita o registro de publicações (ou um outbox): a publicação é gravada na mesma transação do dado de negócio, uma por ouvinte, e marcada como concluída no fim; as incompletas são reenviadas. E completa sem esperar a pergunta seguinte: a entrega é pelo menos uma vez, então o ouvinte tem de ser **idempotente**, idealmente com uma restrição única no banco.
+
+**"O que é `@ApplicationModuleListener` e por que não `@EventListener`?"** Explica as três partes (depois do commit, assíncrono, transação nova) e o motivo de negócio de cada uma, e diz que o `@EventListener` comum roda na mesma transação e thread, sem registro, então uma falha dele desfaz a operação de quem publicou.
+
+**"Como você extrairia um módulo para um serviço?"** Descreve o roteiro: confirmar fronteiras e dados próprios, externalizar os eventos para um broker, subir o serviço em paralelo, trocar o tráfego, mover os dados, apagar o módulo. Um candidato sênior menciona que, a partir da externalização, o evento vira contrato público e precisa de política de versionamento.
+</Callout>
+
+## Checkpoint: bloquear o agendamento de quem está inadimplente
+
+A diretoria pediu: **não deixar agendar** consulta para paciente com cobrança vencida há mais de 30 dias. A primeira tentativa, a `BloqueioPorInadimplencia` de "Quando dá errado", criou um ciclo: a cobrança depende da agenda (ouve `ConsultaRealizada`) e a agenda passou a depender da cobrança (consulta `Cobrancas`). Proponha um desenho que atenda à regra **sem ciclo** e responda:
+
+1. Por que publicar um evento `PacienteInadimplente` na cobrança e ouvi-lo na agenda **não** resolve o ciclo?
+2. Qual tipo você criaria, em qual módulo e em qual pacote, para a agenda perguntar "este paciente pode agendar?" sem depender da cobrança?
+3. Como ficam o `package-info.java` dos módulos envolvidos?
+4. A regra fica com consistência imediata ou eventual? E o que muda no `@ApplicationModuleTest` da agenda?
+
+<details>
+<summary>Uma solução possível</summary>
+
+1. **Eventos nos dois sentidos continuam sendo um ciclo.** O Spring Modulith conta dependência entre **módulos**: se a agenda ouve `cobranca.eventos.PacienteInadimplente` e a cobrança ouve `agenda.eventos.ConsultaRealizada`, a agenda depende da cobrança e a cobrança depende da agenda. Usar eventos não muda a direção da dependência; o tipo do evento pertence a alguém.
+
+2. **Inversão de dependência: a agenda define a pergunta, a cobrança responde.** A agenda cria, num sub-pacote exposto como interface nomeada, uma interface que descreve o que ela precisa saber, na linguagem dela:
+
+   ```java
+   // agenda/spi/RestricaoDeAgendamento.java, com @NamedInterface("spi") no package-info
+   public interface RestricaoDeAgendamento {
+       boolean bloqueado(String paciente);
+   }
+   ```
+
+   O `ServicoDeAgenda.agendar(...)` recebe essa interface no construtor e recusa o agendamento quando `bloqueado(paciente)` é verdadeiro. A cobrança implementa a interface num bean package-private, consultando os próprios dados (cobranças vencidas há mais de 30 dias). Em tempo de execução, o Spring injeta na agenda o bean da cobrança; no código, a seta vai só da cobrança para a agenda. É a mesma ideia de porta e adaptador da aula de [arquitetura hexagonal](../../13-arquitetura/03-hexagonal/), aplicada entre módulos.
+
+3. **As declarações:**
+
+   ```java
+   @org.springframework.modulith.ApplicationModule(displayName = "Agenda")   // não depende de ninguém
+   package dev.trilhajava.m13.aulas.modular.agenda;
+
+   @org.springframework.modulith.ApplicationModule(
+           displayName = "Cobrança",
+           allowedDependencies = { "agenda :: eventos", "agenda :: spi" })
+   package dev.trilhajava.m13.aulas.modular.cobranca;
+   ```
+
+   A agenda continua sem dependências, e a verificação passa.
+
+4. **Consistência imediata**: a pergunta é uma chamada de método síncrona, na hora do agendamento, sobre os dados atuais da cobrança. É o que a regra pede (não deixar agendar), e é por isso que aqui uma chamada é melhor que uma projeção alimentada por eventos. O custo: o `@ApplicationModuleTest` da agenda, em modo `STANDALONE`, não tem nenhum bean de `RestricaoDeAgendamento` no contexto, então o teste precisa de um `@MockitoBean RestricaoDeAgendamento`, o que é bom, porque permite testar "paciente bloqueado" e "paciente liberado" sem cobrança nenhuma.
+
+   Se a regra crescer (bloqueio por inadimplência, por carência do plano, por documentação pendente), a implementação da interface pode sair da cobrança e ir para um módulo novo, `elegibilidade`, que consulta vários módulos. A agenda não muda: ela só conhece a pergunta.
+
+O ponto do exercício é perceber que **um ciclo é sintoma de fronteira mal desenhada**, e que a correção quase nunca é uma anotação: é decidir quem é dono de cada pergunta e fazer a dependência apontar para quem a define.
+
+</details>
+
+<Quiz
+  id="13-modulith"
+  questoes={[
+    {
+      pergunta: 'No Spring Modulith, o módulo notificacoes usa a classe `agenda.internal.Consultas`, que é `public` no Java. O que acontece?',
+      opcoes: ['Nada: a classe é pública', 'A verificação acusa dependência de um tipo não exposto de outro módulo', 'Erro de compilação', 'O Spring não sobe'],
+      correta: 1,
+      explicacao: 'Sub-pacotes de um módulo são internos para a arquitetura, mesmo que o Java permita o acesso. A violação aparece no teste de verificação ("depends on non-exposed type"), não na compilação nem na execução.',
+    },
+    {
+      pergunta: 'Por que o `@ApplicationModuleListener` roda depois do commit, em outra thread e numa transação nova?',
+      opcoes: ['Por desempenho apenas', 'Para não reagir a uma mudança desfeita, não fazer quem publica esperar e isolar a falha de um ouvinte', 'Porque o Spring exige para qualquer evento', 'Para garantir a ordem dos eventos'],
+      correta: 1,
+      explicacao: 'Cada parte tem um motivo: `@TransactionalEventListener` (sem commit, sem reação), `@Async` (quem publica não espera) e `REQUIRES_NEW` (a falha do ouvinte não afeta quem publicou nem os outros ouvintes).',
+    },
+    {
+      pergunta: 'A operadora do convênio estava fora do ar e a GeracaoDeCobranca falhou; o aviso ao paciente deu certo. O que o reenvio das publicações incompletas faz?',
+      opcoes: ['Executa os dois ouvintes de novo', 'Executa só a GeracaoDeCobranca, porque cada ouvinte tem a sua publicação', 'Desfaz o registro do atendimento', 'Nada: eventos com falha são descartados'],
+      correta: 1,
+      explicacao: 'O registro grava uma publicação por ouvinte. A do aviso está COMPLETED e não é reenviada; a da cobrança, incompleta, é. Como pode haver reentrega, o ouvinte precisa ser idempotente.',
+    },
+    {
+      pergunta: 'A suíte tem um `@ApplicationModuleTest` e um teste com `ApplicationModules.of(App.class).verify()`. Qual o risco?',
+      opcoes: ['Nenhum', 'O `verify()` pode não executar de novo (instância em cache já verificada) e o teste passar com violações', 'O teste fica lento', 'Conflito de contexto do Spring'],
+      correta: 1,
+      explicacao: '`verify()` roda uma vez por instância, e `ApplicationModules.of` usa cache. `detectViolations().throwIfPresent()` sempre executa.',
+    },
+    {
+      pergunta: 'Um time de 8 pessoas, com um banco só e sem experiência em sistemas distribuídos, sofre com um monólito em que tudo depende de tudo. Qual a recomendação mais defensável?',
+      opcoes: ['Quebrar em microsserviços, um por entidade', 'Modularizar o monólito por capacidade de negócio, verificar as fronteiras no CI e extrair serviços só com motivo concreto', 'Manter como está, porque monólito não tem solução', 'Reescrever do zero em outra linguagem'],
+      correta: 1,
+      explicacao: 'O problema é acoplamento de código, não o processo único. O monólito modular ataca a causa sem a complexidade operacional dos microsserviços e deixa a extração possível quando houver motivo (escala, time, isolamento).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Monólito modular**: um processo e um deploy, com **fronteiras verificadas** entre módulos. Resolve acoplamento de código sem a complexidade da rede.
+- No Spring Modulith, cada **pacote logo abaixo da aplicação é um módulo**. O pacote base é a **API**; sub-pacotes são **internos**, a não ser que sejam `@NamedInterface`. Módulos pequenos podem esconder o interno com package-private.
+- `@ApplicationModule(allowedDependencies = "agenda :: eventos")` declara a direção permitida. A verificação acusa **dependência fora da lista**, **tipo não exposto** e **ciclos**. Use `detectViolations().throwIfPresent()`.
+- Integração por **eventos** com `@ApplicationModuleListener` = depois do commit + assíncrono + transação nova. Consistência **eventual** entre módulos; o que precisa ser atômico fica num módulo só.
+- O **registro de publicações** grava uma publicação por ouvinte na transação de quem publica; as incompletas são reenviadas (`IncompleteEventPublications`). Entrega pelo menos uma vez, então **ouvintes idempotentes**.
+- `@ApplicationModuleTest` sobe um módulo só (`STANDALONE`, `DIRECT_DEPENDENCIES`, `ALL_DEPENDENCIES`); `Scenario` publica numa transação e espera a mudança de estado. O `Documenter` gera diagramas C4 e canvases a partir do código.
+- Corte por **capacidade de negócio**, com **dados por módulo** (sem FK nem `JOIN` cruzado). Em produção, cuide da limpeza da tabela, do reenvio com várias instâncias e do formato serializado dos eventos.
+- Para **extrair** um módulo: fronteiras limpas, eventos externalizados para um broker (`@Externalized`), serviço em paralelo, troca, dados movidos, módulo apagado.
+
+## Próximo passo
+
+No [exercício 13.03, Loja modular](../../../exercicios/13-arquitetura/03-loja-modular/), você transforma uma loja acoplada num monólito modular: separa pedidos, estoque e faturamento, troca as chamadas diretas por eventos, garante que a falha da SEFAZ não impeça uma compra e que nenhuma fatura se perca. Depois, a aula [Microsserviços: quando, por que e a que custo](../../13-arquitetura/05-microsservicos/) parte de onde esta termina: o que muda quando um módulo vira um serviço de verdade, com rede, banco próprio e deploy independente.
+
+## Referências
+
+- [Spring Modulith, documentação de referência](https://docs.spring.io/spring-modulith/reference/)
+- [Spring Modulith: Fundamentals (módulos, interfaces nomeadas, dependências permitidas)](https://docs.spring.io/spring-modulith/reference/fundamentals.html)
+- [Spring Modulith: Verifying Application Module Structure](https://docs.spring.io/spring-modulith/reference/verification.html)
+- [Spring Modulith: Working with Application Events (registro de publicações, externalização)](https://docs.spring.io/spring-modulith/reference/events.html)
+- [Spring Modulith: Integration Testing Application Modules (`@ApplicationModuleTest`, `Scenario`)](https://docs.spring.io/spring-modulith/reference/testing.html)
+- [Spring Modulith: Documenting Application Modules](https://docs.spring.io/spring-modulith/reference/documentation.html)
+- [Spring Modulith: Production-ready Features (Actuator, observabilidade)](https://docs.spring.io/spring-modulith/reference/production-ready.html)
+- [Spring Framework: Transaction-bound Events](https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html)

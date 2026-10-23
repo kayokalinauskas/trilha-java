@@ -1,0 +1,271 @@
+---
+titulo: "Da bola de lama ao monólito modular com Spring Modulith"
+codigo: "13.03"
+resumo: Uma loja em que confirmar um pedido chama diretamente as classes internas do estoque e do faturamento — e a SEFAZ fora do ar impede qualquer venda. Desacople os módulos com eventos, verifique as fronteiras com Spring Modulith e use o registro de publicações para reenviar o faturamento que falhou, sem baixar o estoque duas vezes.
+modulo: 13-arquitetura
+ordem: 3
+dificuldade: dificil
+tempo: 3h
+conceitos: [monólito modular, Spring Modulith, ApplicationModules, "@ApplicationModuleListener", event publication registry, IncompleteEventPublications, "@TransactionalEventListener"]
+aulas: [13-arquitetura/04-monolito-modular]
+java:
+  modulo: m13-arquitetura
+  arquivos:
+    - src/main/java/dev/trilhajava/m13/loja/pedidos/ServicoDePedidos.java
+    - src/main/java/dev/trilhajava/m13/loja/faturamento/internal/EmissaoDeFaturas.java
+---
+
+## Contexto
+
+A loja tem três módulos, pelo menos no desenho: `pedidos`, `estoque` e `faturamento`. No código, o `ServicoDePedidos.confirmar` baixa o estoque chamando `estoque.internal.Saldos` e emite a nota chamando `faturamento.internal.EmissaoDeFaturas`, tudo na mesma transação.
+
+Na última Black Friday, a SEFAZ (o serviço da Secretaria da Fazenda que autoriza as notas fiscais) ficou instável por duas horas. Como a emissão da nota estava no meio da confirmação, **ninguém conseguiu comprar**. O diretor de tecnologia foi direto: "a nota pode sair depois; a venda, não".
+
+Este exercício é uma **refatoração**: o código inicial funciona (quando a SEFAZ está no ar). Você muda a forma como os módulos conversam, sem mudar o que a loja faz.
+
+## O que você vai praticar
+
+- **Módulos com fronteiras verificadas.** No Spring Modulith, cada pacote logo abaixo do pacote da aplicação é um *módulo*. O que está no pacote do módulo é a API dele; os sub-pacotes (como `internal`) são detalhes, que nenhum outro módulo pode usar. `ApplicationModules.of(...)` lê o código compilado e aponta as violações. Veja [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/).
+- **Eventos como contrato entre módulos.** Em vez de chamar o estoque, `pedidos` publica um fato (`PedidoConfirmado`) com o `ApplicationEventPublisher` do Spring. Quem se interessa, escuta. `pedidos` deixa de depender dos outros módulos.
+- **`@ApplicationModuleListener`.** Um ouvinte com essa anotação roda **depois do commit** de quem publicou, **assíncrono** e numa **transação nova**. A falha de um ouvinte não desfaz a confirmação do pedido nem o trabalho de outro ouvinte.
+- **Registro de publicações (*event publication registry*).** O Spring Modulith grava cada par evento + ouvinte numa tabela, na mesma transação de quem publica, e marca a publicação como concluída quando o ouvinte termina sem erro. A que falhou fica **incompleta**, e `IncompleteEventPublications` a reenvia depois.
+- **Ouvintes idempotentes.** Reenviar pode repetir um ouvinte que já fez parte do trabalho. Um ouvinte idempotente produz o mesmo resultado se rodar uma ou duas vezes.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m13.loja`, a versão acoplada que está em produção:
+
+- `LojaApplication` — `@SpringBootApplication`, `@EnableAsync` (os ouvintes assíncronos precisam dela) e `loja.properties`, que liga o registro de publicações com JDBC num H2 em memória e cria a tabela na subida.
+- **pedidos**: `ServicoDePedidos` (`UUID criar(cliente, itens)`, `void confirmar(UUID)` com `@Transactional`, `boolean confirmado(UUID)`), `Item(sku, quantidade, precoUnitario)` com `subtotal()`, `PedidoNaoEncontradoException`, o evento `PedidoConfirmado(UUID pedido, String cliente, List<Item> itens, BigDecimal total)`, que ninguém publica ainda, e `internal.Pedidos`.
+- **estoque**: `Estoque.disponivel(sku)` (a API do módulo) e `internal.Saldos`, com `CAMISETA-P` = 10, `CAMISETA-M` = 10 e `CANECA` = 50.
+- **faturamento**: `Faturas.doPedido(UUID)` (a API), `Fatura(pedido, cliente, total, chaveDeAcesso)`, `AutorizadorFiscal` (a SEFAZ) e os internos `EmissaoDeFaturas`, `RegistroDeFaturas` e `AutorizadorFiscalSimulado`.
+
+Hoje, `confirmar` marca o pedido como confirmado, chama `saldos.baixar(...)` para cada item e `faturamento.emitir(...)`, tudo na mesma transação e na mesma thread.
+
+### O que você muda
+
+```java
+// pedidos.ServicoDePedidos — mantém a API pública (criar, confirmar, confirmado)
+ServicoDePedidos(Pedidos pedidos, ApplicationEventPublisher eventos)   // sem Saldos e sem EmissaoDeFaturas
+@Transactional public void confirmar(UUID id)                           // regras 1 e 2
+
+// estoque.internal — uma classe nova sua (@Component), com um ouvinte:
+@ApplicationModuleListener void quandoConfirmado(PedidoConfirmado evento)   // regra 3
+
+// faturamento.internal.EmissaoDeFaturas — deixa de ser chamada e passa a ouvir:
+@ApplicationModuleListener void quandoConfirmado(PedidoConfirmado evento)   // regras 4 a 6
+```
+
+Os nomes dos métodos ouvintes e da classe nova do estoque são sugestões; os pacotes são fixos.
+
+## Regras
+
+**Comportamento**
+
+1. **Confirmar publica um fato.** `confirmar(id)` marca o pedido como `CONFIRMADO` e publica **um** `PedidoConfirmado` com o id, o cliente, os itens e o total (a soma dos subtotais). Exemplo: ana com 2 × `CAMISETA-P` a R$ 59,90 e 1 × `CANECA` a R$ 39,90 → `PedidoConfirmado(id, "ana", [2 camisetas, 1 caneca], 159.70)`. Confirmar um pedido já confirmado não publica nada; um id inexistente lança `PedidoNaoEncontradoException`.
+2. **Confirmar não depende de ninguém.** `confirmar` não chama o estoque nem o faturamento e continua `@Transactional`: sem transação, o registro de publicações não grava o evento, e os ouvintes transacionais não disparam.
+3. **O estoque reage.** Ao receber `PedidoConfirmado`, o estoque baixa cada item. Exemplo: `CAMISETA-P` passa de 10 para 8 pouco depois da confirmação (o ouvinte é assíncrono).
+4. **O faturamento reage.** Ao receber `PedidoConfirmado`, o faturamento pede a autorização ao `AutorizadorFiscal` e grava a `Fatura` com a chave de acesso devolvida. Exemplo: `faturas.doPedido(id)` passa a ter a fatura de R$ 159,70.
+5. **Falhas isoladas.** Com a SEFAZ fora do ar (o `AutorizadorFiscal` lança exceção): `confirmar` termina sem erro, `confirmado(id)` é `true`, o estoque é baixado, e não há fatura. A publicação do faturamento fica **incompleta**.
+6. **Nada se perde, nada se repete.** Quando a SEFAZ volta, `incompletas.resubmitIncompletePublications(publicacao -> true)` reenvia o evento **só** ao faturamento: a fatura é emitida, e o estoque **não** baixa de novo (`CAMISETA-P` continua em 8). Se o evento chegar ao faturamento uma segunda vez para um pedido que já tem fatura, nada acontece: a SEFAZ não é chamada, e a fatura não é duplicada.
+
+**Fronteiras**
+
+7. **Nenhum módulo usa o `internal` de outro.** `ApplicationModules.of(LojaApplication.class).detectViolations()` não encontra nada.
+8. **`pedidos` não depende de `estoque` nem de `faturamento`.**
+9. **`estoque` e `faturamento` conhecem de `pedidos` só o evento**: `PedidoConfirmado` e `Item`. E cada um deles usa o `PedidoConfirmado` (é assim que ficam sabendo dos pedidos).
+
+## Passo a passo sugerido
+
+1. **Veja o problema.** Copie o programa do **Experimente** para `src/test/java` e rode-o com o código inicial. A primeira parte lista as violações de fronteira; a segunda termina com `IllegalStateException: SEFAZ indisponível` lançada pelo próprio `confirmar` (pelo Maven, `An exception occurred while executing the Java class. SEFAZ indisponível`): é a Black Friday reproduzida na sua máquina.
+2. **Pedidos publica (regras 1, 2 e 8).** Troque `Saldos` e `EmissaoDeFaturas` por um `ApplicationEventPublisher` no construtor de `ServicoDePedidos`, e as duas chamadas por `eventos.publishEvent(new PedidoConfirmado(...))`.
+3. **O estoque ouve (regra 3).** Uma classe nova em `estoque.internal`, com um método `@ApplicationModuleListener` que baixa os itens.
+4. **O faturamento ouve (regras 4 e 6).** Em `EmissaoDeFaturas`, troque o `emitir(...)` público por um ouvinte, que confere antes se a fatura já existe. A classe pode deixar de ser `public`.
+5. **Rode o programa de novo (regras 5 a 9).** A saída precisa bater com a do **Experimente**.
+
+## Experimente
+
+O programa lê as fronteiras do código compilado e depois sobe a loja (sem servidor web) com uma SEFAZ de mentira, que começa fora do ar. Ela substitui a simulada por ser `@Primary`. O programa confirma um pedido, mostra o estado, "religa" a SEFAZ e reenvia as publicações incompletas.
+
+Salve-o em `src/test/java/dev/trilhajava/m13/loja/ExperimenteLoja.java` (no pacote raiz da loja, que fica fora dos módulos) e rode pelo ▶ do IntelliJ, ou no terminal, na pasta do starter:
+
+```bash
+mvn -q test-compile exec:java "-Dexec.mainClass=dev.trilhajava.m13.loja.ExperimenteLoja" "-Dexec.classpathScope=test"
+```
+
+```java
+package dev.trilhajava.m13.loja;
+
+import dev.trilhajava.m13.loja.estoque.Estoque;
+import dev.trilhajava.m13.loja.faturamento.AutorizadorFiscal;
+import dev.trilhajava.m13.loja.faturamento.Faturas;
+import dev.trilhajava.m13.loja.pedidos.Item;
+import dev.trilhajava.m13.loja.pedidos.ServicoDePedidos;
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.springframework.boot.Banner;
+import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.modulith.core.ApplicationModules;
+import org.springframework.modulith.core.Violations;
+import org.springframework.modulith.events.IncompleteEventPublications;
+
+public class ExperimenteLoja {
+
+    /** A SEFAZ deste programa: fica fora do ar até alguém dizer que voltou. */
+    static final AtomicBoolean SEFAZ_NO_AR = new AtomicBoolean(false);
+
+    public static void main(String[] args) throws Exception {
+        // 1. As fronteiras, lidas do código compilado (não sobe a aplicação).
+        ApplicationModules modulos = ApplicationModules.of(LojaApplication.class);
+        modulos.forEach(modulo -> System.out.println("módulo: " + modulo.getDisplayName()));
+        Violations violacoes = modulos.detectViolations();
+        System.out.println(violacoes.hasViolations() ? "VIOLAÇÕES:\n" + violacoes.getMessage() : "fronteiras: ok");
+
+        // 2. A aplicação, com a SEFAZ deste programa no lugar da simulada (@Primary).
+        ApplicationContextInitializer<GenericApplicationContext> sefazInstavel = contexto -> contexto.registerBean(
+                "sefazInstavel", AutorizadorFiscal.class, () -> (pedido, total) -> {
+                    if (!SEFAZ_NO_AR.get()) {
+                        throw new IllegalStateException("SEFAZ indisponível");
+                    }
+                    return "35260912345678000199550010000012341000099999";
+                }, definicao -> definicao.setPrimary(true));
+
+        try (var contexto = new SpringApplicationBuilder(LojaApplication.class).initializers(sefazInstavel)
+                .web(WebApplicationType.NONE).bannerMode(Banner.Mode.OFF).logStartupInfo(false).run(args)) {
+            ServicoDePedidos pedidos = contexto.getBean(ServicoDePedidos.class);
+            Estoque estoque = contexto.getBean(Estoque.class);
+            Faturas faturas = contexto.getBean(Faturas.class);
+            IncompleteEventPublications incompletas = contexto.getBean(IncompleteEventPublications.class);
+
+            int antes = estoque.disponivel("CAMISETA-P");
+            UUID id = pedidos.criar("ana", List.of(
+                    new Item("CAMISETA-P", 2, new BigDecimal("59.90")),
+                    new Item("CANECA", 1, new BigDecimal("39.90"))));
+
+            System.out.println("-- SEFAZ fora do ar; confirmando o pedido");
+            pedidos.confirmar(id);
+            Thread.sleep(1_000);   // os ouvintes rodam em outra thread, depois do commit
+            System.out.println("pedido confirmado: " + pedidos.confirmado(id));
+            System.out.println("CAMISETA-P: " + antes + " -> " + estoque.disponivel("CAMISETA-P"));
+            System.out.println("fatura: " + faturas.doPedido(id).map(f -> f.chaveDeAcesso()).orElse("nenhuma"));
+
+            System.out.println("-- a SEFAZ voltou; reenviando as publicações incompletas");
+            SEFAZ_NO_AR.set(true);
+            incompletas.resubmitIncompletePublications(publicacao -> true);
+            Thread.sleep(1_000);
+            System.out.println("fatura: " + faturas.doPedido(id).map(f -> f.chaveDeAcesso() + ", total " + f.total())
+                    .orElse("nenhuma"));
+            System.out.println("CAMISETA-P: " + estoque.disponivel("CAMISETA-P"));
+        }
+    }
+}
+```
+
+Com a refatoração completa, a saída é esta (sem as linhas de log comuns da subida):
+
+```text
+módulo: Pedidos
+módulo: Estoque
+módulo: Faturamento
+fronteiras: ok
+-- SEFAZ fora do ar; confirmando o pedido
+... INFO ... Invocation of listener void dev.trilhajava.m13.loja.faturamento.internal.EmissaoDeFaturas.quandoConfirmado(dev.trilhajava.m13.loja.pedidos.PedidoConfirmado) failed with message SEFAZ indisponível. Leaving event publication uncompleted.
+... ERROR ... Unexpected exception occurred invoking async method: void dev.trilhajava.m13.loja.faturamento.internal.EmissaoDeFaturas.quandoConfirmado(...)
+java.lang.IllegalStateException: SEFAZ indisponível
+	(pilha de chamadas)
+pedido confirmado: true
+CAMISETA-P: 10 -> 8
+fatura: nenhuma
+-- a SEFAZ voltou; reenviando as publicações incompletas
+fatura: 35260912345678000199550010000012341000099999, total 159.70
+CAMISETA-P: 8
+```
+
+As duas linhas de log no meio são o comportamento esperado, não um erro seu: o Spring Modulith avisa que deixou a publicação **incompleta** (`Leaving event publication uncompleted`), e o executor assíncrono registra a exceção do ouvinte. A ordem dos módulos pode variar.
+
+Como ler cada resultado:
+
+| Saída | O que mostra | Regra |
+|---|---|---|
+| `fronteiras: ok` | nenhum módulo usa o `internal` de outro | 7 |
+| `pedido confirmado: true` com a SEFAZ fora | a venda não depende da nota | 5 |
+| `CAMISETA-P: 10 -> 8` | o estoque reagiu ao evento, na sua própria transação | 3 |
+| `fatura: nenhuma`, depois a chave | a publicação ficou incompleta e o reenvio a concluiu | 4 e 6 |
+| `CAMISETA-P: 8` no fim | o reenvio não repetiu o ouvinte do estoque | 6 |
+
+Com o código inicial, a primeira parte lista várias violações, todas em `ServicoDePedidos` (o campo, o construtor e as chamadas), como `Module 'pedidos' depends on non-exposed type dev.trilhajava.m13.loja.estoque.internal.Saldos within module 'estoque'!`, e a segunda termina com a exceção da SEFAZ saindo de `confirmar`. As regras 8 e 9 você confere no código: os `import` de `pedidos` não citam `estoque` nem `faturamento`, e os de `estoque` e `faturamento` só citam `PedidoConfirmado` e `Item` de `pedidos`.
+
+## Critérios de aceite
+
+- [ ] O programa do **Experimente** produz a saída acima: `fronteiras: ok`, pedido confirmado com a SEFAZ fora, estoque 10 → 8, fatura só depois do reenvio, estoque ainda 8 no fim.
+- [ ] `ServicoDePedidos` não importa nada de `estoque` nem de `faturamento`.
+- [ ] O emissor de faturas tolera reentrega (não chama a SEFAZ nem emite duas faturas para o mesmo pedido).
+- [ ] Você explica por que o reenvio roda o faturamento e não roda o estoque.
+
+## Desafios opcionais
+
+- Gere a documentação dos módulos com `new Documenter(ApplicationModules.of(LojaApplication.class)).writeDocumentation()` e abra o diagrama em `target/spring-modulith-docs`.
+- Ligue `spring.modulith.events.republish-outstanding-events-on-restart=true` e descreva o que acontece se a aplicação cair com publicações pendentes.
+- Marque `PedidoConfirmado` com `@Externalized` e publique-o também no Kafka do módulo 12.
+- Escreva a sua própria suíte: a verificação dos módulos com `detectViolations().throwIfPresent()`, o módulo de estoque sozinho com `@ApplicationModuleTest(module = "estoque")` e `Scenario`, e a aplicação inteira com `@SpringBootTest`, um `@MockitoBean AutorizadorFiscal` e `@RecordApplicationEvents`.
+
+<Dicas>
+<Dica nivel={1}>
+Três passos, com o programa guiando: (1) em `pedidos`, troque as chamadas diretas por `ApplicationEventPublisher.publishEvent(new PedidoConfirmado(...))`; (2) crie um ouvinte no estoque e mude o emissor do faturamento para ouvir o evento; (3) rode o programa e compare com a saída esperada.
+</Dica>
+<Dica nivel={2}>
+- Os ouvintes usam `@ApplicationModuleListener` (pacote `org.springframework.modulith.events`): depois do commit, assíncrono (a `LojaApplication` já tem `@EnableAsync`) e numa transação nova.
+- O `confirmar` precisa continuar `@Transactional`: sem transação, o `@TransactionalEventListener` (que o `@ApplicationModuleListener` usa por baixo) não dispara, e o registro de publicações não grava.
+- O ouvinte do estoque fica num sub-pacote interno (`estoque.internal`): ele é detalhe do módulo, não API.
+</Dica>
+<Dica nivel={3}>
+- Reentrega: antes de chamar a SEFAZ, o emissor confere `registro.doPedido(evento.pedido())`. Se a fatura já existe, não faz nada.
+- Cada par evento + ouvinte é uma publicação separada no registro. Por isso o reenvio só alcança o ouvinte que falhou.
+- Se o ouvinte do estoque depender de algum bean de outro módulo, um teste com `@ApplicationModuleTest(module = "estoque")` nem sobe o contexto: é um bom sinal de fronteira furada.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="pedidos">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/loja/pedidos/ServicoDePedidos.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/loja/pedidos/PedidoConfirmado.java" />
+</Tab>
+<Tab rotulo="estoque">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/loja/estoque/internal/BaixaDeEstoque.java" />
+</Tab>
+<Tab rotulo="faturamento">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/loja/faturamento/internal/EmissaoDeFaturas.java" />
+</Tab>
+<Tab rotulo="Testes">
+<CodigoJava caminho="m13-arquitetura/solucao/src/test/java/dev/trilhajava/m13/loja/LojaModularTest.java" titulo="solucao/src/test/java/.../LojaModularTest.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Pedidos publica um fato e não sabe quem ouve.** Amanhã, um módulo de fidelidade ouve o mesmo `PedidoConfirmado`, e nenhuma linha de `pedidos` muda.
+- **Cada ouvinte na sua transação.** A falha da SEFAZ desfaz só a transação do faturamento. A baixa do estoque, já confirmada, continua valendo.
+- **Uma publicação por ouvinte.** É por isso que o reenvio roda só o faturamento: a publicação do estoque já estava concluída.
+- **Idempotência no ouvinte.** O reenvio pode repetir um ouvinte que chegou a fazer parte do trabalho. Conferir se a fatura já existe custa uma linha.
+
+### O que deu errado no caminho
+
+O primeiro teste de estrutura da solução usava `ApplicationModules.of(...).verify()`, e ele **passou** no código acoplado quando a suíte inteira rodava. O `verify()` só executa uma vez por instância, e o `@ApplicationModuleTest` do módulo de estoque, que rodou antes, já tinha verificado a mesma instância (do cache). A troca por `detectViolations().throwIfPresent()` fez o teste falhar onde devia. Se você escrever a sua suíte, use `detectViolations()`.
+
+### Avalie sua solução
+
+- A baixa de estoque agora acontece **depois** da confirmação. O que acontece se dois clientes comprarem a última caneca ao mesmo tempo? Como você resolveria (reserva de estoque antes da confirmação? compensação?)
+- Se o faturamento virasse um microsserviço amanhã, o que mudaria no módulo de pedidos?
+
+</Solucao>

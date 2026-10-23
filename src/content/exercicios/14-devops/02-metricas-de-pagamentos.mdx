@@ -1,0 +1,131 @@
+---
+titulo: Métricas de negócio para o painel de pagamentos
+codigo: "14.02"
+resumo: Instrumente um serviço de pagamentos com Micrometer — contador por método e resultado, timer com histograma para p95/p99, gauge de pagamentos em andamento e distribuição dos valores aprovados — sem estourar a cardinalidade, e exponha tudo no /actuator/prometheus com o mínimo de endpoints abertos.
+modulo: 14-devops
+ordem: 2
+dificuldade: medio
+tempo: 2h
+conceitos: [Micrometer, Prometheus, Counter, Timer, Gauge, DistributionSummary, cardinalidade, Actuator]
+aulas: [14-devops/05-observabilidade]
+java:
+  modulo: m14-devops
+  teste: MetricasTest
+---
+
+## Contexto
+
+O time de pagamentos descobre os problemas pelo Twitter: "o Pix de vocês está fora?". Quando alguém olha o servidor, CPU e memória estão normais. O que caiu foi a **taxa de aprovação** do provedor de cartão, e nenhuma métrica mostrava isso.
+
+O pedido do time é um painel no Grafana que responda, por método de pagamento:
+
+- quantos pagamentos por minuto, e quantos aprovados, recusados e com erro;
+- quanto tempo o provedor leva para autorizar (p95 e p99, não a média);
+- quantos pagamentos estão sendo processados agora;
+- quanto dinheiro está passando.
+
+## O que já existe
+
+Em `dev.trilhajava.m14.metricas` (a `MetricasApplication`):
+
+- `Pagamento(id, cliente, metodo, valor)`, com `MetodoDePagamento` (`PIX`, `CARTAO`, `BOLETO`) e a fábrica `Pagamento.de(cliente, metodo, "150.00")`;
+- `Autorizador`, o provedor: `boolean autorizar(Pagamento)`, que pode lançar exceção. Nos testes, um mock;
+- `AutorizadorSimulado`, a implementação de desenvolvimento;
+- `ServicoDePagamentos` (esboço), que recebe o `Autorizador` e o `MeterRegistry`. O `processar` devolve `Resultado.APROVADO` ou `Resultado.RECUSADO`.
+
+Você implementa `ServicoDePagamentos.processar` e completa o `src/main/resources/application.properties`.
+
+## As métricas
+
+| Nome (Micrometer) | Tipo | Tags | Regra |
+|---|---|---|---|
+| `pagamentos.processados` | `Counter` | `metodo`, `resultado` | +1 por pagamento, **inclusive** quando o autorizador lança exceção |
+| `pagamentos.autorizacao` | `Timer` | `metodo`, `resultado` | mede a chamada ao autorizador, inclusive as que falham; com **histograma** publicado |
+| `pagamentos.em.andamento` | `Gauge` | nenhuma | 1 enquanto um pagamento está no autorizador, 0 depois |
+| `pagamentos.valor` | `DistributionSummary` | `metodo` | valor dos pagamentos **aprovados**, com unidade base `reais` |
+
+Valores das tags:
+
+- `metodo`: o nome do enum em **minúsculas** (`pix`, `cartao`, `boleto`);
+- `resultado`: `aprovado`, `recusado` ou `erro` (o autorizador lançou exceção).
+
+A exceção do autorizador **sobe** para quem chamou; ela só não pode deixar de ser contada.
+
+## As regras
+
+- **Nenhuma tag com o cliente.** Nem o nome da tag, nem o valor. Cada valor diferente de tag vira uma série nova no Prometheus: com um milhão de clientes, são milhões de séries, e o Prometheus cai (explosão de cardinalidade).
+- **Exposição mínima.** Só `health` e `prometheus` na web. `/actuator/env` (que mostra propriedades e variáveis de ambiente) tem que dar 404.
+- **Tag comum.** Toda métrica da aplicação leva `aplicacao=trilha-m14`, para distinguir esta aplicação das outras no mesmo Prometheus.
+
+No formato do Prometheus, os pontos viram sublinhados e o contador ganha o sufixo `_total`: `pagamentos_processados_total{metodo="pix",resultado="aprovado",...}`. O histograma aparece como `pagamentos_autorizacao_seconds_bucket{...}`.
+
+## Critérios de aceite
+
+- [ ] `MetricasTest` passa (9 testes).
+- [ ] Um pagamento cujo autorizador lança exceção aparece no contador **e** no timer com `resultado=erro`.
+- [ ] O gauge volta a 0 também quando o autorizador lança exceção.
+
+<Callout tipo="atencao" titulo="O contexto é compartilhado">
+Os testes rodam todos no mesmo contexto do Spring, com o mesmo `MeterRegistry`. Por isso eles comparam **diferenças** (antes e depois), e não valores absolutos. Faça o mesmo se escrever testes seus.
+</Callout>
+
+## Desafios opcionais
+
+- Troque o `Timer` programático por `@Timed` (com o `TimedAspect` e o starter de AspectJ). Como você colocaria a tag `resultado`, que só se conhece no fim?
+- Crie um `MeterFilter` que **recusa** qualquer métrica com uma tag chamada `cliente`: uma proteção para o time todo, e não só para este serviço.
+- Suba um Prometheus e um Grafana com Docker Compose e escreva a consulta da taxa de aprovação por método: `sum by (metodo) (rate(pagamentos_processados_total{resultado="aprovado"}[5m])) / sum by (metodo) (rate(pagamentos_processados_total[5m]))`.
+
+<Dicas>
+<Dica nivel={1}>
+Pense no método como um `try/finally`: o que acontece no `try` (chamar o autorizador) pode dar certo, dar "não" ou explodir; o `finally` roda nos três casos. Tudo o que precisa ser registrado **sempre** (contador, timer, gauge de volta a 0) fica no `finally`. Comece com `resultado = "erro"` e só troque se o autorizador responder.
+</Dica>
+<Dica nivel={2}>
+- Contador e timer com tags dinâmicas: `Counter.builder("pagamentos.processados").tag("metodo", m).tag("resultado", r).register(registro).increment()`. O `register` devolve o mesmo medidor se nome e tags já existirem.
+- Timer medindo um trecho com resultado decidido depois: `Timer.Sample amostra = Timer.start(registro)` no começo e `amostra.stop(timer)` no `finally`, quando você já sabe as tags.
+- `publishPercentileHistogram()` no builder do timer publica os buckets `_bucket` que o Prometheus usa para calcular p95/p99.
+</Dica>
+<Dica nivel={3}>
+- Gauge: `this.emAndamento = registro.gauge("pagamentos.em.andamento", new AtomicInteger())` **no construtor**, guardando o retorno num campo. O registro guarda só uma referência **fraca** ao objeto: se ninguém mais o referenciar, o coletor de lixo o leva e o gauge passa a valer `NaN`.
+- `DistributionSummary.builder("pagamentos.valor").baseUnit("reais").tag("metodo", m).register(registro).record(valor.doubleValue())`, só quando aprovado.
+- Propriedades: `management.endpoints.web.exposure.include=health,prometheus` e `management.metrics.tags.aplicacao=trilha-m14`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/metricas/ServicoDePagamentos.java" />
+
+```properties
+# application.properties (trecho dos 14.02 e 14.03)
+management.endpoints.web.exposure.include=health,prometheus
+management.metrics.tags.aplicacao=trilha-m14
+```
+
+### Passo a passo
+
+1. **`resultado` começa como `"erro"`.** Se o autorizador lança exceção, a linha que muda o resultado nunca roda, e o `finally` registra `erro`. Sem `catch`, sem relançar: a exceção sobe sozinha.
+2. **O cronômetro começa antes e para no `finally`.** `Timer.Sample` separa "começar a medir" de "decidir em qual timer gravar". As tags do timer só são conhecidas depois da resposta, então o `stop` recebe o timer certo.
+3. **O gauge observa, ele não é incrementado.** Um `Gauge` lê o valor atual de um objeto quando o Prometheus pergunta. O `AtomicInteger` sobe antes da chamada e desce no `finally`: com exceção ou sem, ele volta a 0.
+4. **O valor só dos aprovados.** Um pagamento recusado não moveu dinheiro. `baseUnit("reais")` documenta a unidade no próprio medidor, e o Prometheus a usa no nome da série.
+5. **Tags de baixa cardinalidade.** `metodo` (3 valores) × `resultado` (3 valores) = 9 séries por métrica. O `cliente` do pagamento não entra em lugar nenhum: para investigar um cliente específico, o lugar certo é o log (14.01), que tem o `requestId`.
+6. **O Actuator expõe o mínimo.** `health` para o balanceador e `prometheus` para o coletor. `env`, `beans`, `heapdump` e companhia são úteis em desenvolvimento e perigosos em produção.
+
+### Por que histograma, e não a média
+
+A média esconde a cauda: 95 autorizações de 100 ms e 5 de 8 s dão média de 495 ms, que não parece problema, mas 1 em cada 20 clientes esperou 8 segundos. O `publishPercentileHistogram()` publica buckets, e o Prometheus calcula os percentis **somando os buckets de todas as instâncias** (`histogram_quantile(0.99, sum by (le) (rate(pagamentos_autorizacao_seconds_bucket[5m])))`). A alternativa `publishPercentiles(0.95, 0.99)` calcula o percentil **em cada instância**, e percentis de instâncias diferentes não podem ser somados nem tirados da média.
+
+### Alternativas e trade-offs
+
+- **Registrar os medidores no construtor** (um `Counter` por combinação, num `Map`): evita o `builder` a cada chamada, mas com 3 × 3 combinações o ganho é pequeno. O `register` já é um *lookup* num mapa concorrente.
+- **`@Timed` e `@Counted`**: menos código, mas as tags ficam fixas na anotação. Para tags que dependem do resultado, o código programático é mais claro.
+- **Observation API** (`Observation.createNotStarted(...)`): gera métricas **e** spans de tracing com uma instrumentação só. É o caminho recomendado quando o projeto também usa tracing.
+
+### Avalie sua solução
+
+- O que acontece com o seu gauge se você escrever `registro.gauge("...", new AtomicInteger())` sem guardar o retorno? Por que o teste às vezes passaria mesmo assim?
+- Alguém sugere a tag `valor` "para saber quanto cada pagamento teve". Qual é o problema, e qual métrica deste exercício já responde a pergunta certa?
+- Como você criaria um alerta para "taxa de erro do cartão acima de 5% por 5 minutos" com estas métricas?
+
+</Solucao>

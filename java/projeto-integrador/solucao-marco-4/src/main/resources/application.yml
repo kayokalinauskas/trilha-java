@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: fintech-core
+  datasource:
+    url: jdbc:postgresql://localhost:5432/fintech
+    username: fintech
+    password: fintech
+  jpa:
+    open-in-view: false          # sem consultas escondidas na camada web
+    hibernate:
+      ddl-auto: validate         # quem cria o schema é o Flyway; o Hibernate só confere
+  docker:
+    compose:
+      lifecycle-management: start-only   # mvn spring-boot:run sobe o PostgreSQL do compose.yaml
+
+springdoc:
+  swagger-ui:
+    path: /docs
+
+fintech:
+  jwt:
+    # Em produção o segredo vem de uma variável de ambiente alimentada por um cofre (Vault, AWS Secrets
+    # Manager...). O valor padrão abaixo só serve para desenvolvimento local — nunca versione o real.
+    segredo: ${FINTECH_JWT_SEGREDO:segredo-de-desenvolvimento-troque-em-producao!!}
+    emissor: fintech-core
+    validade: 15m
+  admin:
+    # Sem estas variáveis, nenhum administrador é criado.
+    email: ${FINTECH_ADMIN_EMAIL:}
+    senha: ${FINTECH_ADMIN_SENHA:}

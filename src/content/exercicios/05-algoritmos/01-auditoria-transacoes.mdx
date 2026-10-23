@@ -1,0 +1,93 @@
+---
+titulo: Auditoria de transações (hashing)
+codigo: "05.01"
+resumo: Encontre pares que somam um valor contestado, duplicatas próximas, o primeiro cliente único e a maior sequência de dias consecutivos — tudo em O(n) com HashMap e HashSet.
+modulo: 05-algoritmos
+ordem: 1
+dificuldade: facil
+tempo: 1,5h
+conceitos: [HashMap, HashSet, Two Sum, análise amortizada]
+aulas: [05-algoritmos/02-hashing-e-dois-ponteiros, 05-algoritmos/01-como-resolver]
+java:
+  modulo: m05-algoritmos
+  teste: AuditoriaTransacoesTest
+---
+
+## Contexto
+
+O time antifraude de uma adquirente de cartões recebe contestações do tipo "fui cobrado R$ 15,00 e não reconheço". Muitas vezes a cobrança é a **soma de duas transações** legítimas. Os analistas também procuram **transações duplicadas** enviadas em sequência e **clientes que compraram uma única vez** (perfil comum de teste de cartão roubado). Os arquivos têm milhões de linhas, e o script atual, com laços aninhados, leva horas.
+
+## Requisitos
+
+| Método | Retorna |
+|---|---|
+| `parQueSoma(valoresEmCentavos, alvo)` | `[i, j]` com `i < j`, o par com o **menor j** possível; array vazio se não houver |
+| `duplicataEmJanela(ids, k)` | `true` se o mesmo id aparece duas vezes a no máximo `k` posições |
+| `primeiroClienteUnico(clientes)` | `Optional` com o primeiro cliente (na ordem de chegada) que aparece **uma única vez** |
+| `maiorSequenciaDeDias(dias)` | Tamanho da maior sequência de inteiros consecutivos presentes, em qualquer ordem |
+
+## Exemplos
+
+```text
+parQueSoma([1500, 700, 300, 1200], 1500)   → [2, 3]     (300 + 1200)
+duplicataEmJanela([t1, t2, t3, t1, t4], 3) → true       (distância 3)
+primeiroClienteUnico([ana, bia, ana, caio, bia]) → caio
+maiorSequenciaDeDias([100, 4, 200, 1, 3, 2])     → 4    (1, 2, 3, 4)
+```
+
+## Requisito não funcional
+
+**Todos em O(n).** O teste `desempenho` roda com 1 milhão de itens e exige menos de 2 segundos. Força bruta (O(n²)) não passa, e ordenar para `maiorSequenciaDeDias` (O(n log n)) é aceitável, mas a solução-alvo é O(n).
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `AuditoriaTransacoesTest` passam.
+- [ ] Você consegue explicar a complexidade de tempo **e** de memória de cada método.
+- [ ] Em `maiorSequenciaDeDias`, você consegue justificar por que o `while` dentro do `for` não torna o método O(n²).
+
+## Desafios opcionais
+
+- `trincaQueSoma(valores, alvo)` (3Sum) em O(n²).
+- `todosOsPares(valores, alvo)`: todos os pares distintos de **valores**, sem repetir.
+
+<Dicas>
+<Dica nivel={1}>
+Para cada problema, pergunte: "que informação sobre o que eu JÁ VI me faria responder em O(1)?". Para pares: os valores vistos. Para duplicatas: a última posição de cada id. Para o cliente único: a contagem de cada um.
+</Dica>
+<Dica nivel={2}>
+Two Sum: `Map<Long, Integer>` valor → índice; verifique `alvo - atual` **antes** de inserir o atual (senão um valor encontra a si mesmo). Cliente único: um `LinkedHashMap` conta **e** lembra a ordem de chegada.
+</Dica>
+<Dica nivel={3}>
+Sequência de dias: jogue tudo num `HashSet`. Para cada `x`, se `x - 1` existe, pule (não é o início de uma sequência). Se não existe, conte `x, x+1, x+2…` enquanto estiverem no conjunto.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/AuditoriaTransacoes.java" />
+
+### Complexidades
+
+| Método | Tempo | Memória |
+|---|---|---|
+| `parQueSoma` | O(n) | O(n) |
+| `duplicataEmJanela` | O(n) | O(n) (ou O(k) com uma janela de `HashSet`) |
+| `primeiroClienteUnico` | O(n) | O(n) |
+| `maiorSequenciaDeDias` | O(n) amortizado | O(n) |
+
+### Detalhes que fazem diferença
+
+- **`putIfAbsent` no Two Sum**: guarda o **primeiro** índice de cada valor, o que garante o par com o menor `i` para aquele `j`.
+- **`Map.put` devolve o valor anterior**: em `duplicataEmJanela`, uma única operação atualiza a posição e informa onde o id estava.
+- **`long` para centavos**: somas de valores monetários grandes estouram `int`.
+- **Análise amortizada**: em `maiorSequenciaDeDias`, o `while` só roda a partir do início de cada sequência, então cada número é visitado no máximo duas vezes no total.
+
+### Avalie sua solução
+
+- O teste `desempenho` passa com folga (menos de 1 s)?
+- `parQueSoma([1000], 1000)` devolve vazio?
+- Você consegue refazer o `parQueSoma` com dois ponteiros, supondo o array ordenado? Qual informação se perde?
+
+</Solucao>

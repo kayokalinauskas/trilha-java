@@ -1,0 +1,890 @@
+---
+titulo: "Arquibancada — compartilhamento de tela de jogos em 1080p a 60 fps"
+resumo: "Ferramenta web para grupos de amigos assistirem uns aos outros jogando: o anfitrião cria uma sala, manda o link, e qualquer pessoa entra só com um apelido e compartilha a tela do jogo em 1080p a 60 fps com um clique, com até 4 telas ao mesmo tempo, o backend Java controlando acesso, vagas e permissões num SFU WebRTC e a fluidez medida como SLO."
+nivel: pleno
+ordem: 3
+dominio: "Jogos · transmissão em tempo real"
+horas: 132
+stack: [Java 25, Spring Boot 4, Spring Security 7, OAuth2 Login (Google e GitHub), Spring Session, PostgreSQL 18, Flyway, Redis 8, LiveKit (SFU WebRTC), React, TypeScript, Vite, Caddy, Testcontainers 2, k6, OpenTelemetry, Grafana, Docker Compose, GitHub Actions]
+competencias:
+  - Integração de um backend Java com um servidor de mídia WebRTC (SFU) — tokens de curta duração, permissões concedidas em tempo real e webhooks assinados
+  - Concorrência com limites atômicos — vagas na sala e telas simultâneas reservadas no Redis, sem estourar o limite sob cliques simultâneos
+  - Consistência com um sistema externo — webhooks duplicados e fora de ordem, reconciliação periódica e "a primeira causa vence" no encerramento
+  - Segurança de app web moderna — login social no padrão BFF com sessão em cookie, CSRF, convidados sem conta e links impossíveis de adivinhar
+  - Qualidade de vídeo transformada em número — 60 fps medidos pelas estatísticas do WebRTC, com SLO, relatório por transmissão e teste com rede ruim
+  - Produto usado de verdade — no ar numa VPS com TLS, testado pela internet com amigos, com custo de banda calculado
+modulos: [06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - { id: fundacao, titulo: "Fundação e prova de vida: navegador ou app?", resumo: "Compose, CI e um protótipo que mede 1080p60 no navegador, na rede local e pela internet, decidindo entre web e app desktop com dados." }
+  - { id: anfitriao, titulo: "Anfitrião: login social e salas", resumo: "Login com Google ou GitHub no padrão BFF, sessão no Redis, CSRF e o cadastro de salas com link único." }
+  - { id: sala, titulo: "Entrar na sala com um clique", resumo: "Convidado entra pelo link só com apelido, vaga atômica, token do LiveKit e presença pelos webhooks com reconciliação." }
+  - { id: compartilhar, titulo: "Compartilhar a tela a 60 fps", resumo: "Reserva de uma das 4 telas, permissão concedida em tempo real, perfis ditados pelo servidor e ciclo de vida pelos webhooks." }
+  - { id: assistir, titulo: "Assistir: grade, destaque e áudio", resumo: "Grade com todas as telas, destaque em 1080p60, tela cheia, volume por tela, proteção contra eco e painel de estatísticas." }
+  - { id: qualidade, titulo: "Qualidade medida", resumo: "Telemetria do WebRTC, SLOs de fluidez e latência, relatório ao parar de compartilhar e teste com rede degradada." }
+  - { id: controles, titulo: "Controles do anfitrião e proteção", resumo: "Trancar, remover, encerrar tela, trocar o link, limites contra abuso e aviso de privacidade." }
+  - { id: entrega, titulo: "No ar com os amigos e release", resumo: "VPS com Caddy e LiveKit, deploy sem derrubar ninguém, backup, teste de capacidade, uso real e a v1.0.0." }
+---
+
+## Visão geral
+
+Você está jogando e quer mostrar para os amigos. Hoje isso significa abrir um app pesado, achar o botão certo, descobrir que o plano gratuito trava em 720p a 30 fps e ouvir "tá travando aqui". A **Arquibancada** faz uma coisa só, e muito bem: **compartilhar a tela do jogo em 1080p a 60 fps, sem esforço**.
+
+A experiência inteira cabe em três passos:
+
+1. O anfitrião cria uma sala e copia o link (`https://<seu-domínio>/s/7KqP2xWm9a`).
+2. Os amigos abrem o link no navegador, digitam um apelido e clicam em **Entrar**. Ninguém instala nada nem cria conta.
+3. Qualquer pessoa clica em **Compartilhar tela**, escolhe a janela do jogo e pronto: todos veem. Até **4 pessoas compartilham ao mesmo tempo**, como no Discord. Clicar numa tela a coloca em destaque, em 1080p a 60 fps.
+
+Por baixo, a divisão é a mesma de qualquer sistema de vídeo em tempo real:
+
+- **Plano de mídia (LiveKit, um SFU pronto):** recebe o vídeo de quem compartilha uma vez e reencaminha a cada pessoa a qualidade que a rede dela aguenta. O vídeo **não passa pelo Java**.
+- **Plano de controle (o seu backend Java):** quem pode criar salas, quem pode entrar, quantas pessoas cabem, quem pode compartilhar agora, quando uma tela começou e terminou, e se a qualidade está boa.
+
+**Pitch de uma frase:** "Fiz uma ferramenta que meus amigos usam para assistir uns aos outros jogando: entra pelo link, clica em compartilhar, e a tela chega em 1080p a 60 fps — o backend em Java controla salas, vagas e permissões num servidor de mídia WebRTC, e eu medi 99% do tempo acima de 55 fps."
+
+**Por que chama atenção num portfólio Pleno.** É um produto pequeno, completo e **usado**, com uma meta que qualquer pessoa entende (60 fps) transformada em número. E exercita o que uma vaga Pleno cobra no backend: integração com um sistema externo por API e webhooks, limites sob concorrência, segurança de app web e operação real.
+
+<Callout tipo="info" titulo="A base do Resenha">
+Se você fez o [Ozamigos Share](../../junior/03-ozamigos-share/) (Júnior), já conhece a captura, a sinalização e as estatísticas do WebRTC; aqui o vídeo passa a ir por um SFU. Este projeto é o degrau anterior ao [Resenha](../../senior/03-resenha/), o projeto Sênior de voz, chat e transmissão. Tudo o que você fizer aqui é reaproveitado lá: a prova de vida da mídia, os perfis de transmissão, a reserva de vagas, a permissão concedida em tempo real, os webhooks e a telemetria de qualidade. O Resenha acrescenta contas para todos, comunidades, voz, chat, um gateway WebSocket próprio e o app desktop.
+</Callout>
+
+## Contexto de negócio
+
+O ponto de partida é um grupo de amigos que joga junto à noite, muitas vezes em jogos diferentes ao mesmo tempo, e quer espiar a tela uns dos outros. A Arquibancada nasce como ferramenta desse grupo, numa instância privada (só e-mails autorizados criam salas), e é desenhada para poder abrir para mais gente depois.
+
+| Grandeza | Valor de referência |
+|---|---|
+| Pessoas por sala | até 10 (configurável de 2 a 10) |
+| Telas compartilhadas ao mesmo tempo | até 4 por sala (configurável de 1 a 4) |
+| Perfil padrão | 1920×1080 a 60 fps, teto de 8 Mbps na camada alta |
+| Upload de quem compartilha | ≥ 15 Mbps para `1080p60`; ≥ 7 Mbps para `720p60` (RN-20) |
+| Download de quem assiste | ≥ 15 Mbps para ver a grade com 4 telas; ≥ 10 Mbps para uma tela em destaque |
+| Salas ativas ao mesmo tempo (instância entre amigos) | 1 a 3 |
+
+### Atores
+
+| Ator | O que faz |
+|---|---|
+| **Anfitrião** | Entra com Google ou GitHub (só e-mails autorizados), cria e configura salas, copia o link, tranca a sala, remove pessoas, encerra telas, troca o link. Também assiste e compartilha. |
+| **Convidado** | Abre o link, escolhe um apelido, assiste e compartilha. Não tem conta; a identidade dura enquanto durar a sessão do navegador (até 24 h). |
+| **LiveKit** (sistema) | SFU que recebe e reencaminha o vídeo e o áudio; avisa o backend por webhooks assinados e obedece à API de servidor. |
+| **Google e GitHub** (sistemas) | Provedores de identidade do anfitrião (OAuth 2.0 e OpenID Connect). |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **Sala** | Espaço onde as pessoas se encontram. Tem um id interno (que nomeia a sala no LiveKit, `sala-<id>`) e um **código** público de 10 caracteres que forma o link. Trocar o código não muda a sala. |
+| **Participante** | Uma pessoa conectada à sala agora: anfitrião ou convidado, com um apelido. Estado efêmero, guardado no Redis. |
+| **Compartilhamento** | Uma tela (com o áudio dela, se houver) publicada na sala. Tem ciclo de vida controlado pelo backend: `RESERVADO` → `AO_VIVO` → `ENCERRADO`. |
+| **Grade** e **destaque** | Na grade, todas as telas aparecem lado a lado em tamanho menor. Em destaque, uma tela ocupa a área principal em 1080p60. |
+| **Simulcast** | Quem compartilha codifica o vídeo em 3 camadas (1080p60, 720p60 e 360p30). O SFU manda a cada pessoa a camada que cabe no tamanho do vídeo na tela dela e na banda dela. É o que permite 4 telas ao mesmo tempo. |
+| **Janela de qualidade** | Agregado de 10 s das estatísticas do WebRTC (fps, resolução, perda, congelamentos). É a unidade dos SLOs. |
+
+## Escopo
+
+### Dentro
+
+- Uma aplicação web (React + TypeScript) servida no mesmo domínio da API, para Chrome e Edge no computador (compartilhar e assistir) e qualquer navegador moderno (assistir).
+- Backend `arquibancada-api` em Spring Boot 4, com PostgreSQL e Redis, rodando em duas réplicas em produção.
+- LiveKit auto-hospedado, com TURN embutido para redes que bloqueiam UDP.
+- Login do anfitrião com Google e GitHub, lista de e-mails autorizados, convidados sem conta.
+- Telemetria de qualidade, SLOs, painel no Grafana e teste com rede degradada.
+- Produção numa VPS com Caddy (TLS automático), backup e uso real com amigos.
+- **Somente se a decisão 1 pedir** (veja o marco 1): um app desktop Electron que embrulha a mesma interface.
+
+### Fora
+
+- Voz, chat de texto, contas para convidados, lista de amigos e salas públicas (ficam para o Resenha).
+- Gravação de transmissões ou clipes no servidor (nada de mídia é gravado).
+- Compartilhar pelo celular ou por navegadores que não sejam Chromium (eles podem assistir).
+- Perfis acima de 1080p60, AV1 e criptografia ponta a ponta (em [Para ir além](#para-ir-além)).
+- Controle remoto da tela de outra pessoa.
+
+<Callout tipo="dica" titulo="O núcleo que não se corta">
+Se o prazo apertar: link → apelido → entrar → compartilhar com reserva de vaga → destaque em 1080p60 → uma janela de qualidade medida. Proteção contra eco, relatório ao parar, regenerar link e o GitHub como segundo provedor de login são os primeiros candidatos a "próximos passos".
+</Callout>
+
+## Requisitos funcionais
+
+As regras são numeradas de forma contínua (RN-01 a RN-46) para que testes e commits possam citá-las. Horários em UTC na API e no banco. Textos são medidos em *code points*.
+
+### RF-01 · Login do anfitrião
+
+- **RN-01 — Login social no backend.** O anfitrião entra com Google ou GitHub pelo fluxo *authorization code* executado **pelo backend** (Spring Security `oauth2Login`), no padrão BFF: o navegador nunca vê access token nem refresh token. Nenhuma senha é guardada. No primeiro login, o anfitrião é criado com o e-mail verificado do provedor (no Google, o claim `email_verified`; no GitHub, o e-mail primário e verificado da API de e-mails, com o escopo `user:email`). E-mail não verificado → login recusado com a mensagem "verifique seu e-mail no provedor".
+- **RN-02 — Sessão em cookie.** Sessão guardada no Redis (Spring Session) e identificada pelo cookie `__Host-arq_sessao`, com `HttpOnly`, `Secure`, `SameSite=Lax` e `Path=/`. Expira após 7 dias sem uso; `POST /api/logout` a invalida. Toda requisição que altera estado exige o cabeçalho `X-XSRF-TOKEN` igual ao cookie `XSRF-TOKEN` (proteção contra CSRF do Spring Security, configurada para SPA).
+- **RN-03 — Lista de e-mails autorizados.** Uma configuração da instância (`arquibancada.anfitrioes-permitidos`) aceita e-mails exatos e domínios (`@empresa.com`). Login de e-mail fora da lista → página "Esta instância é privada", sem criar registro. Em produção a lista é obrigatória; é ela que impede um estranho de usar a banda do seu servidor.
+- **RN-04 — Excluir conta.** `DELETE /api/eu` exclui as salas do anfitrião (com o efeito da RN-08) e o registro dele.
+
+### RF-02 · Salas
+
+- **RN-05 — Criação.** Nome com 1 a 60 code points. Até 5 salas por anfitrião → `422 limite-atingido`. O código tem 10 caracteres base62 gerados com `SecureRandom` (62¹⁰ ≈ 8,4 × 10¹⁷ combinações), único no banco.
+- **RN-06 — Link e troca do código.** O link é `https://<domínio>/s/<código>`. `POST /api/salas/{id}/codigo` gera um código novo e o antigo deixa de funcionar na hora: quem já está dentro continua; quem chega pelo link antigo vê "sala não encontrada" (`404`).
+- **RN-07 — Trancar.** Com a sala trancada, novas entradas recebem `423 sala-trancada`; quem está dentro continua e pode sair e voltar por 2 minutos (reconexão).
+- **RN-08 — Excluir.** Encerra a sala no LiveKit (`DeleteRoom`): todos saem, e os compartilhamentos terminam com motivo `SALA_ENCERRADA`.
+- **RN-09 — Configurações.** `limiteParticipantes` de 2 a 10 (padrão 10), `limiteTelas` de 1 a 4 (padrão 4) e `perfilMaximo` entre `720p60` e `1080p60` (padrão). Diminuir um limite abaixo do uso atual não expulsa ninguém; vale para as próximas entradas e telas.
+
+### RF-03 · Entrar na sala
+
+- **RN-10 — Pré-visualização pública.** `GET /api/s/{codigo}` devolve nome da sala, nome do anfitrião, participantes atuais e limite, e se está trancada. Inexistente → `404`. Até 20 consultas por minuto por IP (dificulta varrer códigos).
+- **RN-11 — Apelido.** De 1 a 24 code points depois de remover espaços das pontas, sem caracteres de controle. O anfitrião entra com o nome dele (editável). Na primeira entrada, o convidado ganha uma sessão anônima (o mesmo cookie da RN-02) com um id aleatório, válida por 24 h.
+- **RN-12 — Apelido repetido.** Se já houver alguém com o mesmo apelido na sala (sem diferenciar maiúsculas), o novo recebe um sufixo: `Kayo` → `Kayo (2)` → `Kayo (3)`.
+- **RN-13 — Vaga atômica e token.** `POST /api/s/{codigo}/entrada` reserva uma vaga: participantes conectados + reservas pendentes precisam ser menores que `limiteParticipantes`. Conferência e reserva são um único script Lua no Redis; a reserva vale 30 s e é consumida pelo webhook `participant_joined`. Sala cheia → `409 sala-cheia`. A resposta traz `livekitUrl`, `token`, `participanteId` e o apelido final. O token é um JWT assinado com o *API secret* do LiveKit (que só o backend conhece), com `identity = participanteId`, `name = apelido`, sala `sala-<id>`, `roomJoin`, `canSubscribe = true`, **`canPublish = false`**, `canPublishData = false` e validade de 10 minutos. Critério: sala com limite 10, 9 dentro e 3 entradas simultâneas → exatamente 1 token.
+- **RN-14 — Uma presença por sessão.** A identidade no LiveKit é fixa por sessão. Abrir a sala numa segunda aba conecta a mesma identidade, e o LiveKit desconecta a primeira; a aba antiga mostra "Você abriu esta sala em outra aba".
+- **RN-15 — Presença pelos webhooks.** O endpoint `POST /webhooks/livekit` valida a assinatura sobre os bytes exatos do corpo (inválida → `401`), deduplica pelo `id` do evento (guardado por 24 h) e atualiza os participantes no Redis. Cada conexão tem um `participantSid` novo; um `participant_left` só remove a pessoa se o `sid` for o atual. Exemplo: numa reconexão, chegam `participant_joined` (sid B) e depois `participant_left` (sid A) → a pessoa continua na sala.
+- **RN-16 — Reconciliação.** A cada 60 s, para cada sala com participantes no Redis, o backend compara com `ListParticipants` do LiveKit e corrige divergências, incrementando `arq_divergencias_total`. `room_finished` limpa o estado da sala.
+
+### RF-04 · Compartilhar a tela
+
+- **RN-17 — Quem pode compartilhar.** Qualquer participante, em Chrome ou Edge no computador (o cliente detecta `getDisplayMedia` e um navegador Chromium). Nos outros, o botão aparece desabilitado com "Para compartilhar, use Chrome ou Edge no computador".
+- **RN-18 — Reserva de tela.** `POST /api/s/{codigo}/compartilhamentos` com `perfil` (`AUTO`, `1080p60` ou `720p60`). Exige: estar conectado à sala agora (estado da RN-15), não ter outro compartilhamento ativo (`409 ja-compartilhando`) e a sala ter menos telas ativas que `limiteTelas` (`409 limite-de-telas`), e o perfil não passar do `perfilMaximo` (`422 perfil-nao-permitido`). Contagem e reserva no mesmo script Lua. O compartilhamento nasce `RESERVADO`, com expiração em 30 s. Critério: sala com 3 telas e 5 pedidos simultâneos → exatamente 1 `201`.
+- **RN-19 — Permissão concedida em tempo real.** Com a vaga reservada, o backend chama `UpdateParticipant` no LiveKit com `canPublish = true` e `canPublishSources = [SCREEN_SHARE, SCREEN_SHARE_AUDIO]`. Timeout de 2 s e uma nova tentativa; se falhar, a reserva é desfeita e a resposta é `503 midia-indisponivel` com `Retry-After: 5`. Ao encerrar o compartilhamento, a permissão volta a `canPublish = false`.
+- **RN-20 — Perfis ditados pelo servidor.** A resposta do `201` traz os parâmetros de codificação, e o cliente os aplica sem decidir nada sozinho.
+
+| Perfil | Captura máxima | fps | Camada alta | Camadas extras (redução · fps · teto) | Upload total | Upload mínimo | `contentHint` | `degradationPreference` |
+|---|---|---|---|---|---|---|---|---|
+| `1080p60` (padrão) | 1920×1080 | 60 | 8 Mbps | 1,5× · 60 · 3 Mbps; 3× · 30 · 0,6 Mbps | 11,6 Mbps | 15 Mbps | `motion` | `maintain-framerate` |
+| `720p60` | 1280×720 | 60 | 4,5 Mbps | 2× · 30 · 0,6 Mbps | 5,1 Mbps | 7 Mbps | `motion` | `maintain-framerate` |
+
+Codec H.264 (codificação em hardware na maioria das placas de vídeo). O upload mínimo é o total com cerca de 30% de folga. Com `maintain-framerate`, se a rede apertar, o WebRTC reduz a resolução e **mantém os 60 fps**, que é o que importa em jogo.
+
+- **RN-21 — Perfil `AUTO`.** É o padrão do botão. O cliente guarda localmente a banda de saída disponível medida no último compartilhamento (`availableOutgoingBitrate` do par de candidatos ativo). Se ela foi menor que 15 Mbps, pede `720p60`; senão, ou na primeira vez, `1080p60`.
+- **RN-22 — Encaixe da resolução.** A captura é reduzida para caber na caixa do perfil mantendo a proporção, nunca ampliada, com largura e altura pares. Fator = `min(1, larguraMax / largura, alturaMax / altura)`. Exemplos no `1080p60`: monitor 2560×1440 → 1920×1080; ultrawide 3440×1440 → 1920×804; janela 1600×1200 → 1440×1080; janela 1280×720 → continua 1280×720.
+- **RN-23 — Captura.** Depois de receber o `201`, o cliente espera o SDK avisar que as permissões mudaram (até 5 s; se não vier, cancela com `DELETE` e tenta de novo) e chama `getDisplayMedia` pedindo `frameRate` ideal de 60, áudio, e as opções do Chrome que deixam a experiência limpa: não oferecer a própria aba (`selfBrowserSurface: "exclude"`), oferecer áudio do sistema (`systemAudio: "include"`), áudio da janela quando o navegador suportar (`windowAudio`) e permitir trocar de fonte sem parar (`surfaceSwitching: "include"`). Se a pessoa cancelar a janela de escolha, o cliente chama `DELETE` na hora.
+- **RN-24 — Ao vivo.** O webhook `track_published` com fonte `SCREEN_SHARE` de quem tem reserva leva o compartilhamento a `AO_VIVO`, com `trackSid` e `iniciadoEm`. Quem confirma é o webhook, não o cliente.
+- **RN-25 — Reserva expirada.** Sem `track_published` em 30 s, o compartilhamento vira `ENCERRADO` com motivo `RESERVA_EXPIRADA`, a permissão é revogada e a vaga liberada.
+- **RN-26 — Encerramento.** A primeira causa vence (`UPDATE … WHERE status IN ('RESERVADO','AO_VIVO')`): `track_unpublished` da tela → `PARADO_PELO_USUARIO` (inclui o botão "Parar" do app e a barra "Parar compartilhamento" do próprio Chrome, que dispara o evento `ended` da trilha); `participant_left` → `SAIU_DA_SALA`; anfitrião → `ENCERRADO_PELO_ANFITRIAO`; `room_finished` → `SALA_ENCERRADA`. Sempre: permissão revogada e vaga liberada.
+- **RN-27 — Publicação sem reserva.** Se chegar `track_published` de tela sem reserva (não deveria, sem permissão), o backend silencia a trilha (`MutePublishedTrack`), revoga a permissão, registra `WARN` e incrementa `arq_publicacao_sem_reserva_total`.
+
+### RF-05 · Assistir
+
+- **RN-28 — Grade automática.** Toda tela ao vivo aparece na grade sem ninguém clicar em nada. O cliente usa *adaptive stream*, então cada tela chega na camada que cabe no tamanho do quadro: numa grade 2×2 num monitor 1080p, a camada de 720p; numa miniatura, a de 360p.
+- **RN-29 — Destaque e tela cheia.** Clicar numa tela a coloca em destaque (área principal, camada alta, 1080p60) e reduz as outras a miniaturas. Duplo clique ou a tecla `F` abre em tela cheia; `Esc` sai. Se a tela em destaque terminar, a grade volta.
+- **RN-30 — Áudio por tela.** Cada tela tem volume próprio (0 a 100%, padrão 100%) e botão de mudo, lembrados por apelido no navegador. O clique em **Entrar** conta como interação do usuário, então o navegador libera o áudio sem pedir outro clique.
+- **RN-31 — Proteção contra eco.** Quem compartilha a **tela inteira** com áudio transmite o áudio do sistema, que inclui o áudio das telas dos outros tocando no computador dele. Enquanto isso durar (`displaySurface = "monitor"` nas configurações da trilha e uma trilha de áudio publicada), o cliente silencia localmente o áudio das outras telas e mostra "O áudio das outras telas foi silenciado para não voltar como eco", com a opção de reativar mesmo assim. Compartilhando uma janela com o áudio só dela, nada é silenciado.
+- **RN-32 — Estatísticas visíveis.** Painel sobreposto (`Ctrl+Shift+E`) com fps, resolução, camada recebida, codec, bitrate, perda, jitter, RTT e congelamentos; para quem compartilha, também o codificador (`encoderImplementation`) e o motivo de limitação (`qualityLimitationReason`).
+- **RN-33 — Reconexão.** Se a rede cair, o SDK do LiveKit reconecta sozinho; a tela mostra "Reconectando…" e, ao voltar, as telas reaparecem sem ação da pessoa. Se não voltar em 30 s, o cliente oferece "Entrar de novo" (pedindo um token novo).
+
+### RF-06 · Qualidade medida
+
+- **RN-34 — Coleta.** Quem compartilha e quem assiste chamam `getStats()` a cada 2 s e fecham janelas de 10 s: fps, resolução, bitrate, perda, jitter, RTT, congelamentos (`freezeCount` e `totalFreezesDuration`), camada, codec e, para quem compartilha, codificador e motivo de limitação. Também medem o tempo do clique em uma tela até o primeiro quadro.
+- **RN-35 — Envio.** `POST /api/telemetria/qualidade` a cada 30 s com até 20 janelas (`202`; mais que isso → `413`). Idempotente por `(sessaoCliente, compartilhamentoId, papel, janelaInicio)`. Valores fora de faixa descartam a janela, não o lote.
+- **RN-36 — Janela saudável.** Para quem compartilha: `framesPerSecond` ≥ 55 na camada alta. Para quem assiste em destaque: `framesPerSecond` ≥ 55 e nenhum congelamento novo.
+- **RN-37 — Aviso durante o compartilhamento.** Se o motivo de limitação for `bandwidth` por 15 s seguidos, o cliente mostra a quem compartilha "Sua conexão está limitando a qualidade; a resolução caiu para manter 60 fps". Se for `cpu`, "Seu computador está no limite; feche programas ou use 720p60". Discreto, sem cobrir o jogo, e no máximo uma vez a cada 5 minutos.
+- **RN-38 — Relatório ao parar.** `GET /api/compartilhamentos/{id}/qualidade` devolve duração, % de janelas saudáveis de quem compartilhou e de quem assistiu, fps p50 e p5, motivo de limitação predominante e codificador. O cliente mostra ao parar: "Você compartilhou por 1 h 12 min; 99% do tempo a 60 fps".
+- **RN-39 — Retenção.** Janelas por 30 dias (tabela particionada por dia), resumos por 1 ano. Nenhum IP é guardado.
+
+### RF-07 · Controles do anfitrião e proteção
+
+- **RN-40 — Remover participante.** O anfitrião remove alguém (`RemoveParticipant`); a sessão removida fica impedida de entrar naquela sala por 24 h (`403 removido`). Como um convidado pode abrir outra sessão, o app sugere em seguida: "Trocar o link e trancar a sala?".
+- **RN-41 — Encerrar a tela de alguém.** O anfitrião encerra qualquer compartilhamento (RN-26, motivo `ENCERRADO_PELO_ANFITRIAO`). Se a trilha ainda existir 5 s depois da revogação, o backend chama `MutePublishedTrack`.
+- **RN-42 — Anfitrião sempre cabe.** O anfitrião entra na própria sala mesmo cheia ou trancada (ele é contado, mas nunca recebe `409` nem `423`).
+- **RN-43 — Limites contra abuso.** Entrada: 10 por minuto por IP. Pré-visualização: 20 por minuto por IP. Criação de salas: 10 por hora por anfitrião. Pedidos de compartilhamento: 10 por minuto por participante. Excesso → `429 limite-excedido` com `Retry-After`.
+- **RN-44 — Sala abandonada.** Salas sem ninguém há 30 dias são excluídas automaticamente, com o anfitrião avisado por e-mail 7 dias antes (opcional na v1: só o log).
+- **RN-45 — Privacidade.** A página da sala diz, antes de entrar: nada é gravado; o vídeo passa pelo servidor da instância sem criptografia ponta a ponta; o apelido e a sessão anônima duram até 24 h. Logs não guardam tokens, cookies nem e-mails em `INFO` ou acima.
+- **RN-46 — Exportação.** `GET /api/eu/exportacao` devolve ao anfitrião um JSON com o perfil, as salas e o histórico de compartilhamentos dele.
+
+## Requisitos não funcionais
+
+"Sem lag nem interrupção" vira meta mensurável aqui. As metas de mídia valem para quem cumpre os requisitos de rede da RN-20 e, para quem compartilha, numa máquina com codificação de vídeo por hardware.
+
+| RNF | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Fluidez de quem compartilha (SLO) | ≥ 99% das janelas saudáveis no `1080p60` | Telemetria; painel no Grafana |
+| RNF-02 | Fluidez de quem assiste em destaque (SLO) | ≥ 98% das janelas saudáveis | Telemetria |
+| RNF-03 | Sem interrupção | Nenhum congelamento acima de 500 ms em 30 minutos de compartilhamento, em destaque, com a rede dentro dos requisitos | `totalFreezesDuration` e `freezeCount` por janela |
+| RNF-04 | Latência ponta a ponta | Mediana ≤ 250 ms e máximo ≤ 400 ms em 20 medições, com RTT ao servidor ≤ 50 ms | Método do relógio (marco 6) |
+| RNF-05 | Início | p95 ≤ 1,5 s do clique numa tela ao primeiro quadro em destaque | Telemetria |
+| RNF-06 | Degradação | Com quem assiste limitado a 5 Mbps e 3% de perda: troca de camada em até 5 s e nenhum congelamento acima de 1 s depois disso | Teste de rede degradada |
+| RNF-07 | Capacidade | Uma sala cheia (10 pessoas, 4 telas `1080p60`) por 30 minutos com RNF-01 e RNF-02 atendidos; CPU e banda do servidor medidas | `lk load-test` e uma sessão real |
+| RNF-08 | API | 99,9% sem `5xx`; p99 ≤ 300 ms | Métricas `http.server.requests`; k6 |
+| RNF-09 | Segurança | Matriz de autorização testada (anfitrião dono, outro anfitrião, convidado, anônimo); webhook inválido → `401`; CSRF exigido; segredo do LiveKit fora do cliente e do repositório | Testes de fatia; varredura de segredos no CI |
+| RNF-10 | Privacidade | Nenhum token, cookie ou e-mail em logs `INFO`+; retenção da RN-39 automatizada | Teste de log; job com relógio simulado |
+| RNF-11 | Observabilidade | `traceId` em todos os logs de requisição; painéis de salas, compartilhamentos e qualidade | Capturas no README |
+| RNF-12 | Reprodutibilidade | Do clone ao ambiente local rodando com 1 comando em até 10 min | Cronometrar |
+
+## Modelo de dados
+
+PostgreSQL com UUID v7 (`uuidv7()`) e `timestamptz`. O que é efêmero (participantes, reservas, sessões) fica no Redis.
+
+| Tabela | Colunas principais | Restrições e índices |
+|---|---|---|
+| `anfitriao` | `id`, `provedor` (`GOOGLE`/`GITHUB`), `sujeito`, `email`, `nome`, `criado_em` | `UNIQUE (provedor, sujeito)`; índice em `lower(email)` |
+| `sala` | `id`, `anfitriao_id`, `nome`, `codigo`, `trancada`, `limite_participantes`, `limite_telas`, `perfil_maximo`, `criada_em`, `ultimo_uso_em`, `excluida_em` | `UNIQUE (codigo)`; `CHECK` dos limites (2–10 e 1–4); índice em `anfitriao_id` |
+| `compartilhamento` | `id`, `sala_id`, `participante_id`, `apelido`, `perfil`, `status`, `com_audio`, `track_sid`, `reservado_em`, `reserva_expira_em`, `iniciado_em`, `encerrado_em`, `motivo_fim` | `UNIQUE (participante_id) WHERE status IN ('RESERVADO','AO_VIVO')`; índice parcial em `reserva_expira_em WHERE status = 'RESERVADO'` |
+| `webhook_processado` | `evento_id`, `tipo`, `recebido_em` | PK `evento_id`; limpeza após 24 h |
+| `janela_qualidade` | `compartilhamento_id`, `papel`, `sessao_cliente`, `janela_inicio`, `fps`, `largura`, `altura`, `bitrate_kbps`, `perda_pct`, `jitter_ms`, `rtt_ms`, `congelamentos`, `congelado_ms`, `motivo_limitacao`, `codec`, `codificador`, `camada`, `primeiro_quadro_ms` | Particionada por dia em `janela_inicio`; `UNIQUE (sessao_cliente, compartilhamento_id, papel, janela_inicio)` |
+| `resumo_compartilhamento` | `compartilhamento_id`, `duracao_s`, `pct_saudavel_origem`, `pct_saudavel_espectadores`, `fps_p50`, `fps_p5`, `motivo_predominante`, `codificador` | PK `compartilhamento_id` |
+
+| Chave no Redis | Conteúdo | TTL |
+|---|---|---|
+| `spring:session:*` | Sessões de anfitriões e convidados (Spring Session) | 7 dias (anfitrião) / 24 h (convidado) |
+| `sala:<id>:participantes` | hash `participanteId → {apelido, sid, papel, entrouEm}` | sem TTL; corrigido pela reconciliação |
+| `sala:<id>:reservas` | sorted set `participanteId → expiração` (RN-13) | itens de 30 s |
+| `sala:<id>:telas` | conjunto de compartilhamentos ativos (RN-18) | sem TTL; corrigido pela reconciliação |
+| `sala:<id>:removidos` | sessões removidas (RN-40) | 24 h |
+| `rl:<regra>:<chave>` | baldes de rate limit | janela da regra |
+
+**Migrations:** `V1` anfitrião e sala; `V2` compartilhamento e webhooks; `V3` qualidade, com as partições dos próximos 7 dias e um job que cria as seguintes.
+
+## Contrato da API
+
+Mesma origem da aplicação web (`https://<domínio>/api`), JSON, sessão por cookie, CSRF nas escritas. OpenAPI versionado em `contracts/openapi/`.
+
+| Método | Rota | Quem | Resultado |
+|---|---|---|---|
+| `GET` | `/oauth2/authorization/{google\|github}` | qualquer um | Início do login (Spring Security) |
+| `GET` | `/api/eu` | anfitrião ou convidado | Quem sou eu (`401` se nenhum) |
+| `POST` | `/api/logout` | sessão | `204` |
+| `DELETE` | `/api/eu` · `GET` `/api/eu/exportacao` | anfitrião | RN-04, RN-46 |
+| `GET` / `POST` | `/api/salas` | anfitrião | Listar as minhas e criar (RN-05) |
+| `PATCH` / `DELETE` | `/api/salas/{id}` | anfitrião dono | RN-07, RN-08, RN-09 |
+| `POST` | `/api/salas/{id}/codigo` | anfitrião dono | Novo código (RN-06) |
+| `GET` | `/api/s/{codigo}` | público | Pré-visualização (RN-10) |
+| `POST` | `/api/s/{codigo}/entrada` | público (cria sessão de convidado) | Token do LiveKit (RN-11 a RN-13) |
+| `GET` | `/api/s/{codigo}/compartilhamentos` | participante | Telas ativas |
+| `POST` | `/api/s/{codigo}/compartilhamentos` | participante conectado | Reserva e parâmetros (RN-18 a RN-20) |
+| `DELETE` | `/api/compartilhamentos/{id}` | dono do compartilhamento ou anfitrião | RN-26, RN-41 |
+| `GET` | `/api/compartilhamentos/{id}/qualidade` | dono do compartilhamento ou anfitrião | RN-38 |
+| `DELETE` | `/api/s/{codigo}/participantes/{participanteId}` | anfitrião dono | RN-40 |
+| `POST` | `/api/telemetria/qualidade` | participante | `202` (RN-34, RN-35) |
+| `POST` | `/webhooks/livekit` | LiveKit (assinatura) | `200` (RN-15) |
+
+### Entrar na sala
+
+```http
+POST /api/s/7KqP2xWm9a/entrada
+Content-Type: application/json
+X-XSRF-TOKEN: 3f1c...
+
+{ "apelido": "Kayo" }
+```
+
+```http
+HTTP/1.1 201 Created
+Set-Cookie: __Host-arq_sessao=...; Path=/; Secure; HttpOnly; SameSite=Lax
+
+{
+  "participanteId": "c_0199d2a1-7b3c-7e10-9f22-8a1b2c3d4e5f",
+  "apelido": "Kayo (2)",
+  "papel": "CONVIDADO",
+  "livekitUrl": "wss://rtc.seudominio.com",
+  "token": "eyJhbGciOiJIUzI1NiJ9...",
+  "sala": { "nome": "Noite de sexta", "limiteParticipantes": 10, "limiteTelas": 4, "telasAtivas": 2 }
+}
+```
+
+O primeiro acesso de um convidado ainda não tem o cookie `XSRF-TOKEN`: o cliente faz um `GET /api/s/{codigo}` antes (que o recebe) e só então o `POST`.
+
+### Compartilhar
+
+```http
+POST /api/s/7KqP2xWm9a/compartilhamentos
+Content-Type: application/json
+X-XSRF-TOKEN: 3f1c...
+
+{ "perfil": "AUTO", "melhorUploadMedidoKbps": 41200 }
+```
+
+```http
+HTTP/1.1 201 Created
+
+{
+  "id": "0199d2a4-0c11-7a3b-8d4e-5f6a7b8c9d0e",
+  "status": "RESERVADO",
+  "reservaExpiraEm": "2026-10-11T23:20:31Z",
+  "perfil": "1080p60",
+  "parametros": {
+    "captura": { "larguraMax": 1920, "alturaMax": 1080, "fps": 60 },
+    "codec": "h264",
+    "contentHint": "motion",
+    "degradationPreference": "maintain-framerate",
+    "camadas": [
+      { "rid": "f", "reduzirPor": 1,   "fpsMax": 60, "bitrateMaxKbps": 8000 },
+      { "rid": "h", "reduzirPor": 1.5, "fpsMax": 60, "bitrateMaxKbps": 3000 },
+      { "rid": "q", "reduzirPor": 3,   "fpsMax": 30, "bitrateMaxKbps": 600 }
+    ],
+    "audio": { "stereo": true, "bitrateKbps": 128 }
+  }
+}
+```
+
+No SDK JavaScript do LiveKit, os parâmetros viram `screenShareEncoding`, `screenShareSimulcastLayers`, `videoCodec` e `degradationPreference` na publicação. Os presets prontos do SDK para tela param em 30 fps, então os de 60 fps são sempre personalizados.
+
+### Erros (Problem Details, RFC 9457)
+
+```json
+{
+  "type": "https://arquibancada.example/problemas/limite-de-telas",
+  "title": "A sala já tem 4 telas compartilhadas",
+  "status": 409,
+  "detail": "Espere alguém parar de compartilhar.",
+  "instance": "/api/s/7KqP2xWm9a/compartilhamentos",
+  "telasAtivas": 4,
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+| Status | `type` (sufixo) | Quando |
+|---|---|---|
+| 400 | `requisicao-invalida` | Validação; extensão `erros` |
+| 401 | `nao-autenticado` | Sem sessão; webhook com assinatura inválida |
+| 403 | `acesso-negado`, `removido` | Sala de outro anfitrião; RN-40 |
+| 403 | `csrf-invalido` | Escrita sem `X-XSRF-TOKEN` válido |
+| 404 | `sala-nao-encontrada`, `recurso-nao-encontrado` | Código inexistente ou trocado (RN-06); compartilhamento de outra sala |
+| 409 | `sala-cheia`, `ja-compartilhando`, `limite-de-telas`, `fora-da-sala` | RN-13, RN-18 |
+| 413 | `lote-muito-grande` | RN-35 |
+| 422 | `limite-atingido`, `perfil-nao-permitido` | RN-05, RN-18 |
+| 423 | `sala-trancada` | RN-07 |
+| 429 | `limite-excedido` | RN-43, com `Retry-After` |
+| 503 | `midia-indisponivel` | LiveKit fora ou lento (RN-19), com `Retry-After` |
+
+## Arquitetura
+
+<Figura legenda="O navegador fala com a API pelo Caddy, na mesma origem; o vídeo vai do navegador direto ao LiveKit, que o reencaminha aos outros. O backend Java só decide quem entra e quem pode publicar, e reage aos webhooks">
+<svg viewBox="0 0 860 380" width="860" role="img" aria-labelledby="aq-arq-t aq-arq-d">
+  <title id="aq-arq-t">Arquitetura da Arquibancada</title>
+  <desc id="aq-arq-d">Os navegadores carregam a aplicação e chamam a API pelo Caddy, com TLS. A API, em duas réplicas, usa PostgreSQL e Redis, entra com Google ou GitHub para o anfitrião, chama a API de servidor do LiveKit e recebe webhooks assinados. A mídia WebRTC vai dos navegadores direto ao LiveKit.</desc>
+  <defs><marker id="aq-arq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <path d="M85 70 L85 24 L750 24 L750 58" class="d-line" marker-start="url(#aq-arq-seta)" marker-end="url(#aq-arq-seta)"/>
+  <text x="420" y="16" text-anchor="middle" class="d-label">mídia WebRTC (tela e áudio do jogo): navegadores ↔ SFU, sem passar pela API</text>
+  <rect x="10" y="70" width="150" height="56" rx="8" class="d-box"/>
+  <text x="85" y="94" text-anchor="middle" class="d-text">Quem compartilha</text>
+  <text x="85" y="113" text-anchor="middle" class="d-label">Chrome ou Edge</text>
+  <rect x="10" y="150" width="150" height="56" rx="8" class="d-box"/>
+  <text x="85" y="174" text-anchor="middle" class="d-text">Quem assiste</text>
+  <text x="85" y="193" text-anchor="middle" class="d-label">qualquer navegador</text>
+  <path d="M160 98 L198 98" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <path d="M160 178 L198 178" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <rect x="200" y="70" width="110" height="136" rx="8" class="d-info"/>
+  <text x="255" y="122" text-anchor="middle" class="d-title">Caddy</text>
+  <text x="255" y="142" text-anchor="middle" class="d-label">TLS automático</text>
+  <text x="255" y="158" text-anchor="middle" class="d-label">app web + /api</text>
+  <text x="255" y="174" text-anchor="middle" class="d-label">mesma origem</text>
+  <path d="M310 138 L348 138" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <rect x="350" y="60" width="250" height="200" rx="10" class="d-accent"/>
+  <text x="475" y="88" text-anchor="middle" class="d-title">arquibancada-api (2 réplicas)</text>
+  <text x="475" y="108" text-anchor="middle" class="d-label">Spring Boot 4 · virtual threads</text>
+  <text x="370" y="140" class="d-label">login BFF · sessões</text>
+  <text x="370" y="162" class="d-label">salas · entrada · vagas</text>
+  <text x="370" y="184" class="d-label">compartilhamentos · permissões</text>
+  <text x="370" y="206" class="d-label">webhooks · reconciliação</text>
+  <text x="370" y="228" class="d-label">telemetria de qualidade</text>
+  <rect x="650" y="60" width="200" height="120" rx="10" class="d-violet"/>
+  <text x="750" y="90" text-anchor="middle" class="d-title">LiveKit (SFU)</text>
+  <text x="750" y="112" text-anchor="middle" class="d-label">encaminha sem decodificar</text>
+  <text x="750" y="130" text-anchor="middle" class="d-label">simulcast · adaptive stream</text>
+  <text x="750" y="148" text-anchor="middle" class="d-label">TURN embutido</text>
+  <path d="M600 100 L648 100" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <path d="M648 150 L602 150" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <text x="650" y="202" class="d-label">→ permissões, remover, listar</text>
+  <text x="650" y="222" class="d-label">← webhooks assinados</text>
+  <rect x="200" y="300" width="150" height="56" rx="8" class="d-info"/>
+  <text x="275" y="324" text-anchor="middle" class="d-text">Google · GitHub</text>
+  <text x="275" y="343" text-anchor="middle" class="d-label">login do anfitrião</text>
+  <rect x="380" y="300" width="120" height="56" rx="8" class="d-box"/>
+  <text x="440" y="324" text-anchor="middle" class="d-text">PostgreSQL 18</text>
+  <text x="440" y="343" text-anchor="middle" class="d-label">salas · histórico</text>
+  <rect x="520" y="300" width="120" height="56" rx="8" class="d-ok"/>
+  <text x="580" y="324" text-anchor="middle" class="d-text">Redis</text>
+  <text x="580" y="343" text-anchor="middle" class="d-label">sessões · vagas</text>
+  <rect x="660" y="300" width="190" height="56" rx="8" class="d-info"/>
+  <text x="755" y="324" text-anchor="middle" class="d-text">Observabilidade</text>
+  <text x="755" y="343" text-anchor="middle" class="d-label">OTel · Grafana</text>
+  <path d="M380 260 L300 298" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <path d="M440 260 L440 298" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <path d="M560 260 L575 298" class="d-line" marker-end="url(#aq-arq-seta)"/>
+  <path d="M600 240 L740 298" class="d-line" marker-end="url(#aq-arq-seta)"/>
+</svg>
+</Figura>
+
+### Como 4 telas cabem na banda de todo mundo
+
+<Figura legenda="Quem compartilha sobe três camadas uma vez só; o SFU escolhe para cada pessoa a camada que cabe no tamanho do vídeo na tela dela e na banda dela">
+<svg viewBox="0 0 860 300" width="860" role="img" aria-labelledby="aq-sim-t aq-sim-d">
+  <title id="aq-sim-t">Simulcast: uma subida, várias qualidades</title>
+  <desc id="aq-sim-d">Quem compartilha envia ao LiveKit três camadas: 1080p a 60 fps com 8 Mbps, 720p a 60 fps com 3 Mbps e 360p a 30 fps com 0,6 Mbps, somando 11,6 Mbps. O LiveKit envia a camada de 1080p a quem vê em destaque, a de 720p a quem vê a grade 2 por 2, e a de 360p a quem tem a rede ruim ou vê miniaturas.</desc>
+  <defs><marker id="aq-sim-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="100" width="170" height="96" rx="10" class="d-box"/>
+  <text x="95" y="130" text-anchor="middle" class="d-title">Quem compartilha</text>
+  <text x="95" y="152" text-anchor="middle" class="d-label">sobe 11,6 Mbps,</text>
+  <text x="95" y="170" text-anchor="middle" class="d-label">não importa quantos veem</text>
+  <path d="M180 120 L318 120" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <path d="M180 148 L318 148" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <path d="M180 176 L318 176" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <text x="250" y="114" text-anchor="middle" class="d-mono">1080p60 · 8</text>
+  <text x="250" y="142" text-anchor="middle" class="d-mono">720p60 · 3</text>
+  <text x="250" y="170" text-anchor="middle" class="d-mono">360p30 · 0,6</text>
+  <rect x="320" y="90" width="180" height="116" rx="10" class="d-violet"/>
+  <text x="410" y="140" text-anchor="middle" class="d-title">LiveKit</text>
+  <text x="410" y="162" text-anchor="middle" class="d-label">escolhe a camada</text>
+  <text x="410" y="180" text-anchor="middle" class="d-label">por pessoa</text>
+  <path d="M500 110 L638 50" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <path d="M500 148 L638 148" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <path d="M500 186 L638 246" class="d-line" marker-end="url(#aq-sim-seta)"/>
+  <rect x="640" y="22" width="210" height="56" rx="8" class="d-ok"/>
+  <text x="745" y="46" text-anchor="middle" class="d-text">Em destaque</text>
+  <text x="745" y="65" text-anchor="middle" class="d-label">1080p60 · 8 Mbps</text>
+  <rect x="640" y="120" width="210" height="56" rx="8" class="d-box"/>
+  <text x="745" y="144" text-anchor="middle" class="d-text">Grade 2×2</text>
+  <text x="745" y="163" text-anchor="middle" class="d-label">720p60 · 3 Mbps por tela</text>
+  <rect x="640" y="218" width="210" height="56" rx="8" class="d-info"/>
+  <text x="745" y="242" text-anchor="middle" class="d-text">Miniatura ou rede ruim</text>
+  <text x="745" y="261" text-anchor="middle" class="d-label">360p30 · 0,6 Mbps</text>
+</svg>
+</Figura>
+
+As contas que decidem a arquitetura, para uma sala cheia (10 pessoas, 4 telas em `1080p60`):
+
+| Modelo | Upload de quem compartilha | Download de quem assiste | Veredito |
+|---|---|---|---|
+| P2P (cada um manda direto para cada um) | 9 × 8 Mbps = **72 Mbps** por pessoa que compartilha | 4 × 8 = 32 Mbps | Inviável |
+| **SFU com simulcast (LiveKit)** | **11,6 Mbps, fixo** | Grade: 4 × 3 = **12 Mbps**; destaque: 8 + 3 × 0,6 = **9,8 Mbps** | **Escolhido** |
+| OBS + WHIP num servidor de mídia | 8 Mbps | 8 Mbps por tela | Ótima qualidade, mas exige instalar e configurar o OBS: fere o "sem esforço" |
+
+E do lado do servidor: até 10 pessoas recebendo até 12 Mbps cada ≈ **108 Mbps de saída** no pior caso por sala, ou cerca de **49 GB por hora** de sala cheia. É o número que vai para a conta de custo.
+
+### Por que não precisa de um WebSocket próprio
+
+Os navegadores já ficam conectados ao LiveKit, que avisa a todos quando alguém entra, sai, começa ou para de compartilhar. O backend não precisa empurrar nada: ele **autoriza** (tokens e permissões) e **acompanha** (webhooks). Isso mantém o projeto no tamanho Pleno. Um gateway WebSocket próprio aparece no Resenha, quando entram chat, presença e comunidades, que o LiveKit não conhece.
+
+### Organização do código
+
+Um único artefato Spring Boot com pacotes por assunto (`anfitriao`, `salas`, `entrada`, `compartilhamentos`, `livekit`, `qualidade`) e uma camada fina de integração com o LiveKit (porta e adaptador, para testar o domínio sem o LiveKit):
+
+```text
+arquibancada/
+├── backend/                 # Spring Boot 4, Java 25
+├── web/                     # React + TypeScript + Vite
+├── ferramentas/
+│   ├── prova-de-vida/       # marco 1
+│   ├── relogio/             # latência (marco 6)
+│   └── rede-degradada/      # Chrome + tc netem (marco 6)
+├── desktop/                 # só se a decisão 1 pedir: Electron embrulhando o web/
+├── deploy/{dev,producao,grafana}/
+└── docs/{adr,runbooks,slo,custo,resultados.md,privacidade.md}
+```
+
+### Decisões para registrar em ADRs
+
+| ADR | Pergunta | Opções e trade-offs | Recomendação de base |
+|---|---|---|---|
+| 001 | Navegador ou app desktop? | Resultado da prova de vida (marco 1) com o jogo em primeiro plano | Navegador, se a decisão 1 passar; senão, Electron embrulhando a mesma interface |
+| 002 | Como distribuir a mídia? | P2P × SFU WebRTC (LiveKit) × OBS + WHIP (tabela acima) × Media over QUIC (WebTransport + WebCodecs: promissor, mas ainda rascunho no IETF; você escreveria codificação, controle de banda e troca de qualidade à mão) × HLS/LL-HLS (2 a 10 s de atraso) | LiveKit; reavaliar MoQ quando virar RFC e houver um servidor com SDK maduro |
+| 003 | Login do anfitrião | BFF com sessão em cookie (tokens só no servidor; exige CSRF) × SPA com tokens no navegador (exposto a XSS) × Keycloak próprio (mais uma peça para 1 tipo de usuário) | BFF com `oauth2Login` e Spring Session no Redis |
+| 004 | Convidados sem conta | Sessão anônima com apelido (zero atrito; identidade fraca) × conta para todos (atrito) | Sessão anônima, com remoção, troca de link e trancar como defesas |
+| 005 | Fonte da verdade do estado da sala | Webhooks + Redis + reconciliação × consultar o LiveKit a cada requisição (simples; latência e dependência em toda chamada) | Webhooks + Redis + reconciliação |
+| 006 | Precisa de WebSocket próprio? | Sim (controle total) × não, os eventos de sala vêm do LiveKit | Não, com o critério de quando passa a precisar |
+| 007 | Quem decide a codificação | Servidor (ajuste sem nova versão do cliente) × cliente | Servidor |
+| 008 | Onde hospedar | Uma VPS (simples, barata, ponto único de falha) × nuvem gerenciada × LiveKit Cloud | Uma VPS, com backup e runbooks |
+
+<Callout tipo="erro" titulo="canPublishSources vazio não quer dizer 'nada'">
+No LiveKit, uma lista de fontes permitidas **vazia** significa "sem restrição de fonte". Um token com `canPublish = true` e `canPublishSources = []` deixa publicar câmera, microfone e tela. Por isso o token de entrada usa `canPublish = false`, e a permissão de tela só aparece na RN-19, já com a lista explícita.
+</Callout>
+
+## Antes de começar
+
+Umas 3 horas, já contadas no marco 1.
+
+| Item | Mínimo | Como conferir |
+|---|---|---|
+| Computador de quem compartilha | Windows 10 ou 11, placa de vídeo com codificador H.264 por hardware, 16 GB de RAM | Marco 1: o `encoderImplementation` mostra se a codificação é por hardware |
+| Segundo dispositivo | Qualquer computador com Chrome na mesma rede | — |
+| Rede | Upload ≥ 15 Mbps (melhor por cabo) | Teste de velocidade; anote no ADR-001 |
+| Um amigo fora da sua rede | 30 minutos de teste no marco 1 | — |
+| Software | JDK 25, Docker Desktop (WSL 2), Node.js LTS, Git, Chrome, IDE Java e VS Code | [Aula de ambiente](../../../aulas/00-comece-aqui/02-ambiente/) |
+| Contas | GitHub; aplicativos OAuth no Google Cloud e no GitHub (gratuitos); VPS com cobrança por hora (marco 1); domínio próprio ou DNS dinâmico gratuito (marco 8) | — |
+
+**Cronograma.** 132 horas: com 12 horas por semana, umas 11 semanas mais 2 de folga, perto de 3 meses. Se a decisão 1 escolher o app desktop, some 14 horas.
+
+| Semanas (12 h/semana) | Marco | Decisão no fim |
+|---|---|---|
+| 1–2 | 1 · Fundação e prova de vida | **Decisão 1:** navegador ou app? |
+| 2–3 | 2 · Anfitrião | — |
+| 4–5 | 3 · Entrar na sala | — |
+| 5–7 | 4 · Compartilhar | — |
+| 7–8 | 5 · Assistir | — |
+| 9 | 6 · Qualidade | **Decisão 2:** os SLOs fecham? |
+| 10 | 7 · Controles | — |
+| 10–11 | 8 · No ar | Release `v1.0.0` |
+| 12–13 | Folga | Imprevistos ou "Para ir além" |
+
+**Organize antes de codar:** leia a especificação inteira, anote dúvidas em `docs/duvidas.md` e responda cada uma; crie o repositório e um quadro no GitHub Projects com **uma issue por passo** abaixo (`M4-P2 Reserva de tela (RN-18)`), usando o "Confira" do passo como critério de aceite. Regra de atraso: um marco acima de 150% do previsto → corte escopo pelo [núcleo](#escopo).
+
+## Plano de execução
+
+Cada passo termina com um **Confira**: não avance com ele falhando. **Dependências:** 1 → 2 → 3 → 4 → 5 → 6; o 7 pode vir depois do 4; o 8 fecha.
+
+<Marco id="fundacao" numero={1} titulo="Fundação e prova de vida: navegador ou app?" horas={20}>
+
+**Objetivo:** decidir com dados se o navegador entrega 1080p60 sem lag com o jogo em primeiro plano, e deixar o esqueleto pronto.
+
+**Passo a passo**
+
+1. **Compose de desenvolvimento.** `deploy/dev/compose.yaml` com `postgres:18` (volume em `/var/lib/postgresql`, o diretório pai a partir do 18), `redis:8`, `livekit/livekit-server` com `--config` e `grafana/otel-lgtm`, todos com a versão fixada e portas presas em `127.0.0.1`, exceto as do LiveKit. **Confira:** `docker compose up -d` e tudo `running` em 2 minutos.
+
+2. **LiveKit na rede local.** `deploy/dev/livekit/livekit.yaml` com `port: 7880`, `bind_addresses: ["0.0.0.0"]`, `rtc.tcp_port: 7881`, `rtc.udp_port: 7882`, `rtc.use_external_ip: false`, `rtc.node_ip` com o IP da sua máquina na rede local, uma chave com segredo de 32 caracteres ou mais e o webhook para `http://host.docker.internal:8080/webhooks/livekit`. Confira os nomes no `config-sample.yaml` da versão fixada. Libere 7880 e 7881 TCP e 7882 UDP no Firewall do Windows. **Confira:** do segundo dispositivo, `http://<seu-ip>:7880` responde `OK`.
+
+3. **Prova de vida.** `ferramentas/prova-de-vida/` (Vite + TypeScript + `livekit-client`), com tokens do CLI (`lk token create … --join --room prova --identity a --valid-for 24h`). Uma página publica a tela com `createLocalScreenTracks` pedindo 1920×1080 a 60 fps e `contentHint: 'motion'`, e `publishTrack` com `videoCodec: 'h264'`, `degradationPreference: 'maintain-framerate'`, `screenShareEncoding` de 8 Mbps a 60 fps e as duas camadas extras da RN-20. Outra página assiste. **Confira:** a outra máquina vê a tela.
+
+4. **Decisão 1: navegador ou app?** Rode **do jeito que vai ser usado**: o jogo em primeiro plano (janela sem bordas), o Chrome minimizado ou atrás do jogo, 10 minutos de jogo com movimento, assistindo da outra máquina. Anote de `chrome://webrtc-internals` dos dois lados: fps capturado, enviado e recebido, `qualityLimitationReason`, `encoderImplementation`, `freezeCount` e `totalFreezesDuration`.
+   - **Passou** (≥ 98% do tempo acima de 55 fps recebidos e nenhum congelamento acima de 500 ms) → navegador. Siga.
+   - **Falhou, mas passa com o Chrome em primeiro plano** → é a prioridade de processos em segundo plano. Vá para o **plano B (app desktop)**: Electron com `backgroundThrottling: false` embrulhando a mesma interface. Some 8 horas ao marco 4 (empacotar, seletor de fonte com `desktopCapturer` e `setDisplayMediaRequestHandler`) e 6 ao marco 8 (instalador pelo CI).
+   - **Falhou também em primeiro plano** → o limite é o hardware ou a rede, e um app não resolve: siga o diagnóstico (codificador por software → driver e `chrome://gpu`; `bandwidth` → cabo; captura abaixo de 60 → janela sem bordas) e, se nada resolver, rebaixe o padrão para `720p60`.
+
+   **Confira:** o ADR-001 registra os números, as capturas de tela e a decisão.
+
+5. **Ensaio pela internet.** Alugue uma VPS cobrada por hora, suba só o LiveKit com `use_external_ip: true`, TURN/UDP ligado e as portas liberadas, e repita a prova com o amigo de fora da sua rede por 30 minutos. Destrua a VPS no fim. **Confira:** registro em `docs/resultados.md` com a rede do amigo, o RTT e se precisou de TURN.
+
+6. **Backend vazio.** No start.spring.io: Maven, Java 25, Spring Boot 4, com Web, Security, OAuth2 Client, Spring Session Data Redis, Data JPA, Flyway, PostgreSQL, Data Redis, Validation, Actuator e Testcontainers. Virtual threads, logs em JSON, OpenTelemetry para o `lgtm`. **Confira:** `./mvnw verify` passa e uma requisição aparece como trace no Grafana.
+
+7. **Web vazio e CI.** `npm create vite@latest web -- --template react-ts`; o proxy do Vite manda `/api`, `/oauth2` e `/login` para `localhost:8080` (mesma origem em desenvolvimento, como em produção). GitHub Actions com build e testes do backend e do web, varredura de dependências e de segredos, `main` protegida. **Confira:** um PR com teste falhando é bloqueado.
+
+8. **ADRs 002 e 008 e README.** **Confira:** o README explica o problema, o diagrama e como rodar.
+
+**Entregáveis:** Compose, prova de vida, ADRs 001, 002 e 008, CI, README.
+
+**Definição de pronto:** a decisão 1 está tomada com números; o ensaio pela internet funcionou; CI verde.
+
+**Aulas de apoio:** [Ambiente](../../../aulas/00-comece-aqui/02-ambiente/), [Docker e Compose](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), [Observabilidade](../../../aulas/14-devops/05-observabilidade/).
+
+<Callout tipo="erro" titulo="Testar com o navegador em primeiro plano">
+Com o Chrome na frente, tudo parece perfeito. No uso real, o jogo está na frente e o navegador fica em segundo plano, com menos prioridade de CPU. É exatamente esse caso que decide entre navegador e app, então a decisão 1 só vale medida assim.
+</Callout>
+
+</Marco>
+
+<Marco id="anfitriao" numero={2} titulo="Anfitrião: login social e salas" horas={14}>
+
+**Objetivo:** o anfitrião entra com Google ou GitHub e gerencia as salas dele.
+
+**Passo a passo**
+
+1. **Aplicativos OAuth.** Crie o cliente OAuth no Google Cloud (tela de consentimento em modo de teste, com o seu e-mail como testador) e o OAuth App no GitHub, com o redirecionamento `http://localhost:8080/login/oauth2/code/{google|github}`. Segredos em variáveis de ambiente, nunca no Git. **Confira:** a varredura de segredos do CI continua verde.
+
+2. **Login BFF.** `oauth2Login` com os dois provedores, sessão no Redis com o cookie da RN-02, provisionamento do anfitrião e a lista de autorizados (RN-01, RN-03). Para o GitHub, busque o e-mail primário verificado na API de e-mails. **Confira:** login com um e-mail autorizado cria o anfitrião; com outro, mostra "instância privada" e não cria nada.
+
+3. **CSRF para SPA.** Repositório de token em cookie legível (`XSRF-TOKEN`) e o cliente mandando `X-XSRF-TOKEN` em toda escrita. **Confira:** teste de fatia: `POST` sem o cabeçalho → `403`.
+
+4. **Salas.** RN-05 a RN-09 com `V1`, autorização "só o dono" e `404` para sala de outro anfitrião. **Confira:** testes da matriz (dono, outro anfitrião, convidado, anônimo) × (listar, criar, editar, excluir, trocar código).
+
+5. **Telas.** Página inicial com "Entrar com Google" e "Entrar com GitHub", lista de salas, criar, copiar link, configurações. **Confira:** do zero ao link copiado em menos de 30 segundos.
+
+6. **ADR-003.** **Confira:** explica por que nenhum token chega ao navegador.
+
+**Entregáveis:** login, salas, testes da matriz, ADR-003.
+
+**Definição de pronto:** os "Confira" dos passos 2 a 4 são testes automatizados ou estão demonstrados no README.
+
+**Aulas de apoio:** [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/), [OAuth 2 e OpenID Connect](../../../aulas/11-seguranca/07-oauth2-e-openid-connect/), [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/), [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/), [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/).
+
+<Callout tipo="erro" titulo="Desligar o CSRF porque “é uma API”">
+Com autenticação por cookie, o navegador manda o cookie sozinho, inclusive numa requisição disparada por outro site. É exatamente o cenário do CSRF. Desligar a proteção só é seguro quando a autenticação vai num cabeçalho que o navegador não envia sozinho, e este projeto usa cookie de propósito.
+</Callout>
+
+</Marco>
+
+<Marco id="sala" numero={3} titulo="Entrar na sala com um clique" horas={18}>
+
+**Objetivo:** abrir o link, digitar o apelido, entrar e ver quem está na sala.
+
+**Passo a passo**
+
+1. **Pré-visualização.** RN-10 com rate limit por IP. **Confira:** a 21ª consulta no mesmo minuto → `429`.
+
+2. **Sessão de convidado e apelido.** RN-11 e RN-12. **Confira:** dois "Kayo" viram `Kayo` e `Kayo (2)`.
+
+3. **Vaga atômica.** RN-13 com script Lua (`DefaultRedisScript` do Spring Data Redis), RN-07 (trancada) e RN-42 (anfitrião sempre cabe). **Confira:** teste com 3 entradas simultâneas na última vaga → 1 token e dois `409`.
+
+4. **Token do LiveKit.** SDK de servidor (`io.livekit:livekit-server`) com as permissões da RN-13. **Confira:** um teste decodifica o token e confere `canPublish = false`, a sala e a validade.
+
+5. **Webhooks e presença.** RN-15 (corpo como `String`, `WebhookReceiver` do SDK, deduplicação, regra do `sid`) e RN-14. **Confira:** testes com webhook duplicado, fora de ordem e com assinatura inválida.
+
+6. **Reconciliação.** RN-16. **Confira:** apagar a chave de participantes no Redis com gente na sala e, em até 60 s, o estado volta, com a métrica incrementada.
+
+7. **Teste com o LiveKit real.** LiveKit em modo de desenvolvimento num Testcontainer, a aplicação exposta com `Testcontainers.exposeHostPorts` e o webhook para `host.testcontainers.internal`. **Confira:** o teste espera o participante aparecer no Redis e roda no CI.
+
+8. **Tela da sala.** Rota `/s/:codigo`: pré-visualização, campo de apelido, **Entrar**, conexão ao LiveKit e a lista de quem está na sala, com "Reconectando…" (RN-33). **Confira:** três pessoas entram pelo mesmo link, de três máquinas, e todas se veem na lista.
+
+9. **ADRs 004 e 005.** **Confira:** os dois citam os testes que provam as garantias.
+
+**Entregáveis:** entrada, presença, testes, tela da sala, ADRs 004 e 005.
+
+**Definição de pronto:** os "Confira" dos passos 3, 5, 6 e 7 rodam no CI.
+
+**Aulas de apoio:** [Redis](../../../aulas/15-system-design/02-redis/), [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/), [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/), [Testcontainers](../../../aulas/10-testes/05-testcontainers/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/).
+
+<Callout tipo="erro" titulo="Contar com SELECT e depois liberar">
+"Conto quantos estão na sala; se for menor que 10, deixo entrar" falha com dois cliques no mesmo milissegundo: os dois contam 9 e os dois entram. A conferência e a reserva precisam ser **uma operação só**, e no Redis isso é um script Lua, que executa sem nada intercalado.
+</Callout>
+
+</Marco>
+
+<Marco id="compartilhar" numero={4} titulo="Compartilhar a tela a 60 fps" horas={22}>
+
+**Objetivo:** clicar em **Compartilhar tela**, escolher o jogo e todos verem, com o limite de 4 telas garantido pelo backend.
+
+**Passo a passo**
+
+1. **Perfis e encaixe.** RN-20 e RN-22 como configuração, com os exemplos da RN-22 em testes parametrizados escritos antes. **Confira:** 3440×1440 → 1920×804.
+
+2. **Reserva de tela.** `V2` e RN-18, com o índice único como segunda barreira. **Confira:** 5 pedidos simultâneos numa sala com 3 telas → 1 `201`.
+
+3. **Permissão em tempo real.** RN-19 com timeout, nova tentativa e circuit breaker (Resilience4j). **Confira:** com o LiveKit parado, `503` em menos de 3 s e nenhuma vaga presa.
+
+4. **Ciclo de vida.** RN-24 a RN-27, com a rotina de expiração a cada 5 s. **Confira:** testes de cada motivo de encerramento; uma reserva abandonada é liberada em até 35 s.
+
+5. **Botão Compartilhar.** No cliente: `POST`, espera do aviso de permissões, `getDisplayMedia` com as opções da RN-23, publicação com os parâmetros recebidos, `ended` da trilha → parar, e perfil `AUTO` (RN-21). **Confira:** do clique ao "Você está compartilhando" em até 3 cliques (Compartilhar → escolher janela → Compartilhar do Chrome).
+
+6. **Teste da defesa.** Um script com o SDK do LiveKit e um token de entrada válido tenta publicar tela sem reserva. **Confira:** o LiveKit recusa (sem permissão).
+
+7. **Plano B (só se a decisão 1 escolheu o app).** `desktop/` com Electron Forge, a interface do `web/` carregada no app, `backgroundThrottling: false`, seletor de fonte próprio (`desktopCapturer.getSources`) entregue pelo `setDisplayMediaRequestHandler`, e o checklist de segurança do Electron (`contextIsolation`, `sandbox`, sem `nodeIntegration`, CSP). **Confira:** a decisão 1 refeita no app passa.
+
+8. **ADR-007.** **Confira:** explica a vantagem de o servidor ditar os parâmetros.
+
+**Entregáveis:** compartilhamento ponta a ponta, testes de concorrência e de ciclo de vida, ADR-007.
+
+**Definição de pronto:** os "Confira" dos passos 1 a 4 e 6 rodam no CI; 4 pessoas compartilham ao mesmo tempo numa sessão de teste.
+
+**Aulas de apoio:** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/), [Hexagonal](../../../aulas/13-arquitetura/03-hexagonal/), [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/), [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/), [Escala e consistência](../../../aulas/15-system-design/05-escala-e-consistencia/).
+
+<Callout tipo="erro" titulo="Confiar no cliente para o limite de telas">
+Esconder o botão quando há 4 telas não é limite: qualquer pessoa com o token e o SDK do LiveKit tenta publicar. O limite está em três lugares que o cliente não controla: o token sem permissão de publicar, a permissão concedida só depois da reserva atômica e a reação ao webhook (RN-27).
+</Callout>
+
+</Marco>
+
+<Marco id="assistir" numero={5} titulo="Assistir: grade, destaque e áudio" horas={16}>
+
+**Objetivo:** ver a tela dos amigos com a melhor qualidade que a rede permite, sem configurar nada.
+
+**Passo a passo**
+
+1. **Grade.** RN-28 com `adaptiveStream` e `dynacast` ligados na sala. **Confira:** no painel de estatísticas, uma tela numa grade 2×2 recebe a camada de 720p.
+
+2. **Destaque e tela cheia.** RN-29. **Confira:** em destaque, a camada recebida vira a de 1080p em até 2 s; em tela cheia, também.
+
+3. **Áudio por tela.** RN-30. **Confira:** dois amigos compartilhando com áudio, e cada volume é ajustado sem afetar o outro.
+
+4. **Proteção contra eco.** RN-31. **Confira:** A compartilha a tela inteira com áudio enquanto B compartilha um jogo com som; o áudio que chega a C não tem o som do jogo de B repetido.
+
+5. **Painel de estatísticas.** RN-32. **Confira:** os números batem com os do `chrome://webrtc-internals`.
+
+6. **Reconexão.** RN-33. **Confira:** desligar o Wi-Fi de quem assiste por 15 s e religar: as telas voltam sozinhas.
+
+**Entregáveis:** grade, destaque, áudio, painel.
+
+**Definição de pronto:** os "Confira" dos passos 1 a 6 demonstrados num vídeo curto no README.
+
+**Aulas de apoio:** [HTTP na prática](../../../aulas/08-spring-boot/01-http-na-pratica/), [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/).
+
+<Callout tipo="erro" titulo="Assinar a camada alta de todas as telas">
+Forçar 1080p em todas as telas da grade multiplica a banda de quem assiste (4 × 8 = 32 Mbps) por algo que não aparece na tela: uma tela de 960×540 não mostra os detalhes de 1080p. Deixe o *adaptive stream* escolher pela área visível e force a camada alta só no destaque.
+</Callout>
+
+</Marco>
+
+<Marco id="qualidade" numero={6} titulo="Qualidade medida" horas={14}>
+
+**Objetivo:** provar com números que é "sem lag", e saber o que acontece quando a rede piora.
+
+**Passo a passo**
+
+1. **Coleta e envio.** RN-34 e RN-35 no cliente, incluindo o tempo até o primeiro quadro (`requestVideoFrameCallback`). **Confira:** depois de 2 minutos, a tabela tem janelas de quem compartilha e de quem assiste.
+
+2. **Backend.** `V3` com partições, RN-36, RN-38 e RN-39, e métricas no Micrometer. **Confira:** o resumo de uma transmissão de teste com janelas conhecidas sai certo.
+
+3. **Aviso e relatório no app.** RN-37 e a tela de relatório ao parar. **Confira:** limitar a banda de quem compartilha (por exemplo, com o limitador de banda do roteador ou uma ferramenta do sistema) dispara o aviso uma vez.
+
+4. **Painéis e SLOs.** Grafana com os painéis de qualidade e salas (versionados em `deploy/grafana/`), RNF-01 a RNF-05 em `docs/slo/`. **Confira:** os painéis mostram uma sessão real.
+
+5. **Latência pelo método do relógio.** `ferramentas/relogio/`: uma página com milissegundos e contador de quadros; compartilhe essa janela pela VPS de ensaio e assista na mesma máquina, lado a lado; 20 capturas. **Confira:** mediana e máximo no `docs/resultados.md`.
+
+6. **Rede degradada.** `ferramentas/rede-degradada/`: contêiner Linux com `--cap-add NET_ADMIN`, Google Chrome via Playwright (`channel: 'chrome'`, porque o Chromium do Playwright pode não decodificar H.264) entrando como espectador em destaque, e `tc qdisc add dev eth0 root netem loss 3% delay 40ms rate 5mbit`. **Confira:** a telemetria mostra a troca de camada em até 5 s e nenhum congelamento acima de 1 s depois disso (RNF-06).
+
+7. **Decisão 2: os SLOs fecham?** Para cada meta não atingida, registre a ação: ajustar os tetos de bitrate, mudar a meta com justificativa ou aceitar e explicar. **Confira:** nenhum SLO sem valor medido ou sem decisão.
+
+**Entregáveis:** telemetria, relatório, painéis, `docs/slo/`, `docs/resultados.md`.
+
+**Definição de pronto:** os SLOs têm valores medidos e uma decisão cada; o teste de rede degradada está documentado com gráfico.
+
+**Aulas de apoio:** [Observabilidade](../../../aulas/14-devops/05-observabilidade/), [SLI, SLO, RED e alertas](../../../aulas/14-devops/05-observabilidade/#sli-slo-red-e-alertas), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/), [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/).
+
+<Callout tipo="erro" titulo="Medir só a média de fps">
+Uma média de 58 fps esconde dez segundos travados num minuto bom. A unidade é a janela de 10 s, a meta é um percentual de janelas saudáveis, e os congelamentos são contados à parte: é isso que a pessoa percebe como "travou".
+</Callout>
+
+</Marco>
+
+<Marco id="controles" numero={7} titulo="Controles do anfitrião e proteção" horas={10}>
+
+**Objetivo:** o anfitrião resolve qualquer situação chata sem ajuda, e a instância está protegida contra abuso.
+
+**Passo a passo**
+
+1. **Remover e encerrar.** RN-40, RN-41 e a sugestão de trocar o link e trancar. **Confira:** a pessoa removida não volta com a mesma sessão; com o link novo, nem com outra.
+
+2. **Trancar e trocar o link.** RN-06 e RN-07 na interface. **Confira:** o link antigo mostra "sala não encontrada" na hora.
+
+3. **Limites.** RN-43 com baldes no Redis. **Confira:** testes de cada limite com `Retry-After`.
+
+4. **Limpeza e privacidade.** RN-44, RN-45, RN-46, aviso na página da sala e `docs/privacidade.md`. **Confira:** um teste de log prova que nenhum cookie, token ou e-mail aparece em `INFO`.
+
+5. **Modelo de ameaças curto.** Uma tabela em `docs/` com as ameaças (varredura de códigos, sala invadida, uso da banda por estranhos, publicação sem permissão, CSRF, vazamento do segredo do LiveKit) e a regra ou teste que mitiga cada uma. **Confira:** cada linha aponta para uma RN e um teste.
+
+**Entregáveis:** controles, limites, privacidade, modelo de ameaças.
+
+**Definição de pronto:** os "Confira" dos passos 1 a 4 passam.
+
+**Aulas de apoio:** [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/), [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/), [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/).
+
+<Callout tipo="erro" titulo="Código de sala curto ou sequencial">
+Um código de 6 dígitos tem 1 milhão de combinações: um script varre isso em horas, mesmo com rate limit, usando vários IPs. Com 10 caracteres base62 de um gerador criptográfico, adivinhar é inviável, e o rate limit vira só uma segunda barreira.
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={8} titulo="No ar com os amigos e release" horas={18}>
+
+**Objetivo:** a Arquibancada no ar e sendo usada de verdade.
+
+**Passo a passo**
+
+1. **VPS e DNS.** VPS no tamanho medido no passo 4 (comece com 4 vCPUs e 8 GB), registros `app` e `rtc` (e `turn`, se precisar), firewall liberando só 22, 80 e 443 TCP, 7881 TCP, 7882 UDP e 3478 UDP. **Confira:** uma varredura de portas feita de fora mostra só essas.
+
+2. **Compose de produção.** PostgreSQL, Redis e duas instâncias da API (`api-1` na 8080 e `api-2` na 8081) presas em `127.0.0.1`; Caddy e LiveKit com rede do host. O Caddy serve o `web/` compilado e faz o proxy de `/api`, `/oauth2`, `/login` e `/webhooks` para as duas réplicas, com `health_uri /actuator/health/readiness`; `rtc.<domínio>` vai para a porta 7880. Segredos num `.env` com permissão `600`; redirecionamentos de produção cadastrados no Google e no GitHub. **Confira:** `https://app.<domínio>` abre com TLS válido e o login funciona.
+
+3. **LiveKit de produção.** `use_external_ip: true`, portas 7881 TCP e 7882 UDP, TURN/UDP na 3478 com o domínio `turn.<domínio>`, chaves novas e o webhook para `https://app.<domínio>/webhooks/livekit`. **Confira:** o amigo de fora entra e assiste.
+
+4. **Capacidade.** `lk load-test` na própria VPS simulando uma sala cheia (4 publicadores de vídeo e 10 assinantes) por 10 minutos; meça CPU e banda (RNF-07). **Confira:** o tamanho da VPS está justificado no `docs/resultados.md`.
+
+5. **Deploy sem derrubar ninguém.** Script que atualiza `api-1`, espera a prontidão e depois `api-2`. Como a mídia não passa pela API, quem está compartilhando nem percebe. **Confira:** um deploy durante uma sessão real não interrompe nenhuma tela.
+
+6. **Backup e restore.** `pg_dump -Fc` diário enviado para fora da VPS, 14 dias de retenção, e **um restore executado**. **Confira:** o runbook tem o tempo medido.
+
+7. **Runbooks.** LiveKit fora, Redis fora (as sessões caem: todos precisam entrar de novo), disco cheio, certificado expirando, restaurar backup. **Confira:** cada um com sintoma, diagnóstico e ação.
+
+8. **Uso real.** Pelo menos 3 sessões de jogo com amigos, com o relatório da RN-38 de cada uma e um problema encontrado e corrigido. **Confira:** três relatórios e uma melhoria registrados no `docs/resultados.md`.
+
+9. **Release.** Custo calculado, README final, vídeo de 2 minutos, post e a tag `v1.0.0` (no plano B, o instalador gerado pelo CI num runner Windows e publicado no GitHub Releases). **Confira:** a definição de pronto abaixo.
+
+**Entregáveis:** produção, runbooks, relatório de uso real, release.
+
+**Definição de pronto:** um amigo abre o link, entra e assiste em 1080p60 a outro amigo jogando; o restore foi executado; a tag `v1.0.0` existe.
+
+**Aulas de apoio:** [Docker e Compose](../../../aulas/14-devops/03-docker/), [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/).
+
+<Callout tipo="erro" titulo="Publicar a porta do banco no Compose de produção">
+`ports: ["5432:5432"]` publica o PostgreSQL em todas as interfaces, e o Docker abre a porta por fora do firewall do sistema. Use `127.0.0.1:5432:5432` (ou nenhuma porta) para tudo que não seja o Caddy e o LiveKit, e confira com uma varredura de fora.
+</Callout>
+
+</Marco>
+
+### Riscos conhecidos e o plano para cada um
+
+| Risco | Sinal de alerta | Plano |
+|---|---|---|
+| O navegador perde fps com o jogo em primeiro plano | Decisão 1 | Plano B: app Electron com a mesma interface (+14 h) |
+| Hardware de quem compartilha não sustenta 60 fps | Decisão 1 falha também em primeiro plano | Diagnóstico do marco 1; `720p60` como padrão |
+| A mídia não atravessa a rede de alguém | Ensaio do marco 1 | TURN/UDP; depois TURN/TLS na 443 |
+| Jogo em tela cheia exclusiva aparece preto | Teste com o jogo | Orientar "janela sem bordas" na tela de compartilhar |
+| Mudança de API no LiveKit ou no Chrome | Comportamento diferente da spec | Versões fixas; atualizar uma por vez com o CI verde |
+| Custo de banda acima do orçamento | Painel do provedor | Limitar telas por sala, `720p60` como `perfilMaximo` |
+
+## Estratégia de testes
+
+| Nível | O que cobre | Ferramentas |
+|---|---|---|
+| Unidade | Encaixe de resolução, escolha do perfil `AUTO`, apelidos repetidos, máquina de estados do compartilhamento, regra do `sid`, janela saudável | JUnit 6, AssertJ, testes parametrizados, `Clock` fixo |
+| Fatia | Autorização por papel e dono, CSRF, Problem Details, assinatura do webhook | `@WebMvcTest` com segurança |
+| Integração | Scripts Lua de vaga e de tela, sessões no Redis, LiveKit em modo de desenvolvimento com webhooks reais | Testcontainers 2, Awaitility |
+| Mídia e rede | RNF-01 a RNF-07 | Prova de vida, método do relógio, Chrome com `tc netem`, `lk load-test` |
+
+**Cenários obrigatórios** (com a regra no nome, como `deveLiberarTelaQuandoReservaExpira_RN25`): as entradas simultâneas na última vaga; os pedidos simultâneos de tela; a reserva expirada; o webhook duplicado, fora de ordem e com assinatura inválida; a publicação sem reserva; a escrita sem CSRF; a sala de outro anfitrião; o link antigo depois da troca.
+
+## Entregáveis do portfólio
+
+**README** (os primeiros 30 segundos decidem):
+
+```markdown
+# Arquibancada — compartilhe a tela do jogo em 1080p60 com um link
+
+Abra o link, digite um apelido, clique em Compartilhar: seus amigos veem seu jogo em 1080p a 60 fps.
+Backend Java (Spring Boot 4) controla salas, vagas e permissões num servidor de mídia WebRTC (LiveKit).
+
+[Demonstração de 2 min](link) · ![CI](badge)
+
+![GIF: 4 telas na grade e uma em destaque com o painel a 60 fps](docs/img/grade.gif)
+
+## Resultados medidos
+| Meta | Alvo | Medido |
+|---|---|---|
+| Janelas a ≥ 55 fps (quem compartilha) | ≥ 99% | 99,6% (3 sessões reais, 5 h) |
+| Latência ponta a ponta | mediana ≤ 250 ms | 170 ms (máx. 290 ms) |
+| Sala cheia (10 pessoas, 4 telas) | sem congelar | ... |
+
+## Arquitetura · Decisões (ADRs) · Qualidade e testes · Produção e custo · Próximos passos
+```
+
+**Custo** (`docs/custo/`), com os preços consultados e a data:
+
+| Componente | Como estimar | Exemplo |
+|---|---|---|
+| Tráfego de saída por sala cheia | pessoas × banda recebida × horas | ~108 Mbps ≈ **49 GB por hora** no pior caso |
+| Uso do grupo por mês | horas por dia × dias × tráfego por hora × ocupação média | 2 h/dia × 30 × 49 GB × 50% ≈ **1,5 TB por mês** |
+| VPS | vCPU e memória medidas no `lk load-test` com folga de 50% | do passo 4 do marco 8 |
+
+**Vídeo de até 2 minutos:** o link abrindo em três máquinas; quatro pessoas compartilhando; um clique no destaque com o painel a 60 fps; a banda de quem assiste sendo limitada ao vivo e a imagem continuando fluida; o relatório ao parar.
+
+**Post para o LinkedIn:** o problema em uma frase, o GIF, três decisões com o trade-off (SFU com simulcast em vez de P2P, permissão de tela concedida pelo backend, login BFF) e o link do repositório.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível | Acima do nível |
+|---|---|---|---|
+| Arquitetura de mídia | P2P ou escolha sem números | SFU com simulcast e a conta de banda no ADR | Capacidade medida com `lk load-test` e comparada com a conta |
+| Concorrência | Contagem com `SELECT` | Scripts atômicos, índice único como segunda barreira, testes de corrida | Explica o que acontece se o Redis reiniciar no meio |
+| Integração com o LiveKit | Estado vindo do cliente | Webhooks assinados e idempotentes, regra do `sid`, reconciliação | Métrica de divergência perto de zero em uso real |
+| Segurança | Tokens no navegador ou CSRF desligado | BFF, CSRF, códigos fortes, `canPublish = false` na entrada, matriz testada | Modelo de ameaças com cada mitigação ligada a um teste |
+| Qualidade | "Ficou liso" | SLOs medidos, relatório ao parar, teste de rede degradada | Ajuste dos tetos de bitrate justificado pela telemetria |
+| Experiência | Configurações expostas ao usuário | Link → apelido → compartilhar em até 3 cliques, perfil automático | Aviso de banda e de CPU útil, testado com amigos |
+| Operação | Só roda local | VPS com TLS, deploy sem interromper telas, backup restaurado | Custo por hora de sala medido em uso real |
+
+## Como apresentar na entrevista
+
+**Pitch (60 s):** "A Arquibancada é uma ferramenta para amigos assistirem uns aos outros jogando: abre o link, digita um apelido, clica em compartilhar, e a tela chega em 1080p a 60 fps. Até 4 pessoas compartilham ao mesmo tempo. O vídeo vai para um SFU, o LiveKit, que manda a cada pessoa a camada que cabe na tela e na rede dela. Por isso quem compartilha sobe 11,6 Mbps não importa quantos assistem. O backend em Java decide quem entra e quem pode publicar: o token de entrada não permite publicar nada, e a permissão de tela só é concedida depois de uma reserva atômica no Redis. O estado vem dos webhooks do LiveKit, tratados como duplicados e fora de ordem, com reconciliação. Medi 99% do tempo acima de 55 fps em sessões reais."
+
+**Perguntas prováveis**
+
+1. **Por que um SFU e não P2P?** A conta de upload com 9 espectadores; simulcast e *adaptive stream*.
+2. **Como garante no máximo 4 telas?** Script Lua, índice único, permissão concedida depois, reação ao webhook.
+3. **E se dois clicarem em Entrar ao mesmo tempo na última vaga?** Atomicidade no Redis, o teste de corrida.
+4. **Webhooks podem chegar duplicados ou fora de ordem?** Idempotência pelo `id`, regra do `sid`, reconciliação.
+5. **Por que login BFF e não token no navegador?** XSS, cookie `HttpOnly`, o custo é o CSRF.
+6. **Como convidados sem conta são seguros?** Código de 10 caracteres, trancar, remover, trocar o link, rate limit, e o que continua sendo fraco.
+7. **Como você sabe que é 60 fps?** `getStats()`, janelas de 10 s, SLO, congelamentos; captura × envio × recepção.
+8. **O que acontece quando a internet de alguém piora?** Estimativa de banda, troca de camada, `maintain-framerate`; o teste de rede degradada.
+9. **Navegador ou app, como decidiu?** A decisão 1 com o jogo em primeiro plano e os números.
+10. **Quanto custa?** A banda de saída do SFU domina; a conta por hora de sala.
+
+## Para ir além
+
+- O [Resenha](../../senior/03-resenha/): contas para todos, comunidades, voz, chat, gateway WebSocket próprio e app desktop.
+- Perfil `1440p60` e AV1 com codec de reserva para quem não decodifica.
+- Um experimento com Media over QUIC: a mesma tela enviada por WebTransport e WebCodecs a um relay MoQ, comparando latência, fluidez e esforço com a versão WebRTC num ADR.
+- Clipes dos últimos 30 segundos com o LiveKit Egress, com consentimento de quem compartilha.
+- Criptografia ponta a ponta da mídia (E2EE do LiveKit), com a chave no fragmento do link (`#chave`), que nunca chega ao servidor.
+- Assistir pelo celular com uma interface própria para tela pequena.
+- Controle de quem pode compartilhar (só o anfitrião, ou por aprovação).
+
+## O que estudar além da trilha
+
+**WebRTC para quem é de backend.** ICE, STUN e TURN, SDP, DTLS-SRTP, RTP e RTCP, estimativa de banda, simulcast. Referências: [WebRTC for the Curious](https://webrtcforthecurious.com/) (livro gratuito); [High Performance Browser Networking, capítulo de WebRTC](https://hpbn.co/webrtc/).
+
+**Captura de tela e estatísticas no navegador.** `getDisplayMedia` e suas opções, e o significado de cada campo do `getStats()`. Referências: [Screen Capture (W3C)](https://www.w3.org/TR/screen-capture/); [Identifiers for WebRTC's Statistics API (W3C)](https://www.w3.org/TR/webrtc-stats/); [controles de compartilhamento de tela no Chrome](https://developer.chrome.com/docs/web-platform/screen-sharing-controls).
+
+**LiveKit.** Tokens e permissões, webhooks, *adaptive stream*, dynacast e portas. Referências: [documentação do LiveKit](https://docs.livekit.io/); [SDK de servidor para Java/Kotlin](https://github.com/livekit/server-sdk-kotlin).
+
+**OAuth em aplicações web.** Por que o padrão BFF é o recomendado para apps no navegador. Referência: [OAuth 2.0 for Browser-Based Applications (IETF)](https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/).
+
+**React e TypeScript, o mínimo.** Componentes, estado e efeitos, para a interface da sala. Referências: [documentação do React](https://react.dev/learn); [TypeScript Handbook](https://www.typescriptlang.org/docs/handbook/intro.html).

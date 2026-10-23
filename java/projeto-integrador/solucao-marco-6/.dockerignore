@@ -1,0 +1,12 @@
+# Só o jar interessa ao build da imagem.
+.git
+.idea
+.vscode
+*.iml
+.env
+*.log
+src/
+target/classes/
+target/test-classes/
+target/surefire-reports/
+target/site/

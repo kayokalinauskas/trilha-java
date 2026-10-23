@@ -1,0 +1,245 @@
+---
+titulo: "Git no time: branches curtas, pull requests e versões"
+descricao: Como um time usa Git no dia a dia — trunk-based × Git Flow, branches de vida curta, pull request e code review, Conventional Commits, rebase × merge, conflitos, tags com SemVer e o que não entra no repositório.
+modulo: 14-devops
+ordem: 1
+duracao: 50
+objetivos:
+  - Comparar trunk-based development e Git Flow e saber qual cada time usa e por quê
+  - Abrir pull requests pequenos, com mensagens no padrão Conventional Commits
+  - Escolher entre rebase e merge e resolver um conflito sem perder trabalho
+  - Versionar entregas com tags e SemVer e manter o repositório limpo com .gitignore
+tags: [git, trunk-based, git flow, pull request, code review, conventional commits, rebase, semver]
+flashcards:
+  - frente: O que é trunk-based development?
+    verso: Todo mundo integra na branch principal (main) com frequência, no mínimo uma vez por dia, usando branches de vida curta (horas ou poucos dias). Funcionalidades incompletas ficam escondidas por feature flags. É o modelo que combina com CI/CD.
+  - frente: Quando o Git Flow ainda faz sentido?
+    verso: Quando o produto tem várias versões em uso ao mesmo tempo e releases planejadas (um aplicativo instalado, uma biblioteca, um software on-premise). Para um serviço web com deploy contínuo, as branches develop e release só atrasam a integração.
+  - frente: Rebase × merge
+    verso: Merge preserva a história como aconteceu e cria um commit de merge. Rebase reescreve os seus commits em cima da ponta da outra branch, deixando a história linear. Regra de ouro - não faça rebase de commits que outras pessoas já baixaram.
+  - frente: Por que usar --force-with-lease e não --force?
+    verso: O --force-with-lease só sobrescreve a branch remota se ela ainda estiver no ponto que você conhece. Se alguém empurrou algo depois, o push é recusado em vez de apagar o trabalho da outra pessoa.
+  - frente: Como o Conventional Commits se liga ao SemVer?
+    verso: fix vira versão PATCH (1.4.1), feat vira MINOR (1.5.0), e uma mudança incompatível (feat! ou o rodapé BREAKING CHANGE) vira MAJOR (2.0.0). Ferramentas geram o changelog e a próxima versão a partir das mensagens.
+  - frente: O que nunca deve ir para o repositório?
+    verso: Segredos (.env, chaves, senhas), artefatos gerados (target/, build/), arquivos de IDE e logs. Um segredo que foi commitado deve ser considerado vazado e trocado, mesmo que o commit seja apagado depois.
+---
+
+Até aqui, você usou Git sozinho: `add`, `commit`, `push`. Num time, o Git vira o **protocolo de colaboração**: é por ele que o código passa por revisão, pelo CI e chega à produção. Esta aula abre o módulo 14, que trata do caminho entre o seu `commit` e a aplicação rodando e sendo observada em produção.
+
+**Pré-requisitos:** os comandos básicos do Git (usados desde o módulo 0) e ter uma conta no GitHub.
+
+## Intuição: uma cozinha com vários cozinheiros
+
+Imagine cinco cozinheiros preparando o mesmo prato. Se cada um trabalha isolado por uma semana e só junta tudo no fim, a montagem vira um caos: um salgou, o outro também. Se juntam aos poucos, provando a cada etapa, os problemas aparecem pequenos. **Integrar cedo e com frequência** é a ideia central de tudo que vem a seguir.
+
+## Trunk-based × Git Flow
+
+<Figura legenda="Em cima, trunk-based: branches curtas que voltam para a main em horas. Embaixo, Git Flow: develop, release e hotfix convivendo com a main">
+<svg viewBox="0 0 680 300" width="680" role="img" aria-label="Comparação entre trunk-based development com branches curtas e Git Flow com branches develop, feature e release">
+  <defs><marker id="m1401" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="22" class="d-title">Trunk-based</text>
+  <path d="M20 70 H660" class="d-line" marker-end="url(#m1401)"/>
+  <text x="600" y="60" class="d-mono">main</text>
+  <circle cx="60" cy="70" r="7" class="d-accent"/><circle cx="180" cy="70" r="7" class="d-accent"/><circle cx="300" cy="70" r="7" class="d-accent"/><circle cx="420" cy="70" r="7" class="d-accent"/><circle cx="540" cy="70" r="7" class="d-accent"/>
+  <path d="M60 70 Q90 105 120 105 Q150 105 180 76" class="d-line"/><circle cx="120" cy="105" r="5" class="d-ok"/>
+  <path d="M300 70 Q330 105 360 105 Q390 105 420 76" class="d-line"/><circle cx="360" cy="105" r="5" class="d-ok"/>
+  <text x="10" y="140" class="d-label">branch curta (horas) → PR → main sempre pronta para deploy</text>
+  <text x="10" y="175" class="d-title">Git Flow</text>
+  <path d="M20 200 H660" class="d-line"/><text x="600" y="192" class="d-mono">main</text>
+  <path d="M20 240 H660" class="d-line"/><text x="590" y="232" class="d-mono">develop</text>
+  <path d="M80 240 Q110 280 160 280 H300 Q340 280 360 246" class="d-line"/><text x="170" y="272" class="d-mono">feature/…</text>
+  <path d="M420 240 Q440 220 470 220 Q500 220 520 204" class="d-line"/><text x="425" y="214" class="d-mono">release</text>
+  <circle cx="520" cy="200" r="7" class="d-accent"/><text x="535" y="185" class="d-label">tag v2.0.0</text>
+  <text x="10" y="296" class="d-label">branches longas, integração tardia, releases planejadas</text>
+</svg>
+</Figura>
+
+| | Trunk-based | Git Flow |
+|---|---|---|
+| Branches | só `main` + branches de horas ou poucos dias | `main`, `develop`, `feature/*`, `release/*`, `hotfix/*` |
+| Integração | contínua, pelo menos diária | ao fim de cada funcionalidade e de cada release |
+| Código incompleto | escondido atrás de **feature flag** | fica na branch até terminar |
+| Combina com | serviços web com deploy contínuo | produtos com várias versões em uso (apps, bibliotecas, on-premise) |
+
+A maioria dos times de backend que faz deploy várias vezes por semana usa **trunk-based** ou uma variação leve dele (o *GitHub Flow*: branch curta → PR → main → deploy). O Git Flow, criado em 2010, ainda aparece em empresas com ciclos de release longos. Saiba explicar os dois; o próprio autor do Git Flow passou a recomendar algo mais simples para aplicações entregues continuamente.
+
+## O ciclo de uma mudança
+
+```bash
+git switch main
+git pull --rebase                            # traz a main atualizada
+git switch -c feat/limite-pix-noturno        # branch curta, nome descritivo
+
+# ... código e testes ...
+git add src/main/java/.../LimitePix.java src/test/java/.../LimitePixTest.java
+git commit -m "feat(pix): limite de R$ 1.000 entre 20h e 6h"
+
+git push -u origin feat/limite-pix-noturno   # e abra o pull request
+```
+
+Adicione os arquivos pelo caminho, não com `git add -A` ou `git add .`: é assim que um `.env` ou um dump de banco não entram por acidente.
+
+### Pull request e code review
+
+Um bom PR é **pequeno** (até algumas centenas de linhas), faz **uma coisa** e explica o **porquê**. Um roteiro de descrição:
+
+```markdown
+## O que muda
+Limite de R$ 1.000 para PIX entre 20h e 6h (regra do Banco Central).
+
+## Como testar
+LimitePixTest cobre as bordas (19:59, 20:00, 05:59, 06:00).
+
+## Riscos
+Clientes com limite noturno personalizado: tratados em outra issue (#312).
+```
+
+Ao **revisar**, priorize: a mudança está correta? Tem teste que falharia sem ela? Há risco de segurança, de performance ou de dado pessoal no log? Estilo e formatação são trabalho do formatador e do linter no CI, não de comentário humano. Ao **receber** revisão, responda cada comentário (aceitando ou explicando) e não leve para o lado pessoal.
+
+## Conventional Commits
+
+Um padrão de mensagem que máquinas e pessoas conseguem ler:
+
+```text
+<tipo>(<escopo opcional>): <descrição no imperativo>
+
+feat(pix): limite de R$ 1.000 entre 20h e 6h
+fix(extrato): ordena lançamentos do mesmo segundo pelo id
+refactor(conta): extrai Saldo para um record
+test(pix): cobre o horário de verão
+docs: explica como rodar o compose
+ci: roda os testes de integração no pull request
+feat(api)!: remove o campo "saldoDisponivel" da resposta
+```
+
+Os tipos `feat` e `fix` são do padrão; `docs`, `refactor`, `test`, `ci`, `chore` e outros são convenções comuns. O `!` (ou um rodapé `BREAKING CHANGE:`) marca uma mudança **incompatível**. Com isso, ferramentas geram o changelog e decidem a próxima versão sozinhas.
+
+## Rebase × merge
+
+A `main` andou enquanto você trabalhava. Duas formas de trazer as novidades:
+
+```bash
+git fetch origin
+git merge origin/main     # cria um commit de merge; a história mostra a bifurcação
+# ou
+git rebase origin/main    # reaplica os SEUS commits em cima da main; história linear
+git push --force-with-lease
+```
+
+- **Merge** é seguro e preserva a história real, mas enche o log de "Merge branch 'main' into…".
+- **Rebase** deixa a história linear e fácil de ler, mas **reescreve** os commits (novos hashes). A regra de ouro: **não faça rebase de commits que outras pessoas já baixaram**. Na sua branch de PR, que só você usa, tudo bem.
+- Depois de um rebase, o push precisa ser forçado. Use `--force-with-lease`, que recusa o push se alguém tiver empurrado algo que você não viu.
+
+No GitHub, o botão do PR oferece três opções: *merge commit*, *squash and merge* (todos os commits do PR viram um só na main, com a mensagem do título) e *rebase and merge*. Muitos times usam **squash**: a main fica com um commit por PR, e o título do PR segue o Conventional Commits.
+
+### Resolvendo um conflito
+
+```text
+<<<<<<< HEAD
+    private static final BigDecimal LIMITE = new BigDecimal("1000.00");
+=======
+    private static final BigDecimal LIMITE_NOTURNO = new BigDecimal("1000.00");
+>>>>>>> feat/limite-pix-noturno
+```
+
+1. Entenda **as duas intenções** antes de apagar qualquer lado. Muitas vezes o certo é combinar os dois.
+2. Edite, remova os marcadores, **compile e rode os testes**.
+3. `git add` no arquivo e `git rebase --continue` (ou `git commit`, num merge). Se ficou confuso, `git rebase --abort` volta tudo ao estado anterior.
+
+Conflitos grandes são sintoma de branch longa demais. A cura é integrar mais cedo, não ficar melhor em resolver conflitos.
+
+## Tags e SemVer
+
+Uma **tag** marca um commit como uma versão. O **Semantic Versioning** dá significado aos números `MAJOR.MINOR.PATCH`:
+
+| Mudou | Incrementa | Exemplo |
+|---|---|---|
+| correção compatível | PATCH | 1.4.0 → 1.4.1 |
+| funcionalidade compatível | MINOR | 1.4.1 → 1.5.0 |
+| quebra de compatibilidade | MAJOR | 1.5.0 → 2.0.0 |
+
+```bash
+git tag -a v1.5.0 -m "limite noturno do PIX"   # tag anotada: tem autor, data e mensagem
+git push origin v1.5.0                         # tags não vão no push comum
+```
+
+Pré-versões levam sufixo (`2.0.0-rc.1`), e a série `0.y.z` indica desenvolvimento inicial, em que qualquer coisa pode mudar. Em serviços internos, o número importa menos do que em bibliotecas (quem usa uma lib confia no MAJOR para saber se pode atualizar), mas a tag continua útil para saber **o que está em produção**.
+
+## O que fica fora: .gitignore
+
+```text
+# artefatos gerados
+target/
+build/
+.gradle/
+# IDE
+.idea/
+*.iml
+.vscode/
+# segredos e ambiente local
+.env
+*.log
+```
+
+<Callout tipo="atencao" titulo="Segredo commitado é segredo vazado">
+Apagar o arquivo num commit seguinte não resolve: ele continua no histórico, em cada clone e, se o repositório for público, em robôs que varrem o GitHub em busca de chaves. Troque a credencial imediatamente e só depois limpe o histórico. O GitHub oferece *secret scanning* e *push protection* para barrar alguns tipos de segredo no push.
+</Callout>
+
+## Armadilhas comuns
+
+- **Branch de duas semanas**: conflitos enormes e revisão impossível. Quebre em PRs menores, com feature flag se preciso.
+- **`git push --force` na main** ou numa branch compartilhada: apaga o trabalho dos outros. Proteja a main no GitHub (aula 4) e use `--force-with-lease` só na sua branch.
+- **Mensagens como "ajustes" ou "wip"**: a história vira inútil para quem investiga um bug meses depois.
+- **Commitar o `target/`**: repositório inchado e conflitos em arquivos gerados.
+- **Revisão de PR com 2.000 linhas**: ninguém revisa de verdade; o "LGTM" vira carimbo.
+
+<Callout tipo="entrevista">
+Perguntas frequentes: "qual a diferença entre rebase e merge?", "como você resolve um conflito?", "o que é trunk-based?". Uma resposta madura cita o **trade-off** (rebase dá história linear, mas reescreve commits; nunca em branch compartilhada) e o **contexto** (trunk-based com feature flags para deploy contínuo; Git Flow para produtos com releases). Contar como você revisa um PR (correção, testes, segurança antes de estilo) mostra maturidade de time.
+</Callout>
+
+<Quiz
+  id="14-git-no-time"
+  questoes={[
+    {
+      pergunta: 'Seu time faz deploy várias vezes por dia. Qual modelo de branches combina melhor?',
+      opcoes: ['Git Flow com develop e release', 'Trunk-based, com branches curtas e feature flags', 'Uma branch por desenvolvedor, integrada no fim do mês', 'Commits direto na main sem revisão'],
+      correta: 1,
+      explicacao: 'Integração contínua exige branches curtas. Código incompleto fica escondido por feature flag, não numa branch longa.',
+    },
+    {
+      pergunta: 'Você fez rebase da sua branch de PR e o push foi recusado. O que fazer?',
+      opcoes: ['git push --force na main', 'git push --force-with-lease na sua branch', 'Apagar a branch remota e criar outra com outro nome', 'Fazer merge da main de novo'],
+      correta: 1,
+      explicacao: 'O rebase reescreveu os commits, então o push precisa ser forçado. O --force-with-lease protege contra apagar algo que outra pessoa empurrou.',
+    },
+    {
+      pergunta: 'A versão atual é 1.4.2. O próximo release tem um fix e um feat!, que remove um campo da API. Qual a nova versão?',
+      opcoes: ['1.4.3', '1.5.0', '2.0.0', '1.5.3'],
+      correta: 2,
+      explicacao: 'Uma mudança incompatível (o ! ou BREAKING CHANGE) incrementa o MAJOR e zera os demais.',
+    },
+    {
+      pergunta: 'Alguém commitou o .env com a senha do banco e, no commit seguinte, apagou o arquivo. O que fazer?',
+      opcoes: ['Nada, o arquivo já foi apagado', 'Trocar a senha imediatamente, pois ela está no histórico', 'Fazer um revert do commit', 'Tornar o repositório privado e seguir'],
+      correta: 1,
+      explicacao: 'O histórico guarda o arquivo em todos os clones. A credencial deve ser tratada como vazada e trocada.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Trunk-based** (branches curtas + feature flags) é o padrão para deploy contínuo; **Git Flow** serve a produtos com releases e várias versões em uso.
+- PRs **pequenos**, com o porquê na descrição; revisão foca em correção, testes e segurança.
+- **Conventional Commits** (`feat`, `fix`, `!`) alimentam changelog e versão.
+- **Rebase** para história linear só na sua branch; **merge** preserva a história; `--force-with-lease`, nunca `--force` em branch compartilhada.
+- **Tags anotadas** + **SemVer** (`MAJOR.MINOR.PATCH`); `.gitignore` para artefatos, IDE e segredos.
+
+## Referências
+
+- Pro Git, 2ª edição — capítulos *Git Branching* e *Rebasing* (git-scm.com/book)
+- Documentação do GitHub — *About pull requests*, *About merge methods on GitHub* e *About protected branches* (docs.github.com)
+- Conventional Commits 1.0.0 (conventionalcommits.org)
+- Semantic Versioning 2.0.0 (semver.org)
+- Paul Hammant — *Trunk Based Development* (trunkbaseddevelopment.com)

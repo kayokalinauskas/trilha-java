@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.astro/
+java/**/target/
+.idea/
+*.iml
+.DS_Store
+
+# worktrees temporárias dos agentes do Claude Code
+.claude/worktrees/

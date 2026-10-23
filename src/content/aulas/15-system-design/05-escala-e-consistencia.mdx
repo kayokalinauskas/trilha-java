@@ -1,0 +1,231 @@
+---
+titulo: "Escala e consistência: réplicas, partições, CAP e sagas"
+descricao: Escala vertical × horizontal, serviços sem estado, replicação líder-seguidor e o atraso de leitura, particionamento por faixa e por hash, hot keys, hashing consistente com nós virtuais, CAP sem mitos e PACELC, consistência forte e eventual, idempotência e sagas com compensação — incluindo o caso em que o timeout não é falha.
+modulo: 15-system-design
+ordem: 5
+duracao: 65
+objetivos:
+  - Explicar replicação líder-seguidor, o atraso de leitura e como garantir read-your-writes
+  - Comparar particionamento por faixa e por hash e explicar por que o hashing consistente minimiza a redistribuição
+  - Enunciar o teorema CAP corretamente e complementá-lo com o PACELC
+  - Desenhar uma saga com compensações que trata o timeout como incerteza, não como falha
+tags: [escalabilidade, replicação, sharding, hashing consistente, CAP, PACELC, consistência eventual, saga, idempotência]
+flashcards:
+  - frente: O que é read-your-writes e como garantir?
+    verso: A garantia de que você vê o que acabou de gravar. Com réplicas assíncronas, a leitura numa réplica atrasada pode não mostrar. Solução - ler do líder os dados do próprio usuário (ou por alguns segundos após uma escrita), ou esperar a réplica alcançar a posição da escrita.
+  - frente: Por que hash(chave) mod N é ruim para distribuir chaves entre nós?
+    verso: Ao mudar N, quase todas as chaves mudam de nó (de 4 para 5 nós, cerca de 80%). Com hashing consistente, só as chaves do trecho do anel que o novo nó assume se movem (cerca de 1 em N).
+  - frente: Para que servem os nós virtuais no hashing consistente?
+    verso: Cada nó físico aparece em muitos pontos do anel. A carga fica mais uniforme e, quando um nó sai, as chaves dele se espalham entre vários nós, em vez de caírem todas no vizinho.
+  - frente: O que o teorema CAP realmente diz?
+    verso: Num sistema distribuído, durante uma partição de rede, você precisa escolher entre consistência (linearizável) e disponibilidade (todo nó responde). Sem partição, não há escolha forçada. "Escolha 2 de 3" é uma simplificação enganosa.
+  - frente: O que o PACELC acrescenta ao CAP?
+    verso: Se há Partição, escolha entre A e C; senão (Else), escolha entre Latência e Consistência. Mesmo sem falhas, replicar de forma síncrona custa latência.
+  - frente: Numa saga, o passo remoto deu timeout. Compensar?
+    verso: Não de imediato. Timeout é incerteza - o passo pode ter sido executado. Consulte o estado pelo id idempotente; se não houver resposta, repita com o mesmo id. Compense só diante de uma falha confirmada.
+---
+
+A Fintech Core cresceu. Uma instância da aplicação e um PostgreSQL não dão mais conta, e alguém propõe "vamos escalar". Escalar é fácil de dizer e cheio de consequências: copiar dados cria atrasos, dividir dados cria consultas que atravessam partes, e dividir **serviços** cria operações que não cabem numa transação.
+
+Esta aula reúne as ideias que aparecem em toda discussão de sistemas distribuídos, na ordem em que os problemas surgem.
+
+## Vertical × horizontal, e serviços sem estado
+
+- **Escala vertical**: uma máquina maior. Simples, sem mudança de código, e com teto (e preço) crescente. Para bancos relacionais, costuma ser o primeiro passo, e vai mais longe do que muita gente imagina.
+- **Escala horizontal**: mais máquinas. Sem teto teórico, mas exige que o trabalho possa ser dividido.
+
+Para a aplicação, escalar horizontalmente é fácil **se ela não tiver estado**: nenhuma sessão em memória, nenhum arquivo em disco local, nenhum contador num campo estático. O estado vai para o banco, o Redis ou o armazenamento de objetos, e o balanceador pode mandar qualquer requisição para qualquer instância. O difícil é escalar **os dados**.
+
+## Replicação líder-seguidor
+
+O líder recebe as escritas e as envia para os seguidores (réplicas), que atendem leituras. Em geral, a replicação é **assíncrona**: o líder confirma a escrita sem esperar as réplicas.
+
+O efeito colateral é o **atraso de replicação** (*replication lag*): normalmente milissegundos, às vezes segundos sob carga. O usuário faz um PIX, a tela recarrega o extrato numa réplica atrasada, e o PIX não aparece. Ele tenta de novo.
+
+Garantias que você pode oferecer:
+
+- **Read-your-writes**: o usuário sempre vê o que ele mesmo gravou. Leia do líder os dados do próprio usuário, ou por alguns segundos após uma escrita dele, ou espere a réplica alcançar a posição da escrita.
+- **Leituras monotônicas**: o usuário não "volta no tempo" entre duas leituras. Fixe cada usuário numa réplica.
+
+Replicação **síncrona** elimina o atraso, e cobra em latência e disponibilidade: se a réplica síncrona cair, as escritas param (ou o sistema desiste da garantia).
+
+## Particionamento (sharding)
+
+Quando os dados ou as escritas não cabem num nó, eles são divididos em partições, cada uma num nó.
+
+| | Por faixa | Por hash |
+|---|---|---|
+| Como | intervalos da chave (A a F, G a M...; ou por data) | `hash(chave)` decide a partição |
+| Consulta por intervalo | eficiente: uma ou poucas partições | espalhada por todas |
+| Distribuição | pode desequilibrar (datas recentes recebem todas as escritas) | uniforme, se a chave variar |
+| Exemplo | extrato particionado por mês | contas distribuídas por id |
+
+Os problemas que o particionamento traz:
+
+- **Hot keys.** Uma chave muito acessada (a conta de um grande varejista, o perfil de uma celebridade) sobrecarrega uma partição, por melhor que seja o hash. Defesas: cache para leituras, e dividir a chave em subchaves (`conta-42#0` a `conta-42#9`) para escritas, somando na leitura.
+- **Consultas entre partições.** "Todas as transações acima de R$ 10 mil hoje" consulta todas as partições e junta o resultado. Escolha a chave de partição pelo acesso **mais frequente**.
+- **Transações entre partições**: caras ou inexistentes. Daí as sagas, no fim da aula.
+
+## Hashing consistente
+
+Com `hash(chave) mod N`, mudar N muda o destino de quase todas as chaves: de 4 para 5 nós, uma chave só fica onde estava se o resto da divisão por 4 e por 5 coincidir, o que acontece em cerca de 1 a cada 5 casos. Uns **80%** das chaves mudam de nó: num cache, é o mesmo que esvaziá-lo.
+
+O **hashing consistente** coloca nós e chaves no mesmo anel de valores de hash. Cada chave pertence ao **primeiro nó no sentido horário**:
+
+<Figura legenda="Um anel de hash com nós virtuais. Um nó novo assume só o trecho entre ele e o nó anterior">
+<svg viewBox="0 0 680 300" width="680" role="img" aria-label="Anel de hash com pontos dos nós A, B e C repetidos como nós virtuais; chaves apontam para o próximo nó no sentido horário; um novo nó D assume apenas um trecho">
+  <defs><marker id="m1505" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <circle cx="170" cy="150" r="110" class="d-box"/>
+  <circle cx="170" cy="40" r="14" class="d-ok"/><text x="170" y="45" text-anchor="middle" class="d-mono">A</text>
+  <circle cx="265" cy="95" r="14" class="d-info"/><text x="265" y="100" text-anchor="middle" class="d-mono">B</text>
+  <circle cx="265" cy="205" r="14" class="d-violet"/><text x="265" y="210" text-anchor="middle" class="d-mono">C</text>
+  <circle cx="170" cy="260" r="14" class="d-ok"/><text x="170" y="265" text-anchor="middle" class="d-mono">A</text>
+  <circle cx="75" cy="205" r="14" class="d-info"/><text x="75" y="210" text-anchor="middle" class="d-mono">B</text>
+  <circle cx="75" cy="95" r="14" class="d-violet"/><text x="75" y="100" text-anchor="middle" class="d-mono">C</text>
+  <circle cx="226" cy="55" r="6" class="d-accent"/><text x="238" y="48" class="d-label">k1</text>
+  <path d="M232 60 L252 82" class="d-line" marker-end="url(#m1505)"/>
+  <circle cx="110" cy="50" r="14" class="d-accent"/><text x="110" y="55" text-anchor="middle" class="d-mono">D</text>
+  <text x="320" y="50" class="d-label">Cada nó físico (A, B, C) aparece em</text>
+  <text x="320" y="68" class="d-label">vários pontos: são os nós virtuais.</text>
+  <text x="320" y="102" class="d-label">k1 pertence ao primeiro nó no</text>
+  <text x="320" y="120" class="d-label">sentido horário (B).</text>
+  <text x="320" y="154" class="d-label">D entra no anel: assume só as chaves</text>
+  <text x="320" y="172" class="d-label">entre C e D, que antes eram de A.</text>
+  <text x="320" y="190" class="d-label">O resto não se move.</text>
+  <text x="320" y="224" class="d-label">Com N nós, entrar ou sair move cerca</text>
+  <text x="320" y="242" class="d-label">de 1/N das chaves, e não quase todas,</text>
+  <text x="320" y="260" class="d-label">como no mod N.</text>
+</svg>
+</Figura>
+
+- **Entrar um nó** move apenas as chaves do trecho que ele assume, cerca de 1/N do total.
+- **Sair um nó** passa as chaves dele para o próximo no anel.
+- **Nós virtuais**: com um ponto só por nó, os trechos têm tamanhos muito diferentes, e o nó que sai joga toda a carga num único vizinho. Com dezenas ou centenas de pontos por nó físico, a carga fica uniforme e se espalha. Nós mais potentes podem receber mais pontos.
+
+O exercício 15.03 implementa o anel com nós virtuais (um `TreeMap` e seu `ceilingEntry` resolvem a busca no sentido horário) e mede quantas chaves se movem ao adicionar um nó.
+
+## CAP sem mitos, e PACELC
+
+O **teorema CAP** (conjectura de Eric Brewer, provada por Gilbert e Lynch em 2002) diz: num sistema distribuído sujeito a **partições de rede**, durante uma partição, não dá para ter ao mesmo tempo:
+
+- **C**onsistência, no sentido de **linearizabilidade**: toda leitura vê a escrita mais recente, como se houvesse uma cópia só;
+- **A** (disponibilidade): todo nó que está funcionando responde, sem erro.
+
+Os mitos a evitar:
+
+- **"Escolha 2 de 3."** Partições não são opcionais: a rede falha. A escolha real é entre C e A **durante** uma partição.
+- **"Sistema CA."** Um sistema distribuído não pode prometer que não haverá partição.
+- **CAP descreve o sistema todo, o tempo todo.** Não: fala só do comportamento durante a partição, e só de uma definição estrita de C e de A. Muitos sistemas reais não são nem C nem A nesse sentido, e fazem escolhas diferentes por operação.
+
+O **PACELC** (Daniel Abadi) completa: se há **P**artição, escolha entre **A** e **C**; senão (**E**lse), escolha entre **L**atência e **C**onsistência. É o lado que você sente todo dia: replicar de forma síncrona para ter consistência custa latência em **toda** escrita, mesmo sem falha nenhuma. Bancos no estilo do Dynamo, como o Cassandra na configuração padrão, costumam ser citados como PA/EL; um banco relacional com réplica síncrona fica do lado PC/EC.
+
+## Consistência forte, eventual, e idempotência
+
+- **Forte**: depois da confirmação, todos veem o novo valor. Necessária para o **saldo** e para "não vender o mesmo assento duas vezes".
+- **Eventual**: as cópias convergem, em algum momento, se as escritas pararem. Aceitável para o contador de curtidas, o índice de busca, o extrato numa réplica, a notificação.
+
+A pergunta de design é **onde** cada garantia é necessária, não qual o sistema inteiro terá.
+
+E, como a rede repete mensagens e os clientes repetem requisições, toda operação que atravessa a rede precisa ser **idempotente**: repetir tem o mesmo efeito que executar uma vez. O módulo 12 mostrou as ferramentas (chave de idempotência, tabela de mensagens processadas). Aqui elas deixam de ser boas práticas e viram pré-requisito para a próxima seção.
+
+## Sagas
+
+Uma transferência entre a Fintech Core e outro banco envolve **dois sistemas**: debitar aqui, creditar lá. Não existe transação ACID entre eles. Uma **saga** (Garcia-Molina e Salem, 1987) é uma sequência de transações locais em que cada passo tem uma **compensação**, uma ação que desfaz o efeito de negócio (não um rollback: o débito aconteceu, e o estorno é um novo lançamento).
+
+| | Orquestração | Coreografia |
+|---|---|---|
+| Como | um orquestrador chama cada passo e decide o próximo | cada serviço reage ao evento do anterior |
+| Visão do fluxo | num lugar só, com estado persistido | espalhada pelos serviços |
+| Acoplamento | o orquestrador conhece todos | os serviços conhecem só eventos |
+| Bom para | fluxos com vários passos e compensações (pagamentos) | fluxos curtos e estáveis |
+
+O ponto mais sutil: **timeout não é falha**. Se o crédito no outro banco deu timeout, ele pode ter sido feito. Estornar o débito agora pode criar dinheiro: o cliente recebe o estorno e o destinatário recebe o crédito.
+
+```java
+public void executar(Transferencia t) {
+    contas.debitar(t.origem(), t.valor(), t.id());         // passo 1: local, idempotente pelo id
+    try {
+        outroBanco.creditar(t.destino(), t.valor(), t.id()); // passo 2: remoto, mesmo id
+        t.concluir();
+    } catch (CreditoRecusadoException recusa) {              // falha CONFIRMADA
+        contas.estornar(t.origem(), t.valor(), t.id());      // compensação
+        t.falhar(recusa.motivo());
+    } catch (TempoEsgotadoException incerto) {               // NÃO sabemos o que aconteceu
+        t.marcarPendenteDeConfirmacao();                     // nada de compensar ainda
+    }
+    transferencias.salvar(t);                                // o estado da saga é persistido
+}
+
+// um job revisita as pendentes
+void resolver(Transferencia t) {
+    switch (outroBanco.consultarCredito(t.id())) {
+        case EFETIVADO -> t.concluir();
+        case RECUSADO -> { contas.estornar(t.origem(), t.valor(), t.id()); t.falhar("recusado"); }
+        case NAO_ENCONTRADO -> outroBanco.creditar(t.destino(), t.valor(), t.id());   // reenvio seguro: idempotente
+        case EM_PROCESSAMENTO -> t.agendarNovaConsulta();
+    }
+}
+```
+
+Tudo isso depende de o outro lado aceitar o **mesmo id** e deduplicar. Depois de muitas tentativas sem resposta, a transferência vai para análise manual: é melhor um caso parado e visível que um estorno errado. O exercício 15.04 implementa essa saga com testes para cada caminho, com uma diferença: quando o parceiro diz que nunca recebeu, ele estorna em vez de reenviar (e discute quando cada escolha é a certa).
+
+<Callout tipo="atencao" titulo="Compensação também falha">
+O estorno é uma chamada como outra qualquer: precisa ser idempotente, repetível e registrado. Uma saga cujo estado vive só em memória se perde no primeiro deploy. Persista o estado de cada passo (e publique os eventos pela outbox).
+</Callout>
+
+<Callout tipo="entrevista">
+"Como manter a consistência entre dois serviços?" Transação distribuída com commit em duas fases (2PC/XA) existe, mas é bloqueante, exige que todos os participantes suportem o protocolo e quase nunca está disponível entre serviços ou bancos diferentes: use uma **saga**.
+
+- Orquestração (estado persistido, fácil de acompanhar) × coreografia (eventos, menos acoplamento).
+- Cada passo **idempotente**, com **compensação** que é um novo lançamento.
+- **Timeout é incerteza**: consulte o estado pelo id antes de compensar; reenvie com o mesmo id.
+- Se perguntarem de CAP, diga que a escolha é **durante a partição**, e cite o PACELC para o custo de latência no dia a dia.
+</Callout>
+
+<Quiz
+  id="15-escala"
+  questoes={[
+    {
+      pergunta: 'O usuário grava um dado e, ao recarregar a página, não o vê. A leitura foi para uma réplica assíncrona. Qual garantia faltou?',
+      opcoes: ['Particionamento', 'Read-your-writes', 'Linearizabilidade entre todos os usuários', 'Hashing consistente'],
+      correta: 1,
+      explicacao: 'Ler do líder os dados do próprio usuário logo após uma escrita resolve sem abrir mão das réplicas.',
+    },
+    {
+      pergunta: 'De 4 para 5 nós, com hash(chave) mod N, aproximadamente quantas chaves mudam de nó?',
+      opcoes: ['cerca de 20%', 'cerca de 50%', 'cerca de 80%', 'nenhuma'],
+      correta: 2,
+      explicacao: 'Só permanecem as chaves cujo resto por 4 e por 5 coincide, cerca de 1 em 5. Com hashing consistente, move-se cerca de 1/5.',
+    },
+    {
+      pergunta: 'Qual enunciado do CAP está correto?',
+      opcoes: ['Todo sistema escolhe 2 de 3 propriedades para sempre', 'Durante uma partição de rede, é preciso escolher entre consistência linearizável e disponibilidade', 'Sistemas CA são os mais comuns', 'CAP trata de latência'],
+      correta: 1,
+      explicacao: 'A escolha é forçada durante a partição. Latência sem partição é o assunto do PACELC.',
+    },
+    {
+      pergunta: 'Numa saga, o crédito no outro banco deu timeout. O que fazer?',
+      opcoes: ['Estornar o débito imediatamente', 'Marcar como pendente, consultar o estado pelo id e reenviar com o mesmo id se não for encontrado', 'Ignorar e marcar como concluída', 'Debitar de novo'],
+      correta: 1,
+      explicacao: 'O crédito pode ter acontecido. Compensar sem confirmar pode fazer o dinheiro existir duas vezes.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Escale a aplicação horizontalmente mantendo-a **sem estado**; os dados são o difícil.
+- Réplicas assíncronas têm **atraso**: ofereça **read-your-writes** onde o usuário percebe.
+- Particione por **faixa** (intervalos eficientes) ou por **hash** (distribuição uniforme); cuidado com **hot keys** e consultas entre partições.
+- **Hashing consistente** move cerca de 1/N das chaves; **nós virtuais** equilibram a carga.
+- **CAP**: durante a partição, C ou A. **PACELC**: sem partição, latência ou consistência.
+- Consistência forte onde o negócio exige (saldo), eventual no resto; **idempotência** em tudo que cruza a rede.
+- **Sagas**: passos locais com compensação; **timeout não é falha**, consulte antes de compensar.
+
+## Referências
+
+- Martin Kleppmann — *Designing Data-Intensive Applications*, capítulos 5 (replicação), 6 (particionamento), 8 e 9 (consistência)
+- Seth Gilbert e Nancy Lynch — *Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services* (2002)
+- Daniel Abadi — *Consistency Tradeoffs in Modern Distributed Database System Design* (IEEE Computer, 2012)
+- Hector Garcia-Molina e Kenneth Salem — *Sagas* (SIGMOD, 1987)
+- Chris Richardson — *Microservices Patterns* (Manning), capítulo sobre sagas

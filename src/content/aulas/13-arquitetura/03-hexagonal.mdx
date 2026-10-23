@@ -1,0 +1,852 @@
+---
+titulo: "Arquitetura hexagonal: portas, adaptadores e a regra da dependência"
+descricao: "Um programa de fidelidade construído de dentro para fora: domínio sem framework, portas de entrada e de saída, adaptadores web, JDBC e de eventos, o custo real do mapeamento entre modelos, testes por camada com ArchUnit vigiando as dependências, e os critérios para saber quando a hexagonal é exagero."
+modulo: 13-arquitetura
+ordem: 3
+duracao: 110
+objetivos:
+  - Separar um serviço em domínio, casos de uso, portas de entrada, portas de saída e adaptadores, e justificar onde fica cada classe
+  - Aplicar a regra da dependência e explicar a diferença entre hexagonal, camadas tradicionais, onion e clean architecture
+  - Escrever adaptadores web, JDBC e de eventos que implementam ou chamam as portas, mapeando entre o modelo de domínio, as linhas do banco e o JSON
+  - Testar cada camada no nível certo - núcleo com fakes, adaptador com teste de fatia - e garantir as dependências com uma regra de ArchUnit que falha no build
+  - Abrir a transação e montar o núcleo sem colocar anotações do Spring nele
+  - Decidir quando a hexagonal se paga e quando um controller com repositório resolve melhor
+tags: [hexagonal, portas e adaptadores, clean architecture, onion, ArchUnit, DIP, testes de fatia]
+flashcards:
+  - frente: O que é uma porta de entrada (driving port)?
+    verso: A interface de um caso de uso, como ResgatarRecompensa. Adaptadores de entrada (um controller REST, um consumidor de fila, um teste) chamam o núcleo por ela, sem saber qual classe a implementa.
+  - frente: O que é uma porta de saída (driven port)?
+    verso: Uma interface que o núcleo DEFINE, nos termos dele, para pedir algo ao mundo (CarteirasDePontos, PublicadorDeEventos). Adaptadores de saída (JDBC, Kafka, e-mail) a implementam.
+  - frente: Qual é a regra da dependência?
+    verso: As dependências de código apontam só para dentro. Adaptadores dependem do núcleo, nunca o contrário; o domínio não conhece a aplicação; e nenhum dos dois conhece HTTP, banco ou framework. Adaptadores também não dependem uns dos outros.
+  - frente: Qual a diferença essencial entre camadas tradicionais e hexagonal?
+    verso: Nas camadas tradicionais o serviço depende do repositório concreto, então a regra depende da persistência. Na hexagonal a interface do repositório pertence ao núcleo e o adaptador a implementa, então a persistência depende da regra (inversão de dependência).
+  - frente: Hexagonal, onion e clean são a mesma coisa?
+    verso: Quase. As três põem o núcleo de regras no centro e fazem as dependências apontarem para dentro. Mudam o vocabulário e o número de anéis. O essencial, em qualquer uma, é a direção das dependências.
+  - frente: Como a hexagonal muda a estratégia de testes?
+    verso: O núcleo é testado com new e fakes, em milissegundos e sem Spring. Cada adaptador ganha um teste de fatia (@WebMvcTest, @JdbcTest) contra a tecnologia real. Uma regra de ArchUnit garante que ninguém crie atalhos entre as camadas.
+  - frente: Qual o custo principal da hexagonal?
+    verso: Mais tipos e mais mapeamento. Um campo novo pode atravessar JSON, comando, domínio, linha do banco e evento. Em CRUD com pouca regra, esse custo não se paga.
+  - frente: Onde fica o @Transactional se o núcleo não pode depender do Spring?
+    verso: Fora dele. A montagem (composition root) embrulha o caso de uso num TransactionTemplate, ou o time aceita @Transactional na camada de aplicação como concessão explícita e verificada.
+---
+
+A rede de cafeterias Grão Fiel tem um programa de fidelidade: cada compra rende pontos, e os pontos viram recompensas. Um café coado custa 500 pontos; frete grátis na loja online, 800. O sistema nasceu há três anos como um projeto Spring Boot comum. Hoje a regra "só resgata se tiver saldo e se a recompensa estiver ativa" existe em quatro lugares: no `RecompensaController`, que confere o saldo antes de chamar o serviço; numa `@Entity Carteira` cheia de anotações do JPA e do Jackson, que também é o JSON da API; no consumidor Kafka que recebe resgates do aplicativo de um parceiro (escrito às pressas copiando o controller); e num job noturno que expira pontos. Na semana passada, o time mudou o custo das recompensas promocionais em dois desses lugares e esqueceu os outros dois. Um parceiro resgatou 3.000 cafés com saldo negativo.
+
+O problema não é falta de testes, nem de talento. É que **a regra de negócio não tem endereço**. Ela está misturada com HTTP, JSON, JPA e Kafka, e cada nova forma de chegar ao sistema (uma API, uma fila, um job) ganha a sua cópia. Para testar a regra, é preciso subir o Spring, um banco e às vezes um broker. E quando o time quis trocar o JPA por SQL direto, numa consulta lenta, descobriu que a entidade anotada era usada até na tela de administração.
+
+Nesta aula você vai reconstruir o resgate de pontos com a **arquitetura hexagonal**, também chamada de **portas e adaptadores**: a regra no centro, sem nenhum framework, e tudo o que é tecnologia (HTTP, SQL, eventos) por fora, plugado por interfaces. Você vai construir o código passo a passo, rodar a aplicação de verdade, ver as mensagens de erro reais quando alguém quebra a arquitetura e, principalmente, aprender a decidir **quando isso vale o custo**, porque às vezes não vale.
+
+## A intuição: a cozinha do restaurante
+
+Pense na cozinha de um restaurante. Ali mora o que o restaurante sabe fazer de verdade: as receitas, o ponto da carne, a regra de que o risoto não sai sem o parmesão. A cozinha recebe pedidos por uma **janela**, sempre no mesmo formato de comanda: prato, quantidade, mesa. Quem escreve a comanda pode ser o garçom do salão, o tablet do delivery ou o totem de autoatendimento. A cozinha não sabe nem quer saber: ela só lê comandas.
+
+Para funcionar, a cozinha também precisa de coisas de fora: ingredientes, gás, alguém que lave a louça. Ela pede ingredientes numa **lista de compras padronizada**, que ela mesma definiu ("2 kg de arroz arbóreo, 1 kg de parmesão"). Quem atende a lista pode ser o fornecedor A, o fornecedor B ou o mercado da esquina num domingo de emergência. Trocar de fornecedor não muda nenhuma receita.
+
+Agora compare com o restaurante desorganizado: o garçom entra na cozinha e mexe a panela, o fornecedor decide as receitas de acordo com o que tem no caminhão, e cada canal de pedido tem o seu próprio cozinheiro com a sua própria versão do risoto. É o sistema da Grão Fiel.
+
+A arquitetura hexagonal é a cozinha organizada:
+
+- A **cozinha** é o **núcleo**: as regras de negócio (o domínio) e os casos de uso.
+- A **janela de comandas** é uma **porta de entrada**: a interface pela qual o mundo pede algo ao núcleo.
+- O garçom, o tablet e o totem são **adaptadores de entrada**: traduzem o mundo (HTTP, mensagem de fila, linha de comando) para a comanda.
+- A **lista de compras** é uma **porta de saída**: a interface, definida pela cozinha, pela qual o núcleo pede algo ao mundo.
+- Os fornecedores são **adaptadores de saída**: implementam a lista com uma tecnologia concreta (PostgreSQL, Kafka, um serviço de e-mail).
+
+O detalhe que faz tudo funcionar: **quem define o formato da comanda e da lista é a cozinha**. Os de fora se adaptam a ela, nunca o contrário. Em código, isso se chama **regra da dependência**.
+
+<Figura legenda="O núcleo (domínio e casos de uso) no centro, com as portas na borda. Os adaptadores ficam do lado de fora e dependem das portas; o núcleo não conhece nenhum adaptador.">
+<svg viewBox="0 0 960 440" width="960" role="img" aria-labelledby="hex-titulo hex-desc">
+  <title id="hex-titulo">O hexágono do programa de fidelidade</title>
+  <desc id="hex-desc">Um hexágono central contém a camada de aplicação, com o ServicoDeResgate, e dentro dela o domínio, com CarteiraDePontos, Pontos, Recompensa e Resgate. Na borda esquerda fica a porta de entrada ResgatarRecompensa, chamada por três adaptadores de entrada: ResgateController, um teste JUnit e um consumidor de fila. Na borda direita ficam três portas de saída, CarteirasDePontos, CatalogoDeRecompensas e PublicadorDeEventos, implementadas por adaptadores de saída: JDBC para as carteiras, JDBC para o catálogo e eventos do Spring. Todas as setas apontam para o hexágono.</desc>
+  <defs><marker id="mk-hex-1303" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <polygon points="330,30 630,30 735,220 630,410 330,410 225,220" class="d-box"/>
+  <text x="480" y="68" text-anchor="middle" class="d-title">aplicação (casos de uso)</text>
+  <text x="480" y="92" text-anchor="middle" class="d-mono">ServicoDeResgate</text>
+  <rect x="392" y="150" width="176" height="112" rx="10" class="d-accent"/>
+  <text x="480" y="180" text-anchor="middle" class="d-title">domínio</text>
+  <text x="480" y="206" text-anchor="middle" class="d-mono">CarteiraDePontos</text>
+  <text x="480" y="229" text-anchor="middle" class="d-label">Pontos · Recompensa</text>
+  <text x="480" y="248" text-anchor="middle" class="d-label">Resgate</text>
+  <text x="480" y="335" text-anchor="middle" class="d-label">Java puro: sem Spring, sem SQL, sem HTTP</text>
+  <rect x="198" y="194" width="182" height="52" rx="8" class="d-ok"/>
+  <text x="289" y="213" text-anchor="middle" class="d-label">porta de entrada</text>
+  <text x="289" y="234" text-anchor="middle" class="d-mono">ResgatarRecompensa</text>
+  <text x="676" y="122" text-anchor="middle" class="d-label">portas de saída</text>
+  <rect x="580" y="132" width="192" height="36" rx="8" class="d-info"/>
+  <text x="676" y="155" text-anchor="middle" class="d-mono">CarteirasDePontos</text>
+  <rect x="580" y="180" width="192" height="36" rx="8" class="d-info"/>
+  <text x="676" y="203" text-anchor="middle" class="d-mono">CatalogoDeRecompensas</text>
+  <rect x="580" y="228" width="192" height="36" rx="8" class="d-info"/>
+  <text x="676" y="251" text-anchor="middle" class="d-mono">PublicadorDeEventos</text>
+  <rect x="8" y="110" width="162" height="40" rx="8" class="d-violet"/>
+  <text x="89" y="135" text-anchor="middle" class="d-mono">ResgateController</text>
+  <rect x="8" y="200" width="162" height="40" rx="8" class="d-violet"/>
+  <text x="89" y="225" text-anchor="middle" class="d-mono">teste JUnit</text>
+  <rect x="8" y="290" width="162" height="40" rx="8" class="d-violet"/>
+  <text x="89" y="315" text-anchor="middle" class="d-mono">consumidor de fila</text>
+  <path d="M170 130 L196 206" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <path d="M170 220 L196 220" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <path d="M170 310 L196 234" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <rect x="798" y="132" width="154" height="36" rx="8" class="d-violet"/>
+  <text x="875" y="155" text-anchor="middle" class="d-mono">JDBC: carteiras</text>
+  <rect x="798" y="180" width="154" height="36" rx="8" class="d-violet"/>
+  <text x="875" y="203" text-anchor="middle" class="d-mono">JDBC: catálogo</text>
+  <rect x="798" y="228" width="154" height="36" rx="8" class="d-violet"/>
+  <text x="875" y="251" text-anchor="middle" class="d-mono">eventos Spring</text>
+  <path d="M798 150 L775 150" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <path d="M798 198 L775 198" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <path d="M798 246 L775 246" class="d-line" marker-end="url(#mk-hex-1303)"/>
+  <text x="89" y="372" text-anchor="middle" class="d-label">adaptadores de entrada</text>
+  <text x="875" y="300" text-anchor="middle" class="d-label">adaptadores de saída</text>
+</svg>
+</Figura>
+
+Repare nas setas da direita. O fluxo de dados vai do núcleo **para** o banco (o núcleo manda gravar), mas a **dependência de código** vai do adaptador **para** o núcleo: é o `CarteirasDePontosJdbc` que importa e implementa a interface `CarteirasDePontos`. Fluxo de dados e dependência de código são coisas diferentes, e toda a arquitetura hexagonal se resume a separar as duas.
+
+## Vocabulário
+
+Os termos abaixo aparecem em livros, artigos e entrevistas, às vezes com nomes diferentes para a mesma coisa. Vale conhecer todos.
+
+| Termo | O que é | No programa de fidelidade |
+|---|---|---|
+| **Núcleo** (*core*, *application*) | Tudo o que é regra: domínio + casos de uso + portas. Não depende de tecnologia | os pacotes `dominio` e `aplicacao` |
+| **Domínio** | Entidades, objetos de valor e regras puras do negócio | `CarteiraDePontos`, `Pontos`, `Recompensa` |
+| **Entidade** | Objeto com identidade que muda ao longo do tempo | `CarteiraDePontos` (identificada pelo cliente) |
+| **Objeto de valor** (*value object*) | Objeto sem identidade, imutável, definido pelos seus valores | `Pontos` (500 pontos são iguais a quaisquer outros 500 pontos) |
+| **Caso de uso** | Uma operação que o sistema oferece, orquestrando o domínio | "resgatar uma recompensa" |
+| **Porta de entrada** (*driving port*, *primary port*) | Interface de um caso de uso, chamada pelo mundo | `ResgatarRecompensa` |
+| **Porta de saída** (*driven port*, *secondary port*) | Interface que o núcleo define para pedir algo ao mundo | `CarteirasDePontos`, `PublicadorDeEventos` |
+| **Adaptador de entrada** (*driving/primary adapter*) | Traduz uma tecnologia de entrada para a porta de entrada | `ResgateController` |
+| **Adaptador de saída** (*driven/secondary adapter*) | Implementa uma porta de saída com uma tecnologia | `CarteirasDePontosJdbc` |
+| **Regra da dependência** | As dependências de código apontam só para dentro | verificada por ArchUnit |
+| **Montagem** (*composition root*) | O único lugar que conhece o núcleo e o framework e liga uma coisa à outra | `MontagemDoNucleo` |
+| **Mapeamento** | A tradução entre o modelo de domínio e os modelos de cada borda (JSON, linha do banco, mensagem) | `RespostaDeResgate.de(...)`, o `RowMapper` do JDBC |
+
+Duas observações que evitam confusão:
+
+- **"Hexágono" é só um desenho.** Alistair Cockburn, que propôs o padrão em 2005, escolheu o hexágono para ter espaço de desenhar várias portas, não porque existam seis de alguma coisa. O nome que ele mesmo prefere é *Ports and Adapters*.
+- **"Driving" e "driven"** dizem quem toma a iniciativa. Um adaptador *driving* (o controller) **dirige** a aplicação: ele chama. Um adaptador *driven* (o JDBC) **é dirigido** por ela: ele é chamado. Os dois dependem do núcleo.
+
+### Camadas tradicionais, hexagonal, onion e clean
+
+A arquitetura em **camadas tradicionais** (*layered architecture*) organiza o código de cima para baixo: apresentação, negócio, persistência, banco. Cada camada chama a de baixo, e **depende** dela. O serviço importa o repositório concreto; o repositório importa o JPA. O resultado é que a regra de negócio, no meio da pilha, depende de tudo o que está embaixo, inclusive do banco.
+
+A hexagonal mantém a separação, mas **inverte a dependência da persistência**: a interface do repositório passa a pertencer ao núcleo, e quem depende é o adaptador. É o princípio da inversão de dependência (o "D" do SOLID, visto na [aula 13.01](../../13-arquitetura/01-solid-sem-dogma/#d-a-regra-não-depende-do-detalhe)) aplicado à arquitetura inteira.
+
+<Figura legenda="À esquerda, camadas tradicionais: as setas de dependência descem até o banco. À direita, hexagonal: o adaptador web chama o núcleo, e o adaptador JDBC implementa uma interface que pertence ao núcleo. As duas setas apontam para dentro.">
+<svg viewBox="0 0 900 400" width="900" role="img" aria-labelledby="cam-titulo cam-desc">
+  <title id="cam-titulo">Direção das dependências: camadas tradicionais e hexagonal</title>
+  <desc id="cam-desc">Na coluna da esquerda, quatro caixas empilhadas: Controller, Serviço, Repositório JPA e Banco de dados, com setas descendo de cada uma para a de baixo; legenda: a regra depende da persistência. Na coluna da direita, uma caixa central chamada núcleo, com domínio, casos de uso e portas; acima, ResgateController com seta para baixo até o núcleo, rotulada chama a porta de entrada; abaixo, CarteirasDePontosJdbc com seta para cima até o núcleo, rotulada implementa a porta de saída; legenda: a persistência depende da regra.</desc>
+  <defs><marker id="mk-cam-1303" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="200" y="30" text-anchor="middle" class="d-title">Camadas tradicionais</text>
+  <rect x="70" y="50" width="260" height="44" rx="8" class="d-box"/>
+  <text x="200" y="77" text-anchor="middle" class="d-text">Controller (web)</text>
+  <rect x="70" y="130" width="260" height="44" rx="8" class="d-accent"/>
+  <text x="200" y="157" text-anchor="middle" class="d-text">Serviço (@Service)</text>
+  <rect x="70" y="210" width="260" height="44" rx="8" class="d-box"/>
+  <text x="200" y="237" text-anchor="middle" class="d-text">Repositório (JPA)</text>
+  <rect x="70" y="290" width="260" height="44" rx="8" class="d-info"/>
+  <text x="200" y="317" text-anchor="middle" class="d-text">Banco de dados</text>
+  <path d="M200 94 L200 128" class="d-line" marker-end="url(#mk-cam-1303)"/>
+  <path d="M200 174 L200 208" class="d-line" marker-end="url(#mk-cam-1303)"/>
+  <path d="M200 254 L200 288" class="d-line" marker-end="url(#mk-cam-1303)"/>
+  <text x="200" y="372" text-anchor="middle" class="d-label">a regra depende da persistência</text>
+  <text x="680" y="30" text-anchor="middle" class="d-title">Hexagonal</text>
+  <rect x="580" y="60" width="200" height="44" rx="8" class="d-violet"/>
+  <text x="680" y="87" text-anchor="middle" class="d-mono">ResgateController</text>
+  <rect x="490" y="160" width="380" height="72" rx="10" class="d-accent"/>
+  <text x="680" y="190" text-anchor="middle" class="d-title">núcleo</text>
+  <text x="680" y="214" text-anchor="middle" class="d-label">domínio + casos de uso + portas</text>
+  <rect x="580" y="290" width="200" height="44" rx="8" class="d-violet"/>
+  <text x="680" y="317" text-anchor="middle" class="d-mono">CarteirasDePontosJdbc</text>
+  <path d="M680 104 L680 158" class="d-line" marker-end="url(#mk-cam-1303)"/>
+  <path d="M680 290 L680 234" class="d-line" marker-end="url(#mk-cam-1303)"/>
+  <text x="692" y="136" class="d-label">chama a porta de entrada</text>
+  <text x="692" y="266" class="d-label">implementa a porta de saída</text>
+  <text x="680" y="372" text-anchor="middle" class="d-label">a persistência depende da regra</text>
+</svg>
+</Figura>
+
+Duas outras arquiteturas dizem praticamente a mesma coisa com outro desenho:
+
+- **Onion architecture** (Jeffrey Palermo, 2008): anéis concêntricos. No centro, o *domain model*; em volta, *domain services*; depois, *application services*; por fora, a infraestrutura, a interface com o usuário e os testes. Dependências só para dentro.
+- **Clean architecture** (Robert C. Martin, 2012, depois o livro de 2017): também em anéis: *entities*, *use cases*, *interface adapters*, *frameworks and drivers*. Martin a apresentou explicitamente como uma síntese da hexagonal, da onion e de outras propostas da época.
+
+| | Hexagonal (Cockburn) | Onion (Palermo) | Clean (Martin) |
+|---|---|---|---|
+| Centro | a aplicação (sem divisão interna obrigatória) | domain model | entities |
+| Casos de uso | portas de entrada + implementação | application services | use cases (interactors) |
+| Contratos com o mundo | portas de saída | interfaces no núcleo | gateways / boundaries |
+| Borda | adaptadores | infrastructure, UI, tests | interface adapters + frameworks & drivers |
+| Ênfase | simetria: entrada e saída são "lados" iguais | anéis e domínio no centro | regra da dependência explícita e anéis nomeados |
+
+Na prática, o código de um projeto "hexagonal" e o de um projeto "clean" bem feitos ficam muito parecidos. A clean costuma criar mais tipos (um *presenter*, um modelo de entrada e um de saída para cada caso de uso); a hexagonal é mais econômica e diz pouco sobre o interior do núcleo. Em entrevista, mostre que conhece as três, e diga que o essencial é o que elas têm em comum: **núcleo independente de tecnologia e dependências apontando para dentro**.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.hexagonal`, e roda no CI. O caso de uso é um só, de propósito: **resgatar uma recompensa**. Um caso de uso basta para ver todas as peças, e o que se aprende vale para os próximos.
+
+As regras do resgate:
+
+1. A carteira do cliente precisa existir; senão, "não encontrado".
+2. A recompensa precisa existir no catálogo; senão, "não encontrado".
+3. A recompensa precisa estar ativa; uma caneca da coleção do ano passado não pode mais ser resgatada.
+4. O saldo precisa cobrir o custo. Saldo nunca fica negativo.
+5. Depois do resgate, o novo saldo é gravado e um evento `RecompensaResgatada` é publicado (o aplicativo do parceiro e o e-mail de confirmação reagem a ele).
+6. Se duas operações tentarem gravar a mesma carteira ao mesmo tempo, a segunda falha em vez de sobrescrever a primeira.
+
+A organização dos pacotes:
+
+```text
+dev.trilhajava.m13.aulas.hexagonal
+├── FidelidadeApplication.java        ← @SpringBootApplication
+├── MontagemDoNucleo.java             ← liga portas a adaptadores, abre a transação
+├── dominio/                          ← Java puro: as regras
+│   ├── CarteiraDePontos.java
+│   ├── Pontos.java, Recompensa.java, Resgate.java
+│   ├── RecompensaResgatada.java      ← evento de domínio
+│   └── *Exception.java
+├── aplicacao/                        ← Java puro: os casos de uso
+│   ├── ServicoDeResgate.java
+│   ├── NaoEncontradoException.java
+│   └── porta/
+│       ├── entrada/   ResgatarRecompensa, ComandoDeResgate
+│       └── saida/     CarteirasDePontos, CatalogoDeRecompensas, PublicadorDeEventos
+└── adaptador/                        ← tecnologia: Spring MVC, JDBC, eventos
+    ├── web/           ResgateController, ErrosDoResgate
+    ├── persistencia/  CarteirasDePontosJdbc, CatalogoDeRecompensasJdbc
+    └── mensageria/    PublicadorDeEventosSpring
+```
+
+E os testes, um por camada:
+
+| Teste | Camada | Tipo | Precisa de |
+|---|---|---|---|
+| `ServicoDeResgateTest` | domínio + aplicação | unitário, com fakes | nada além do JUnit |
+| `CarteirasDePontosJdbcTest` | adaptador de persistência | fatia `@JdbcTest` | H2 em memória |
+| `ResgateControllerTest` | adaptador web | fatia `@WebMvcTest` | MockMvc, porta mockada |
+| `ArquiteturaHexagonalTest` | todas | regra de arquitetura | ArchUnit |
+
+## Mão na massa
+
+Os comandos rodam a partir da pasta do módulo:
+
+```bash
+cd java/m13-arquitetura/aulas
+```
+
+A ordem dos passos é a mesma que você usaria num projeto real: **de dentro para fora**. Primeiro o domínio, depois os casos de uso e as portas, e só no fim a tecnologia. Isso não é dogma: é o que permite escrever e testar as regras antes de escolher banco, formato de JSON ou broker.
+
+### Passo 1: o domínio, sem nenhum framework
+
+**O que vamos fazer e por quê.** O domínio é onde as regras 3 e 4 moram. Ele não pode depender de nada que não seja o próprio Java, porque é a parte do sistema que mais tempo vive: o framework web muda de versão a cada ano, o banco pode trocar, mas "não se resgata com saldo insuficiente" vale enquanto o programa de fidelidade existir.
+
+Comece pelo objeto de valor `Pontos`. Ele existe para que um `long` solto não circule pelo sistema: com o tipo próprio, o compilador impede que alguém some pontos com centavos ou com um identificador, e a regra "nunca negativo" fica num lugar só.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/dominio/Pontos.java" />
+
+Agora a entidade. Leia com atenção o método `resgatar`: as regras 3 e 4 estão ali, e em nenhum outro lugar do sistema.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/dominio/CarteiraDePontos.java" />
+
+Compile:
+
+```bash
+mvn -q compile
+```
+
+Saída esperada: nenhuma. Com `-q`, o Maven só imprime algo quando dá errado.
+
+**O que acabou de acontecer.**
+
+- `CarteiraDePontos` não tem `@Entity`, `@Id`, `@JsonProperty` nem `@Component`. Os únicos imports são do `java.time` e do `java.util`. É uma classe que você poderia copiar para outro projeto, com outro framework, e ela continuaria funcionando.
+- O construtor é privado e existe uma fábrica, `reconstituir`. O nome diz a intenção: a carteira não está sendo **criada** (isso seria outro caso de uso, com outras regras, como um bônus de boas-vindas); ela está sendo **recriada** a partir do que estava guardado. Quem chama `reconstituir` é o adaptador de persistência.
+- O campo `versao` serve para o controle de concorrência otimista (a regra 6). O domínio só o carrega de um lado para o outro; quem o usa é o adaptador. É uma pequena concessão, e é honesta: concorrência é uma preocupação real do negócio ("dois resgates simultâneos não podem gastar o mesmo saldo"), mesmo que a técnica seja de persistência. A alternativa, que é guardar a versão num mapa paralelo dentro do adaptador, é mais pura e mais frágil.
+- `resgatar` recebe o instante atual como parâmetro (`Instant agora`) em vez de chamar `Instant.now()`. O domínio não decide que horas são: quem decide é o caso de uso, com um `Clock` injetado. Isso torna o domínio determinístico.
+- As exceções (`SaldoInsuficienteException`, `RecompensaIndisponivelException`) herdam de uma base comum, `RegraDeFidelidadeException`. O adaptador web vai traduzir essa base inteira para HTTP 422 com um único tratador, sem conhecer cada regra.
+
+### Passo 2: as portas
+
+**O que vamos fazer e por quê.** As portas são as fronteiras do núcleo. Antes de escrever qualquer adaptador, você decide **o que** o núcleo oferece (porta de entrada) e **do que** ele precisa (portas de saída), nos termos do negócio.
+
+A porta de entrada é a interface do caso de uso, e o comando é o "formulário" que ela recebe:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/aplicacao/porta/entrada/ResgatarRecompensa.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/aplicacao/porta/entrada/ComandoDeResgate.java" />
+
+E a porta de saída mais importante, a das carteiras:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/aplicacao/porta/saida/CarteirasDePontos.java" />
+
+As outras duas seguem o mesmo estilo: `CatalogoDeRecompensas` tem um único método, `Optional<Recompensa> porCodigo(String codigo)`, e `PublicadorDeEventos` tem `void publicar(RecompensaResgatada evento)`.
+
+**O que acabou de acontecer.**
+
+- **As portas de saída ficam no núcleo**, no pacote `aplicacao.porta.saida`, e não no pacote do adaptador. Quem precisa de persistência é o caso de uso, então a interface pertence a ele. É isso que inverte a dependência.
+- **Os nomes são do negócio**: `doCliente(clienteId)`, e não `findById`; `CarteirasDePontos`, e não `CarteiraRepository extends JpaRepository`. Uma porta escrita nos termos de uma tecnologia (`findBySaldoGreaterThanAndAtivaTrue`, `Page`, `Pageable`) traz a tecnologia para dentro do núcleo, e o desacoplamento vira fachada.
+- **A porta tem só o que o caso de uso usa.** Dois métodos. Um repositório genérico com `findAll`, `deleteById` e `count` "porque um dia pode precisar" obriga todo adaptador e todo fake a implementar o que ninguém chama. É o princípio da segregação de interfaces, de novo.
+- **A exceção também é contrato.** O Javadoc de `salvar` diz que ela lança `CarteiraAlteradaException` em caso de conflito. Essa exceção mora junto da porta, no núcleo. Se o adaptador deixasse escapar uma `OptimisticLockingFailureException` do Spring, o núcleo e o adaptador web teriam de conhecer o Spring Data para tratá-la.
+- **O comando valida o formato, não a regra.** `ComandoDeResgate` recusa um `clienteId` vazio, porque isso é um dado malformado em qualquer canal (HTTP, fila, teste). "Saldo insuficiente" é regra, e fica no domínio.
+
+<Callout tipo="dica" titulo="Uma interface por caso de uso ou uma por serviço?">
+Aqui há uma porta de entrada por caso de uso (`ResgatarRecompensa`). Quando surgirem `ConsultarExtrato` e `CreditarPontos`, cada um ganha a sua. Interfaces pequenas deixam claro o que cada adaptador usa: o consumidor de fila do parceiro só precisa de `ResgatarRecompensa`, e o compilador garante que ele não chama mais nada. A alternativa, uma interface `ServicoDeFidelidade` com tudo, é aceitável em serviços pequenos; o custo aparece quando ela passa de dez métodos.
+</Callout>
+
+### Passo 3: o caso de uso e o primeiro teste
+
+**O que vamos fazer e por quê.** O serviço implementa a porta de entrada e orquestra: busca a carteira e a recompensa pelas portas de saída, pede ao domínio que faça o resgate, grava e publica o evento. Ele não tem regra própria; a regra é da carteira.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/aplicacao/ServicoDeResgate.java" semImports />
+
+Repare no que **não** está aí: nem `@Service`, nem `@Transactional`, nem `@Autowired`. É uma classe Java comum, com um construtor. Como ela vira um bean do Spring e quem abre a transação, você vê no passo 7.
+
+Agora o teste. Ele usa **fakes** (aula de [Mockito](../../10-testes/03-mockito/)): implementações simples, mas que funcionam, das portas de saída.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/hexagonal/aplicacao/ServicoDeResgateTest.java" semImports />
+
+Rode:
+
+```bash
+mvn test -Dtest=ServicoDeResgateTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.hexagonal.aplicacao.ServicoDeResgateTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in dev.trilhajava.m13.aulas.hexagonal.aplicacao.ServicoDeResgateTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **Oito milissegundos** para os dois testes. Sem contexto do Spring, sem banco, sem servidor. Num núcleo com duzentas regras, isso é a diferença entre uma suíte que roda a cada salvamento de arquivo e uma que roda só no CI.
+- As três portas de saída foram atendidas de três jeitos diferentes, e todos são simples: `CarteirasEmMemoria` é uma classe de dez linhas com um `Map`; o catálogo é uma **lambda**, porque `CatalogoDeRecompensas` tem um único método (é uma interface funcional); o publicador é a referência de método `publicados::add`, que joga cada evento numa lista. Portas pequenas tornam os fakes triviais.
+- O teste de saldo insuficiente confere **estado**, não interação: o saldo continua 300 e a lista de eventos está vazia. Se alguém mudar o serviço para publicar o evento antes de chamar o domínio, o teste quebra.
+- `Clock.fixed(AGORA, ZoneOffset.UTC)` fixa o relógio, e o teste confere que o resgate saiu com `realizadoEm` igual a `AGORA`.
+- A mensagem da exceção é verificada com `hasMessage`. Ela vai aparecer no JSON de erro da API, então é parte do comportamento.
+
+### Passo 4: o adaptador de persistência e o teste de fatia
+
+**O que vamos fazer e por quê.** Agora sim, tecnologia. O adaptador implementa `CarteirasDePontos` com SQL, usando o `JdbcClient` do Spring Framework (a API fluente de JDBC disponível desde o Spring 6.1). É aqui, e só aqui, que uma linha do banco vira um objeto de domínio, e vice-versa.
+
+O esquema fica numa pasta própria (`src/main/resources/hexagonal/schema.sql`), porque o módulo das aulas é compartilhado por vários exemplos:
+
+```sql
+create table carteira_de_pontos (
+    cliente_id varchar(40) primary key,
+    saldo      bigint      not null check (saldo >= 0),
+    versao     bigint      not null
+);
+```
+
+E o adaptador:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/persistencia/CarteirasDePontosJdbc.java" semImports />
+
+O teste usa `@JdbcTest`, um **teste de fatia** (aula de [testes de fatia](../../10-testes/04-testes-de-fatia-no-spring/)): sobe só o necessário para JDBC (o `DataSource`, o `JdbcClient`, a transação), troca o banco por um embutido (o H2, que está no classpath) e desfaz cada teste com rollback no fim.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/persistencia/CarteirasDePontosJdbcTest.java" semImports />
+
+```bash
+mvn test -Dtest=CarteirasDePontosJdbcTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.hexagonal.adaptador.persistencia.CarteirasDePontosJdbcTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.717 s -- in dev.trilhajava.m13.aulas.hexagonal.adaptador.persistencia.CarteirasDePontosJdbcTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **O mapeamento é explícito.** A lambda passada a `query` é um `RowMapper`: lê `cliente_id`, `saldo` e `versao` e chama `CarteiraDePontos.reconstituir`. Na volta, `salvar` lê `saldo()` e `versao()` da carteira e monta o `update`. Não há reflexão, nem anotação, nem mágica. Também não há nada de graça: cada coluna nova é uma linha a mais aqui.
+- **A concorrência otimista está no SQL.** O `update` só altera a linha se a versão ainda for a que foi lida (`where ... and versao = :versao`) e incrementa a versão. Se outra transação gravou antes, nenhuma linha é alterada, `update()` devolve 0 e o adaptador traduz isso para a exceção do contrato, `CarteiraAlteradaException`. É a mesma técnica que o JPA usa com `@Version` (aula de [locking](../../09-persistencia/06-locking-e-flyway/)), feita à mão.
+- **O teste simula duas leituras concorrentes**: carrega a mesma carteira duas vezes, grava a primeira (saldo 700, versão 1) e tenta gravar a segunda, que ainda está na versão 0. A segunda é recusada. Sem a versão, a segunda gravação sobrescreveria a primeira, e o cliente teria gastado 500 pontos duas vezes pagando uma só: o clássico **lost update**.
+- **`@Import(CarteirasDePontosJdbc.class)`** é necessário porque o `@JdbcTest` não faz varredura de componentes: ele não registra seus `@Repository` sozinho. Isso é bom: o teste declara exatamente o que está sendo testado.
+- **O teste usa o domínio real** (`primeira.resgatar(cafe, ...)`) para alterar o saldo. Adaptadores podem depender do núcleo; é para isso que ele existe.
+- O banco do teste é o H2. Para um adaptador com SQL específico do PostgreSQL (`on conflict`, `jsonb`, `for update skip locked`), o teste de fatia deveria rodar contra um PostgreSQL real, com Testcontainers (aula de [Testcontainers](../../10-testes/05-testcontainers/)). Aqui o SQL é portável, e o H2 basta.
+
+<Callout tipo="info" titulo="E se fosse JPA?">
+Com JPA, o adaptador teria uma classe `CarteiraJpa` anotada com `@Entity`, `@Id` e `@Version`, um `CarteiraJpaRepository extends JpaRepository`, e o adaptador `CarteirasDePontosJpa` faria a conversão entre `CarteiraJpa` e `CarteiraDePontos` nos dois sentidos. A `@Entity` **nunca** é a classe de domínio: se fosse, o domínio dependeria do Jakarta Persistence, e a regra de ArchUnit do passo 8 quebraria. Você troca a conveniência do *dirty checking* (o JPA detectando sozinho o que mudou) por um mapeamento explícito. A seção sobre mapeamento, mais abaixo, discute quando isso compensa.
+</Callout>
+
+### Passo 5: o adaptador de mensageria
+
+**O que vamos fazer e por quê.** A regra 5 pede um evento a cada resgate. O núcleo declarou o que precisa (`PublicadorDeEventos`) sem dizer como. A primeira implementação usa o mecanismo de eventos do próprio Spring, que entrega o evento dentro da aplicação:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/mensageria/PublicadorDeEventosSpring.java" semImports />
+
+**O que acabou de acontecer.**
+
+- O adaptador tem oito linhas úteis. Ele é **package-private** (sem `public`): ninguém de fora do pacote `adaptador.mensageria` consegue nem referenciá-lo. Só o Spring, por reflexão, o instancia e o injeta onde se pede um `PublicadorDeEventos`. O mesmo vale para os adaptadores JDBC e para o controller. É o encapsulamento do Java trabalhando a favor da arquitetura.
+- Para levar o evento ao Kafka, você escreve outra classe que implementa a mesma porta. Nenhuma linha do núcleo muda. Mas atenção ao que **não** muda sozinho: publicar no Kafka dentro da transação do banco tem o problema da escrita dupla (o banco confirma e o Kafka falha, ou o contrário). A solução de produção é o **transactional outbox** ([aula 12.04](../../12-mensageria/04-transactional-outbox/)): o adaptador grava o evento numa tabela, na mesma transação do saldo, e um processo separado o envia ao broker. Do ponto de vista do núcleo, continua sendo `eventos.publicar(...)`. A hexagonal não resolve consistência; ela só deixa o lugar certo para resolver.
+- O evento `RecompensaResgatada` mora no domínio e é um `record` com tipos simples (`String`, `long`, `Instant`). Ele não carrega `Pontos` nem a `CarteiraDePontos` inteira, porque vai sair do sistema e virar o contrato com outros times. Mudar o domínio não deve mudar, sem querer, o formato de uma mensagem que três consumidores leem.
+
+### Passo 6: o adaptador web
+
+**O que vamos fazer e por quê.** O controller é um adaptador de entrada: traduz HTTP para a porta de entrada e o resultado de volta para JSON. Ele não decide nada sobre pontos.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/web/ResgateController.java" semImports />
+
+As exceções do núcleo viram respostas HTTP num `@RestControllerAdvice`, no formato **Problem Details** (RFC 9457):
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/web/ErrosDoResgate.java" semImports />
+
+O teste é um `@WebMvcTest`, a fatia que sobe só o Spring MVC com o controller pedido. A porta de entrada é um mock (`@MockitoBean`), porque o que se testa aqui é a **tradução**: o JSON certo vira o comando certo, o resultado vira o JSON certo, e a exceção vira o status certo.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/hexagonal/adaptador/web/ResgateControllerTest.java" semImports />
+
+```bash
+mvn test -Dtest=ResgateControllerTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.hexagonal.adaptador.web.ResgateControllerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.825 s -- in dev.trilhajava.m13.aulas.hexagonal.adaptador.web.ResgateControllerTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **Três modelos diferentes se encontram no controller**: `PedidoDeResgate` (o JSON que chega), `ComandoDeResgate` (a entrada do caso de uso) e `RespostaDeResgate` (o JSON que sai). O `Resgate` do domínio nunca é serializado diretamente. Se o domínio ganhar um campo interno amanhã, a API não muda sem querer; se a API precisar de um campo calculado só para a tela, o domínio não ganha um getter estranho.
+- **A validação está dividida por natureza.** `@NotBlank` no `PedidoDeResgate` é validação de **formato** na borda, com Jakarta Validation, porque a borda é onde o framework está. O comando repete a checagem de formato em Java puro, porque outros adaptadores (a fila, um teste) também criam comandos. E as regras de negócio ficam no domínio.
+- **O controller depende da interface `ResgatarRecompensa`**, não do `ServicoDeResgate`. Isso permitiu o `@MockitoBean` no teste, e permite à montagem (passo 7) entregar ao controller um objeto que embrulha o serviço numa transação.
+- **O `@RestControllerAdvice(assignableTypes = ResgateController.class)`** limita o tratador a esse controller. Sem o filtro, ele valeria para a aplicação inteira, e um `NaoEncontradoException` de outro módulo seria tratado por um código que não foi pensado para ele.
+- **`HttpStatus.UNPROCESSABLE_CONTENT`** é o 422 com o nome atual da RFC 9110. O nome antigo, `UNPROCESSABLE_ENTITY`, continua existindo no Spring Framework 7, marcado como obsoleto.
+- O teste usa o `MockMvcTester`, a API do Spring com asserções do AssertJ. `isLenientlyEqualTo` compara o JSON ignorando campos que o esperado não lista (aqui, `realizadoEm`).
+
+### Passo 7: a montagem e a aplicação no ar
+
+**O que vamos fazer e por quê.** O núcleo não tem anotações do Spring, então alguém precisa criar o `ServicoDeResgate`, entregar a ele os adaptadores e abrir a transação. Esse alguém é a **montagem** (em inglês, *composition root*): o único lugar do sistema que conhece o núcleo **e** o framework.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/MontagemDoNucleo.java" semImports />
+
+E a classe da aplicação, que aponta os scripts de banco para a pasta própria desta aula:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/hexagonal/FidelidadeApplication.java" semImports />
+
+Suba a aplicação numa porta livre:
+
+```bash
+mvn spring-boot:run "-Dspring-boot.run.main-class=dev.trilhajava.m13.aulas.hexagonal.FidelidadeApplication" "-Dspring-boot.run.arguments=--server.port=8093"
+```
+
+Saída esperada (as últimas linhas):
+
+```text
+... com.zaxxer.hikari.HikariDataSource       : HikariPool-1 - Start completed.
+... o.s.boot.tomcat.TomcatWebServer          : Tomcat started on port 8093 (http) with context path '/'
+... d.t.m.a.hexagonal.FidelidadeApplication  : Started FidelidadeApplication in 1.375 seconds (process running for 1.602)
+```
+
+Em outro terminal, a cliente Ana (1.200 pontos) resgata um café:
+
+```bash
+curl -i -X POST http://localhost:8093/clientes/cli-ana/resgates \
+     -H "Content-Type: application/json" -d '{"recompensa":"CAFE-GRATIS"}'
+```
+
+```text
+HTTP/1.1 201
+Location: /clientes/cli-ana/resgates/ac81d7d2-630a-4c41-842f-752569ef2cc8
+Content-Type: application/json
+
+{"id":"ac81d7d2-630a-4c41-842f-752569ef2cc8","recompensa":"CAFE-GRATIS","pontosDebitados":500,"saldoRestante":700,"realizadoEm":"2026-10-06T08:07:38.899675400Z"}
+```
+
+Com 700 pontos, ela tenta o frete grátis (800); depois, a caneca de 2025, que está inativa; e um cliente que não existe tenta um café:
+
+```text
+HTTP/1.1 422
+Content-Type: application/problem+json
+
+{"detail":"cliente cli-ana tem 700 pontos e a recompensa custa 800","instance":"/clientes/cli-ana/resgates","status":422,"title":"Unprocessable Content"}
+
+HTTP/1.1 422
+Content-Type: application/problem+json
+
+{"detail":"a recompensa CANECA-2025 não está disponível para resgate","instance":"/clientes/cli-ana/resgates","status":422,"title":"Unprocessable Content"}
+
+HTTP/1.1 404
+Content-Type: application/problem+json
+
+{"detail":"carteira não encontrada: cli-ze","instance":"/clientes/cli-ze/resgates","status":404,"title":"Not Found"}
+```
+
+O `id` e o instante do resgate vão ser outros na sua execução. Pare a aplicação com Ctrl+C.
+
+**O que acabou de acontecer.**
+
+- **`MontagemDoNucleo` cria o serviço com `new`** e o registra indiretamente: o bean exposto é do tipo `ResgatarRecompensa` (a porta), e é uma lambda que chama o serviço dentro de `transacao.execute(...)`. O `TransactionTemplate` é a forma programática de abrir uma transação no Spring: tudo o que o serviço faz pelas portas (ler a carteira, gravar o saldo, publicar o evento) acontece numa transação só, e uma exceção faz rollback.
+- **O serviço em si não é um bean.** Isso é deliberado: se fosse, haveria dois beans do tipo `ResgatarRecompensa` (o serviço e a lambda transacional), e o Spring não saberia qual injetar no controller. Além disso, ninguém consegue, por engano, injetar o serviço sem transação.
+- **Os adaptadores são encontrados por varredura** (`@Repository`, `@Component`, `@RestController`), porque eles podem depender do Spring. Só o núcleo é montado à mão.
+- **O `Clock` é um bean** e, em produção, é o `Clock.systemUTC()`. No teste do passo 3, ele foi um relógio fixo.
+- **Os erros saíram com `application/problem+json`**, o tipo de mídia da RFC 9457. O campo `detail` carrega a mensagem da exceção do domínio; `title` e `status` vêm do status HTTP.
+
+<Callout tipo="atencao" titulo="E se o time preferir @Transactional?">
+É uma escolha legítima, e muito comum, aceitar `@Transactional` (e até `@Service`) na camada de aplicação, mantendo só o domínio puro. Você ganha simplicidade e perde a garantia de que o núcleo roda sem Spring. O importante é a decisão ser **explícita** (registrada num ADR) e **verificada** (a regra de ArchUnit permitindo exatamente `org.springframework.transaction.annotation` na aplicação, e nada mais).
+</Callout>
+
+### Passo 8: a arquitetura como teste
+
+**O que vamos fazer e por quê.** Até aqui, a regra da dependência só existe porque você a seguiu. No primeiro dia de pressa, alguém vai injetar o `CarteirasDePontosJdbc` direto no controller "só para uma consulta rápida", ou colocar um `@Service` no núcleo. Code review pega algumas vezes; um teste pega todas. O **ArchUnit** analisa o bytecode das classes e verifica regras sobre as dependências entre elas.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/hexagonal/ArquiteturaHexagonalTest.java" semImports />
+
+```bash
+mvn test -Dtest=ArquiteturaHexagonalTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.hexagonal.ArquiteturaHexagonalTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.886 s -- in dev.trilhajava.m13.aulas.hexagonal.ArquiteturaHexagonalTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@AnalyzeClasses` importa as classes do pacote (só as de produção, por causa de `ImportOption.DoNotIncludeTests`), e cada campo `@ArchTest` é uma regra.
+- **`onionArchitecture()`** é uma regra pronta da biblioteca do ArchUnit para arquiteturas de núcleo e adaptadores. Você diz quais pacotes são o domínio, quais são a aplicação e quais são os adaptadores (cada um com um nome), e ela verifica: o domínio não depende da aplicação nem dos adaptadores; a aplicação não depende dos adaptadores; e **um adaptador não depende de outro**. O nome é "onion", mas a regra é a mesma da hexagonal.
+- **`withOptionalLayers(true)`** evita que a regra falhe porque a camada *domain services* não existe neste projeto.
+- **`ignoreDependency(...)`** abre uma exceção para o pacote raiz, onde estão a montagem e a classe da aplicação: elas precisam conhecer tudo. A exceção é estreita (`resideInAPackage` com o pacote exato, sem `..`), então ela não vale para subpacotes.
+- **A segunda regra** completa a primeira: a onion verifica dependências **entre** as camadas declaradas, mas não diz nada sobre bibliotecas. Por isso, `noClasses()` do domínio e da aplicação podem depender de `org.springframework..`, `jakarta..` (JPA, Validation, Servlet) e `java.sql..`. `CompositeArchRule.of(...).and(...)` junta as duas num único teste.
+
+### Passo 9: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.886 s -- in dev.trilhajava.m13.aulas.hexagonal.ArquiteturaHexagonalTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.717 s -- in dev.trilhajava.m13.aulas.hexagonal.adaptador.persistencia.CarteirasDePontosJdbcTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.825 s -- in dev.trilhajava.m13.aulas.hexagonal.adaptador.web.ResgateControllerTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in dev.trilhajava.m13.aulas.hexagonal.aplicacao.ServicoDeResgateTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cinco testes, cada um no seu nível. Repare na distribuição do tempo: as regras de negócio (o que mais muda e mais importa) levam milissegundos; os adaptadores, que sobem um pedaço do Spring, levam perto de um segundo cada. Num sistema real, a proporção certa é **muitos** testes do núcleo e **poucos** por adaptador, focados no que é do adaptador: o SQL e a concorrência num, o status e o JSON no outro.
+
+## Uma estratégia de testes por camada
+
+A arquitetura define a estratégia de testes, e vice-versa. Com o núcleo isolado, cada pergunta tem um lugar certo para ser respondida:
+
+| Pergunta | Onde testar | Ferramenta | Quantidade típica |
+|---|---|---|---|
+| A regra de saldo está certa? E a de recompensa inativa? | domínio, direto | JUnit + AssertJ, `new` | muitos (todas as regras, todas as bordas) |
+| O caso de uso grava, publica e para no erro certo? | aplicação | fakes das portas de saída | alguns por caso de uso |
+| O SQL lê e grava as colunas certas? A versão protege contra lost update? | adaptador de persistência | `@JdbcTest` / `@DataJpaTest`, Testcontainers se o SQL for específico | poucos por adaptador |
+| O JSON vira o comando certo? A exceção vira o status certo? | adaptador web | `@WebMvcTest` + `@MockitoBean` da porta | poucos por endpoint |
+| A mensagem do Kafka tem o formato combinado? | adaptador de mensageria | teste com broker embutido ou de contrato | poucos por evento |
+| Tudo funciona junto? | aplicação inteira | `@SpringBootTest` + Testcontainers | um punhado de caminhos críticos |
+| Alguém criou um atalho entre as camadas? | o código inteiro | ArchUnit | uma ou duas regras |
+
+O erro mais comum em projetos hexagonais é **testar o núcleo pela borda**: escrever cinquenta testes de `@SpringBootTest` com MockMvc para cobrir as regras de saldo. Funciona, mas cada teste leva segundos, e a suíte inteira vira minutos. O núcleo isolado existe justamente para ser testado barato. Isso conversa com a [aula de TDD e arquitetura](../../10-testes/06-tdd-e-arquitetura/): o design guiado por testes tende a produzir exatamente essas portas.
+
+## O mapeamento entre modelos e o seu custo
+
+Conte quantos tipos representam "um resgate" neste projeto: `PedidoDeResgate` (JSON de entrada), `ComandoDeResgate` (entrada do caso de uso), `Resgate` (domínio), `RespostaDeResgate` (JSON de saída), `RecompensaResgatada` (evento) e as colunas da tabela. São seis representações, e cinco funções de tradução entre elas. Essa é a conta que os críticos da hexagonal fazem, e eles estão certos sobre o custo.
+
+**O que o mapeamento compra:**
+
+- **Contratos que evoluem separadamente.** A API pública, o esquema do banco, o formato do evento e o modelo de domínio mudam por motivos diferentes e em ritmos diferentes. Renomear um campo do domínio não quebra o aplicativo do parceiro; acrescentar uma coluna de auditoria não aparece no JSON.
+- **Segurança.** Um DTO de saída só tem o que foi listado. Uma entidade serializada direto pode vazar campos (`versao`, um CPF, um hash) que ninguém pensou em esconder. E um DTO de entrada impede o *mass assignment*: o cliente não consegue mandar `"saldo": 99999` num JSON e vê-lo gravado.
+- **Liberdade no domínio.** Sem `@Entity`, a classe de domínio pode ter construtor privado, campos finais, objetos de valor como `Pontos` e invariantes no construtor, sem brigar com as exigências do framework de persistência (construtor sem argumentos, setters, proxies).
+
+**O que ele custa:**
+
+- **Código e manutenção.** Um campo novo que precisa chegar do JSON ao banco atravessa até seis tipos. Em times grandes, isso é o tipo de mudança que alguém faz pela metade.
+- **Perda de facilidades do ORM.** Com o domínio separado da `@Entity`, o *dirty checking*, o *lazy loading* e a navegação por associações do JPA ficam do lado do adaptador. O caso de uso precisa chamar `salvar` explicitamente, e o adaptador precisa saber o que mudou. Para agregados grandes (um pedido com cem itens), isso exige cuidado para não regravar tudo a cada alteração.
+- **Desempenho**, quase sempre irrelevante: copiar meia dúzia de campos custa nanossegundos perto de uma ida ao banco. O custo de desempenho real aparece em outro lugar: quando a porta força a carregar o agregado inteiro para uma consulta que precisava de duas colunas.
+
+**Como gastar menos:**
+
+- **Mapeie à mão, com métodos de fábrica pequenos** (`RespostaDeResgate.de(resgate)`), perto do tipo de destino. Bibliotecas de mapeamento por geração de código, como o MapStruct, ajudam quando os modelos são grandes e parecidos; elas atrapalham quando a tradução tem lógica, porque a lógica fica escondida em anotações.
+- **Não crie um tipo que não traduz nada.** Se `ComandoDeResgate` e `PedidoDeResgate` tivessem exatamente os mesmos campos e nenhum motivo para divergir, um só bastaria? Aqui não, porque o comando inclui o `clienteId`, que vem do caminho da URL (e, num sistema com autenticação, viria do token). Mas a pergunta deve ser feita.
+- **Consultas não precisam passar pelo domínio.** Para uma tela de extrato com filtros e paginação, a porta de entrada `ConsultarExtrato` pode devolver um `record` de leitura montado direto pelo SQL, sem carregar `CarteiraDePontos`. Leitura e escrita têm necessidades diferentes; essa separação, levada adiante, é o padrão CQRS (*Command Query Responsibility Segregation*).
+
+## Pacotes: por camada ou por funcionalidade?
+
+Existem duas formas de organizar os pacotes de um sistema, e a hexagonal funciona com as duas.
+
+**Por camada** (*package by layer*): no topo, os pacotes técnicos; dentro deles, todas as funcionalidades.
+
+```text
+dev.graofiel
+├── dominio/      CarteiraDePontos, Pedido, Cupom, Loja ...
+├── aplicacao/    ServicoDeResgate, ServicoDePedidos, ServicoDeCupons ...
+└── adaptador/
+    ├── web/          ResgateController, PedidoController, CupomController ...
+    └── persistencia/ CarteirasJdbc, PedidosJpa, CuponsJpa ...
+```
+
+**Por funcionalidade** (*package by feature*): no topo, as áreas de negócio; dentro de cada uma, as camadas.
+
+```text
+dev.graofiel
+├── fidelidade/
+│   ├── dominio/  aplicacao/  adaptador/
+├── pedidos/
+│   ├── dominio/  aplicacao/  adaptador/
+└── cupons/
+    ├── dominio/  aplicacao/  adaptador/
+```
+
+O código desta aula é a segunda forma em miniatura: `hexagonal` faz o papel de `fidelidade`, a única funcionalidade.
+
+| | Por camada | Por funcionalidade |
+|---|---|---|
+| Onde fica uma mudança de negócio | espalhada por 3 a 5 pacotes | quase toda num pacote só |
+| Visibilidade | tudo precisa ser `public` para atravessar pacotes | adaptadores e detalhes podem ser package-private |
+| Acoplamento entre áreas | invisível: qualquer serviço chama qualquer repositório | explícito: `pedidos` só fala com `fidelidade` pela porta dela |
+| Extrair um microsserviço depois | difícil: é preciso garimpar classes em todos os pacotes | o pacote da funcionalidade já é o candidato |
+| Bom para | serviços pequenos com uma ou duas áreas | sistemas com várias áreas de negócio e vários times |
+
+Para sistemas com mais de uma área de negócio, a recomendação é **por funcionalidade no primeiro nível e por papel hexagonal dentro de cada uma**. A pergunta seguinte, "como impedir que `pedidos` use as classes internas de `fidelidade`?", é o tema da próxima aula, sobre monólito modular, em que cada funcionalidade vira um módulo verificado pelo Spring Modulith.
+
+## Quando dá errado
+
+As mensagens abaixo são reais. Foram geradas quebrando o código de propósito e rodando os testes (depois, tudo foi desfeito).
+
+### Architecture Violation: alguém pegou um atalho
+
+Duas mudanças "inocentes" ao mesmo tempo: um `@org.springframework.stereotype.Service` no `ServicoDeResgate` (para "facilitar a injeção") e, na `CarteiraDePontos`, um método que cria um `NaoEncontradoException` do pacote da aplicação.
+
+```text
+[ERROR] dev.trilhajava.m13.aulas.hexagonal.ArquiteturaHexagonalTest.dependenciasApontamParaDentro -- Time elapsed: 0.976 s <<< FAILURE!
+java.lang.AssertionError:
+Architecture Violation [Priority: MEDIUM] - Rule 'Onion architecture consisting of (optional)
+domain models ('..hexagonal.dominio..')
+application services ('..hexagonal.aplicacao..')
+adapter 'web' ('..hexagonal.adaptador.web..')
+adapter 'persistencia' ('..hexagonal.adaptador.persistencia..')
+adapter 'mensageria' ('..hexagonal.adaptador.mensageria..') and o núcleo não depende de framework, de HTTP nem de JDBC' was violated (2 times):
+Class <dev.trilhajava.m13.aulas.hexagonal.aplicacao.ServicoDeResgate> is annotated with <org.springframework.stereotype.Service> in (ServicoDeResgate.java:0)
+Method <dev.trilhajava.m13.aulas.hexagonal.dominio.CarteiraDePontos.naoEncontrada(java.lang.String)> calls constructor <dev.trilhajava.m13.aulas.hexagonal.aplicacao.NaoEncontradoException.<init>(java.lang.String)> in (CarteiraDePontos.java:41)
+```
+
+**Como ler:** o cabeçalho descreve a regra inteira (as duas partes da regra composta), e `was violated (2 times)` diz quantas dependências proibidas foram encontradas. Depois vem uma linha por violação, com a classe ou o método de origem, o tipo de dependência (*is annotated with*, *calls constructor*, *has field of type*, *depends on*...) e o arquivo e a linha. A primeira foi pega pela regra "o núcleo não depende de framework"; a segunda, pela regra da onion (domínio dependendo da aplicação).
+
+**Como corrigir:** não "conserte" o teste. Para o `@Service`, a montagem já registra o caso de uso; a anotação é desnecessária. Para a exceção, se o domínio precisa sinalizar algo, a exceção pertence ao domínio. E se a violação for uma decisão consciente (o time decidiu aceitar `@Transactional` na aplicação), mude a regra de forma explícita e estreita, com um comentário que aponte o ADR, e nunca com um `ignoreDependency` genérico.
+
+<Callout tipo="dica" titulo="Projeto legado com centenas de violações">
+Ligar uma regra de arquitetura num sistema antigo costuma revelar dezenas de violações de uma vez. O ArchUnit tem o recurso de **freezing** (`FreezingArchRule.freeze(regra)`): ele grava as violações existentes num arquivo e só falha com violações **novas**. O time para de piorar no dia um e corrige o passivo aos poucos, removendo linhas do arquivo.
+</Callout>
+
+### No qualifying bean of type ResgatarRecompensa
+
+Um `@WebMvcTest` sem o `@MockitoBean` da porta:
+
+```text
+[ERROR] dev.trilhajava.m13.aulas.hexagonal.adaptador.web.ResgateControllerTest.traduzOJsonParaOComandoEOResultadoDeVolta -- Time elapsed: 0.001 s <<< ERROR!
+java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@119d4443 testClass = dev.trilhajava.m13.aulas.hexagonal.adaptador.web.ResgateControllerTest, ...]
+...
+Caused by: org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'resgateController' defined in file [...\ResgateController.class]: Unsatisfied dependency expressed through constructor parameter 0: No qualifying bean of type 'dev.trilhajava.m13.aulas.hexagonal.aplicacao.porta.entrada.ResgatarRecompensa' available: expected at least 1 bean which qualifies as autowire candidate. Dependency annotations: {}
+```
+
+**Como ler:** vá direto ao último `Caused by`. O `@WebMvcTest` sobe só a camada web: controllers, advices, conversores. A `MontagemDoNucleo` (uma `@Configuration` comum) e os adaptadores JDBC ficam de fora, de propósito. Então ninguém fornece um `ResgatarRecompensa`. **Como corrigir:** declare a porta como `@MockitoBean`. Resista à tentação de "consertar" com `@Import(MontagemDoNucleo.class)`: aí o teste precisaria de banco e de transação, e deixaria de ser um teste do adaptador web.
+
+A mesma mensagem aparece na aplicação real, com outra causa, quando alguém esquece de registrar um adaptador (por exemplo, um adaptador de saída novo sem `@Component`): o Spring não acha quem implementa a porta. Nesse caso, a correção é o contrário: registrar o adaptador.
+
+### No data scripts found at location
+
+O `@JdbcTest` com o caminho do script de dados digitado errado (`dados.sql` em vez de `data.sql`):
+
+```text
+Caused by: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'dataSourceScriptDatabaseInitializer' defined in class path resource [org/springframework/boot/jdbc/autoconfigure/DataSourceInitializationAutoConfiguration.class]: No data scripts found at location 'classpath:hexagonal/dados.sql'
+Caused by: java.lang.IllegalStateException: No data scripts found at location 'classpath:hexagonal/dados.sql'
+```
+
+**Como ler:** o inicializador de banco do Spring Boot não achou o arquivo indicado em `spring.sql.init.data-locations`. A falha é imediata e clara, o que é bom. **Como corrigir:** acerte o caminho. Se o script é opcional, o prefixo `optional:` (`optional:classpath:hexagonal/dados.sql`) faz o Spring Boot seguir sem ele. Em produção, o esquema não deve vir de `schema.sql`, e sim de migrações versionadas com Flyway, executadas antes da aplicação receber tráfego.
+
+### Um 400 que não segue o padrão
+
+Um JSON com a recompensa em branco, `{"recompensa":""}`, devolve:
+
+```text
+HTTP/1.1 400
+Content-Type: application/json
+
+{"timestamp":"2026-10-06T08:07:39.266Z","status":400,"error":"Bad Request","path":"/clientes/cli-ana/resgates"}
+```
+
+**Como ler:** não é um erro de teste, mas é um defeito real. O `@NotBlank` funcionou (status 400), mas a resposta saiu no formato de erro padrão do Spring Boot, e não como Problem Details, porque o `ErrosDoResgate` só trata as exceções do núcleo. Os clientes da API agora precisam entender dois formatos de erro, e a mensagem nem diz qual campo está errado. **Como corrigir:** trate também a `MethodArgumentNotValidException` no advice do adaptador web, devolvendo um `ProblemDetail` com os campos inválidos, ou ligue o suporte do Spring Boot a Problem Details para as exceções do Spring MVC (propriedade `spring.mvc.problemdetails.enabled=true`). É uma decisão da borda: o núcleo não muda.
+
+### CarteiraAlteradaException em produção
+
+Não é uma mensagem de teste, mas é a que mais aparece quando o sistema vai para a rua: dois resgates simultâneos da mesma carteira (um pelo aplicativo, outro pelo parceiro), e o segundo recebe um 409 com `a carteira do cliente cli-ana foi alterada por outra operação; tente de novo`. **Isso é o sistema funcionando**: sem a versão, os dois resgates teriam gastado o mesmo saldo. O que se decide é a reação: o cliente HTTP tenta de novo? O consumidor de fila recoloca a mensagem? Uma nova tentativa automática, dentro do próprio caso de uso, só é segura se a operação inteira for refeita (ler de novo, validar o saldo de novo), e nunca reenviando a gravação antiga.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Hexagonal num CRUD de categorias" depois="Controller + Spring Data, e pronto">
+```java
+// porta de entrada, porta de saída, serviço, dois mapeadores...
+public interface CadastrarCategoria {
+    Categoria cadastrar(ComandoDeCategoria comando);
+}
+public interface Categorias {
+    void salvar(Categoria categoria);
+}
+public class ServicoDeCategorias implements CadastrarCategoria {
+    // valida, chama categorias.salvar(...), devolve
+}
+// + CategoriaJpa, CategoriasJpa, CategoriaController,
+//   CategoriaRequest, CategoriaResponse, MontagemDeCategorias
+```
+
+```java
+@Entity
+class Categoria {
+    @Id @GeneratedValue Long id;
+    @NotBlank String nome;
+}
+
+interface CategoriaRepository
+        extends JpaRepository<Categoria, Long> {
+}
+
+@RestController
+@RequestMapping("/categorias")
+class CategoriaController { /* 20 linhas */ }
+```
+</Comparar>
+
+À esquerda, nove arquivos para um cadastro sem regra. À direita, três arquivos que fazem a mesma coisa. Se um dia surgir regra de verdade (categorias com hierarquia, aprovação, vigência), refatorar três arquivos para a estrutura da esquerda é uma tarde de trabalho. A hexagonal **se paga** quando existem, juntas ou não:
+
+- **regra de negócio que vale proteger**: dinheiro, pontos, estoque, reservas, cálculos fiscais, prazos legais;
+- **mais de uma borda** de entrada ou de saída: REST e fila, banco e API externa, ou a expectativa realista de trocar uma tecnologia;
+- **vida longa e vários times**: o sistema vai durar anos e passar por muitas mãos.
+
+E não se paga em: CRUDs e cadastros; protótipos e provas de conceito; serviços de integração que só repassam dados de um lado para o outro (aí o "núcleo" seria vazio); funções pequenas e descartáveis. Nada impede **aplicar só onde precisa**: o módulo de fidelidade é hexagonal, o cadastro de lojas é um controller com repositório, no mesmo sistema.
+
+As armadilhas mais comuns em projetos que adotam a hexagonal:
+
+- **Interface para tudo, por reflexo.** A porta de saída existe porque o núcleo precisa ser independente de uma tecnologia. Uma interface `CalculadoraDeDesconto` com uma única implementação dentro do próprio núcleo não é porta, é cerimônia: use a classe.
+- **Portas com cara de tecnologia.** `CarteiraPort extends JpaRepository`, métodos que recebem `Pageable` ou devolvem `ResultSet`, `Specification` do Spring Data como parâmetro. O núcleo passa a depender do Spring Data por tabela. Portas falam a língua do negócio.
+- **Portas genéricas.** `RepositorioGenerico<T, ID>` com dez métodos. Todo fake vira um trabalho, e nenhum caso de uso usa mais que dois métodos.
+- **Domínio anêmico com casca hexagonal.** Todos os pacotes certos, e a regra inteira no `ServicoDeResgate` com `if`s sobre getters. A estrutura está lá, mas o benefício (regras isoladas, testáveis e reaproveitáveis) não.
+- **Adaptador com regra.** O controller que confere o saldo "para dar uma mensagem melhor", o adaptador JDBC que filtra recompensas inativas no SQL "para economizar". Cada regra na borda é uma regra que o consumidor de fila não vai aplicar. É exatamente o problema da Grão Fiel.
+- **Adaptadores conversando entre si.** O controller chamando o repositório JDBC para "só uma consulta". A regra de onion do ArchUnit pega isso, desde que ela exista.
+- **Transação no lugar errado.** Abrir transação no controller (ou não abrir nenhuma) e chamar o caso de uso duas vezes: duas transações, e um meio-resgate se a segunda falhar. A transação abraça o caso de uso, uma vez.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber desenhar o hexágono é o começo. O que se espera de quem é pleno ou sênior é decidir **se**, **onde** e **até que ponto** aplicar, e prever o que acontece com o sistema e com o time depois.
+
+**Como justificar a escolha para o time.** "Porque é boa prática" não convence ninguém e não deveria. Os argumentos que funcionam são concretos e mensuráveis. Quantos lugares implementam a regra de resgate hoje? (Na Grão Fiel, quatro.) Quanto tempo a suíte leva e quantos testes precisam de banco para testar uma regra? Quantos incidentes do último trimestre vieram de regra duplicada ou divergente? Quantas bordas o módulo tem, e quantas estão no roadmap? Se as respostas forem "um", "trinta segundos", "nenhum" e "uma", a hexagonal não é prioridade. Registre a decisão num **ADR** (*Architecture Decision Record*): o contexto, as opções, a escolha e as consequências aceitas, inclusive o custo de mapeamento. O ADR é o que permite, dois anos depois, alguém entender por que o módulo de fidelidade tem seis pacotes e o de cadastro tem um.
+
+**Adoção incremental, nunca o big bang.** Reescrever o sistema inteiro em hexagonal é o tipo de projeto que dura seis meses, entrega zero funcionalidade e é cancelado na metade. O caminho que funciona: escolha o módulo com mais dor (o resgate de pontos), extraia a regra para uma classe de domínio sem framework e cubra-a com testes; faça o código antigo (os quatro lugares) chamar essa classe; crie a porta de entrada e aponte o controller e o consumidor para ela; só então separe a persistência. Cada passo vai para produção sozinho. Ligue a regra de ArchUnit com *freezing* no primeiro dia, para o resto do time não aumentar o passivo enquanto você o diminui.
+
+**Transações e consistência.** A hexagonal empurra uma pergunta para a superfície: **onde começa e termina a transação?** A resposta deste exemplo (a montagem embrulha o caso de uso num `TransactionTemplate`) mantém o núcleo puro e deixa explícito que um caso de uso é uma transação. Duas consequências a vigiar. Primeira: o evento publicado dentro da transação. Com o adaptador de eventos do Spring, um ouvinte síncrono roda **dentro** da transação, e uma falha dele desfaz o resgate; para efeitos externos, use `@TransactionalEventListener` do lado de quem ouve, ou o outbox. Segunda: um caso de uso que chama uma API externa (um parceiro que confirma o resgate) não deveria segurar uma transação de banco aberta durante uma chamada HTTP de 2 segundos. A porta não esconde a latência; ela só esconde a tecnologia.
+
+**Concorrência e escala.** O controle otimista com `versao` funciona bem quando conflitos são raros (a mesma carteira raramente recebe dois resgates no mesmo segundo). Se forem frequentes, por exemplo uma carteira corporativa compartilhada por quinhentos funcionários, o otimista vira uma sequência de 409 e novas tentativas, e um bloqueio pessimista (`select ... for update`) ou um modelo diferente (um lançamento por resgate, com o saldo como soma) passa a fazer mais sentido. A boa notícia: essa troca acontece **dentro do adaptador** e, no máximo, no contrato da porta. O domínio e os outros adaptadores não percebem.
+
+**Desempenho real.** O custo de CPU do mapeamento é desprezível. Os custos que aparecem de verdade são três: portas que forçam carregar o agregado inteiro para responder a uma consulta simples (resolva com portas de leitura específicas); casos de uso que chamam a porta de saída num laço, gerando N consultas onde uma bastaria (a porta precisa de um método em lote, como `porCodigos(Set<String>)`); e a perda das otimizações automáticas do ORM, que precisam ser refeitas à mão no adaptador. Meça antes de culpar a arquitetura: em quase todos os casos, o gargalo é uma consulta, não uma cópia de objetos.
+
+**Segurança.** A autenticação ("quem é você?") é assunto da borda: o filtro do Spring Security valida o token antes do controller. A **autorização de negócio** ("esta carteira é sua?") é regra, e regras moram no núcleo. O jeito hexagonal é o adaptador extrair a identidade do token e colocá-la no comando (`ComandoDeResgate` com o `clienteId` vindo do token, e não da URL), e o caso de uso conferir. Assim, o consumidor de fila do parceiro, que não tem token de usuário, passa pela mesma regra com outra identidade. Um detalhe importante: o exemplo desta aula pega o `clienteId` do caminho da URL, o que, sem autenticação, é exatamente a falha de autorização em nível de objeto (BOLA) vista no módulo de segurança. Num sistema real, o adaptador web leria o cliente do token.
+
+**Operação e observabilidade.** Logs, métricas e rastreamento são preocupações de borda, e há dois bons lugares para eles: nos adaptadores (o tempo de cada consulta, o status de cada resposta) e num **decorador** da porta de entrada, montado na mesma `MontagemDoNucleo`, que mede cada caso de uso e registra o resultado sem tocar no serviço. O núcleo pode registrar eventos de negócio, mas não deveria depender de uma biblioteca de métricas. Para depurar em produção, uma vantagem prática: quando algo dá errado, a pergunta "é regra ou é integração?" tem resposta rápida, porque elas moram em pacotes diferentes.
+
+**Pessoas e tempo de adaptação.** Para quem chega ao time, a hexagonal tem uma curva: mais arquivos, mais indireção, "onde está o código que faz X?". Mitigue com uma estrutura de pacotes previsível (a mesma em todos os módulos), nomes de portas iguais aos casos de uso que o negócio usa, um README de arquitetura com o desenho e o ADR, e a regra de ArchUnit como documentação executável. Em time pequeno e júnior, uma versão leve (domínio puro e portas de saída, sem portas de entrada nem comandos) costuma ser o melhor custo-benefício.
+
+**Quando trocar de abordagem.** Sinais de que a hexagonal está sobrando: a maioria dos casos de uso só repassa dados do controller para o repositório; os mapeadores são cópias campo a campo, sem nenhuma tradução; o núcleo não tem regras próprias. Nesse caso, simplifique: junte camadas, mantenha só o que protege regra. Sinais de que falta: regras duplicadas em controllers e consumidores, testes de regra que precisam de banco, medo de atualizar o framework. E o próximo degrau, quando o sistema cresce em áreas de negócio: os módulos hexagonais viram módulos com fronteiras verificadas (monólito modular), e só então, se houver motivo de escala ou de autonomia de times, serviços separados. Um módulo hexagonal bem feito é o melhor candidato possível a virar um microsserviço, porque as portas já são as fronteiras.
+
+<Callout tipo="entrevista">
+**"Explique arquitetura hexagonal."** Uma boa resposta desenha o núcleo com domínio e casos de uso, as portas de entrada (interfaces dos casos de uso) e de saída (interfaces que o núcleo define para persistência, mensageria, serviços externos), e os adaptadores por fora. Diz a **regra da dependência** (tudo aponta para dentro, adaptadores não se conhecem) e o mecanismo: a porta de saída é inversão de dependência. Dá o ganho concreto ("o núcleo é testado com fakes em milissegundos; adicionar um consumidor de fila é escrever um adaptador") e fecha com o trade-off ("custa tipos e mapeamento; num CRUD eu não usaria").
+
+**"Qual a diferença entre hexagonal, onion e clean?"** São variações da mesma ideia, com vocabulários e número de anéis diferentes; o essencial comum é o núcleo independente de tecnologia. Mostra maturidade dizer que, na prática, os códigos ficam parecidos e que a escolha de nome importa menos do que a regra verificada.
+
+**"Onde você coloca o @Transactional?"** Respostas fracas: "no repositório" ou "no controller". Uma boa: a transação abraça o caso de uso; ou na aplicação, como concessão consciente ao framework, ou fora do núcleo, num decorador ou `TransactionTemplate` na montagem. Pontos extras por mencionar o evento e o outbox.
+
+**"Sua @Entity do JPA pode ser a classe de domínio?"** Pode, e muitos times fazem isso conscientemente para economizar mapeamento. O custo: o domínio passa a depender do Jakarta Persistence e das exigências dele (construtor vazio, proxies, campos mutáveis). Uma boa resposta pesa os dois lados e diz quando escolheria cada um.
+
+**"Como garantir que a arquitetura não se degrada?"** Regras de ArchUnit no build (onion ou camadas, mais "núcleo sem framework"), *freezing* para legado, revisão de ADRs. Arquitetura que não é verificada é só um desenho.
+</Callout>
+
+## Checkpoint: quem pode importar o quê?
+
+Um colega abriu um pull request no programa de fidelidade com as seis mudanças abaixo. Para cada uma, diga se ela respeita a regra da dependência, se a regra de ArchUnit desta aula a pegaria, e o que você sugeriria no code review.
+
+1. `ResgateController` passa a importar `dev.trilhajava.m13.aulas.hexagonal.dominio.Pontos` para montar a resposta.
+2. `ServicoDeResgate` passa a importar `org.slf4j.Logger` para registrar cada resgate.
+3. `CarteiraDePontos` ganha `@jakarta.persistence.Version` no campo `versao`.
+4. Um novo adaptador `adaptador.fila.ConsumidorDeResgatesDoParceiro` injeta `ResgatarRecompensa`.
+5. O mesmo consumidor passa a injetar `CarteirasDePontosJdbc` para conferir o saldo antes de chamar o caso de uso.
+6. `CarteirasDePontos` (a porta) muda a assinatura para `Page<CarteiraDePontos> doCliente(String clienteId, Pageable pagina)`.
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+1. **Respeita.** Um adaptador pode depender do domínio; a dependência aponta para dentro. A onion permite. No review, nada a objetar, desde que `Pontos` não vá parar no JSON (o `RespostaDeResgate` expõe `long`, e deve continuar assim).
+2. **Zona cinzenta, e a regra desta aula não pega.** O SLF4J não é `org.springframework..` nem `jakarta..`, então passa. É uma dependência técnica leve e estável, que muitos times aceitam no núcleo. Se o time quiser o núcleo totalmente puro, registra os eventos de negócio por uma porta ou mede o caso de uso num decorador na montagem. O importante é decidir e, se for o caso, colocar `org.slf4j..` na regra.
+3. **Viola.** O domínio passa a depender do Jakarta Persistence. A segunda regra (núcleo sem `jakarta..`) pega, com uma mensagem `is annotated with` ou `has field annotated with`. No review: a versão fica como está no domínio, e a anotação, se o time migrar para JPA, vai numa `@Entity` do adaptador.
+4. **Respeita.** É exatamente o que a hexagonal promete: uma nova borda que chama a mesma porta de entrada. Para a regra de ArchUnit continuar completa, o novo pacote precisa ser declarado como adaptador (`.adapter("fila", "..hexagonal.adaptador.fila..")`); senão, a onion não sabe que ele existe e não verifica as dependências dele com os outros adaptadores.
+5. **Viola duas vezes.** Um adaptador dependendo de outro adaptador (a onion pega, se o pacote da fila estiver declarado) e uma regra de negócio (o saldo) duplicada na borda: o problema original da Grão Fiel. Na prática, o compilador já recusaria, porque `CarteirasDePontosJdbc` é package-private. No review: tire a checagem; a carteira já recusa o resgate com saldo insuficiente.
+6. **Viola.** `Page` e `Pageable` são do Spring Data, e a porta faz parte do núcleo. A segunda regra pega (`org.springframework..`). Além disso, paginação não faz sentido para buscar a carteira de **um** cliente. No review: se surgir uma consulta paginada (o extrato), ela ganha uma porta própria, com um tipo de página do próprio núcleo, como um `record` com itens, página e total.
+
+</details>
+
+<Quiz
+  id="13-hexagonal"
+  questoes={[
+    {
+      pergunta: 'A interface `CarteirasDePontos` (porta de saída) deve ficar em qual pacote?',
+      opcoes: ['No adaptador de persistência, junto da implementação JDBC', 'No núcleo (aplicação), porque quem precisa dela é o caso de uso', 'Num pacote "interfaces" compartilhado por todos', 'No domínio, junto da `CarteiraDePontos`, obrigatoriamente'],
+      correta: 1,
+      explicacao: 'A porta pertence a quem a usa: é a inversão de dependência. O adaptador depende dela. Há projetos que põem as portas de saída no domínio; o que não pode é ela ficar do lado do adaptador, porque aí o núcleo dependeria da persistência.',
+    },
+    {
+      pergunta: 'O núcleo não tem anotações do Spring. Como o `ServicoDeResgate` executa numa transação?',
+      opcoes: ['Não executa: hexagonal não usa transações', 'A montagem embrulha o caso de uso num `TransactionTemplate` e expõe esse embrulho como o bean da porta de entrada', 'O adaptador JDBC abre e fecha uma transação em cada método', 'O controller anota o método com `@Transactional` e chama o repositório'],
+      correta: 1,
+      explicacao: 'A transação abraça o caso de uso inteiro (ler, gravar, publicar). Fazer isso fora do núcleo mantém o domínio e a aplicação livres do framework. Transação por método do adaptador quebraria a atomicidade do resgate.',
+    },
+    {
+      pergunta: 'Por que o `ResgateControllerTest` usa `@MockitoBean` para `ResgatarRecompensa` em vez de importar a montagem real?',
+      opcoes: ['Porque o `@WebMvcTest` não aceita `@Import`', 'Porque o teste do adaptador web verifica a tradução HTTP; as regras já são testadas no núcleo, e importar a montagem exigiria banco e transação', 'Porque o Mockito é mais rápido que o Spring', 'Porque a porta de entrada não pode ter implementação real em teste'],
+      correta: 1,
+      explicacao: 'Cada camada é testada no seu nível. O teste de fatia web confere JSON, status e tradução de exceções. Trazer o núcleo e o banco transformaria um teste de adaptador num teste de integração lento.',
+    },
+    {
+      pergunta: 'A regra `onionArchitecture()` do ArchUnit passou, mas uma classe do domínio tem `@jakarta.persistence.Entity`. Por quê?',
+      opcoes: ['Porque o ArchUnit não analisa anotações', 'Porque a onion só verifica dependências entre as camadas declaradas; bibliotecas externas precisam de outra regra, como `noClasses()...dependOnClassesThat().resideInAnyPackage("jakarta..")`', 'Porque `@Entity` é permitida no domínio pela regra', 'Porque faltou `withOptionalLayers(true)`'],
+      correta: 1,
+      explicacao: 'A onion garante a direção entre domínio, aplicação e adaptadores. A independência de framework é outra propriedade, e por isso esta aula combina as duas regras com `CompositeArchRule`.',
+    },
+    {
+      pergunta: 'Qual destes sistemas MENOS se beneficia de arquitetura hexagonal?',
+      opcoes: ['Um motor de cobrança com regras fiscais, chamado por API e por fila', 'Um cadastro de categorias de produto, sem regras, com uma tela de administração', 'Um programa de fidelidade com resgates por app, site e parceiros', 'Um sistema de reservas de salas com conflitos de horário e notificações'],
+      correta: 1,
+      explicacao: 'Sem regra a proteger e com uma única borda, o custo das portas e do mapeamento não se paga. Um controller com um repositório do Spring Data resolve, e é fácil de refatorar se um dia surgir regra.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- A **arquitetura hexagonal** (portas e adaptadores) põe o **núcleo** (domínio e casos de uso) no centro, sem dependência de tecnologia, e deixa HTTP, banco e mensageria em **adaptadores** por fora.
+- **Porta de entrada** é a interface de um caso de uso, chamada pelos adaptadores de entrada. **Porta de saída** é uma interface que o núcleo define, nos termos dele, e que os adaptadores de saída implementam.
+- A **regra da dependência**: tudo aponta para dentro, e adaptadores não se conhecem. A diferença para as camadas tradicionais é a inversão da dependência da persistência. Onion e clean dizem o mesmo com outros nomes e anéis.
+- O núcleo pode ficar **livre do framework**: a **montagem** cria o serviço com `new`, liga as portas aos adaptadores e abre a transação com `TransactionTemplate`. Aceitar `@Transactional` na aplicação é uma concessão válida, se for explícita e verificada.
+- **Testes por camada**: domínio e casos de uso com fakes, em milissegundos; cada adaptador com um teste de fatia (`@JdbcTest`, `@WebMvcTest`); e o **ArchUnit** (`onionArchitecture()` mais "núcleo sem framework") transformando a arquitetura num teste que falha no build.
+- O **mapeamento** entre JSON, comando, domínio, banco e evento tem custo real em código e manutenção; ele compra contratos independentes, segurança e liberdade no domínio. Mapeie à mão, não crie tipos que não traduzem nada e deixe consultas fora do domínio.
+- **Pacotes por funcionalidade** no primeiro nível e por papel hexagonal dentro de cada uma é o arranjo que escala.
+- **Não use** onde não há regra para proteger nem mais de uma borda; aplique só nos módulos que precisam, e adote de forma incremental, com ADR e ArchUnit.
+
+## Próximo passo
+
+No [exercício 13.02, Reservas hexagonal](../../../exercicios/13-arquitetura/02-reservas-hexagonal/), você aplica tudo isto num sistema de reservas de salas: domínio com regras de conflito de horário, portas de entrada e de saída, adaptadores web e de persistência, a montagem fora das camadas e uma regra de ArchUnit protegendo o desenho. Depois, a [aula 13.04, Monólito modular](../../13-arquitetura/04-monolito-modular/), dá o passo seguinte: várias funcionalidades, cada uma com o seu hexágono, num mesmo sistema, com fronteiras entre elas verificadas pelo Spring Modulith.
+
+## Referências
+
+- Alistair Cockburn — [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/) (o artigo original do autor do padrão)
+- ArchUnit — [User Guide: Architectures (Layered e Onion)](https://www.archunit.org/userguide/html/000_Index.html#_architectures) e [Freezing Arch Rules](https://www.archunit.org/userguide/html/000_Index.html#_freezing_arch_rules)
+- Spring Framework — [Programmatic Transaction Management (`TransactionTemplate`)](https://docs.spring.io/spring-framework/reference/data-access/transaction/programmatic.html)
+- Spring Framework — [JDBC: `JdbcClient`](https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html#jdbc-JdbcClient)
+- Spring Framework — [Error Responses (Problem Details)](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html)
+- Spring Boot — [Testing: auto-configured JDBC and Spring MVC tests](https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html)
+- Spring Boot — [Database Initialization](https://docs.spring.io/spring-boot/how-to/data-initialization.html)

@@ -1,0 +1,82 @@
+---
+/**
+ * Um marco do plano de execução de um projeto de portfólio.
+ * O `id` precisa existir em `marcos` no frontmatter do projeto: ele vira a âncora "#marco-<id>"
+ * e a chave do progresso (o botão no fim do marco e a lista da coluna esquerda ficam sincronizados).
+ */
+import Icon from '../Icon.astro';
+
+interface Props {
+  id: string;
+  numero: number;
+  titulo: string;
+  /** estimativa de horas do marco */
+  horas?: number;
+}
+const { id, numero, titulo, horas } = Astro.props;
+---
+
+<section class="marco" id={`marco-${id}`} data-marco={id} aria-labelledby={`marco-${id}-titulo`}>
+  <div class="marco-topo">
+    <span class="marco-num">Marco {numero}</span>
+    {horas && <span class="marco-horas"><Icon name="clock" size={13} /> ~{horas}h</span>}
+  </div>
+  <h3 id={`marco-${id}-titulo`}>{titulo}</h3>
+  <div class="marco-corpo"><slot /></div>
+  <div class="marco-pe" data-pagefind-ignore>
+    <button type="button" class="btn btn-sm marco-feito" data-marco-toggle={id} aria-pressed="false">
+      <Icon name="check-circle" size={16} /> <span>Marcar este marco como concluído</span>
+    </button>
+  </div>
+</section>
+
+<style>
+  .marco {
+    margin-block: 1.8em;
+    padding: 18px 20px 16px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    scroll-margin-top: calc(var(--header-h) + 16px);
+  }
+  .marco-topo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .marco-num {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .marco-horas {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .marco h3 {
+    margin-top: 4px !important;
+  }
+  .marco-corpo > :global(:first-child) {
+    margin-top: 0.6em;
+  }
+  .marco-pe {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .marco-feito[aria-pressed='true'] {
+    background: var(--ok-soft);
+    border-color: var(--ok);
+    color: var(--ok);
+  }
+  :global(.marco.feito) {
+    border-left-color: var(--ok);
+  }
+</style>

@@ -1,0 +1,134 @@
+---
+titulo: Cliente HTTP de câmbio com cache e fallback
+codigo: "08.04"
+resumo: Integre com uma API externa de cotações usando uma HTTP interface do Spring, com timeout, cache com validade, tradução de erros e fallback para a última cotação conhecida — testado contra um servidor HTTP real.
+modulo: 08-spring-boot
+ordem: 4
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [RestClient, "@HttpExchange", timeout, cache, fallback, Clock, "@ConfigurationProperties"]
+aulas: [08-spring-boot/06-restclient-versionamento-openapi, 08-spring-boot/03-ioc-e-injecao-de-dependencias]
+java:
+  modulo: m08-spring-boot
+  teste: ConversorDeMoedasTest
+---
+
+## Contexto
+
+Uma plataforma de viagens mostra preços de pacotes internacionais em dólar, euro e libra. A conversão depende de uma API de cotações de um parceiro, que tem três problemas conhecidos: cobra por requisição, às vezes demora 30 segundos para responder e, algumas vezes por mês, fica fora do ar por uma hora.
+
+Na última queda, as páginas de pacotes ficaram travadas até darem timeout no navegador — e o site inteiro ficou lento, porque todas as threads do servidor estavam esperando o parceiro. Sua missão é escrever o conversor que **nunca mais** deixa isso acontecer.
+
+## A API do parceiro
+
+```http
+GET {base-url}/cotacoes/USD
+Accept: application/json
+```
+
+```json
+{"moeda": "USD", "compra": 5.1234, "venda": 5.1301, "dataHora": "2026-09-28T13:00:00Z"}
+```
+
+Moeda desconhecida → `404`. Instabilidade → `5xx` ou demora.
+
+## O que já existe
+
+`Cotacao` (o JSON acima), `Conversao(moeda, valorEmReais, valorConvertido, taxa, fonte)`, o enum `FonteDaCotacao { API, CACHE, CACHE_EXPIRADO }` e as exceções `MoedaNaoSuportadaException` e `CotacaoIndisponivelException`.
+
+## O que você cria
+
+| Tipo | Responsabilidade |
+|---|---|
+| `CambioProperties` | `@ConfigurationProperties("cambio")`: `base-url`, `timeout` (padrão `2s`), `validade` (`60s`), `validade-maxima-fallback` (`24h`) |
+| `CotacaoClient` | HTTP interface com `@GetExchange("/cotacoes/{moeda}")` |
+| `CambioConfig` | `@Bean` do `CotacaoClient` (com **timeout** de conexão e leitura) e `@Bean` de `java.time.Clock` |
+| `ConversorDeMoedas` | `@Service` com `Conversao converter(BigDecimal valorEmReais, String moeda)` |
+
+## Regras de `converter`
+
+1. Valor nulo, zero ou negativo, ou moeda em branco → `IllegalArgumentException`, **sem chamar a API**.
+2. Normalize a moeda: `" eur "` → `EUR`.
+3. Converta usando a taxa de **venda**: `valorEmReais ÷ venda`, com **2 casas** (`HALF_EVEN`).
+4. **Cache**: uma cotação obtida há **até 60 s** (inclusive) é reaproveitada, com `fonte = CACHE`, sem chamar a API.
+5. **404** da API → `MoedaNaoSuportadaException`.
+6. **Qualquer outra falha** (5xx, timeout, conexão recusada):
+   - se houver cotação obtida há **até 24 h**, use-a com `fonte = CACHE_EXPIRADO` (e registre um aviso no log);
+   - senão, `CotacaoIndisponivelException`.
+7. A idade do cache é medida pelo `Clock` injetado — os testes avançam o relógio sem esperar.
+
+## Como os testes funcionam
+
+`ConversorDeMoedasTest` sobe um **servidor HTTP de verdade** (o `HttpServer` do JDK) numa porta aleatória e aponta `cambio.base-url` para ele. Cada teste programa a resposta (200, 404, 500 ou uma demora de 3 s) e confere as requisições recebidas. O teste de timeout usa `cambio.timeout=500ms` e exige que o conversor desista em menos de 2 s.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ConversorDeMoedasTest` passam.
+- [ ] Nenhuma URL ou timeout fixo no código: tudo vem de `CambioProperties`.
+- [ ] O cache é thread-safe.
+- [ ] O conversor não usa `Instant.now()` nem `System.currentTimeMillis()`.
+
+## Desafios opcionais
+
+- Troque a montagem manual por `@ImportHttpServices(group = "cambio", types = CotacaoClient.class)` e as propriedades `spring.http.serviceclient.cambio.*`. O que você ganha e o que perde?
+- Evite o "efeito manada": se 100 requisições pedirem USD ao mesmo tempo com o cache vencido, só **uma** deve chamar a API (dica: `ConcurrentHashMap.compute` ou um `CompletableFuture` por moeda).
+- Exponha `GET /conversoes?valor=1000&moeda=USD` e devolva o header `Warning`-like `X-Cotacao-Fonte` quando a fonte for `CACHE_EXPIRADO`.
+
+<Dicas>
+<Dica nivel={1}>
+Separe em etapas: (1) configuração e `CotacaoClient` funcionando no caminho feliz; (2) a conta com `divide(venda, 2, RoundingMode.HALF_EVEN)`; (3) o cache; (4) os erros. Um `record` privado `CotacaoEmCache(Cotacao cotacao, Instant obtidaEm)` num `ConcurrentHashMap<String, ...>` resolve o cache.
+</Dica>
+<Dica nivel={2}>
+O `RestClient` lança `HttpClientErrorException.NotFound` para 404 e outras subclasses de `RestClientException` para 5xx e falhas de rede (inclusive timeout). Capture **primeiro** o `NotFound` e depois o `RestClientException`. Para o timeout, crie o `RestClient` com um `JdkClientHttpRequestFactory` configurado com `setReadTimeout(...)` e um `HttpClient` com `connectTimeout(...)`.
+</Dica>
+<Dica nivel={3}>
+Montando o cliente declarativo:
+
+```java
+RestClient restClient = builder.baseUrl(props.baseUrl().toString()).requestFactory(requestFactory).build();
+return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(restClient))
+        .build()
+        .createClient(CotacaoClient.class);
+```
+
+A idade do cache: `Duration.between(obtidaEm, clock.instant())` comparada com `props.validade()` usando `compareTo(...) <= 0`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Conversor">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/cambio/ConversorDeMoedas.java" />
+</Tab>
+<Tab rotulo="Cliente e configuração">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/cambio/CotacaoClient.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/cambio/CambioConfig.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/cambio/CambioProperties.java" />
+</Tab>
+<Tab rotulo="O servidor falso dos testes">
+<CodigoJava caminho="m08-spring-boot/testes/dev/trilhajava/m08/cambio/ApiDeCotacoesFalsa.java" titulo="testes/ApiDeCotacoesFalsa.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Timeout no cliente**: é a linha que impede a queda do parceiro de virar a sua. Sem ela, o teste de timeout esperaria os 3 s inteiros — e em produção, os 30.
+- **Erros classificados**: 404 é culpa do pedido (não adianta insistir, nem usar cache); 5xx e timeout são transitórios e aceitam o fallback.
+- **Fallback sinalizado**: devolver uma cotação velha **sem avisar** seria mentir para o usuário. O campo `fonte` deixa a decisão de exibição para a tela ("cotação de 2 h atrás").
+- **`Clock` como dependência**: o tempo vira algo que o teste controla. Testes com `Thread.sleep(61_000)` são lentos e instáveis.
+- **HTTP interface**: o contrato da API externa fica numa interface de três linhas; URL, headers e JSON são problema do Spring.
+
+### Alternativas e trade-offs
+
+- **Spring Cache (`@Cacheable`) + Caffeine** resolveria o cache com uma anotação — mas não o fallback com validade diferente. Para regras como essa, um cache explícito é mais claro.
+- **Resilience4j** (módulo 13) adiciona retry com backoff e circuit breaker: depois de N falhas, para de chamar o parceiro por um tempo e vai direto ao fallback.
+
+### Avalie sua solução
+
+- Quantas requisições ao parceiro acontecem se 50 usuários pedirem USD no mesmo segundo com o cache vazio?
+- Se o parceiro devolver `"venda": 0`, o que o seu código faz? E o que deveria fazer?
+
+</Solucao>

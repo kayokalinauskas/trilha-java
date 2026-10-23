@@ -1,0 +1,225 @@
+---
+titulo: Fila de tarefas no PostgreSQL com Testcontainers
+codigo: "10.03"
+resumo: Implemente uma fila de tarefas sobre o PostgreSQL com FOR UPDATE SKIP LOCKED e prove, com testes que sobem um PostgreSQL 18 de verdade pelo Testcontainers, que 8 trabalhadores a consomem ao mesmo tempo sem duplicar nada e sem esperar uns pelos outros.
+modulo: 10-testes
+ordem: 3
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [Testcontainers, ServiceConnection, JdbcClient, SKIP LOCKED, JSONB, concorrência, PostgreSQL]
+aulas: [10-testes/05-testcontainers, 10-testes/02-junit-e-assertj, 09-persistencia/06-locking-e-flyway, 06-concorrencia/03-executors]
+java:
+  modulo: m10-testes
+  arquivos:
+    - src/main/java/dev/trilhajava/m10/fila/FilaDeTarefas.java
+    - src/test/java/dev/trilhajava/m10/fila/ContainersDeTeste.java
+    - src/test/java/dev/trilhajava/m10/fila/FilaDeTarefasTest.java
+---
+
+## Contexto
+
+Um SaaS de emissão de notas fiscais processa tarefas em segundo plano: gerar o PDF, enviar o e-mail, consultar a Sefaz. Elas ficam numa tabela do próprio PostgreSQL, sem Kafka nem RabbitMQ, e várias instâncias da aplicação as consomem. O código antigo fazia um `SELECT` da tarefa mais antiga e depois um `UPDATE`: duas instâncias pegavam a mesma tarefa, e clientes recebiam o mesmo e-mail duas vezes.
+
+Pior: os testes antigos rodavam em H2 e passavam. O H2 não tem `JSONB`, não tem `FOR UPDATE SKIP LOCKED` e trava linhas de outro jeito, então aquela suíte verde não dizia nada sobre a produção.
+
+Você vai reescrever a fila **e** a suíte que prova que ela funciona, contra um PostgreSQL 18 de verdade, num container que o Testcontainers sobe e descarta a cada execução.
+
+## O que você vai praticar
+
+- **Testcontainers com `@ServiceConnection`.** Uma `@TestConfiguration` declara o container como `@Bean`; o Spring o inicia antes do `DataSource`, e o `@ServiceConnection` lê do container a URL, o usuário e a senha. Nenhuma `spring.datasource.*` escrita à mão, nenhuma porta fixa. Veja [Testes de integração com Testcontainers](../../../aulas/10-testes/05-testcontainers/).
+- **A mesma versão da produção, com tag fixa.** `postgres:18`, nunca `latest`: o teste só prova algo se o banco for o mesmo da produção. Um teste pode (e deve) conferir isso pelo `DatabaseMetaData`. Mesma aula.
+- **Isolamento dos dados.** O container (e o contexto do Spring) é compartilhado entre os testes da classe; cada teste começa limpando a tabela num `@BeforeEach`, para não depender da ordem de execução. Mesma aula.
+- **Lock pessimista que não espera: `FOR UPDATE SKIP LOCKED`.** `FOR UPDATE` trava as linhas escolhidas até o fim da transação; `SKIP LOCKED` faz as outras transações **pularem** as linhas travadas em vez de esperar por elas. É o que deixa vários consumidores trabalharem em paralelo na mesma tabela. Veja [Locking otimista, pessimista e migrações com Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/).
+- **Testar concorrência de verdade.** Um `ExecutorService` com 8 threads, um `CountDownLatch` para todas largarem juntas, e uma contagem de quantas vezes cada tarefa foi processada. Veja [Executors e pools de threads](../../../aulas/06-concorrencia/03-executors/).
+- **Asserções que explicam a falha (AssertJ).** `containsEntry`, `hasValue`, `succeedsWithin(Duration)` para um `Future` que não pode demorar. Veja [JUnit 6 e AssertJ a fundo](../../../aulas/10-testes/02-junit-e-assertj/).
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m10.fila` (não precisa mudar):
+
+- `FilaApplication` — a aplicação Spring Boot, com `@PropertySource("classpath:fila.properties")`;
+- `fila.properties` — só `spring.flyway.locations=classpath:db/fila`. **Não há** `spring.datasource.url`: a conexão vem do container;
+- `db/fila/V1__cria_tarefa.sql` — a tabela `tarefa`, aplicada pelo Flyway: `id` (identidade), `tipo`, `payload` (**`JSONB`**), `status` (`PENDENTE` por padrão), `tentativas` (0 por padrão), `reservada_por`, `reservada_em`, `ultimo_erro` e `criada_em` (`clock_timestamp()`), e um índice parcial só das pendentes;
+- `StatusTarefa` — `PENDENTE`, `EM_PROCESSAMENTO`, `CONCLUIDA` e `FALHOU`;
+- `Tarefa` — `record Tarefa(long id, String tipo, String payload, StatusTarefa status, int tentativas, String reservadaPor)`, com o payload como texto;
+- as dependências no `pom.xml`: `spring-boot-starter-jdbc`, Flyway, o driver do PostgreSQL, `spring-boot-testcontainers`, `testcontainers-postgresql` e `testcontainers-junit-jupiter`.
+
+### O que você implementa
+
+**1. A fila**, em `src/main/java/.../FilaDeTarefas.java` (a classe já existe, anotada com `@Repository`), usando o `JdbcClient` do Spring:
+
+```java
+public FilaDeTarefas(JdbcClient jdbc)
+
+public long enfileirar(String tipo, String payloadJson)          // regra 1
+public Optional<Tarefa> reservarProxima(String trabalhador)       // regras 2 e 3
+public void concluir(long id)                                      // regra 4
+public void falhar(long id, String erro)                           // regra 5
+public Map<StatusTarefa, Long> contagemPorStatus()                 // regra 6
+```
+
+**2. O banco dos testes**, em `src/test/java/.../ContainersDeTeste.java`: uma `@TestConfiguration(proxyBeanMethods = false)` pública com um `@Bean` `PostgreSQLContainer` (pacote `org.testcontainers.postgresql`) anotado com `@ServiceConnection` (regra 7).
+
+**3. A suíte**, em `src/test/java/.../FilaDeTarefasTest.java`: `@SpringBootTest`, `@Import(ContainersDeTeste.class)` e `@EnabledIfDockerAvailable`, com **pelo menos um teste por regra** (regra 8).
+
+| Chamada, a partir da tabela vazia | Resultado |
+|---|---|
+| `enfileirar("email", "{\"pedido\": 1}")` | `1` (o id gerado) |
+| `enfileirar("email", "{\"pedido\": 2}")` | `2` |
+| `reservarProxima("trabalhador-a")` | `Optional[Tarefa[id=1, tipo=email, payload={"pedido": 1}, status=EM_PROCESSAMENTO, tentativas=1, reservadaPor=trabalhador-a]]` |
+| `reservarProxima("trabalhador-b")` | a tarefa `2` |
+| `reservarProxima("trabalhador-c")` | `Optional.empty` |
+| `concluir(1)` | nada; a tarefa 1 fica `CONCLUIDA` |
+| `concluir(1)` de novo | `IllegalStateException` |
+| `contagemPorStatus()` | `{PENDENTE=0, EM_PROCESSAMENTO=1, CONCLUIDA=1, FALHOU=0}` |
+
+As mensagens das exceções são livres; só o **tipo** importa. Os ids começam em 1 num banco novo, mas não voltam a 1 depois de um `DELETE`: nos seus testes, guarde o id que `enfileirar` devolve em vez de supor um número.
+
+## Regras
+
+**A fila**
+
+1. **`enfileirar` cria uma tarefa `PENDENTE`, com 0 tentativas, e devolve o id**, maior que o de qualquer tarefa anterior. O payload é gravado como `JSONB` (`CAST(:payload AS jsonb)`), e o PostgreSQL o **normaliza**: `"{\"pedido\":1,   \"cliente\":\"ana\"}"` volta como `{"pedido": 1, "cliente": "ana"}` (espaços padronizados) e `{"b": 1, "a": 2, "b": 3}` volta como `{"a": 2, "b": 3}` (chaves reordenadas, a repetida fica com o último valor). JSON inválido, como `"{pedido: 1}"`, é recusado pelo banco: `DataIntegrityViolationException` do Spring, e nada é gravado.
+2. **`reservarProxima` pega a `PENDENTE` mais antiga (ordem de chegada)** e, no mesmo comando, marca `EM_PROCESSAMENTO`, grava `reservada_por` e `reservada_em` e soma 1 em `tentativas`. Devolve a tarefa **já atualizada**; sem pendentes, `Optional.empty()`. Enfileiradas 1 e 2: a primeira reserva devolve a 1 com `tentativas=1`, a segunda devolve a 2, a terceira devolve vazio.
+3. **Nunca a mesma tarefa para dois trabalhadores, e ninguém espera por ninguém.** A escolha e a reserva são **um único comando SQL** com `FOR UPDATE SKIP LOCKED`. Exemplo: com as tarefas 1 e 2 pendentes, uma transação ainda aberta reserva a 1 (a linha fica travada até o commit); outro trabalhador que chame `reservarProxima` nesse momento recebe a **2 imediatamente**, sem esperar o commit. E 8 trabalhadores concorrentes consumindo 200 tarefas processam **cada uma exatamente uma vez**.
+4. **`concluir` leva `EM_PROCESSAMENTO` → `CONCLUIDA`.** Em qualquer outro estado, ou com um id que não existe, `IllegalStateException`. Enfileirada e ainda pendente: `concluir` lança. Reservada: `concluir` funciona e ela não é mais reservada por ninguém. Concluída: `concluir` ou `falhar` de novo lançam. `concluir(999999)` lança.
+5. **`falhar` devolve à fila, guardando o erro; na 3ª tentativa, `FALHOU`.** Só vale para `EM_PROCESSAMENTO` (senão, `IllegalStateException`). A tarefa volta a `PENDENTE` com `ultimo_erro = erro` e `reservada_por` vazio (`NULL`), **na mesma posição da fila** (a ordem é a de chegada, não a da falha). Exemplo: 1 e 2 enfileiradas; reserva a 1 e falha a 1 com `"gateway fora do ar"` → a próxima reserva devolve a **1** de novo, com `tentativas=2`, e só depois a 2. Se a tarefa já está com 3 tentativas, `falhar` a marca `FALHOU` (com o erro gravado), e ela nunca mais é reservada.
+6. **`contagemPorStatus` traz os quatro status, mesmo os que têm zero.** Tabela vazia → `{PENDENTE=0, EM_PROCESSAMENTO=0, CONCLUIDA=0, FALHOU=0}`. Duas enfileiradas e uma reservada → `PENDENTE=1, EM_PROCESSAMENTO=1`, e os outros dois com `0`.
+
+**Os testes**
+
+7. **O banco dos testes é um PostgreSQL 18 num container.** `ContainersDeTeste` declara `new PostgreSQLContainer("postgres:18")` como bean com `@ServiceConnection`. Nenhuma `spring.datasource.*` em lugar nenhum. Um teste confere, pelo `DatabaseMetaData` da conexão, que o produto é `"PostgreSQL"` e a versão principal é `18`.
+8. **Um teste por regra, cada um independente dos outros.** A tabela é limpa num `@BeforeEach` (`DELETE FROM tarefa`), e nenhum teste depende de outro ter rodado antes. Sem Docker, a classe é **pulada** (`@EnabledIfDockerAvailable`), nunca "aprovada". A suíte precisa **falhar** se alguém trocar o comando da regra 3 por um `SELECT` seguido de `UPDATE`, ou se tirar o `SKIP LOCKED` (veja **Experimente**).
+
+## Passo a passo sugerido
+
+Faça um passo de cada vez e rode os testes depois de cada um.
+
+1. **O container.** Escreva `ContainersDeTeste` e uma `FilaDeTarefasTest` com um único teste: o da versão do banco (regra 7). Para ele, injete o `DataSource` com `@Autowired`. Rode e veja o container subir; a primeira execução baixa a imagem `postgres:18`, e as seguintes começam em poucos segundos.
+2. **Enfileirar (regra 1).** O construtor guarda o `JdbcClient`; `enfileirar` é um `INSERT ... RETURNING id`. Para o teste, injete também um `JdbcClient` e leia a linha gravada (`payload::text` devolve o JSONB como texto). Aqui entra o `@BeforeEach` da regra 8.
+3. **Reservar, sem se preocupar com concorrência (regra 2).** Escreva o teste de ordem de chegada e faça-o passar.
+4. **Concluir e falhar (regras 4 e 5).** Os dois são um `UPDATE ... WHERE id = :id AND status = 'EM_PROCESSAMENTO'`: o número de linhas afetadas (`update()` devolve um `int`) diz se a tarefa estava mesmo em processamento.
+5. **A contagem (regra 6).** Um `GROUP BY status`, completando os que faltarem com zero.
+6. **O teste de concorrência (regra 3).** 200 tarefas, 8 threads, um `CountDownLatch` de largada e um `ConcurrentHashMap<Long, AtomicInteger>` contando as vezes que cada id foi processado. Se a sua reserva ainda é "escolher e depois atualizar", ele deve ficar vermelho. Agora reescreva a reserva como um único comando com `FOR UPDATE SKIP LOCKED`.
+7. **O teste do "não espera" (regra 3).** Com um `TransactionTemplate` (injetável), abra uma transação, reserve a primeira dentro dela e, **antes** do commit, peça a reserva em outra thread. Confira que o `Future` termina em até 2 segundos com a segunda tarefa.
+8. **Quebre de propósito.** Faça as trocas da tabela do **Experimente** e confira que a sua suíte pega cada uma. Um teste que nunca falhou não provou nada.
+
+## Experimente
+
+Com o Docker ligado, rode a sua suíte na pasta do starter:
+
+```bash
+mvn test -Dtest=FilaDeTarefasTest
+```
+
+Enquanto ela roda, `docker ps` num outro terminal mostra dois containers: `postgres:18` e `testcontainers/ryuk` (o faxineiro que remove os containers quando a JVM termina). Quando os testes acabam, os dois somem.
+
+Os resultados esperados, com a solução de referência e com as trocas que a sua suíte precisa pegar:
+
+| Cenário | Resultado |
+|---|---|
+| sua fila e seus testes prontos, Docker ligado | todos os testes passam; o teste da versão vê `PostgreSQL` `18` |
+| `ContainersDeTeste` sem o `@ServiceConnection` | todos os testes com erro: `Failed to load ApplicationContext`, causado por `Failed to determine a suitable driver class` (o container sobe, mas ninguém conta ao Spring onde ele está) |
+| `reservarProxima` como `SELECT` da mais antiga seguido de `UPDATE ... WHERE id = :id` | o teste de concorrência quebra: dois trabalhadores recebem a mesma tarefa, e o segundo `concluir` lança `IllegalStateException: A tarefa … não está em processamento`; o teste do "não espera" também falha |
+| `FOR UPDATE` sem o `SKIP LOCKED` | o teste de concorrência **passa**, mas o do "não espera" falha: o `Future` não termina em 2 segundos (`TimeoutException`), porque o segundo trabalhador fica esperando o commit do primeiro |
+| `enfileirar("email", "{pedido: 1}")` | `DataIntegrityViolationException` (`invalid input syntax for type json`) |
+| `enfileirar` com `{"pedido":1,   "cliente":"ana"}` e depois reservar | `payload={"pedido": 1, "cliente": "ana"}` |
+
+Repare na penúltima troca: o teste de concorrência sozinho não distingue `FOR UPDATE` de `FOR UPDATE SKIP LOCKED`, porque as duas versões acabam processando as 200 tarefas uma vez cada (a sem `SKIP LOCKED` só enfileira os trabalhadores uns atrás dos outros). É o teste da transação aberta que prova o `SKIP LOCKED`.
+
+O que pode variar: os ids nas mensagens, os tempos, e em que tarefa a versão ingênua duplica. A duplicação da versão `SELECT` + `UPDATE` depende do escalonamento das threads; com 8 trabalhadores e 200 tarefas, ela apareceu em todas as execuções da referência.
+
+Sem Docker, o `@EnabledIfDockerAvailable` faz a classe aparecer como **pulada** (`Skipped`) em vez de falhar. Isso não conta como aprovado.
+
+## Critérios de aceite
+
+- [ ] A sua suíte passa com o Docker ligado, contra um PostgreSQL 18 que ela mesma sobe, sem nenhuma `spring.datasource.*`.
+- [ ] Cada regra de 1 a 6 tem pelo menos um teste, e cada teste passa sozinho ou em qualquer ordem.
+- [ ] A sua suíte fica vermelha com a reserva em `SELECT` + `UPDATE` e também sem o `SKIP LOCKED` (as duas trocas da tabela).
+- [ ] Todos os resultados da tabela do **Experimente** se confirmam.
+- [ ] Você explica, com as suas palavras, por que esses testes não poderiam rodar num H2.
+
+## Desafios opcionais
+
+- **Tarefas abandonadas.** Se um trabalhador morrer no meio, a tarefa fica `EM_PROCESSAMENTO` para sempre. Crie `recuperarAbandonadas(Duration limite)`, que devolve à fila as reservadas há mais tempo que o limite, e teste-o sem esperar (dica: ajuste `reservada_em` no teste com um `UPDATE`).
+- **Prioridade.** Uma migração `V2` com a coluna `prioridade` e o índice parcial correspondente; a reserva passa a ordenar por prioridade e depois por chegada.
+- **O container no desenvolvimento.** Uma classe `FilaLocal` em `src/test/java` com `SpringApplication.from(FilaApplication::main).with(ContainersDeTeste.class).run(args)` sobe a aplicação com o mesmo PostgreSQL do teste.
+- **Reuso entre execuções.** Experimente `.withReuse(true)` e `testcontainers.reuse.enable=true` no `~/.testcontainers.properties`, e compare o tempo da segunda execução.
+
+<Dicas>
+<Dica nivel={1}>
+O `ContainersDeTeste` tem umas dez linhas: a anotação da classe, um método `@Bean @ServiceConnection` que devolve `new PostgreSQLContainer("postgres:18")`. O `JdbcClient` tem uma API fluente: `jdbc.sql("...").param("nome", valor).query(Long.class).single()` para ler um valor, `.optional()` quando pode não haver linha, e `.update()` para escrever (devolve as linhas afetadas).
+</Dica>
+<Dica nivel={2}>
+- O coração da fila é um `UPDATE ... WHERE id = (SELECT id ... FOR UPDATE SKIP LOCKED) RETURNING ...`: a subconsulta escolhe e trava, o `UPDATE` reserva, o `RETURNING` devolve a linha já atualizada. Tudo num comando só, sem janela para outro trabalhador.
+- Para `falhar`, um `CASE` decide o novo status: `SET status = CASE WHEN tentativas >= 3 THEN 'FALHOU' ELSE 'PENDENTE' END`.
+- No teste do "não espera", o `TransactionTemplate` e o `JdbcClient` usam a mesma transação da thread atual: a reserva feita dentro de `executeWithoutResult` só é confirmada quando o lambda termina.
+</Dica>
+<Dica nivel={3}>
+```sql
+UPDATE tarefa
+   SET status = 'EM_PROCESSAMENTO', reservada_por = :trabalhador,
+       reservada_em = now(), tentativas = tentativas + 1
+ WHERE id = (SELECT id FROM tarefa
+              WHERE status = 'PENDENTE'
+              ORDER BY criada_em, id
+              LIMIT 1
+              FOR UPDATE SKIP LOCKED)
+RETURNING id, tipo, payload::text AS payload, status, tentativas, reservada_por
+```
+
+E o teste do "não espera":
+
+```java
+try (var outroTrabalhador = Executors.newSingleThreadExecutor()) {
+    transacao.executeWithoutResult(status -> {
+        assertThat(fila.reservarProxima("lento")).map(Tarefa::id).hasValue(primeira);
+        Future<Optional<Tarefa>> rapido = outroTrabalhador.submit(() -> fila.reservarProxima("rapido"));
+        assertThat(rapido).succeedsWithin(Duration.ofSeconds(2))
+                .satisfies(t -> assertThat(t).map(Tarefa::id).hasValue(segunda));
+    });
+}
+```
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="FilaDeTarefas">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/fila/FilaDeTarefas.java" />
+</Tab>
+<Tab rotulo="ContainersDeTeste">
+<CodigoJava caminho="m10-testes/solucao/src/test/java/dev/trilhajava/m10/fila/ContainersDeTeste.java" />
+</Tab>
+<Tab rotulo="FilaDeTarefasTest">
+<CodigoJava caminho="m10-testes/solucao/src/test/java/dev/trilhajava/m10/fila/FilaDeTarefasTest.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Um comando atômico.** Escolher e reservar na mesma instrução elimina o intervalo em que dois trabalhadores viam a mesma tarefa livre. Nenhum `synchronized` em Java: quem coordena os trabalhadores, inclusive os de outras instâncias da aplicação, é o banco.
+- **`SKIP LOCKED` em vez de esperar.** Com `FOR UPDATE` puro, os trabalhadores fariam fila atrás da mesma linha; com `SKIP LOCKED`, cada um pega a próxima livre. O teste da transação aberta torna essa diferença visível, e o de concorrência sozinho não.
+- **Transições condicionais.** `WHERE id = :id AND status = 'EM_PROCESSAMENTO'` detecta, pelas linhas afetadas, o `concluir` duplicado ou fora de hora, sem ler a tarefa antes (o que abriria outra janela de corrida).
+- **O banco real nos testes.** `JSONB`, a normalização do payload, `SKIP LOCKED`, `clock_timestamp()` e o índice parcial são testados exatamente como rodam em produção. O `@ServiceConnection` elimina toda a configuração de conexão, e o `@EnabledIfDockerAvailable` impede que a falta de Docker vire um falso "verde".
+- **Um container para a classe inteira.** O contexto do Spring (e o container, que é um bean dele) é criado uma vez e reaproveitado; o `@BeforeEach` com `DELETE` dá a cada teste uma tabela vazia. Recriar o container por teste multiplicaria o tempo da suíte.
+
+### Alternativas
+
+- **Container estático com `@Testcontainers` e `@Container`**, e um `@DynamicPropertySource` copiando `getJdbcUrl()`, `getUsername()` e `getPassword()`. Funciona, e ainda é o caminho para serviços que o Spring Boot não conhece, mas é mais código para o mesmo resultado.
+- **`@JdbcTest` em vez de `@SpringBootTest`.** Sobe só a fatia JDBC (mais rápido), mas por padrão troca o `DataSource` por um banco embutido e envolve cada teste numa transação com rollback. Aqui seria preciso `@AutoConfigureTestDatabase(replace = NONE)` e desligar a transação do teste, porque os testes de concorrência precisam de commits de verdade.
+- **Uma biblioteca de jobs** (db-scheduler, JobRunr) usa exatamente este padrão por baixo. Para volumes altos, com muitos consumidores e *replay*, Kafka ou RabbitMQ são as ferramentas certas; a fila no banco ganha quando a tarefa precisa ser criada **na mesma transação** do dado que a originou (o padrão *outbox*, do módulo 12).
+
+### Avalie sua solução
+
+- A sua suíte fica vermelha com as duas trocas do **Experimente**? Se o teste de concorrência passasse com a versão `SELECT` + `UPDATE`, o que faltaria nele?
+- O que acontece com uma tarefa cujo trabalhador caiu no meio do processamento?
+- O seu `contagemPorStatus` faz uma consulta ou quatro?
+- Quanto tempo a sua suíte leva? Quanto disso é o container subindo, e o que mudaria se cada classe de teste declarasse o seu próprio container?
+
+</Solucao>

@@ -1,0 +1,233 @@
+---
+titulo: "System design: um encurtador de URLs"
+codigo: "15.05"
+resumo: Aplique o roteiro da aula 4 ao clássico encurtador de URLs e escreva o documento de design — requisitos, estimativas com as contas e as premissas à mostra, API, geração de códigos curtos, modelo de dados, cache de redirecionamento, 301 × 302 e analytics, particionamento, rate limiting e abuso — como você defenderia numa entrevista ou numa revisão de arquitetura.
+modulo: 15-system-design
+ordem: 5
+dificuldade: medio
+tempo: 1h30–2h
+conceitos: [system design, estimativas, base62, geração de ids, cache-aside, Redis, "301 × 302", analytics assíncrono, particionamento, rate limiting, phishing, trade-offs]
+aulas: [15-system-design/04-framework-system-design, 15-system-design/01-cache, 15-system-design/02-redis, 15-system-design/05-escala-e-consistencia]
+---
+
+## Contexto
+
+A **Encurta+** quer lançar um encurtador de links para o mercado brasileiro: lojas mandam links curtos por SMS e WhatsApp, influenciadores colocam links na bio, e as empresas querem saber quantas pessoas clicaram. O produto é simples de descrever: você cola uma URL longa e recebe algo como `enc.to/aZ3kP9x`; quem abre o link curto é redirecionado para a URL longa.
+
+É também a pergunta de system design mais comum em entrevistas, justamente porque parece simples. As decisões interessantes estão nos detalhes: como gerar códigos curtos e únicos com várias instâncias, o que acontece quando um link viraliza, por que a escolha entre 301 e 302 é uma decisão de negócio, e o que fazer quando alguém usa o seu domínio para espalhar phishing.
+
+O que a Encurta+ já sabe (o resto, você decide e declara):
+
+- O objetivo é chegar, em um ano, a **100 milhões de links novos por mês**.
+- Links são muito mais lidos do que criados: o time espera uns **100 redirecionamentos para cada link criado**.
+- O redirecionamento é o caminho crítico: se ele cai, todos os links impressos, enviados por SMS e colados em bios quebram de uma vez.
+- Os clientes pagantes querem estatísticas: cliques por dia, por país e por origem.
+- Um concorrente teve o domínio bloqueado por filtros antiphishing depois de ser usado em golpes. Isso não pode acontecer aqui.
+
+## O que entregar
+
+Um **documento de design** em Markdown, com as seis etapas do roteiro da aula 4:
+
+1. **Requisitos**: funcionais (3 a 5, com o que fica **fora** do escopo) e não funcionais (escala, latência, disponibilidade, consistência, retenção).
+2. **Estimativas**: escritas e leituras por segundo (média e pico), armazenamento em 5 anos, tamanho do espaço de códigos, memória do cache. **Declare cada premissa** e mostre cada conta.
+3. **API e modelo de dados**: os endpoints do caminho principal, com o que entra e o que sai (inclusive os códigos de status do redirecionamento), e a tabela principal com a chave.
+4. **Desenho de alto nível**: os componentes e os dois fluxos, criação e redirecionamento, percorridos passo a passo.
+5. **Aprofundamentos**, pelo menos estes:
+   - **geração dos códigos**: compare contador + base62, hash da URL e ids pré-alocados em blocos, e escolha;
+   - **cache do redirecionamento** com Redis: chave, TTL, invalidação, cache negativo, link viral;
+   - **301 × 302** e como as estatísticas são coletadas sem atrasar o redirecionamento;
+   - **particionamento**: por qual chave, e por quê.
+6. **Gargalos e trade-offs**: pontos únicos de falha, **rate limiting**, **abuso e phishing**, e o que você **não** faria agora.
+
+Limite: umas duas páginas, com um diagrama (ASCII serve). Se não couber, você está detalhando o que ninguém perguntou.
+
+## Critérios de avaliação
+
+- [ ] As premissas estão escritas, e cada número tem a conta que o produziu. Números sem conta não contam.
+- [ ] As estimativas **mudam o desenho**: o documento diz o que elas permitem descartar (por exemplo, "40 escritas por segundo não pedem sharding na escrita").
+- [ ] A geração de códigos compara pelo menos três abordagens, com o problema real de cada uma (ponto único, colisão, previsibilidade, tamanho do código).
+- [ ] O redirecionamento continua funcionando para os links quentes se o banco cair, e o documento diz por quê.
+- [ ] A escolha entre 301 e 302 está ligada a um requisito (estatísticas, poder bloquear um link), não a uma preferência.
+- [ ] Rate limiting e abuso aparecem com medidas concretas, não como "tem que ter segurança".
+- [ ] Nada de tecnologia sem motivo: cada componente responde a um requisito ou a um número.
+
+<Dicas>
+<Dica nivel={1}>
+Faça as estimativas **antes** de pensar em tecnologia, e para cada número pergunte "o que isso me permite descartar?". Depois olhe para a proporção 100 para 1: num sistema em que quase tudo é leitura pela mesma chave, onde deve morar a maior parte do trabalho?
+</Dica>
+<Dica nivel={2}>
+- 100 milhões por mês ÷ 30 dias ÷ ~86.400 s. Multiplique por 100 para os redirecionamentos, e por um fator de pico que você declara.
+- Espaço de códigos: 62 elevado a 6 e a 7. Compare com o total de links em 5 ou 10 anos.
+- Geração: um contador global único é simples e não colide, mas é um ponto único e deixa os códigos **previsíveis** (quem vê `aZ3kP9x` tenta `aZ3kP9y`). Um hash da URL não precisa de coordenação, mas colide ao cortar para 7 caracteres. Blocos de ids (cada instância reserva, por exemplo, 10 mil números de uma vez numa sequência do banco) ficam no meio do caminho.
+- 301 é permanente e o navegador guarda. O que isso faz com as estatísticas? E com um link de phishing que você precisa desativar hoje?
+</Dica>
+<Dica nivel={3}>
+Um esqueleto de decisão: códigos de 7 caracteres base62, a partir de ids em blocos embaralhados por uma permutação reversível (para não serem sequenciais); tabela `link` com o código como chave, particionável por hash do código; Redis cache-aside `link:<codigo>` com TTL e jitter, cache negativo para códigos inexistentes, e remoção da chave quando o link é bloqueado; `302` com o clique publicado de forma assíncrona numa fila e agregado por outro serviço; rate limit por usuário e por IP na criação; verificação da URL contra listas de sites maliciosos na criação **e** periodicamente. Outras escolhas são defensáveis: o que conta é a justificativa.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### Um design de referência
+
+Não existe uma resposta única. Este é **um** design bem justificado; compare o raciocínio, não as escolhas. As premissas de escala são as mesmas da resposta de entrevista em inglês sobre o tema.
+
+```markdown
+# Encurta+ — design do encurtador de URLs
+
+## 1. Requisitos
+
+Funcionais
+- Criar link curto a partir de uma URL longa (com alias personalizado opcional, para pagantes).
+- Redirecionar o código curto para a URL longa.
+- Expiração opcional; desativar um link (pelo dono ou por moderação).
+- Estatísticas de cliques por dia, país e origem (pagantes).
+- Fora do escopo agora: editar o destino de um link, QR code, domínios próprios de clientes.
+
+Não funcionais
+- Redirecionamento: p99 abaixo de 50 ms no servidor; disponibilidade de 99,99% (é o caminho crítico).
+- Criação: p99 abaixo de 300 ms; 99,9% basta (dá para tentar de novo).
+- Consistência: um link criado precisa redirecionar logo em seguida (read-your-writes);
+  estatísticas podem atrasar alguns minutos (eventual).
+- Retenção: links sem expiração ficam 5 anos (premissa).
+
+## 2. Estimativas (premissas marcadas com *)
+
+- * 100 milhões de links novos por mês; * 100 redirecionamentos por link criado; * pico = 3 × média.
+- Escritas: 100.000.000 ÷ 30 ≈ 3,3 milhões/dia; ÷ 86.400 ≈ 40/s. Pico ≈ 120/s.
+- Leituras: 40 × 100 = 4.000/s. Pico ≈ 12.000/s. Por dia: 4.000 × 86.400 ≈ 350 milhões.
+- * Registro ≈ 250 B (código 7 B, URL longa ~100 B, dono, datas, status, e a sobra de índice).
+  Por mês: 100 milhões × 250 B = 25 GB. Por ano: 300 GB. Em 5 anos: 1,5 TB (+ réplicas).
+- Espaço de códigos: em 5 anos, 100 milhões × 60 = 6 bilhões de links.
+  62^6 ≈ 57 bilhões (folga de ~10×); 62^7 ≈ 3,5 trilhões. Escolha: 7 caracteres.
+- Cache: * 20 milhões de links distintos acessados por dia, * 20% deles recebem 80% dos cliques.
+  4 milhões × 250 B ≈ 1 GB; com a sobrecarga do Redis, 2 a 3 GB. Cabe num nó (com réplica).
+- Cliques para analytics: 350 milhões/dia × * 100 B ≈ 35 GB/dia de eventos brutos.
+
+O que os números dizem
+- 120 escritas/s cabem num PostgreSQL: nada de sharding na escrita.
+- 12.000 leituras/s pela mesma chave, com 80/20: o cache resolve a maior parte; o banco vê o resto.
+- O que cresce de verdade são os eventos de clique (35 GB/dia), não os links: agregar, e
+  guardar o bruto por pouco tempo.
+
+## 3. API e modelo de dados
+
+POST /api/links                 Authorization, Idempotency-Key
+     { "url": "https://...", "alias": "black-friday" (opcional), "expiraEm": "..." (opcional) }
+  → 201 { "codigo": "aZ3kP9x", "urlCurta": "https://enc.to/aZ3kP9x" }
+  → 400 URL inválida · 409 alias em uso · 422 URL bloqueada · 429 limite excedido
+
+GET /{codigo}
+  → 302 Location: <url longa>    Cache-Control: private, max-age=60
+  → 404 não existe · 410 expirado ou desativado (página explicando, sem redirecionar)
+
+GET /api/links/{codigo}/cliques?de=...&ate=...   → 200 { "porDia": [...], "porPais": {...} }
+DELETE /api/links/{codigo}                        → 204
+
+link(codigo VARCHAR(16) PK, url_longa TEXT, dono_id BIGINT NULL, criado_em, expira_em NULL,
+     status ATIVO|DESATIVADO|BLOQUEADO)
+cliques_por_dia(codigo, dia, pais, origem, total)   -- agregado; o evento bruto vai para a fila
+
+O acesso é quase sempre "dado o código, qual a URL?": chave-valor. Um PostgreSQL com o código
+como PK atende; o alias personalizado é só um código escolhido pelo cliente, na mesma PK
+(a unicidade vem de graça), com uma lista de palavras reservadas (api, admin, login...).
+
+## 4. Alto nível
+
+  cliente ─► CDN/balanceador ─► serviço de redirecionamento (sem estado, N instâncias)
+                                     │  1. Caffeine local (segundos)  2. Redis  3. PostgreSQL (réplica)
+                                     └─► publica o clique (assíncrono) ─► Kafka ─► agregador ─► cliques_por_dia
+
+  app/API ─► serviço de links ─► gerador de códigos (blocos) ─► PostgreSQL (primário)
+                              └─► verificação da URL (listas de sites maliciosos)
+
+Redirecionamento: extrai o código → Caffeine → Redis → banco (no miss, grava no Redis) →
+se ATIVO e não expirado, 302 com Location; publica o clique numa fila em memória que envia
+em lote ao Kafka, sem esperar confirmação no caminho da requisição.
+
+Criação: valida a URL e o limite do cliente → verifica listas de sites maliciosos →
+obtém um código do bloco local → INSERT → apaga link:<codigo> no Redis → devolve 201.
+Não grava a URL no cache: a primeira leitura carrega (evita cachear links que ninguém abre).
+Mas apaga a chave, porque um robô pode ter tentado aquele código antes e deixado um
+marcador negativo (abaixo), que esconderia o link novo por até 60 s.
+
+## 5. Aprofundamentos
+
+Geração de códigos
+| Abordagem | A favor | Contra |
+|---|---|---|
+| Contador global + base62 | sem colisão, códigos curtos | ponto único; sequencial = dá para enumerar os links de todos |
+| Hash da URL (7 chars do SHA-256 em base62) | sem coordenação; mesma URL, mesmo código | colisões ao cortar (checar e tentar de novo, com ida ao banco); a mesma URL de dois clientes mistura as estatísticas |
+| Blocos pré-alocados | sem ponto único no caminho quente; sem colisão | buracos quando uma instância morre (irrelevante com 3,5 trilhões); ainda sequencial dentro do bloco |
+| Snowflake (64 bits) | sem coordenação, ordenável | até 11 caracteres em base62: mais longo que o necessário |
+
+Escolha: blocos. Cada instância reserva 10.000 ids de uma vez numa sequência do banco
+(com 40 escritas/s no total, um bloco dura uns 4 minutos mesmo que uma instância só
+receba tudo: a sequência quase não é tocada), e cada id passa por uma
+permutação reversível do espaço de 62^7 antes do base62, para os códigos não serem
+consecutivos. Não é criptografia: é só para impedir a enumeração trivial.
+
+Cache do redirecionamento
+- Chave link:<codigo> → URL longa + status + expiração; TTL de 24 h + jitter (aula 1).
+- Cache negativo: código inexistente grava um marcador por 60 s. Robôs que varrem códigos
+  batem no Redis, não no banco.
+- Desativar ou bloquear um link APAGA a chave no Redis (cache-aside: invalidar é apagar).
+  O Caffeine local tem TTL de 5 s, que é o atraso máximo aceito para um bloqueio.
+- Link viral (50 mil cliques/s num código): uma chave só no Redis vira hot key. O Caffeine
+  de poucos segundos em cada instância absorve; o Redis vê uma leitura por instância a cada 5 s.
+- Redis fora: cai no banco (réplica) com timeout curto; as instâncias seguem respondendo.
+  Banco fora: os links que estão no cache continuam funcionando (a maioria dos cliques).
+
+301 × 302
+- 301 (permanente): o navegador guarda e não volta mais. Menos carga, mas perdemos o clique
+  para as estatísticas e perdemos o poder de desativar o link para quem já o abriu.
+- 302 (temporário): todo clique passa por nós. Escolha: 302, porque estatística é produto
+  pago e bloquear phishing é requisito. O custo são as 12.000 req/s, que já estimamos.
+- O clique é publicado de forma assíncrona. Perder uma fração mínima de cliques numa queda é
+  aceitável; atrasar o redirecionamento, não.
+
+Particionamento
+- Hoje não é preciso (1,5 TB em 5 anos, 120 escritas/s). Quando for: por hash do código,
+  que distribui de forma uniforme e é a única chave de acesso do redirecionamento. Por faixa
+  concentraria os links novos (os mais acessados) na última partição.
+
+## 6. Gargalos e trade-offs
+
+- Rate limiting: criação limitada por conta (anônimo: 10/hora por IP; pagante: conforme
+  o plano) com contador no Redis (INCR + expiração num script, aula 2). No redirecionamento,
+  limite por IP largo, só contra varredura (com o cache negativo).
+- Abuso e phishing: verificar a URL contra listas de sites maliciosos na criação E de novo
+  periodicamente (o destino pode mudar depois); canal de denúncia; status BLOQUEADO com
+  página de aviso em vez de redirecionar; proibir encurtar links do próprio domínio (laços)
+  e outros encurtadores (esconder o destino).
+- Pontos únicos: a sequência de blocos (se cair, as instâncias têm o bloco local para minutos);
+  o primário do banco (só a criação para; o redirecionamento segue pelo cache e pelas réplicas).
+- Read-your-writes: o link recém-criado pode não estar na réplica; no miss do redirecionamento,
+  ler do primário quando o código não é encontrado na réplica.
+- Não faria agora: sharding, multirregião ativo-ativo, banco NoSQL "porque é chave-valor".
+  Reavaliar quando: escritas passarem de alguns milhares/s, ou o banco passar de ~5 TB.
+```
+
+<Callout tipo="info" titulo="Por que 1,5 TB aqui e ~100 GB por ano na resposta em inglês?">
+A resposta curta de entrevista (`en-url-shortener`) usa só o tamanho da URL (~80 a 100 bytes por link) e chega a uns 100 GB por ano. Aqui o registro inclui metadados e índice (250 B), e o resultado é 300 GB por ano. As duas contas levam à mesma conclusão, que é o que importa: centenas de GB por ano **cabem num banco relacional bem configurado**, e o armazenamento dos links não é o gargalo. Mudar uma premissa e mostrar que a conclusão não muda é um bom movimento numa entrevista.
+</Callout>
+
+### O que torna este design bom
+
+- **Os números mandam.** As estimativas descartaram sharding na escrita e apontaram o que cresce de verdade (os cliques). Cada componente responde a um número ou a um requisito.
+- **O caminho crítico é protegido.** O redirecionamento não depende do primário, nem do Kafka, nem da verificação de URLs: cache em dois níveis, réplica e publicação assíncrona.
+- **Decisões de protocolo viram decisões de negócio.** O 302 existe porque estatística é produto e porque bloquear um golpe precisa funcionar para quem já recebeu o link.
+- **Os problemas de cada opção de id estão escritos**, inclusive o que ninguém lembra: códigos sequenciais permitem enumerar os links dos outros clientes.
+- **O documento diz o que não faria.** Deixar sharding e multirregião para quando os números pedirem é uma decisão, não um esquecimento.
+
+### Erros comuns
+
+- Começar pelo diagrama com Kafka, Cassandra e microsserviços, sem uma pergunta sobre escala.
+- Números sem conta ("uns 10 mil QPS"), ou contas que não mudam nada no desenho.
+- Hash da URL cortado em 7 caracteres **sem** tratar colisão, ou tratando com um `SELECT` antes do `INSERT` (corrida: use a PK e trate a violação).
+- Escolher 301 "porque é mais eficiente" e depois prometer estatísticas de cliques.
+- Gravar o clique no banco, **sincronamente**, dentro do redirecionamento: a leitura mais barata do sistema vira uma escrita.
+- Esquecer que o cache precisa ser invalidado quando um link é bloqueado: o golpe continua no ar por 24 horas.
+- Tratar abuso como detalhe. Para um encurtador, ter o domínio marcado como malicioso é o fim do produto.
+
+</Solucao>

@@ -1,0 +1,17 @@
+# Aula 11.07: o portal web faz login com OpenID Connect (Authorization Code + PKCE).
+# Carregada com spring.config.name=portal.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          portal:
+            provider: loja
+            client-id: portal-web
+            client-secret: ${PORTAL_CLIENT_SECRET}   # cliente confidencial: o segredo fica no servidor
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            scope: openid, profile, email, pedidos:ler
+        provider:
+          loja:
+            issuer-uri: ${EMISSOR:http://localhost:9000}

@@ -1,0 +1,398 @@
+---
+import { getEntries, render } from 'astro:content';
+import Leitura from '../../layouts/Leitura.astro';
+import Icon from '../../components/Icon.astro';
+import { mdxComponents } from '../../components/mdx';
+import { NIVEL_PROJETO, getProjetos, pad2, type Projeto } from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+export async function getStaticPaths() {
+  const projetos = await getProjetos();
+  return projetos.map((p, i) => ({
+    params: { id: p.id },
+    props: { projeto: p, anterior: projetos[i - 1], proximo: projetos[i + 1] },
+  }));
+}
+
+const { projeto, anterior, proximo } = Astro.props as { projeto: Projeto; anterior?: Projeto; proximo?: Projeto };
+const p = projeto.data;
+const modulos = (await getEntries(p.modulos)).sort((a, b) => a.data.numero - b.data.numero);
+const { Content, headings: todos } = await render(projeto);
+
+// Sumário: as seções (h2) e, logo depois do plano de execução, um item por marco.
+const headings = todos
+  .filter((h) => h.depth === 2)
+  .flatMap((h) =>
+    h.slug === 'plano-de-execução'
+      ? [h, ...p.marcos.map((m, i) => ({ depth: 3, slug: `marco-${m.id}`, text: `${i + 1}. ${m.titulo}` }))]
+      : [h],
+  );
+---
+
+<Leitura title={`${p.titulo} · Projeto ${NIVEL_PROJETO[p.nivel]}`} description={p.resumo} headings={headings}>
+  <div slot="lateral" class="plano" data-plano={projeto.id} data-pagefind-ignore>
+    <a class="plano-voltar" href={url('projetos')}><Icon name="arrow-left" size={14} /> Todos os projetos</a>
+    <div class="plano-head">
+      <span class={`nivel nivel-${p.nivel}`}>{NIVEL_PROJETO[p.nivel]}</span>
+      <p class="plano-titulo">{p.titulo}</p>
+      <div class="plano-barra" role="progressbar" aria-label="Marcos concluídos" aria-valuemin="0" aria-valuemax={p.marcos.length} aria-valuenow="0">
+        <span data-barra></span>
+      </div>
+      <p class="plano-conta"><span data-conta>0</span> de {p.marcos.length} marcos</p>
+    </div>
+    <p class="nav-sec">Plano de execução</p>
+    <ol class="plano-lista">
+      {
+        p.marcos.map((m, i) => (
+          <li>
+            <button type="button" class="chk" data-marco-toggle={m.id} aria-pressed="false" aria-label={`Marco ${i + 1} concluído`}>
+              <Icon name="check" size={12} />
+            </button>
+            <a href={`#marco-${m.id}`}>
+              <span class="mono">{i + 1}</span> {m.titulo}
+            </a>
+          </li>
+        ))
+      }
+    </ol>
+  </div>
+
+  <header slot="header" class="pj-head">
+    <nav class="crumbs" aria-label="Você está em">
+      <a href={url('projetos')}>Projetos</a> / {NIVEL_PROJETO[p.nivel]}
+    </nav>
+    <p class="eyebrow">Projeto de portfólio · {NIVEL_PROJETO[p.nivel]}</p>
+    <h1>{p.titulo}</h1>
+    <p class="lead">{p.resumo}</p>
+    <div class="row meta">
+      <span class={`badge nivel-badge nivel-${p.nivel}`}><Icon name="briefcase" size={13} /> {NIVEL_PROJETO[p.nivel]}</span>
+      <span class="badge"><Icon name="target" size={13} /> {p.dominio}</span>
+      <span class="badge"><Icon name="clock" size={13} /> ~{p.horas}h</span>
+      <span class="badge"><Icon name="flag" size={13} /> {p.marcos.length} marcos</span>
+    </div>
+
+    <div class="resumo-grid">
+      <section class="card bloco" aria-labelledby="o-que-mostra">
+        <h2 id="o-que-mostra" class="bloco-titulo"><Icon name="eye" size={16} /> O que quem contrata vai enxergar</h2>
+        <ul>
+          {p.competencias.map((c) => <li>{c}</li>)}
+        </ul>
+      </section>
+      <section class="card bloco" aria-labelledby="stack">
+        <h2 id="stack" class="bloco-titulo"><Icon name="layers" size={16} /> Stack</h2>
+        <div class="chips">{p.stack.map((s) => <span class="badge">{s}</span>)}</div>
+        <h2 class="bloco-titulo sub"><Icon name="book" size={16} /> Base na trilha</h2>
+        <p class="mods">
+          {modulos.map((m, i) => (
+            <>
+              {i > 0 && ' · '}
+              <a href={url(`modulos/${m.id}`)}>{pad2(m.data.numero)} {m.data.titulo}</a>
+            </>
+          ))}
+        </p>
+      </section>
+    </div>
+  </header>
+
+  <div class="prose" data-projeto={projeto.id}>
+    <Content components={mdxComponents} />
+  </div>
+
+  <nav slot="footer" class="pager" aria-label="Navegação entre projetos" data-pagefind-ignore>
+    {
+      anterior ? (
+        <a class="pg" href={url(`projetos/${anterior.id}`)}>
+          <small>
+            <Icon name="arrow-left" size={14} /> Anterior
+          </small>
+          <strong>{anterior.data.titulo}</strong>
+        </a>
+      ) : (
+        <span />
+      )
+    }
+    {
+      proximo && (
+        <a class="pg next" href={url(`projetos/${proximo.id}`)}>
+          <small>
+            Próximo <Icon name="arrow-right" size={14} />
+          </small>
+          <strong>{proximo.data.titulo}</strong>
+        </a>
+      )
+    }
+  </nav>
+</Leitura>
+
+<script>
+  import { aoMudar, marcarMarco, marcosConcluidos, toast } from '../../lib/progresso';
+
+  const plano = document.querySelector<HTMLElement>('[data-plano]');
+  if (plano) {
+    const projeto = plano.dataset.plano!;
+    const total = plano.querySelectorAll('.plano-lista li').length;
+    const render = () => {
+      const feitos = new Set(marcosConcluidos(projeto));
+      document.querySelectorAll<HTMLButtonElement>('[data-marco-toggle]').forEach((b) => {
+        const ok = feitos.has(b.dataset.marcoToggle!);
+        b.setAttribute('aria-pressed', String(ok));
+        const rotulo = b.querySelector('span');
+        if (rotulo) rotulo.textContent = ok ? 'Marco concluído' : 'Marcar este marco como concluído';
+      });
+      document.querySelectorAll<HTMLElement>('[data-marco]').forEach((s) => s.classList.toggle('feito', feitos.has(s.dataset.marco!)));
+      const n = [...plano.querySelectorAll('[data-marco-toggle]')].filter((b) => feitos.has((b as HTMLElement).dataset.marcoToggle!)).length;
+      plano.querySelector('[data-conta]')!.textContent = String(n);
+      plano.querySelector<HTMLElement>('[data-barra]')!.style.width = `${total ? (n / total) * 100 : 0}%`;
+      plano.querySelector('[role="progressbar"]')!.setAttribute('aria-valuenow', String(n));
+    };
+    render();
+    aoMudar(render);
+    document.querySelectorAll<HTMLButtonElement>('[data-marco-toggle]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const concluir = b.getAttribute('aria-pressed') !== 'true';
+        marcarMarco(projeto, b.dataset.marcoToggle!, concluir);
+        if (concluir && marcosConcluidos(projeto).length === total) {
+          toast('Projeto concluído! Revise a rubrica e o roteiro de entrevista antes de publicar.');
+        } else if (concluir) {
+          toast('Marco concluído. Faça o commit, atualize o README e siga para o próximo.');
+        }
+      }),
+    );
+  }
+</script>
+
+<style>
+  .plano {
+    display: grid;
+    gap: 4px;
+  }
+  .plano-voltar {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    font-size: 0.82rem;
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .plano-voltar:hover {
+    color: var(--accent);
+  }
+  .plano-head {
+    margin-top: 8px;
+    padding: 14px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+  .plano-titulo {
+    margin-top: 6px;
+    font-family: var(--font-display);
+    font-weight: 650;
+    line-height: 1.3;
+  }
+  .plano-barra {
+    height: 6px;
+    margin-top: 12px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    overflow: hidden;
+  }
+  .plano-barra span {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--ok);
+    transition: width 0.3s var(--ease);
+  }
+  .plano-conta {
+    margin-top: 6px;
+    font-size: 0.78rem;
+    color: var(--text-3);
+  }
+  .nav-sec {
+    margin: 20px 12px 8px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .plano-lista {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 2px;
+  }
+  .plano-lista li {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 4px 6px 4px 10px;
+    border-radius: 9px;
+  }
+  .plano-lista li:hover {
+    background: var(--surface-2);
+  }
+  .plano-lista a {
+    flex: 1;
+    font-size: 0.86rem;
+    line-height: 1.4;
+    padding-block: 3px;
+    color: var(--text-2);
+    text-decoration: none;
+  }
+  .plano-lista a:hover {
+    color: var(--text);
+  }
+  .plano-lista .mono {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-3);
+    margin-right: 2px;
+  }
+  .chk {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    margin-top: 3px;
+    padding: 0;
+    border-radius: 6px;
+    border: 1.5px solid var(--border-strong);
+    background: transparent;
+    color: transparent;
+  }
+  .chk[aria-pressed='true'] {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: var(--accent-ink);
+  }
+  .nivel {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .nivel-junior {
+    color: var(--lvl-jr);
+  }
+  .nivel-pleno {
+    color: var(--lvl-pleno);
+  }
+  .nivel-senior {
+    color: var(--lvl-senior);
+  }
+  .nivel-badge {
+    background: var(--surface);
+  }
+
+  .pj-head {
+    margin-bottom: 36px;
+    max-width: var(--measure);
+  }
+  .crumbs {
+    font-size: 0.85rem;
+    color: var(--text-3);
+  }
+  .crumbs a {
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .crumbs a:hover {
+    color: var(--accent);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .meta {
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .resumo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+    gap: 14px;
+    margin-top: 24px;
+  }
+  .bloco {
+    padding: 16px 18px;
+  }
+  .bloco-titulo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .bloco-titulo.sub {
+    margin-top: 16px;
+  }
+  .bloco ul {
+    margin: 0;
+    padding-left: 1.15em;
+    display: grid;
+    gap: 6px;
+    font-size: 0.9rem;
+    color: var(--text-2);
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .mods {
+    font-size: 0.86rem;
+    line-height: 1.6;
+    color: var(--text-3);
+  }
+  .mods a {
+    color: var(--accent);
+  }
+  .pager {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    max-width: var(--measure);
+    margin-top: 56px;
+  }
+  .pg {
+    display: grid;
+    gap: 4px;
+    padding: 14px 18px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    text-decoration: none;
+  }
+  .pg:hover {
+    border-color: var(--accent);
+  }
+  .pg small {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .pg.next {
+    text-align: right;
+    grid-column: 2;
+  }
+  .pg.next small {
+    justify-content: flex-end;
+  }
+  @media (max-width: 600px) {
+    .pager {
+      grid-template-columns: 1fr;
+    }
+    .pg.next {
+      grid-column: 1;
+    }
+  }
+</style>

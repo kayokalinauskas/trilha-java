@@ -1,0 +1,177 @@
+---
+titulo: "Fintech Core — Marco 1: API de contas"
+codigo: "08.05"
+resumo: Comece o projeto integrador da trilha — a API de uma conta digital com abertura de contas, depósitos, saques, extrato, erros padronizados, concorrência correta e documentação OpenAPI.
+modulo: 08-spring-boot
+ordem: 5
+marco: 1
+dificuldade: dificil
+tempo: 6–10h
+conceitos: [projeto integrador, API REST, camadas, ProblemDetail, OpenAPI, concorrência]
+aulas: [08-spring-boot/02-design-de-apis-rest, 08-spring-boot/04-spring-boot-e-spring-mvc, 08-spring-boot/05-validacao-e-erros, 08-spring-boot/06-restclient-versionamento-openapi]
+java:
+  modulo: projeto-integrador
+  teste: Marco1ContasTest
+---
+
+## O projeto integrador
+
+Do módulo 08 ao 14, você vai construir o **Fintech Core**, o núcleo de uma conta digital, em **marcos**. Cada marco acrescenta o que um time de verdade acrescentaria:
+
+| Marco | Módulo | Entrega |
+|---|---|---|
+| **1** | 08 | **API de contas** (este) |
+| 2 | 09 | Persistência com JPA e Flyway, transferências atômicas e idempotentes |
+| 3 | 10 | Suíte de testes: unidade, fatias, Testcontainers e ArchUnit |
+| 4 | 11 | Autenticação com JWT e autorização por dono da conta |
+| 5 | 12 | Eventos de transferência com Kafka e outbox |
+| 6 | 14 | Docker, CI e observabilidade |
+
+No fim, você terá um projeto de portfólio que demonstra, com código e testes, quase tudo o que uma vaga Júnior/Pleno pede.
+
+### Como os marcos são avaliados
+
+Os testes de aceitação, em `java/projeto-integrador/testes`, são **caixa-preta**: sobem a sua aplicação numa porta real e só falam **HTTP e JSON** com ela, como um cliente faria. A organização interna é decisão sua. É assim que muitas empresas avaliam desafios técnicos (*take-home*).
+
+Você trabalha sempre no mesmo projeto, `java/projeto-integrador/starter`, e a cada marco roda os testes daquele marco. Os testes dos marcos anteriores continuam valendo.
+
+## Contexto
+
+A **Fintech Core** é uma conta digital que está saindo do papel. Neste primeiro marco, o objetivo é uma API funcional em memória, com um contrato bem definido, para o time do aplicativo começar a integrar.
+
+## O contrato
+
+Todos os erros seguem Problem Details com `type` = `https://fintech.dev/problemas/<slug>`.
+
+| Requisição | Sucesso | Erros |
+|---|---|---|
+| `POST /contas` | `201` + `Location` + conta | `400` `dados-invalidos` / `requisicao-malformada` · `409` `conta-duplicada` |
+| `GET /contas/{id}` | `200` + conta | `404` `conta-nao-encontrada` · `400` id não é UUID |
+| `GET /contas?cpf=&pagina=&tamanho=` | `200` + página | `400` (tamanho de 1 a 100) |
+| `POST /contas/{id}/depositos` | `200` + conta atualizada | `400` · `404` |
+| `POST /contas/{id}/saques` | `200` + conta atualizada | `400` · `404` · `422` `saldo-insuficiente` (+ `saldoDisponivel`) |
+| `GET /contas/{id}/extrato` | `200` + extrato | `404` |
+| `GET /v3/api-docs` | `200` + especificação OpenAPI com todos os caminhos acima | |
+
+**Abertura**: `{"titular": "Ana Souza", "cpf": "52998224725", "tipo": "CORRENTE"}` (`tipo`: `CORRENTE` ou `POUPANCA`).
+
+**Conta**:
+
+```json
+{
+  "id": "0f8b1c2e-6a4d-4f53-9a57-3c1e2b7d9a10",
+  "titular": "Ana Souza",
+  "cpf": "***.982.247-**",
+  "tipo": "CORRENTE",
+  "saldo": 0.00,
+  "criadaEm": "2026-09-28T13:00:00Z"
+}
+```
+
+**Movimentação**: `{"valor": 150.50}`. **Extrato**:
+
+```json
+{
+  "contaId": "0f8b1c2e-...",
+  "saldo": 100.25,
+  "movimentos": [
+    {"tipo": "DEPOSITO", "valor": 150.50, "saldoApos": 150.50, "dataHora": "2026-09-28T13:01:00Z"},
+    {"tipo": "SAQUE", "valor": 50.25, "saldoApos": 100.25, "dataHora": "2026-09-28T13:02:00Z"}
+  ]
+}
+```
+
+**Página**: `{"itens": [...], "pagina": 0, "tamanho": 20, "totalItens": 2, "totalPaginas": 1}`, em ordem de abertura.
+
+## Regras de negócio
+
+1. `id` é um **UUID** gerado pelo servidor.
+2. Titular obrigatório (até 120 caracteres); CPF válido (11 dígitos) e **sempre mascarado** nas respostas.
+3. Uma pessoa (CPF) pode ter **no máximo uma conta de cada tipo**.
+4. Valores de movimentação: obrigatórios, **positivos**, com no máximo **2 casas decimais**.
+5. O saldo **nunca** fica negativo.
+6. O extrato lista os movimentos em ordem cronológica, com o saldo após cada um.
+7. **Concorrência**: 50 depósitos simultâneos de R$ 10,00 na mesma conta resultam em exatamente R$ 500,00 e 50 movimentos.
+
+## Organização sugerida
+
+O `LEIA-ME.md` do starter sugere os pacotes `api`, `aplicacao`, `dominio` e `infra`. **No marco 3 essa organização vira obrigatória** (verificada com ArchUnit), então vale começar assim:
+
+- **dominio**: `Conta` (protege o saldo), `Cpf` (value object), `Movimento`, as exceções de negócio e a **interface** `RepositorioDeContas`;
+- **aplicacao**: `ServicoDeContas` (casos de uso);
+- **infra**: `RepositorioDeContasEmMemoria` (no marco 2, JPA), configuração (`Clock`, OpenAPI);
+- **api**: controller, DTOs, `TratadorDeErros`.
+
+## Dependências deste marco
+
+`spring-boot-starter-webmvc`, `spring-boot-starter-validation` e `springdoc-openapi-starter-webmvc-ui` — já estão no `pom.xml` do starter.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `Marco1ContasTest` passam.
+- [ ] `mvn spring-boot:run` sobe a API; o Swagger UI permite abrir uma conta e depositar.
+- [ ] O domínio não conhece Spring MVC nem DTOs.
+- [ ] Nenhum `double`/`float` para dinheiro.
+- [ ] O README do seu repositório explica como rodar e mostra exemplos com `curl`. (Recrutador olha isso.)
+
+## Desafios opcionais
+
+- `GET /contas/{id}/extrato?de=2026-09-01&ate=2026-09-30` com filtro por período.
+- Limite diário de saque de R$ 5.000,00 por conta (`422 limite-diario-excedido`).
+- Um arquivo `fintech.http` (IntelliJ) com todas as requisições de exemplo, versionado no projeto.
+
+<Dicas>
+<Dica nivel={1}>
+Faça o domínio primeiro, sem Spring: `Conta` com `depositar`/`sacar` que validam e registram `Movimento`s, e um teste unitário simples para ela. Depois o serviço, o repositório em memória e, por último, o controller. Reaproveite o `TratadorDeErros` do exercício 08.03 trocando a base dos `type`.
+</Dica>
+<Dica nivel={2}>
+- O teste de concorrência envia depósitos na mesma conta em paralelo. Métodos `synchronized` na própria `Conta` (que guarda saldo e movimentos) resolvem em memória. "Verificar duplicidade + salvar" na abertura também é *check-then-act*.
+- Para `@PathVariable UUID id`, um valor inválido já vira 400 sozinho (`ResponseEntityExceptionHandler`).
+- O OpenAPI vem de graça com o springdoc: basta a dependência. Enriqueça com `@Tag` e `@Operation`.
+</Dica>
+<Dica nivel={3}>
+Validação de valor: `@NotNull @Positive @Digits(integer = 13, fraction = 2) BigDecimal valor`. Para o 422 com o saldo disponível, a exceção de domínio carrega o valor e o handler faz `problema.setProperty("saldoDisponivel", e.saldoDisponivel())`. Para o `Location`: `uri.path("/contas/{id}").buildAndExpand(conta.id()).toUri()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução de referência
+
+O projeto completo do marco está em `java/projeto-integrador/solucao-marco-1`. Os arquivos principais:
+
+<Tabs>
+<Tab rotulo="Domínio">
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/dominio/Conta.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/dominio/Cpf.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/dominio/RepositorioDeContas.java" />
+</Tab>
+<Tab rotulo="Aplicação">
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeContas.java" />
+</Tab>
+<Tab rotulo="API">
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/api/ContaController.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/api/TratadorDeErros.java" />
+</Tab>
+<Tab rotulo="Infra">
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/infra/RepositorioDeContasEmMemoria.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-1/src/main/java/dev/trilhajava/fintech/infra/ConfiguracaoGeral.java" />
+</Tab>
+</Tabs>
+
+### Decisões de design
+
+- **A interface do repositório mora no domínio** (uma "porta", no vocabulário da arquitetura hexagonal do módulo 13). O serviço depende dela, não da implementação. No marco 2, trocar memória por JPA será escrever outra classe em `infra`.
+- **`Conta` protege as próprias regras**: não existe `setSaldo`. O único jeito de mudar o saldo é `depositar`/`sacar`, que validam e registram o movimento. Isso é o oposto de um "modelo anêmico".
+- **`Cpf` como value object**: se existe, é válido; e o `toString()` mascarado evita vazar CPF num log descuidado.
+- **UUID como id**: não revela quantas contas existem e não permite adivinhar `id + 1`.
+- **`Clock` injetado**: datas de abertura e de movimentos ficam testáveis.
+- **`synchronized` agora, banco depois**: em memória, a trava da própria conta resolve a concorrência. Com várias instâncias da aplicação (e dados no banco), essa responsabilidade passa para o banco — o assunto do marco 2.
+
+### Avalie sua solução
+
+- Quantas classes você precisaria mudar para guardar as contas num banco?
+- Um desenvolvedor novo consegue entender as regras de negócio lendo só o pacote `dominio`?
+- O `GET /docs` mostra exemplos úteis e os erros possíveis de cada operação?
+
+</Solucao>

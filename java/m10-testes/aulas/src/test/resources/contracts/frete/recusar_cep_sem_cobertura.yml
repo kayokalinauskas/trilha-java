@@ -1,0 +1,24 @@
+description: |
+  Para um CEP fora da área de entrega, o serviço de frete responde 422 com Problem Details.
+  O serviço de pedidos só depende do status, do tipo do problema e do campo "cep".
+name: recusar_cep_sem_cobertura
+request:
+  method: POST
+  url: /fretes/cotacoes
+  headers:
+    Content-Type: application/json
+  body:
+    cepDestino: "69005-040"
+    pesoEmGramas: 800
+  matchers:
+    body:
+      - path: $.cepDestino
+        type: by_regex
+        value: "69[0-9]{3}-[0-9]{3}"
+response:
+  status: 422
+  headers:
+    Content-Type: application/problem+json
+  body:
+    type: "https://frete.dev/problemas/cep-sem-cobertura"
+    cep: "69005-040"

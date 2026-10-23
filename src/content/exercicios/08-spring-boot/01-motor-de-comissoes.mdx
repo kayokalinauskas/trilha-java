@@ -1,0 +1,145 @@
+---
+titulo: Motor de comissões com injeção de dependências
+codigo: "08.01"
+resumo: Transforme regras de comissão em beans do Spring, deixe a calculadora descobri-las sozinha e leve percentuais e tetos para uma configuração tipada e validada.
+modulo: 08-spring-boot
+ordem: 1
+dificuldade: facil
+tempo: 1,5–2h
+conceitos: [injeção de dependências, beans, List de beans, "@ConfigurationProperties", Strategy]
+aulas: [08-spring-boot/03-ioc-e-injecao-de-dependencias]
+java:
+  modulo: m08-spring-boot
+  teste: "CalculadoraDeComissaoTest,ComissaoConfiguradaTest"
+---
+
+## Contexto
+
+Uma rede de lojas de eletrodomésticos calcula a comissão dos vendedores com um método de 300 linhas cheio de `if (canal.equals("LOJA"))`. Toda vez que surge um canal novo (o último foi o marketplace), alguém edita esse método, algum canal antigo quebra e o time de RH descobre no fechamento do mês. O teto de comissão por venda e o percentual dos parceiros estão "chumbados" no código: mudar exige um deploy.
+
+Você vai reescrever o motor com **injeção de dependências**: cada canal é uma classe, o Spring encontra todas, e os valores de negócio vêm da configuração.
+
+## O que já existe
+
+| Tipo | Papel |
+|---|---|
+| `Venda(vendedor, canal, valor)` | record da venda |
+| `RegraDeComissao` | interface: `String canal()` e `BigDecimal calcular(Venda)` (comissão bruta) |
+| `CanalDesconhecidoException` | exceção para canal sem regra |
+
+## Requisitos
+
+**As regras** (cada uma, um bean que implementa `RegraDeComissao`):
+
+| Classe | Canal | Comissão bruta |
+|---|---|---|
+| `ComissaoLoja` | `LOJA` | 5% do valor |
+| `ComissaoOnline` | `ONLINE` | 3% do valor, **+ R$ 10,00** se o valor for de R$ 1.000,00 ou mais |
+| `ComissaoParceiro` | `PARCEIRO` | percentual de `comissao.parceiro.percentual` (padrão **2**) |
+
+**A calculadora** (`CalculadoraDeComissao`, um bean):
+
+| Método | Comportamento |
+|---|---|
+| construtor `(List<RegraDeComissao>, ComissaoProperties)` | recebe **todas** as regras do contexto; dois beans para o mesmo canal → `IllegalStateException` (com o nome do canal) |
+| `calcular(venda)` | escolhe a regra pelo canal, limita ao **teto por venda** e arredonda para **2 casas** (`HALF_UP`) |
+| `totalPorVendedor(vendas)` | `Map` com o total por vendedor, **em ordem alfabética** |
+
+**A configuração** (`ComissaoProperties`, prefixo `comissao`):
+
+```properties
+comissao.teto-por-venda=500.00      # padrão 500.00, precisa ser positivo
+comissao.parceiro.percentual=2      # padrão 2, entre 0 e 100
+```
+
+## Regras
+
+- Valor negativo → `IllegalArgumentException`. Zero é permitido (comissão zero).
+- Canal sem regra → `CanalDesconhecidoException`.
+- A calculadora **não pode conhecer** nenhuma regra concreta: um teste cria um canal `MARKETPLACE` só com um bean novo, e a calculadora precisa atendê-lo sem nenhuma alteração.
+
+## Exemplos
+
+| Venda | Comissão |
+|---|---|
+| LOJA, R$ 200,00 | R$ 10,00 |
+| LOJA, R$ 19,99 | R$ 1,00 (0,9995 arredondado) |
+| ONLINE, R$ 999,99 | R$ 30,00 |
+| ONLINE, R$ 1.000,00 | R$ 40,00 (30 + 10 de bônus) |
+| LOJA, R$ 20.000,00 | R$ 500,00 (teto) |
+| PARCEIRO, R$ 1.000,00 com `percentual=4.5` | R$ 45,00 |
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `CalculadoraDeComissaoTest` e `ComissaoConfiguradaTest` passam.
+- [ ] Nenhum `new` de regra ou da calculadora no código de produção: o Spring monta tudo.
+- [ ] Injeção **por construtor**, campos `final`.
+- [ ] Uma configuração inválida (teto negativo) impede a aplicação de subir.
+
+## Desafios opcionais
+
+- Rode `ComissaoApplication` com `--comissao.teto-por-venda=-1` e leia a mensagem de erro. Depois rode com a variável de ambiente `COMISSAO_TETOPORVENDA=300` e confirme que ela vence o valor padrão.
+- Ligue a regra `PARCEIRO` só quando `comissao.parceiro.habilitado=true`, com `@ConditionalOnProperty`.
+- Troque a `List` por um `Map<String, RegraDeComissao>` injetado: o que vem como chave? Por que não é o canal?
+
+<Dicas>
+<Dica nivel={1}>
+Anote cada regra com `@Component` e a calculadora com `@Service`. Peça `List<RegraDeComissao>` no construtor da calculadora: o Spring injeta todos os beans desse tipo, inclusive os que forem criados depois (como o do teste).
+</Dica>
+<Dica nivel={2}>
+Na calculadora, transforme a lista num `Map` de canal → regra uma única vez, no construtor. `Collectors.toMap` aceita uma função de *merge*, chamada quando duas chaves colidem: lance a `IllegalStateException` ali. Para a configuração, anote o record com `@ConfigurationProperties("comissao")` e a aplicação com `@ConfigurationPropertiesScan`.
+</Dica>
+<Dica nivel={3}>
+Padrões e validação no record:
+
+```java
+@Validated
+@ConfigurationProperties("comissao")
+public record ComissaoProperties(
+        @DefaultValue("500.00") @Positive BigDecimal tetoPorVenda,
+        @DefaultValue @Valid Parceiro parceiro) {
+    public record Parceiro(@DefaultValue("2") @PositiveOrZero @DecimalMax("100") BigDecimal percentual) {}
+}
+```
+
+`@DefaultValue` sem valor num record aninhado faz o Spring criar o `Parceiro` com os padrões dele. Em `calcular`: `regra.calcular(venda).min(teto).setScale(2, RoundingMode.HALF_UP)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Calculadora">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/comissao/CalculadoraDeComissao.java" />
+</Tab>
+<Tab rotulo="Configuração">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/comissao/ComissaoProperties.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/comissao/ComissaoApplication.java" />
+</Tab>
+<Tab rotulo="Regras">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/comissao/ComissaoOnline.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/comissao/ComissaoParceiro.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Strategy sem fábrica**: o `switch` por canal virou uma coleção de estratégias, e quem monta a coleção é o container. Canal novo = classe nova. Isso é o princípio aberto/fechado na prática.
+- **Falha na subida**: a colisão de canais é detectada no construtor, ou seja, quando a aplicação sobe — não na primeira venda do canal, em produção, no fim do mês.
+- **Responsabilidades separadas**: a regra calcula o bruto; teto e arredondamento são políticas da calculadora, aplicadas **iguais para todos** os canais. Se cada regra arredondasse do seu jeito, os totais divergiriam entre relatórios.
+- **Configuração validada**: `@Validated` transforma um erro de configuração num erro de inicialização com mensagem clara.
+- **`TreeMap` no agrupamento**: ordem alfabética garantida sem ordenar depois.
+
+### Alternativas
+
+- `Map<String, RegraDeComissao>` injetado direto: a chave é o **nome do bean** (`comissaoLoja`), não o canal — por isso a solução monta o próprio mapa.
+- `@Qualifier` e `@Primary` resolvem "qual das implementações", mas aqui queremos **todas**.
+
+### Avalie sua solução
+
+- Você consegue testar `CalculadoraDeComissao` sem Spring, só com `new`? (Deveria: é só passar uma lista e um `ComissaoProperties`.)
+- O que acontece se alguém anotar uma segunda classe com `canal()` devolvendo `"LOJA"`?
+
+</Solucao>

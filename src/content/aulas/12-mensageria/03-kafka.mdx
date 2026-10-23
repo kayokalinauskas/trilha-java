@@ -1,0 +1,778 @@
+---
+titulo: "Kafka 4: tópicos, partições, chaves e consumer groups"
+descricao: "O Kafka como log distribuído: tópicos, partições e offsets; por que a chave decide a partição e a ordem; consumer groups e rebalanceamento com o protocolo novo do Kafka 4; acks, produtor idempotente e commit de offset; e o Spring Kafka 4 na prática, com KafkaTemplate, @KafkaListener e testes com @EmbeddedKafka, sem Docker."
+modulo: 12-mensageria
+ordem: 3
+duracao: 110
+objetivos:
+  - Explicar tópico, partição, offset, retenção e consumer group, e desenhar como um evento vai do produtor ao consumidor
+  - Escolher a chave de uma mensagem pela entidade que precisa de ordem, e prever em que partição ela cai
+  - Prever quantos consumidores de um grupo trabalham e o que acontece num rebalanceamento
+  - Configurar a durabilidade do produtor (acks=all, idempotência) e explicar quando o offset é confirmado no Spring Kafka
+  - Publicar com KafkaTemplate, consumir com @KafkaListener e testar o fluxo com @EmbeddedKafka
+  - Ler as mensagens de erro de broker inacessível e de listener que falha, e corrigir a causa
+tags: [Kafka, KRaft, partição, chave, consumer group, offset, Spring Kafka, EmbeddedKafka]
+flashcards:
+  - frente: O Kafka garante a ordem das mensagens de um tópico?
+    verso: Só dentro de cada partição. Para que os eventos de uma entidade (um pedido, uma conta) sejam consumidos em ordem, eles precisam ter a mesma chave, que os leva sempre à mesma partição.
+  - frente: Como o produtor escolhe a partição de uma mensagem?
+    verso: "Com chave: hash murmur2 da chave, módulo o número de partições. Sem chave: o partitioner \"gruda\" numa partição até encher um lote (batch.size) e depois troca, espalhando a carga."
+  - frente: Num consumer group com 3 partições e 5 consumidores, quantos trabalham?
+    verso: Três. Cada partição é atribuída a no máximo um consumidor do grupo; os outros dois ficam ociosos. O número de partições é o teto de paralelismo do grupo.
+  - frente: Quando o Spring Kafka confirma (commit) o offset, por padrão?
+    verso: "O Spring desliga o enable.auto.commit do cliente e confirma ele mesmo, com AckMode BATCH: depois que o listener processou sem erro todos os registros devolvidos por um poll(). Se a aplicação cair antes, os registros voltam: é pelo menos uma vez."
+  - frente: "acks=all e enable.idempotence=true: o que cada um garante?"
+    verso: "acks=all: o líder só confirma depois que todas as réplicas em sincronia gravaram. Idempotência: o broker descarta as repetições que o próprio produtor faz ao reenviar um lote, sem duplicar nem reordenar. Os dois são padrão desde o Kafka 3.0."
+  - frente: O que mudou no Kafka 4?
+    verso: O ZooKeeper foi removido (só KRaft, com os metadados no próprio Kafka), o protocolo novo de consumer groups (KIP-848, group.protocol=consumer) ficou estável, e no 4.2 os share groups (filas no Kafka) ficaram prontos para produção.
+  - frente: O que é o @EmbeddedKafka?
+    verso: Uma anotação do spring-kafka-test que sobe um broker Kafka KRaft dentro da JVM do teste, cria os tópicos pedidos e preenche spring.kafka.bootstrap-servers. Testa o fluxo real de produção e consumo sem Docker.
+  - frente: Por que aumentar o número de partições de um tópico é perigoso?
+    verso: Porque a partição de cada chave é hash % partições. Mudando o divisor, parte das chaves troca de partição, e eventos novos de uma entidade podem ser consumidos antes dos antigos, que ainda estão na partição velha.
+---
+
+Toda loja on-line tem uma tela "Acompanhe seu pedido". Por trás dela, um serviço de **rastreio** recebe eventos de vários sistemas: o checkout avisa que o pedido foi criado, o financeiro avisa que foi pago, a logística avisa que saiu para entrega e depois que foi entregue. Num sábado de promoção, chegam reclamações estranhas: um cliente viu o pedido como "Entregue" e, minutos depois, a tela voltou para "Pago". Outro pedido ficou parado em "Criado" para sempre, embora o pacote estivesse na casa da cliente.
+
+Ninguém perdeu evento nenhum. O que aconteceu foi mais sutil: os eventos chegaram **fora de ordem**, porque foram publicados sem pensar em como o Kafka distribui e ordena as mensagens. O Kafka é o padrão de mercado para fluxos de eventos (pagamentos, pedidos, cliques, atualizações de estoque, dados para análise), e quase todo bug sério com ele vem de três decisões tomadas sem entender o modelo: **qual a chave** da mensagem, **quantas partições** o tópico tem e **quando o consumidor confirma** que processou.
+
+Nesta aula você vai construir esse serviço de rastreio com o **Spring Kafka 4** e um **Kafka 4** de verdade (rodando dentro do teste, sem Docker), e vai entender, peça por peça, o que garante que os eventos de um pedido cheguem em ordem e o que acontece quando algo falha. Na [aula 2](../../12-mensageria/02-rabbitmq/) você viu o RabbitMQ, um *broker* de filas; aqui a ideia central é outra: o Kafka não é uma fila mais rápida, é um **log distribuído**, e entender essa diferença é o que separa quem usa Kafka de quem apanha dele.
+
+## A intuição: os cadernos numerados da central de pedidos
+
+Imagine a central de uma transportadora antes dos computadores. Tudo o que acontece com os pedidos é anotado à mão, e para dar conta do volume a central usa **três cadernos** em vez de um. Cada anotação vai para o fim de um caderno, numa linha numerada: linha 0, linha 1, linha 2... Ninguém apaga nem reescreve nada; os cadernos só crescem.
+
+A regra para escolher o caderno é simples e fixa: pegue o número do pedido, faça uma conta com ele e use o resultado para escolher o caderno 0, 1 ou 2. Como a conta sempre dá o mesmo resultado para o mesmo número, **tudo o que acontece com o pedido 2004 vai sempre para o mesmo caderno, e em sequência**. Para saber a história desse pedido, basta ler um caderno de cima para baixo.
+
+Várias equipes leem os cadernos. A equipe do rastreio tem três pessoas e divide o trabalho: cada uma fica com um caderno. Cada pessoa usa um **marcador de página** para saber até que linha já leu. A equipe de análise de dados lê os mesmos cadernos, no seu próprio ritmo, com os seus próprios marcadores. Ler não apaga nada: a anotação continua lá para quem vier depois. De tempos em tempos, um arquivista joga fora as páginas mais velhas (digamos, de mais de sete dias).
+
+E se uma pessoa da equipe do rastreio faltar? O coordenador redistribui: o caderno dela passa para uma colega, que continua **a partir do marcador** que ficou na página. Se a pessoa que faltou tinha lido três linhas mas não tinha mexido no marcador, a colega relê essas três linhas. Ninguém perde nada, mas algumas linhas são lidas duas vezes.
+
+Essa é a história inteira do Kafka. Os cadernos são as **partições**; o número da linha é o **offset**; a conta com o número do pedido é o **particionamento pela chave**; as equipes são os **consumer groups**; os marcadores são os **offsets confirmados**; a redistribuição é o **rebalanceamento**; e o arquivista é a **retenção**.
+
+<Figura legenda="Um tópico com 3 partições. Mensagens novas entram no fim de cada partição; cada consumer group guarda o seu próprio offset por partição, e ler não apaga nada">
+<svg viewBox="0 0 720 330" width="720" role="img" aria-labelledby="log-titulo log-desc">
+  <title id="log-titulo">Tópico pedidos.eventos com três partições e dois consumer groups</title>
+  <desc id="log-desc">Três linhas, uma por partição, cada uma com caixas numeradas a partir de zero: a partição 0 tem offsets de 0 a 5, a partição 1 de 0 a 3 e a partição 2 de 0 a 4. A última caixa de cada partição está destacada como a mensagem mais nova. À direita, dois grupos de consumidores: rastreio-pedidos, que já leu até o fim de todas as partições, e analytics, que está atrasado, com offsets menores. Abaixo, três notas: ler não apaga, a retenção remove as mensagens antigas e um grupo novo escolhe começar do início ou do fim.</desc>
+  <text x="10" y="24" class="d-title">tópico pedidos.eventos</text>
+  <text x="10" y="70" class="d-mono">p0</text>
+  <text x="10" y="120" class="d-mono">p1</text>
+  <text x="10" y="170" class="d-mono">p2</text>
+  <rect x="40" y="50" width="44" height="30" class="d-box"/><text x="62" y="70" text-anchor="middle" class="d-mono">0</text>
+  <rect x="84" y="50" width="44" height="30" class="d-box"/><text x="106" y="70" text-anchor="middle" class="d-mono">1</text>
+  <rect x="128" y="50" width="44" height="30" class="d-box"/><text x="150" y="70" text-anchor="middle" class="d-mono">2</text>
+  <rect x="172" y="50" width="44" height="30" class="d-box"/><text x="194" y="70" text-anchor="middle" class="d-mono">3</text>
+  <rect x="216" y="50" width="44" height="30" class="d-box"/><text x="238" y="70" text-anchor="middle" class="d-mono">4</text>
+  <rect x="260" y="50" width="44" height="30" class="d-accent"/><text x="282" y="70" text-anchor="middle" class="d-mono">5</text>
+  <rect x="40" y="100" width="44" height="30" class="d-box"/><text x="62" y="120" text-anchor="middle" class="d-mono">0</text>
+  <rect x="84" y="100" width="44" height="30" class="d-box"/><text x="106" y="120" text-anchor="middle" class="d-mono">1</text>
+  <rect x="128" y="100" width="44" height="30" class="d-box"/><text x="150" y="120" text-anchor="middle" class="d-mono">2</text>
+  <rect x="172" y="100" width="44" height="30" class="d-accent"/><text x="194" y="120" text-anchor="middle" class="d-mono">3</text>
+  <rect x="40" y="150" width="44" height="30" class="d-box"/><text x="62" y="170" text-anchor="middle" class="d-mono">0</text>
+  <rect x="84" y="150" width="44" height="30" class="d-box"/><text x="106" y="170" text-anchor="middle" class="d-mono">1</text>
+  <rect x="128" y="150" width="44" height="30" class="d-box"/><text x="150" y="170" text-anchor="middle" class="d-mono">2</text>
+  <rect x="172" y="150" width="44" height="30" class="d-box"/><text x="194" y="170" text-anchor="middle" class="d-mono">3</text>
+  <rect x="216" y="150" width="44" height="30" class="d-accent"/><text x="238" y="170" text-anchor="middle" class="d-mono">4</text>
+  <text x="320" y="70" class="d-label">← novas mensagens entram no fim</text>
+  <rect x="420" y="96" width="290" height="44" rx="8" class="d-ok"/>
+  <text x="565" y="115" text-anchor="middle" class="d-label">grupo rastreio-pedidos</text>
+  <text x="565" y="132" text-anchor="middle" class="d-mono">p0@6 p1@4 p2@5</text>
+  <rect x="420" y="148" width="290" height="44" rx="8" class="d-info"/>
+  <text x="565" y="167" text-anchor="middle" class="d-label">grupo analytics (atrasado)</text>
+  <text x="565" y="184" text-anchor="middle" class="d-mono">p0@2 p1@1 p2@0</text>
+  <text x="10" y="236" class="d-text">Ler não apaga: cada grupo avança o SEU offset em cada partição.</text>
+  <text x="10" y="262" class="d-text">A retenção (por tempo ou tamanho) é que remove as mensagens antigas.</text>
+  <text x="10" y="288" class="d-text">Um grupo sem offset começa do início (earliest) ou do fim (latest).</text>
+  <text x="10" y="314" class="d-label">O offset confirmado é o da PRÓXIMA mensagem a ler: p0@6 = leu de 0 a 5.</text>
+</svg>
+</Figura>
+
+Repare em duas diferenças importantes em relação ao RabbitMQ da aula anterior. Numa fila, a mensagem **sai** da fila quando é confirmada; no Kafka, ela **fica**, e cada grupo guarda só um número por partição dizendo até onde chegou. E por isso, no Kafka, **reler é barato**: um sistema novo pode ler o histórico inteiro desde o começo, e um consumidor com bug corrigido pode voltar o offset e reprocessar. Isso é impossível numa fila tradicional, onde a mensagem consumida não existe mais.
+
+## Vocabulário
+
+Os termos abaixo aparecem na documentação, nos logs e nas entrevistas; o resto da aula usa todos eles.
+
+| Termo | O que é | No rastreio de pedidos |
+|---|---|---|
+| **Broker** | Um servidor Kafka. Guarda partições em disco e atende produtores e consumidores | O processo que roda em `localhost:9092` |
+| **Cluster** | Um conjunto de brokers que dividem as partições e as réplicas | Em produção, 3 brokers ou mais |
+| **Controlador (KRaft)** | Os nós que guardam os metadados do cluster (quais tópicos existem, quem lidera cada partição), usando o protocolo de consenso Raft | No desenvolvimento, o mesmo processo é broker e controlador |
+| **Tópico** | Um nome lógico para um fluxo de mensagens do mesmo tipo | `pedidos.eventos` |
+| **Partição** | Um pedaço do tópico: um log só de acréscimo (*append-only*), ordenado, guardado num broker | `pedidos.eventos-0`, `-1` e `-2` |
+| **Offset** | A posição de uma mensagem dentro da partição: 0, 1, 2... Nunca é reaproveitado | `p1@3`: partição 1, offset 3 |
+| **Record** | Uma mensagem: **chave**, **valor**, **headers** (metadados) e **timestamp** | chave `PED-2004`, valor `{"status":"PAGO",...}` |
+| **Produtor** | O cliente que publica mensagens | `PublicadorDeEventos`, via `KafkaTemplate` |
+| **Consumidor** | O cliente que lê mensagens com chamadas repetidas a `poll()` | O container por trás do `@KafkaListener` |
+| **Consumer group** | Consumidores com o mesmo `group.id`, que **dividem** as partições entre si | `rastreio-pedidos` |
+| **Commit de offset** | O consumidor grava no Kafka até onde o grupo processou | "o grupo já processou p1 até o offset 3" |
+| **Rebalanceamento** | A redistribuição das partições quando um consumidor entra, sai ou para de responder | Ao subir a aplicação, ao fazer deploy |
+| **Réplica, líder e ISR** | Cada partição tem cópias em vários brokers; uma é a **líder** (atende leitura e escrita) e as que estão em dia formam o **ISR** (*in-sync replicas*) | Fator de replicação 3 em produção |
+| **Retenção** | Por quanto tempo (ou até que tamanho) o broker guarda as mensagens | 7 dias, o padrão |
+| **Lag** | A distância entre o fim da partição e o offset confirmado do grupo | "o rastreio está 2.000 eventos atrasado" |
+
+<Callout tipo="novidade" titulo="Kafka 4: só KRaft, grupos novos e filas">
+O Kafka 4.0 (março de 2025) **removeu o ZooKeeper**. Até a versão 3.x, um cluster Kafka precisava de um segundo sistema, o ZooKeeper, para guardar os metadados e eleger o controlador. Agora os metadados ficam num log interno do próprio Kafka, replicado com o protocolo **KRaft** (Kafka + Raft). Um cluster, e um `docker run` de desenvolvimento, passou a ser só Kafka. O 4.0 também tornou estável o **protocolo novo de consumer groups** (KIP-848), em que o broker coordena a distribuição das partições e o rebalanceamento deixa de parar o grupo inteiro; no cliente, ele é ligado com `group.protocol=consumer`. E no 4.2 (fevereiro de 2026) os **share groups** (KIP-932, "filas para o Kafka") ficaram prontos para produção: um modo de consumo em que vários consumidores leem a mesma partição, com confirmação por mensagem. Se você encontrar tutoriais com `zookeeper.connect` ou `--zookeeper`, eles são de antes do Kafka 4.
+</Callout>
+
+## A chave decide a partição (e a ordem)
+
+Quando o produtor publica uma mensagem **com chave**, o particionador padrão do cliente Kafka faz esta conta:
+
+```text
+partição = positivo(murmur2(bytes da chave)) % número de partições
+```
+
+`murmur2` é uma função de *hash* rápida: transforma os bytes da chave num número inteiro, sempre o mesmo para a mesma chave, espalhando chaves diferentes de forma bem uniforme. O `% número de partições` (resto da divisão) transforma esse número num índice de partição. Essa conta acontece **no produtor**, antes do envio: o broker só recebe a mensagem já endereçada à partição certa.
+
+Duas consequências, que você vai usar o tempo todo:
+
+1. **Mesma chave, mesma partição, mesma ordem.** Todos os eventos do pedido `PED-2004` caem na mesma partição, gravados na ordem em que foram publicados, e o consumidor daquela partição os recebe nessa ordem. Sem chave, eles se espalham pelas partições, cada partição é lida por um consumidor diferente, em paralelo, e um `ENTREGUE` pode ser processado antes do `ENVIADO`. Foi exatamente o bug da tela "Acompanhe seu pedido".
+2. **A chave define a distribuição.** Se a chave tem poucos valores possíveis (o estado do cliente, `"SP"`), tudo se concentra em poucas partições: uma fica sobrecarregada (uma **partição quente**) e as outras ficam ociosas. Se uma única chave tem muito mais tráfego que as outras (o maior vendedor de um *marketplace*), a partição dela vira o gargalo do grupo inteiro.
+
+E **sem chave**? Desde o Kafka 3.3, o particionador padrão "gruda" numa partição até completar um lote de `batch.size` bytes e então troca para outra, o que forma lotes maiores e espalha a carga com o tempo. A documentação do Kafka 4.2 descreve assim: sem chave, o produtor escolhe uma partição "pegajosa" (*sticky*), que muda quando pelo menos `batch.size` bytes foram produzidos para ela. Ótimo para logs e métricas, em que a ordem não importa; péssimo para eventos de uma entidade.
+
+<Figura legenda="O produtor calcula a partição a partir da chave. No grupo rastreio-pedidos, cada partição tem um único dono; com três partições, até três consumidores trabalham em paralelo">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="chave-titulo chave-desc">
+  <title id="chave-titulo">Da chave à partição e da partição ao consumidor</title>
+  <desc id="chave-desc">À esquerda, três eventos com as chaves PED-2001, PED-1001 e PED-2004. Eles passam por uma caixa que calcula murmur2 da chave módulo 3. PED-2001 vai para a partição 0, PED-1001 e PED-2004 vão para a partição 1, e a partição 2 não recebe nenhum desses. À direita, o grupo rastreio-pedidos tem três consumidores, cada um dono de uma partição: consumidor 1 com p0, consumidor 2 com p1, consumidor 3 com p2.</desc>
+  <defs><marker id="mk-chave" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="80" y="28" text-anchor="middle" class="d-title">Produtor</text>
+  <rect x="10" y="50" width="140" height="40" rx="8" class="d-box"/><text x="80" y="75" text-anchor="middle" class="d-mono">PED-2001</text>
+  <rect x="10" y="130" width="140" height="40" rx="8" class="d-box"/><text x="80" y="155" text-anchor="middle" class="d-mono">PED-1001</text>
+  <rect x="10" y="210" width="140" height="40" rx="8" class="d-box"/><text x="80" y="235" text-anchor="middle" class="d-mono">PED-2004</text>
+  <rect x="190" y="110" width="190" height="80" rx="10" class="d-accent"/>
+  <text x="285" y="142" text-anchor="middle" class="d-mono">murmur2(chave)</text>
+  <text x="285" y="166" text-anchor="middle" class="d-mono">% 3</text>
+  <path d="M150 70 L190 130" class="d-line" marker-end="url(#mk-chave)"/>
+  <path d="M150 150 L188 150" class="d-line" marker-end="url(#mk-chave)"/>
+  <path d="M150 230 L190 172" class="d-line" marker-end="url(#mk-chave)"/>
+  <text x="510" y="28" text-anchor="middle" class="d-title">Tópico</text>
+  <rect x="440" y="50" width="140" height="40" rx="8" class="d-info"/><text x="510" y="75" text-anchor="middle" class="d-mono">p0</text>
+  <rect x="440" y="130" width="140" height="40" rx="8" class="d-info"/><text x="510" y="155" text-anchor="middle" class="d-mono">p1</text>
+  <rect x="440" y="210" width="140" height="40" rx="8" class="d-info"/><text x="510" y="235" text-anchor="middle" class="d-mono">p2</text>
+  <path d="M380 130 L438 75" class="d-line" marker-end="url(#mk-chave)"/>
+  <path d="M380 150 L438 150" class="d-line" marker-end="url(#mk-chave)"/>
+  <text x="400" y="98" class="d-label">2001</text>
+  <text x="392" y="142" class="d-label">1001, 2004</text>
+  <text x="680" y="28" text-anchor="middle" class="d-title">rastreio-pedidos</text>
+  <rect x="620" y="50" width="130" height="40" rx="8" class="d-ok"/><text x="685" y="75" text-anchor="middle" class="d-text">consumidor 1</text>
+  <rect x="620" y="130" width="130" height="40" rx="8" class="d-ok"/><text x="685" y="155" text-anchor="middle" class="d-text">consumidor 2</text>
+  <rect x="620" y="210" width="130" height="40" rx="8" class="d-ok"/><text x="685" y="235" text-anchor="middle" class="d-text">consumidor 3</text>
+  <path d="M580 70 L618 70" class="d-line" marker-end="url(#mk-chave)"/>
+  <path d="M580 150 L618 150" class="d-line" marker-end="url(#mk-chave)"/>
+  <path d="M580 230 L618 230" class="d-line" marker-end="url(#mk-chave)"/>
+  <text x="10" y="290" class="d-text">A ordem existe dentro de cada partição; entre partições, não há ordem nenhuma.</text>
+  <text x="10" y="316" class="d-label">As partições reais dessas chaves foram conferidas no teste da aula (murmur2 do kafka-clients 4.2).</text>
+</svg>
+</Figura>
+
+Como escolher a chave? Pergunte: **qual é a entidade cujos eventos precisam ser processados em ordem?** A chave é o identificador dessa entidade.
+
+| Mensagem | Boa chave | Por quê |
+|---|---|---|
+| evento de pedido (criado, pago, enviado) | número do pedido | as etapas de um pedido têm ordem; pedidos diferentes, não |
+| movimento de estoque | SKU (código do produto) | o saldo de cada produto depende da ordem dos movimentos |
+| evento de conta (depósito, transferência) | id da conta | o saldo precisa de ordem |
+| clique num site | id da sessão | a navegação de uma sessão em ordem, e muitas sessões espalham bem a carga |
+| log de aplicação | nenhuma | ordem não importa; distribuição máxima |
+
+<Callout tipo="atencao" titulo="Mudar o número de partições embaralha as chaves">
+O divisor da conta é o número de partições. Se você aumentar o tópico de 3 para 6 partições, parte das chaves passa a cair em outra partição: os eventos novos de um pedido vão para a partição nova, enquanto os antigos, ainda não consumidos, estão na velha. Durante a transição, a ordem entre eles se perde. O Kafka permite aumentar partições, mas **nunca diminuir**. Por isso a quantidade de partições é uma decisão de projeto, tomada pensando no pico futuro; o dimensionamento fica para a aula [Kafka em produção](../../12-mensageria/08-kafka-em-producao/).
+</Callout>
+
+## Consumer groups: paralelismo e rebalanceamento
+
+Os consumidores com o mesmo `group.id` formam um **grupo** e **dividem as partições** entre si: cada partição é atribuída a **um único** consumidor do grupo, e um consumidor pode ter várias partições. É essa regra que preserva a ordem: se duas threads lessem a mesma partição ao mesmo tempo, a ordem dentro dela se perderia.
+
+| Partições | Consumidores no grupo | Resultado |
+|---|---|---|
+| 3 | 1 | um consumidor lê as 3 |
+| 3 | 3 | um por partição: paralelismo máximo |
+| 3 | 5 | **2 ociosos**: o número de partições é o teto de paralelismo |
+| 6 | 3 | dois por consumidor; dá para crescer até 6 consumidores sem mexer no tópico |
+
+**Grupos diferentes não competem.** Se o rastreio (`rastreio-pedidos`) e o serviço de notificações (`notificacoes`) leem o mesmo tópico, cada grupo recebe **todas** as mensagens e guarda os próprios offsets. É assim que o Kafka faz *publish-subscribe*: um grupo por sistema interessado, e dentro de cada grupo a carga é dividida.
+
+### Rebalanceamento
+
+O grupo precisa redistribuir as partições sempre que muda de composição: um consumidor novo entra (a aplicação subiu, ou ganhou mais uma instância), um sai de forma organizada (deploy) ou para de responder. Para saber quem está vivo, cada consumidor manda **heartbeats** (sinais de vida) ao coordenador do grupo, que fica num dos brokers. Há dois limites de tempo que você precisa conhecer:
+
+- `session.timeout.ms` (45 s por padrão no protocolo clássico): se o coordenador fica esse tempo sem heartbeat, considera o consumidor morto e redistribui as partições dele.
+- `max.poll.interval.ms` (5 minutos por padrão): o intervalo máximo entre duas chamadas a `poll()`. Se o seu código demora mais que isso para processar um lote, o consumidor **sai do grupo** mesmo estando vivo. As mensagens que ele estava processando são entregues a outro consumidor, e você tem duplicatas.
+
+No **protocolo clássico**, toda a lógica de distribuição roda nos clientes, e um rebalanceamento pode parar o grupo inteiro por alguns segundos (com o *cooperative sticky assignor*, só as partições que mudam de dono são revogadas, mas a coordenação continua no cliente). No **protocolo novo** do Kafka 4 (KIP-848), o broker calcula a distribuição e conversa com cada consumidor separadamente: um consumidor entrando não faz os outros pararem, e as partições migram de forma incremental. Você vai ver isso acontecer nos logs do passo 5, em que um consumidor recebe as três partições primeiro e depois devolve duas, que vão para os colegas.
+
+O protocolo padrão do cliente ainda é o clássico (`group.protocol=classic`); para usar o novo, configure `group.protocol=consumer`, como faz o código desta aula. O broker do Kafka 4 aceita os dois.
+
+## Commit de offset e as garantias de entrega
+
+O consumidor funciona num laço: chama `poll()`, recebe um lote de registros (até `max.poll.records`, 500 por padrão), processa e, em algum momento, **confirma** o offset (faz o *commit*) para o grupo. O momento do commit em relação ao processamento define a garantia que você tem:
+
+| Quando confirma | Se a aplicação cair no meio | Garantia |
+|---|---|---|
+| **antes** de processar | as mensagens já confirmadas e não processadas se perdem | no máximo uma vez (*at-most-once*) |
+| **depois** de processar | as mensagens processadas e não confirmadas são relidas | pelo menos uma vez (*at-least-once*) |
+| processamento e commit numa transação | nada se perde nem se repete (dentro do Kafka) | exatamente uma vez (*exactly-once*) |
+
+O cliente Kafka puro, por padrão, faz **commit automático** (`enable.auto.commit=true`) a cada 5 segundos, em segundo plano, sem saber se o seu código terminou de processar. O Spring Kafka desliga isso: a documentação diz que, desde a versão 2.3, o framework define `enable.auto.commit` como `false`, a não ser que você o configure explicitamente. Quem confirma é o **container** do listener, de acordo com o `AckMode`:
+
+| `AckMode` | Quando o container confirma |
+|---|---|
+| `BATCH` (padrão) | depois que o listener processou, sem erro, todos os registros devolvidos por um `poll()` |
+| `RECORD` | depois de cada registro processado |
+| `TIME` / `COUNT` / `COUNT_TIME` | depois do lote, se passou um tempo ou uma contagem desde o último commit |
+| `MANUAL` | quando o listener chama `Acknowledgment.acknowledge()`; o commit acontece junto com os do lote |
+| `MANUAL_IMMEDIATE` | imediatamente, quando o listener chama `acknowledge()` |
+
+O resultado prático: com o Spring Kafka, o padrão é **pelo menos uma vez**. Se a aplicação cair depois de processar e antes do commit, os registros voltam. Isso não é defeito, é o contrato, e o consumidor precisa ser **idempotente** (processar duas vezes tem o mesmo efeito que processar uma), assunto da [aula 5](../../12-mensageria/05-consumidores-idempotentes/). Exatamente uma vez, com transações do Kafka, existe e tem custo e limites (só vale para efeitos dentro do próprio Kafka); fica para a aula [Kafka em produção](../../12-mensageria/08-kafka-em-producao/).
+
+<Figura legenda="Commit depois de processar: se o consumidor cai entre processar e confirmar, quem assume a partição recomeça do último offset confirmado e reprocessa as mensagens do meio">
+<svg viewBox="0 0 720 300" width="720" role="img" aria-labelledby="commit-titulo commit-desc">
+  <title id="commit-titulo">Linha do tempo de um commit de offset com queda do consumidor</title>
+  <desc id="commit-desc">Uma partição com os offsets de 10 a 15. O último offset confirmado pelo grupo é 10. O consumidor A processou as mensagens 10, 11 e 12 e caiu antes de confirmar. O consumidor B assume a partição no rebalanceamento, começa do offset confirmado, 10, e processa de novo 10, 11 e 12, que viram duplicatas, e depois segue com 13, 14 e 15.</desc>
+  <defs><marker id="mk-commit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="24" class="d-title">partição pedidos.eventos-1</text>
+  <rect x="120" y="44" width="80" height="36" class="d-ok"/><text x="160" y="67" text-anchor="middle" class="d-mono">10</text>
+  <rect x="200" y="44" width="80" height="36" class="d-ok"/><text x="240" y="67" text-anchor="middle" class="d-mono">11</text>
+  <rect x="280" y="44" width="80" height="36" class="d-ok"/><text x="320" y="67" text-anchor="middle" class="d-mono">12</text>
+  <rect x="360" y="44" width="80" height="36" class="d-box"/><text x="400" y="67" text-anchor="middle" class="d-mono">13</text>
+  <rect x="440" y="44" width="80" height="36" class="d-box"/><text x="480" y="67" text-anchor="middle" class="d-mono">14</text>
+  <rect x="520" y="44" width="80" height="36" class="d-box"/><text x="560" y="67" text-anchor="middle" class="d-mono">15</text>
+  <path d="M160 120 L160 84" class="d-line" marker-end="url(#mk-commit)"/>
+  <text x="120" y="140" class="d-label">offset confirmado = 10</text>
+  <rect x="10" y="160" width="350" height="44" rx="8" class="d-accent"/>
+  <text x="185" y="187" text-anchor="middle" class="d-text">Consumidor A: processa 10, 11, 12 e cai</text>
+  <rect x="10" y="224" width="590" height="44" rx="8" class="d-info"/>
+  <text x="305" y="251" text-anchor="middle" class="d-text">Consumidor B: recomeça do 10; 10, 11 e 12 são processados de novo</text>
+  <text x="10" y="292" class="d-label">Sem idempotência no consumidor, as três primeiras viram efeitos duplicados.</text>
+</svg>
+</Figura>
+
+## O produtor: acks, idempotência e o envio assíncrono
+
+Do lado de quem publica, a pergunta é: **quando posso considerar a mensagem gravada?** Cada partição tem uma réplica líder e, em produção, mais duas seguidoras. A configuração `acks` diz quantas precisam ter gravado antes de o broker responder ao produtor:
+
+| `acks` | O líder responde quando... | Risco |
+|---|---|---|
+| `0` | o produtor nem espera resposta | perde mensagens sem saber |
+| `1` | o líder gravou | se o líder cair antes de replicar, a mensagem some |
+| `all` (padrão desde o Kafka 3.0) | todas as réplicas do ISR gravaram | mais latência; nada se perde enquanto restar uma réplica do ISR |
+
+`acks=all` tem um parceiro do lado do tópico: `min.insync.replicas`, quantas réplicas precisam estar no ISR para o broker aceitar a escrita. O padrão é `1`, o que significa que, se as seguidoras ficarem para trás, `acks=all` vira, na prática, `acks=1`. A combinação clássica de produção é fator de replicação 3 com `min.insync.replicas=2`: o cluster aguenta perder um broker sem parar e sem perder dados. Essa configuração é do tópico e do cluster, e aparece na aula [Kafka em produção](../../12-mensageria/08-kafka-em-producao/).
+
+O outro risco é a **duplicata do próprio produtor**. Imagine: o produtor envia um lote, o broker grava, mas a resposta se perde na rede. O produtor não sabe se deu certo e reenvia (o padrão de `retries` é praticamente infinito, limitado por `delivery.timeout.ms`, 2 minutos). Sem proteção, o lote é gravado duas vezes. Com `enable.idempotence=true` (o padrão desde o Kafka 3.0), o produtor recebe um identificador do broker e numera cada lote por partição; o broker descarta um lote com número já visto. A idempotência também preserva a **ordem** com até 5 lotes em voo por conexão (`max.in.flight.requests.per.connection`, cujo padrão é 5): se o lote 2 falhar e o 3 passar, o broker recusa o 3 até o 2 chegar.
+
+<Callout tipo="atencao" titulo="Idempotência do produtor não é idempotência do consumidor">
+O `enable.idempotence` só elimina as duplicatas criadas pelos **reenvios automáticos** de uma mesma instância do produtor. Se a sua aplicação chama `send` duas vezes para o mesmo evento (porque o usuário clicou duas vezes, porque um relay do outbox repetiu a publicação), são duas mensagens diferentes para o Kafka, e as duas são gravadas. E nada disso protege contra o reprocessamento no consumidor depois de um rebalanceamento. A defesa de verdade contra duplicatas fica no consumidor.
+</Callout>
+
+Mais dois detalhes do produtor que mudam o comportamento da sua aplicação:
+
+- **O envio é assíncrono e em lotes.** `send` não vai à rede: ele coloca a mensagem num buffer e devolve um futuro. Uma thread do cliente junta as mensagens de cada partição em lotes e os envia. `linger.ms` é quanto ela espera para encher um lote; no Kafka 4 o padrão passou de 0 para **5 ms**, o que melhora a vazão quase sem custo de latência.
+- **O `send` pode bloquear e falhar na hora.** Antes de pôr a mensagem no buffer, o produtor precisa dos **metadados** do tópico (quantas partições, quem é o líder). Se não consegue obtê-los, ou se o buffer está cheio, `send` bloqueia por até `max.block.ms` (60 s por padrão) e então lança uma exceção, **sem** devolver futuro nenhum. Você vai ver essa mensagem real em "Quando dá errado".
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está no projeto Maven da trilha, no módulo `java/m12-mensageria/aulas`, pacote `dev.trilhajava.m12.aulas.kafka`, e roda no CI. São oito classes pequenas:
+
+| Arquivo | Papel |
+|---|---|
+| `StatusDoPedido` | As etapas do pedido, em ordem: `CRIADO`, `PAGO`, `ENVIADO`, `ENTREGUE` |
+| `EventoDePedido` | O `record` que vira JSON no valor da mensagem |
+| `RastreioDePedidos` | A projeção que o site consulta; recusa eventos fora de ordem |
+| `TransicaoInvalidaException` | O erro de um evento que pulou etapas |
+| `TopicosDePedidos` | Declara o tópico `pedidos.eventos` com 3 partições |
+| `PublicadorDeEventos` | O produtor, com `KafkaTemplate` e o número do pedido como chave |
+| `ConsumidorDeEventos` | O consumidor, com `@KafkaListener` e 3 consumidores no grupo |
+| `AplicacaoDeRastreio` | A aplicação Spring Boot e o arquivo `aula-kafka.properties` |
+
+E dois testes: `RastreioDePedidosTest`, só com Java, e `KafkaDePedidosTest`, com um broker Kafka 4 de verdade dentro da JVM, usando `@EmbeddedKafka`. O módulo já depende do `spring-boot-starter-kafka` (que traz o Spring Kafka 4.1 e o `kafka-clients` 4.2) e do `spring-boot-starter-kafka-test` (que traz o `spring-kafka-test`, onde mora o `@EmbeddedKafka`).
+
+## Mão na massa
+
+Os comandos abaixo rodam a partir da pasta `java/` do repositório, com o JDK 25. Na primeira vez, instale os módulos de que o `aulas` depende:
+
+```bash
+cd java
+mvn -q -pl m12-mensageria/aulas -am install -DskipTests
+cd m12-mensageria/aulas
+```
+
+### Passo 1: o domínio, sem Kafka nenhum
+
+**O que vamos fazer e por quê.** Antes de falar com o broker, vamos escrever a regra que o Kafka precisa proteger. Se o rastreio não soubesse distinguir um evento fora de ordem, você nunca perceberia o bug: a tela simplesmente mostraria o status errado. Começamos pelas etapas:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/StatusDoPedido.java" />
+
+O evento é um `record` que se valida no construtor. O número do pedido vai no valor (no JSON) **e** na chave da mensagem, como você verá no passo 3:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/EventoDePedido.java" semImports />
+
+E a projeção, o coração do serviço. Leia o Javadoc: as três regras são o que torna os problemas de ordem e de duplicata **visíveis**.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/RastreioDePedidos.java" semImports />
+
+Dois testes conferem as regras 2 e 3:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/kafka/RastreioDePedidosTest.java" semImports />
+
+```bash
+mvn test -Dtest=RastreioDePedidosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.kafka.RastreioDePedidosTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.019 s -- in dev.trilhajava.m12.aulas.kafka.RastreioDePedidosTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- A regra 2 trata a **reentrega**: um `PAGO` que chega depois de `PAGO` é ignorado e devolve `REPETIDO`. Como o Kafka entrega pelo menos uma vez, essa situação vai acontecer em produção (depois de cada rebalanceamento com commit pendente), e ela não pode virar erro.
+- A regra 3 trata a **desordem**: `ENVIADO` logo depois de `CRIADO` significa que o `PAGO` ainda não foi visto. A projeção lança `TransicaoInvalidaException` e não altera o estado. Lançar, em vez de ignorar em silêncio, é deliberado: o erro aparece nos logs e no tratamento de erros do consumidor (passo 4), em vez de virar um pedido parado em "Criado" para sempre.
+- `ConcurrentHashMap.compute` executa a função de forma **atômica por chave**. O consumidor terá três threads (uma por partição); dois pedidos diferentes podem ser atualizados ao mesmo tempo, mas o mesmo pedido nunca. Na prática, como os eventos de um pedido estão todos numa partição, só uma thread mexe em cada pedido; o `compute` é uma segunda proteção que custa pouco.
+
+Repare que a regra 2 já é uma forma simples de **consumidor idempotente**: ela usa o próprio estado (o histórico do pedido) para reconhecer a duplicata. Nem sempre o domínio ajuda assim; a [aula 5](../../12-mensageria/05-consumidores-idempotentes/) mostra o caso geral, com uma tabela de mensagens processadas.
+
+### Passo 2: a configuração e o tópico
+
+**O que vamos fazer e por quê.** O Spring Boot configura o `KafkaTemplate`, a fábrica de consumidores e o `KafkaAdmin` a partir das propriedades `spring.kafka.*`. Vamos declarar o que importa, inclusive o que já é padrão, para que a garantia fique escrita.
+
+```properties title="m12-mensageria/aulas/src/main/resources/aula-kafka.properties"
+# Aula 12.03 — Kafka. O endereço do broker vem de spring.kafka.bootstrap-servers
+# (padrão localhost:9092; nos testes, o @EmbeddedKafka preenche essa propriedade).
+
+# Chave e valor como texto: o JSON é gerado e lido pela aplicação.
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+
+# Durabilidade: o líder só confirma depois que as réplicas em sincronia gravaram, e o broker
+# descarta as repetições do produtor. Já são os padrões do Kafka, mas declarados ninguém
+# troca por acks=1 sem perceber o que perde.
+spring.kafka.producer.acks=all
+spring.kafka.producer.properties.enable.idempotence=true
+
+# Um grupo sem offset confirmado começa do início do tópico (o padrão, latest, começa do fim).
+spring.kafka.consumer.auto-offset-reset=earliest
+
+# O protocolo de rebalanceamento novo (KIP-848), estável desde o Kafka 4.0.
+spring.kafka.consumer.properties.group.protocol=consumer
+```
+
+Linha a linha:
+
+- **Serializadores.** Chave e valor viajam como texto (`StringSerializer` e `StringDeserializer`). O JSON é gerado e lido pela aplicação, com o `JsonMapper` do Jackson 3. A alternativa, configurar um serializador JSON do Spring Kafka, tem uma armadilha na leitura (a "mensagem envenenada", que trava a partição) que a [aula 6](../../12-mensageria/06-retry-e-dlq/) explica.
+- **`acks=all` e `enable.idempotence=true`.** São os padrões do cliente desde o Kafka 3.0, mas declarados ninguém troca por `acks=1` "para ganhar desempenho" sem perceber o que perde. Repare na diferença de prefixo: `acks` tem propriedade própria no Spring Boot (`spring.kafka.producer.acks`); `enable.idempotence` não tem, e por isso vai em `spring.kafka.producer.properties.*`, que repassa qualquer configuração do cliente Kafka sem tradução.
+- **`auto-offset-reset=earliest`.** Vale só quando o grupo **não tem offset confirmado** naquela partição (grupo novo, ou offset expirado). O padrão do Kafka, `latest`, começa do fim: um rastreio novo ignoraria todos os eventos já publicados. Para uma projeção que precisa do histórico, `earliest` é a escolha certa.
+- **`group.protocol=consumer`.** Liga o protocolo novo de rebalanceamento (KIP-848).
+
+O endereço do broker não aparece no arquivo: o padrão do Spring Boot é `localhost:9092`, e nos testes o `@EmbeddedKafka` preenche `spring.kafka.bootstrap-servers`. A aplicação carrega o arquivo com `@PropertySource`:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/AplicacaoDeRastreio.java" semImports />
+
+E o tópico é declarado como um bean `NewTopic`. Na subida, o `KafkaAdmin` do Spring cria o tópico se ele não existir:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/TopicosDePedidos.java" semImports />
+
+<Callout tipo="info" titulo="Criar tópicos pela aplicação ou fora dela?">
+O bean `NewTopic` é ótimo no desenvolvimento e nos testes: a aplicação sobe e o tópico existe. Em produção, muitas empresas desligam a criação automática de tópicos no broker (`auto.create.topics.enable=false`) e criam os tópicos por um processo controlado (Terraform, um operador no Kubernetes, uma ferramenta interna), porque partições, replicação e retenção são decisões de capacidade e custo, revisadas por quem opera o cluster. O `KafkaAdmin` não diminui partições nem muda a replicação de um tópico que já existe.
+</Callout>
+
+### Passo 3: o produtor
+
+**O que vamos fazer e por quê.** Publicar cada evento com o **número do pedido como chave**. É a linha mais importante da aula: sem ela, todo o resto funciona nos testes simples e quebra em produção.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/PublicadorDeEventos.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `kafka.send(topico, chave, valor)` é a sobrecarga que recebe a chave. Existe também `send(topico, valor)`, sem chave: é ela que causa o bug do começo da aula.
+- `send` devolve um `` CompletableFuture<SendResult<String, String>> ``. Quando o broker confirma, o futuro completa com um `SendResult`, cujo `getRecordMetadata()` traz a **partição** e o **offset** em que a mensagem foi gravada.
+- `publicar` é **assíncrono**: devolve na hora. Serve quando você publica muitos eventos e confere o resultado depois, todos juntos, como o teste do passo 5 faz com `CompletableFuture.allOf`.
+- `publicarEConfirmar` é **síncrono**: espera o futuro por até 10 segundos. Serve quando o próximo passo depende da confirmação. O caso típico é o relay do *transactional outbox* ([aula 4](../../12-mensageria/04-transactional-outbox/)): ele só pode marcar o evento como publicado depois que o broker confirmou.
+- Os quatro `catch` não engolem nada: todos transformam a falha numa `FalhaAoPublicarException` com a causa. O `InterruptedException` restaura a flag de interrupção da thread antes de lançar, como manda a boa prática (módulo 06). E o `catch (KafkaException e)` existe por um motivo que você só descobre testando com o broker fora do ar: nesse caso o `send` **lança na hora**, sem devolver futuro nenhum. A mensagem real está em "Quando dá errado".
+
+<Callout tipo="erro" titulo="Ignorar o futuro do send">
+`kafka.send(...)` sem olhar o resultado é o equivalente Kafka de um `catch` vazio. Se o broker recusar a mensagem (tópico inexistente, mensagem grande demais, réplicas insuficientes para `acks=all`), a falha fica só num log de erro do `LoggingProducerListener`, e o evento se perde. Ou você espera o futuro, ou registra um tratamento com `whenComplete`, ou publica pelo outbox, que tenta de novo até conseguir.
+</Callout>
+
+### Passo 4: o consumidor
+
+**O que vamos fazer e por quê.** Ler os eventos com um grupo de **três consumidores**, um por partição, e aplicar cada um na projeção.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/kafka/ConsumidorDeEventos.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `@KafkaListener` registra o método num **container de listener**, que roda o laço `poll()` → processar → commit numa thread própria. `groupId = "rastreio-pedidos"` define o consumer group; sem ele (e sem `spring.kafka.consumer.group-id`), o container não sobe, porque a gestão de grupo exige um `group.id`.
+- `concurrency = "3"` cria **três consumidores** dentro do mesmo container, cada um com a sua thread. Com três partições, cada thread fica com uma. Com `concurrency = "5"`, duas threads ficariam ociosas, consumindo memória e conexões à toa.
+- O parâmetro `` ConsumerRecord<String, String> `` dá acesso à chave, ao valor, à partição, ao offset, aos headers e ao timestamp. Se você só precisa do valor, o parâmetro pode ser uma `String`; aqui usamos o registro inteiro para o log mostrar de onde cada evento veio.
+- O listener **não tem `try/catch`**. Se `readValue` ou `aplicar` lançar, a exceção sobe para o container, que a entrega ao *error handler* (por padrão, o `DefaultErrorHandler`: repete o registro e, esgotadas as tentativas, registra o erro e segue). O offset só é confirmado para registros processados sem erro, ou já tratados pelo error handler. Um `catch` que só registra o erro no log faria o container achar que deu tudo certo, e o evento estaria perdido sem ninguém saber.
+- Os eventos de cada partição chegam **um por vez, em ordem**, na mesma thread. Por isso a regra 3 da projeção nunca dispara com a chave certa.
+
+### Passo 5: testando o fluxo com @EmbeddedKafka
+
+**O que vamos fazer e por quê.** Testar o fluxo de verdade: o produtor serializa, o broker grava nas partições, o grupo rebalanceia, o consumidor lê e a projeção é atualizada. Com mocks do `KafkaTemplate` nada disso seria exercitado. O `@EmbeddedKafka` do `spring-kafka-test` sobe um broker Kafka **KRaft** dentro da JVM do teste, em poucos segundos e sem Docker.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/kafka/KafkaDePedidosTest.java" semImports />
+
+```bash
+mvn test -Dtest=KafkaDePedidosTest "-Dlogging.level.dev.trilhajava.m12.aulas.kafka=INFO" "-Dlogging.level.org.springframework.kafka.listener=INFO"
+```
+
+As duas propriedades de log ligam as mensagens do nosso consumidor e do container, que o projeto deixa em `WARN` para a saída dos testes ficar limpa. Saída real (sem a data e o número do processo, e com as linhas de PED-2002 a PED-2006 resumidas):
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.kafka.KafkaDePedidosTest
+Formatting metadata directory C:\Users\...\Temp\kafka-8985695079379372947\combined_0_0 with metadata.version 4.3-IV0.
+INFO [main] KafkaDePedidosTest : Started KafkaDePedidosTest in 3.664 seconds
+INFO [ntainer#0-2-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions assigned: []
+INFO [ntainer#0-0-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions assigned: []
+INFO [ntainer#0-1-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions assigned: [pedidos.eventos-0, pedidos.eventos-1, pedidos.eventos-2]
+INFO [ntainer#0-1-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions revoked: [pedidos.eventos-1, pedidos.eventos-2]
+INFO [ntainer#0-1-C-1] ConsumidorDeEventos : p0@0 chave=PED-2001 CRIADO -> APLICADO
+INFO [ntainer#0-1-C-1] ConsumidorDeEventos : p0@1 chave=PED-2002 CRIADO -> APLICADO
+INFO [ntainer#0-1-C-1] ConsumidorDeEventos : p0@2 chave=PED-2005 CRIADO -> APLICADO
+INFO [ntainer#0-1-C-1] ConsumidorDeEventos : p0@3 chave=PED-2001 PAGO -> APLICADO
+...
+INFO [ntainer#0-1-C-1] ConsumidorDeEventos : p0@9 chave=PED-2001 ENTREGUE -> APLICADO
+INFO [ntainer#0-0-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions assigned: [pedidos.eventos-1]
+INFO [ntainer#0-2-C-1] KafkaMessageListenerContainer : rastreio-pedidos: partitions assigned: [pedidos.eventos-2]
+INFO [ntainer#0-0-C-1] ConsumidorDeEventos : p1@0 chave=PED-1001 CRIADO -> APLICADO
+INFO [ntainer#0-0-C-1] ConsumidorDeEventos : p1@1 chave=PED-1001 PAGO -> APLICADO
+INFO [ntainer#0-0-C-1] ConsumidorDeEventos : p1@2 chave=PED-2003 CRIADO -> APLICADO
+...
+INFO [ntainer#0-0-C-1] ConsumidorDeEventos : p1@13 chave=PED-2006 ENTREGUE -> APLICADO
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 11.65 s -- in dev.trilhajava.m12.aulas.kafka.KafkaDePedidosTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, por partes.**
+
+- **O broker.** `@EmbeddedKafka(partitions = 3, topics = ...)` subiu um broker KRaft (a linha *Formatting metadata directory* é o broker formatando o diretório de metadados, como faria um cluster novo) e criou o tópico com três partições. Desde o Spring Kafka 3.0.10, a anotação também preenche `spring.kafka.bootstrap-servers` com o endereço do broker, por isso o teste não configura nada. No Spring Kafka 4, só existe a implementação KRaft (`EmbeddedKafkaKraftBroker`).
+- **O rebalanceamento incremental.** Os três consumidores (`ntainer#0-0`, `#0-1` e `#0-2` são as threads do container) entraram no grupo quase juntos. O broker deu as três partições ao consumidor 1, e os outros receberam uma lista vazia. Pouco depois, o consumidor 1 **devolveu** as partições 1 e 2 (*partitions revoked*), e cada uma foi para um colega. Enquanto isso, o consumidor 1 continuou trabalhando na partição 0, sem parar. Esse é o protocolo novo do Kafka 4 em ação: as partições migram aos poucos, e quem não perdeu nada segue processando.
+- **As chaves.** `PED-2001`, `PED-2002` e `PED-2005` caíram na partição 0; `PED-1001`, `PED-2003`, `PED-2004` e `PED-2006`, na partição 1. Nenhum pedido do teste foi para a partição 2: com sete chaves, a distribuição ainda não é uniforme. É um lembrete de que o *hash* espalha bem **muitas** chaves; com poucas, partições ficam vazias por acaso.
+- **A ordem.** Dentro de cada partição, os offsets crescem e as etapas de cada pedido aparecem em sequência (`CRIADO`, depois `PAGO`...), intercaladas com as de outros pedidos. Nenhum `TransicaoInvalidaException`, mesmo com seis pedidos publicados de forma assíncrona e intercalada. O primeiro teste confere a mesma coisa de outro jeito: calcula `Utils.toPositive(Utils.murmur2(chave)) % 3`, exatamente a conta do produtor, e compara com a partição que o broker devolveu.
+- **A espera.** O consumo é assíncrono, então o teste não pode verificar o rastreio logo depois de publicar. O método `aguardar` verifica a condição a cada 50 ms, até um prazo de 15 segundos. O que **nunca** se deve fazer é um `Thread.sleep(5000)` fixo: o teste fica lento quando tudo dá certo e frágil quando a máquina está lenta.
+
+<Callout tipo="dica" titulo="@EmbeddedKafka ou Testcontainers?">
+O `@EmbeddedKafka` roda o broker dentro da JVM do teste: sobe rápido, não precisa de Docker e é ótimo para testar a sua lógica de produção e consumo. Ele roda, porém, a versão do Kafka que veio com o `spring-kafka-test`, com a configuração de teste, num único broker. Para testar contra a mesma imagem que vai para produção, com várias réplicas ou com SSL, use o Testcontainers com `new KafkaContainer("apache/kafka:4.2.1")` e `@ServiceConnection` ([aula 10.05](../../10-testes/05-testcontainers/)), como fazem os testes do exercício deste módulo. Uma divisão comum: `@EmbeddedKafka` nos testes do dia a dia, Testcontainers na suíte de integração do CI.
+</Callout>
+
+### Passo 6: olhando um broker de verdade pela linha de comando
+
+**O que vamos fazer e por quê.** Em produção você não terá os logs do teste para entender o que está acontecendo: terá as ferramentas de linha de comando que vêm com o Kafka. Vamos subir um broker com Docker e usar as quatro ferramentas que mais aparecem no dia a dia. Atenção: a saída deste passo é **ilustrativa**, montada a partir do formato documentado das ferramentas, porque não foi possível rodar o Docker na máquina em que a aula foi escrita. Os números (offsets, ids) serão diferentes na sua máquina.
+
+Suba um broker Kafka 4.2 em modo KRaft (a imagem oficial já vem configurada para um nó que é broker e controlador ao mesmo tempo):
+
+```bash
+docker run -d --name kafka -p 9092:9092 apache/kafka:4.2.1
+```
+
+Crie o tópico e veja como ele ficou:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic pedidos.eventos --partitions 3 --replication-factor 1
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --topic pedidos.eventos
+```
+
+```text
+Created topic pedidos.eventos.
+Topic: pedidos.eventos  TopicId: ...  PartitionCount: 3  ReplicationFactor: 1  Configs:
+  Topic: pedidos.eventos  Partition: 0  Leader: 1  Replicas: 1  Isr: 1
+  Topic: pedidos.eventos  Partition: 1  Leader: 1  Replicas: 1  Isr: 1
+  Topic: pedidos.eventos  Partition: 2  Leader: 1  Replicas: 1  Isr: 1
+```
+
+Publique dois eventos **com chave**. O produtor de console separa chave e valor pelo caractere que você indicar; no Kafka 4.2, as propriedades do leitor vão em `--reader-property` (a opção antiga, `--property`, foi descontinuada):
+
+```bash
+docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 \
+  --topic pedidos.eventos --reader-property parse.key=true --reader-property key.separator='|'
+PED-2004|{"numeroPedido":"PED-2004","status":"CRIADO","ocorridoEm":"2026-10-05T13:00:00Z"}
+PED-2004|{"numeroPedido":"PED-2004","status":"PAGO","ocorridoEm":"2026-10-05T13:02:00Z"}
+```
+
+Leia o tópico desde o início, mostrando partição, offset e chave (no consumidor de console, as opções de formatação vão em `--formatter-property`):
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic pedidos.eventos --from-beginning --group inspecao \
+  --formatter-property print.partition=true --formatter-property print.offset=true \
+  --formatter-property print.key=true
+```
+
+```text
+Partition:1	Offset:0	PED-2004	{"numeroPedido":"PED-2004","status":"CRIADO",...}
+Partition:1	Offset:1	PED-2004	{"numeroPedido":"PED-2004","status":"PAGO",...}
+```
+
+Os dois foram para a partição 1, a mesma que o teste do passo 5 mostrou para `PED-2004`: o produtor de console usa o mesmo particionador do `KafkaTemplate`. Por fim, a ferramenta mais importante para quem opera consumidores, a descrição do grupo:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --describe --group inspecao
+```
+
+```text
+GROUP     TOPIC            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID  HOST  CLIENT-ID
+inspecao  pedidos.eventos  0          0               0               0    ...
+inspecao  pedidos.eventos  1          2               2               0    ...
+inspecao  pedidos.eventos  2          0               0               0    ...
+```
+
+`CURRENT-OFFSET` é o offset confirmado do grupo, `LOG-END-OFFSET` é o fim da partição, e `LAG` é a diferença. Lag zero: o grupo está em dia. O que fazer quando o lag cresce, como alertar e como dimensionar fica para a aula [Kafka em produção](../../12-mensageria/08-kafka-em-producao/). Para rodar a aplicação da aula contra esse broker, basta subir `AplicacaoDeRastreio` pela IDE: o endereço padrão, `localhost:9092`, é o do container.
+
+## Quando dá errado
+
+As mensagens abaixo são reais: foram geradas quebrando o cenário de propósito, com um teste temporário (já removido do projeto) e o mesmo broker embutido. Os logs foram encurtados (sem data, número de processo e parte da pilha de chamadas).
+
+### Broker inacessível: "Topic ... not present in metadata"
+
+Para gerar esta, o produtor foi apontado para `localhost:9999`, onde não há broker, com `max.block.ms=3000` para não esperar o minuto padrão:
+
+```text
+WARN [ad | producer-1] org.apache.kafka.clients.NetworkClient : [Producer clientId=producer-1] Connection to node -1 (localhost/127.0.0.1:9999) could not be established. Node may not be available.
+WARN [ad | producer-1] org.apache.kafka.clients.NetworkClient : [Producer clientId=producer-1] Connection to node -1 (localhost/127.0.0.1:9999) could not be established. Node may not be available.
+...
+ERROR [main] o.s.k.support.LoggingProducerListener : Exception thrown when sending a message with key='PED-9' and payload='{"numeroPedido":"PED-9","status":"CRIADO","ocorridoEm":"2026-10-06T02:52:33.859464700Z"}' to topic pedidos.eventos:
+
+org.apache.kafka.common.errors.TimeoutException: Topic pedidos.eventos not present in metadata after 3000 ms.
+
+org.springframework.kafka.KafkaException: Send failed
+	at org.springframework.kafka.core.KafkaTemplate.doSend(KafkaTemplate.java:870)
+	at org.springframework.kafka.core.KafkaTemplate.observeSend(KafkaTemplate.java:827)
+	at org.springframework.kafka.core.KafkaTemplate.send(KafkaTemplate.java:608)
+	at dev.trilhajava.m12.aulas.kafka.PublicadorDeEventos.publicar(PublicadorDeEventos.java:33)
+	...
+Caused by: org.apache.kafka.common.errors.TimeoutException: Topic pedidos.eventos not present in metadata after 3000 ms.
+```
+
+**Como ler.** *Node -1* é o broker de *bootstrap*: o endereço que você configurou, antes de o cliente conhecer os brokers reais do cluster. O cliente tenta reconectar em intervalos crescentes e avisa a cada tentativa. Depois de `max.block.ms`, desiste: como não conseguiu nem descobrir as partições do tópico, não tem como pôr a mensagem num lote. Repare na pilha: a exceção saiu de **dentro do `send`** (`KafkaTemplate.send`, chamado por `PublicadorDeEventos.publicar`), e não do futuro. Por isso o `publicarEConfirmar` tem um `catch (KafkaException e)`; sem ele, essa falha escaparia como uma `KafkaException` genérica, e um código que só tratasse o futuro (`whenComplete`) nem a veria.
+
+**Como corrigir.** Confira `spring.kafka.bootstrap-servers` (o padrão é `localhost:9092`), se o broker está de pé e se a porta está acessível. Com Docker, um erro clássico é o broker anunciar um endereço (*advertised listener*) que o cliente não alcança: a primeira conexão funciona, e as seguintes vão para um nome que só existe dentro da rede do Docker. A mesma mensagem *not present in metadata* também aparece quando o tópico não existe e a criação automática está desligada no broker.
+
+### O listener falha: "Backoff ... exhausted"
+
+Aqui foram publicados dois eventos ruins: um `ENVIADO` para um pedido que nunca foi criado (`PED-3001`) e um JSON cortado ao meio (`PED-3002`). O consumidor da aula não tem `try/catch`, então as exceções sobem para o container:
+
+```text
+INFO [ntainer#0-1-C-1] o.s.k.l.KafkaMessageListenerContainer : Record in retry and not yet recovered
+ERROR [ntainer#0-1-C-1] o.s.kafka.listener.DefaultErrorHandler : Backoff FixedBackOffExecution[interval=0, currentAttempts=10, maxAttempts=9] exhausted for pedidos.eventos-2@0
+
+org.springframework.kafka.listener.ListenerExecutionFailedException: Listener method 'void dev.trilhajava.m12.aulas.kafka.ConsumidorDeEventos.receber(org.apache.kafka.clients.consumer.ConsumerRecord<java.lang.String, java.lang.String>)' threw exception
+	...
+Caused by: dev.trilhajava.m12.aulas.kafka.TransicaoInvalidaException: pedido PED-3001: recebido ENVIADO, mas o status atual é (nenhum)
+	at dev.trilhajava.m12.aulas.kafka.RastreioDePedidos.lambda$aplicar$0(RastreioDePedidos.java:39)
+	at dev.trilhajava.m12.aulas.kafka.RastreioDePedidos.aplicar(RastreioDePedidos.java:30)
+	at dev.trilhajava.m12.aulas.kafka.ConsumidorDeEventos.receber(ConsumidorDeEventos.java:32)
+
+ERROR [ntainer#0-0-C-1] o.s.kafka.listener.DefaultErrorHandler : Backoff FixedBackOffExecution[interval=0, currentAttempts=10, maxAttempts=9] exhausted for pedidos.eventos-1@0
+org.springframework.kafka.listener.ListenerExecutionFailedException: Listener method 'void dev.trilhajava.m12.aulas.kafka.ConsumidorDeEventos.receber(...)' threw exception
+	...
+Caused by: tools.jackson.core.exc.UnexpectedEndOfInputException: Unexpected end-of-input: expected close marker for Object (start marker at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #UNKNOWN])
+	at dev.trilhajava.m12.aulas.kafka.ConsumidorDeEventos.receber(ConsumidorDeEventos.java:31)
+```
+
+**Como ler.** `pedidos.eventos-2@0` é "partição 2, offset 0": o registro exato que falhou. *currentAttempts=10, maxAttempts=9* quer dizer 1 tentativa original mais 9 repetições, sem intervalo entre elas (`interval=0`): é o padrão do `DefaultErrorHandler`. A linha *Record in retry and not yet recovered* aparece durante as repetições. O `Caused by` mostra a causa de verdade: na primeira, a regra 3 da projeção (o pedido não tem status, e chegou um `ENVIADO`); na segunda, o Jackson 3 (pacote `tools.jackson`) encontrou o fim do texto antes de fechar o objeto JSON. A posição aparece como `REDACTED` porque o Jackson não inclui o conteúdo da entrada nas mensagens de erro (a opção `StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` está desligada), o que evita vazar dados em logs.
+
+**O que acontece depois** é o ponto mais importante: esgotadas as tentativas, o `DefaultErrorHandler` padrão **registra o erro e segue em frente**. O offset avança, e o evento está perdido; o único rastro é esse log. Para o JSON quebrado, repetir dez vezes foi desperdício (ele nunca vai ficar válido); para o evento fora de ordem, talvez o `PAGO` chegasse logo depois e uma repetição com intervalo resolvesse. Separar falhas transitórias de permanentes, repetir com intervalo e mandar o que não tem conserto para um tópico de mensagens mortas (DLT) é o assunto da [aula 6](../../12-mensageria/06-retry-e-dlq/).
+
+**Como corrigir.** No caso de desordem, a causa raiz está no produtor: publique com a chave da entidade. No JSON inválido, a causa está em quem publicou; o seu consumidor precisa se proteger (DLT) e o time produtor precisa de um contrato de mensagem, assunto da aula [Evolução de esquemas de eventos](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/).
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Sem chave: rápido de escrever, errado em produção" depois="Com a chave da entidade: ordem por pedido">
+```java
+// Distribui bem... e embaralha as etapas de cada pedido.
+kafka.send("pedidos.eventos",
+        json.writeValueAsString(evento));
+
+// No rastreio, com 3 consumidores em paralelo:
+//   p2: ENTREGUE (PED-2004) processado às 10:00:01
+//   p0: ENVIADO  (PED-2004) processado às 10:00:02
+// A tela volta de "Entregue" para "Enviado".
+```
+
+```java
+// Todos os eventos do pedido na mesma partição.
+kafka.send("pedidos.eventos",
+        evento.numeroPedido(),
+        json.writeValueAsString(evento));
+
+// Um consumidor por partição, em ordem:
+//   p1: ENVIADO  (PED-2004)
+//   p1: ENTREGUE (PED-2004)
+```
+</Comparar>
+
+As armadilhas que mais aparecem em code review e em incidentes:
+
+- **Retry que republica no mesmo tópico.** Um consumidor que, ao falhar, publica a mensagem de novo no fim do tópico para "tentar mais tarde" quebra a ordem da chave: o `PAGO` republicado fica atrás do `ENVIADO`. Repetições devem acontecer **no lugar** (o error handler repete o mesmo registro) ou em tópicos de retry com consciência de que a ordem se perde.
+- **`concurrency` maior que o número de partições.** Threads ociosas não aumentam a vazão. E se você roda 4 instâncias da aplicação com `concurrency = "3"`, o grupo tem 12 consumidores: com 3 partições, 9 ficam parados.
+- **Processamento pesado dentro do listener.** O laço do consumidor é sequencial por partição. Uma chamada HTTP de 2 segundos por mensagem limita aquela partição a meia mensagem por segundo, e se o lote inteiro passar de `max.poll.interval.ms`, o consumidor sai do grupo. Ponha *timeouts* em tudo o que o listener chama.
+- **Passar o processamento para outra thread.** Entregar o registro a um `ExecutorService` e retornar na hora parece aumentar a vazão, mas o container confirma o offset de algo que ainda não foi processado (vira *no máximo uma vez*) e a ordem por chave se perde. Se precisa de mais paralelismo, aumente partições e consumidores.
+- **`auto-offset-reset=latest` num consumidor que precisa do histórico.** Um grupo novo começa do fim e ignora em silêncio tudo o que já foi publicado. E se os offsets do grupo expirarem (o broker os apaga depois de 7 dias sem atividade do grupo, por padrão), o grupo volta a aplicar essa regra.
+- **Mensagens grandes.** O limite padrão de uma mensagem é de cerca de 1 MB. Arquivos, PDFs e imagens vão para um armazenamento de objetos, e a mensagem leva só a referência.
+
+**Quando NÃO usar Kafka:**
+
+- **Fila de tarefas com roteamento, prioridade ou atraso por mensagem** ("mande este e-mail daqui a 10 minutos", "esta mensagem vai para a fila de clientes VIP"): o RabbitMQ da [aula 2](../../12-mensageria/02-rabbitmq/) faz isso nativamente. Os share groups do Kafka 4.2 aproximam o Kafka de uma fila, mas sem o roteamento flexível do RabbitMQ.
+- **Pedido e resposta síncronos** ("calcule o frete e me responda agora"): uma chamada HTTP é mais simples, mais rápida e mais fácil de depurar.
+- **Pouco volume e um time sem quem opere o cluster.** Algumas centenas de eventos por dia cabem numa tabela do PostgreSQL lida periodicamente, ou num serviço de filas gerenciado. Um cluster Kafka exige monitoração, atualização, dimensionamento e plantão.
+- **Ordem global entre todas as mensagens.** Só é possível com uma partição, ou seja, sem paralelismo. Quase sempre, a necessidade real é ordem **por entidade**, e o modelo de chaves resolve.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+O que diferencia quem é pleno ou sênior é saber **decidir** com o Kafka: escolher garantias, prever o custo e explicar a escolha para o time.
+
+### A chave é parte do contrato do evento
+
+Trocar a chave de um tópico em produção muda a partição de todas as entidades e quebra a ordem durante a transição, exatamente como aumentar partições. E todos os consumidores dependem dela: um serviço de notificação pode ter sido construído supondo ordem por pedido. Por isso a chave entra na documentação do evento, ao lado dos campos do JSON (o catálogo de eventos dos projetos Pleno e Sênior desta trilha tem uma coluna "chave"). Antes de definir, pergunte ao time: "qual entidade precisa de ordem, agora e no futuro previsível?". Se a resposta muda depois (os eventos passam a precisar de ordem por **cliente**, e não por pedido), o caminho seguro é um tópico novo, publicado em paralelo durante a migração, e não a troca da chave no tópico atual.
+
+### Ordem custa paralelismo, e chaves quentes custam latência
+
+A ordem por chave limita o paralelismo de duas formas. Primeiro, o grupo não pode ter mais consumidores ativos do que partições. Segundo, uma chave muito mais ativa que as outras faz a partição dela crescer mais rápido, e o consumidor daquela partição vira o gargalo, mesmo com os outros ociosos. Em *marketplaces*, o grande vendedor; em bancos, a conta de uma empresa com milhares de transações por minuto. As saídas, cada uma com custo: chaves mais finas (por pedido, e não por vendedor), se a regra de negócio aceitar ordem mais fraca; um tópico separado para as entidades grandes; ou aceitar o atraso. O número que importa é a vazão de **uma** partição com o seu processamento, medida, não chutada.
+
+### Garantias de entrega têm preço
+
+`acks=all` com `min.insync.replicas=2` e replicação 3 é a configuração de quem não aceita perder dados, e custa latência (o produtor espera duas réplicas) e disco (três cópias de tudo). Para métricas de uso, cliques e logs, perder uma fração mínima em caso de falha de broker pode ser aceitável, e `acks=1` reduz a latência. A decisão é por tópico e deve ser explícita: "eventos financeiros, pedidos e estoque: `acks=all`; telemetria: `acks=1`". O mesmo raciocínio vale para o consumidor: *pelo menos uma vez* com consumidor idempotente é o padrão da indústria, porque é simples e seguro; *exatamente uma vez* com transações do Kafka só vale quando o efeito também está no Kafka (ler de um tópico, escrever em outro), e não protege um `UPDATE` no PostgreSQL nem uma chamada HTTP.
+
+### Gerenciado ou operado pelo time
+
+Rodar Kafka em produção significa cuidar de brokers, discos, atualizações de versão, rebalanceamento de partições entre brokers, segurança e monitoração 24 horas. Os serviços gerenciados (dos provedores de nuvem e de empresas especializadas) cobram por isso, em geral por vazão, armazenamento e partições, e tiram do time a operação do cluster. A conta que importa não é só a fatura: é a fatura contra o custo de pessoas com conhecimento para operar e o risco de um incidente às 3 da manhã. Um time pequeno, começando, quase sempre ganha com o gerenciado; uma empresa com volume muito alto e um time de plataforma pode compensar operando o próprio cluster.
+
+### Segurança
+
+Um broker de desenvolvimento aceita qualquer conexão sem senha. Em produção, três camadas são o mínimo: **criptografia** em trânsito (TLS entre clientes e brokers), **autenticação** de cada aplicação (SASL, com usuário e senha ou certificados de cliente) e **autorização** por tópico e por grupo com ACLs (listas de controle de acesso): o serviço de rastreio pode **ler** `pedidos.eventos` no grupo `rastreio-pedidos`, e só o checkout pode **escrever** nele. Sem ACLs, qualquer aplicação com acesso à rede pode publicar um `ENTREGUE` falso ou ler dados pessoais dos eventos. E lembre: os eventos ficam guardados pela retenção inteira. Dado sensível (CPF, endereço, cartão) que entra num tópico fica lá por dias, em vários brokers e réplicas; publique o mínimo necessário.
+
+### Observabilidade e o que fica para a aula 8
+
+O consumidor que você escreveu funciona, mas em produção a pergunta diária é "ele está acompanhando?". A resposta vem do **lag** por partição e por grupo, da taxa de rebalanceamentos e das métricas do produtor (taxa de erro, latência de envio). Como medir e alertar sobre lag, como dimensionar o número de partições, como configurar retenção e tópicos compactados (que guardam só a última mensagem de cada chave) e como funcionam as transações e o *exactly-once* são os temas da aula [Kafka em produção](../../12-mensageria/08-kafka-em-producao/).
+
+### Como justificar a escolha para o time
+
+Uma boa proposta de uso do Kafka cabe numa página e responde: qual o volume esperado (eventos por segundo, no pico) e o crescimento; quem produz e quem consome; qual a chave e por quê; quantas partições e qual o raciocínio; quais garantias (`acks`, idempotência no consumidor) e o que acontece em cada falha; quem opera o cluster; e quais alternativas foram descartadas (RabbitMQ, tabela no PostgreSQL, chamada HTTP), com o motivo. Registrar isso num ADR (*Architecture Decision Record*, módulo 13) protege o time de rediscutir a decisão a cada novo integrante e mostra, numa entrevista, que você decide com critérios e não por moda.
+
+<Callout tipo="entrevista">
+Perguntas que caem para vagas Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Como garantir a ordem no Kafka?"** A ordem só existe dentro da partição; a chave (o id da entidade) leva os eventos à mesma partição; no grupo, uma partição tem um único consumidor; produtor idempotente para que reenvios não reordenem. Riscos: retry que republica no tópico, aumento de partições, processamento em outra thread. Ordem global só com uma partição, e em geral indica problema mal modelado.
+- **"O Kafka entrega exatamente uma vez?"** O padrão, com o Spring Kafka, é pelo menos uma vez: commit depois de processar. Duplicatas vêm de reenvios do produtor (resolvidos pela idempotência) e de rebalanceamentos com commit pendente (resolvidos pelo consumidor idempotente). Transações do Kafka dão exatamente uma vez só de tópico para tópico, não para efeitos em banco ou HTTP.
+- **"Quantos consumidores você coloca num grupo?"** No máximo o número de partições, somando todas as instâncias da aplicação. Partições são o teto de paralelismo, e aumentar depois embaralha as chaves; por isso se dimensiona pelo pico previsto.
+- **"Qual a diferença entre Kafka e RabbitMQ?"** Log retido e relido versus fila que remove a mensagem confirmada; ordem por partição versus roteamento flexível por *exchange*; vários grupos independentes sobre os mesmos dados versus filas por consumidor. Escolho pelo caso de uso, não pela fama.
+- **"O que acontece se o seu consumidor demorar 10 minutos numa mensagem?"** Passa de `max.poll.interval.ms`, sai do grupo, a partição vai para outro consumidor, o lote é reprocessado. Corrijo a lentidão (timeouts) e ajusto `max.poll.records`.
+
+Bônus que mostra experiência: citar o Kafka 4 (só KRaft, protocolo novo de grupos com `group.protocol=consumer`, share groups no 4.2) e dizer que `acks=all` sem `min.insync.replicas=2` não garante o que parece.
+</Callout>
+
+## Checkpoint: o que acontece se o tópico crescer?
+
+O time decidiu aumentar `pedidos.eventos` de 3 para 6 partições para ganhar paralelismo. Antes de aprovar, você quer saber o impacto nos pedidos do teste.
+
+**O desafio:**
+
+1. Escreva um pequeno programa (um `main` ou um teste seu) que, para os pedidos `PED-1001` e `PED-2001` a `PED-2006`, calcule a partição com 3 e com 6 partições, usando a mesma conta do produtor (`Utils.toPositive(Utils.murmur2(...))`, da classe `org.apache.kafka.common.utils.Utils`).
+2. Diga quais pedidos mudam de partição.
+3. Explique o que pode acontecer com o pedido `PED-2004` se o `ENVIADO` foi publicado antes da mudança, ainda não foi consumido (há lag) e o `ENTREGUE` foi publicado depois.
+
+<details>
+<summary>Solução</summary>
+
+O programa:
+
+```java
+import java.nio.charset.StandardCharsets;
+import org.apache.kafka.common.utils.Utils;
+
+public class ParticoesDosPedidos {
+    public static void main(String[] args) {
+        String[] pedidos = {"PED-1001", "PED-2001", "PED-2002", "PED-2003", "PED-2004", "PED-2005", "PED-2006"};
+        for (String pedido : pedidos) {
+            int hash = Utils.toPositive(Utils.murmur2(pedido.getBytes(StandardCharsets.UTF_8)));
+            System.out.println(pedido + " com 3: p" + hash % 3 + " | com 6: p" + hash % 6);
+        }
+    }
+}
+```
+
+A saída (real, com o `kafka-clients` 4.2.1):
+
+```text
+PED-1001 com 3: p1 | com 6: p1
+PED-2001 com 3: p0 | com 6: p3
+PED-2002 com 3: p0 | com 6: p0
+PED-2003 com 3: p1 | com 6: p1
+PED-2004 com 3: p1 | com 6: p4
+PED-2005 com 3: p0 | com 6: p3
+PED-2006 com 3: p1 | com 6: p1
+```
+
+**Quem muda:** `PED-2001` e `PED-2005` (de p0 para p3) e `PED-2004` (de p1 para p4). Os outros quatro ficam onde estavam. Não é coincidência que cada chave vá para `p` ou `p + 3`: como 6 é múltiplo de 3, `hash % 6` só pode dar `hash % 3` ou `hash % 3 + 3`. Ao dobrar as partições, em média metade das chaves muda; com um número que não é múltiplo do anterior, a proporção é ainda maior.
+
+**O risco no PED-2004:** o `ENVIADO` está na partição 1, esperando na fila do lag; o `ENTREGUE` foi para a partição 4, lida por outro consumidor, talvez ociosa e sem atraso. O `ENTREGUE` pode ser processado primeiro, e a projeção lança `TransicaoInvalidaException` (pedido em `PAGO`, chegou `ENTREGUE`). Com o tratamento de erro padrão, o evento é descartado depois de 10 tentativas, e o pedido fica em `ENVIADO` para sempre. Por isso, aumentar partições exige um plano: escolher um momento de lag zero e parar os produtores durante a mudança, ou criar um tópico novo e migrar os consumidores, ou ter uma projeção que tolera e reordena eventos (por exemplo, guardando eventos "do futuro" até a etapa anterior chegar).
+
+</details>
+
+<Quiz
+  id="12-kafka"
+  questoes={[
+    {
+      pergunta: 'Os eventos de um pedido são publicados SEM chave num tópico de 3 partições, lido por um grupo com 3 consumidores. O que pode acontecer?',
+      opcoes: ['Nada: o Kafka garante a ordem no tópico inteiro', 'Os eventos se espalham pelas partições e podem ser processados fora de ordem', 'O produtor recusa mensagens sem chave', 'Todos vão para a partição 0, e a ordem se mantém'],
+      correta: 1,
+      explicacao: 'A ordem só existe dentro de uma partição. Sem chave, o particionador distribui as mensagens entre as partições, cada uma lida por um consumidor diferente, em paralelo. A chave (o número do pedido) é que leva todos os eventos à mesma partição.',
+    },
+    {
+      pergunta: 'Um tópico tem 4 partições. A aplicação roda em 2 instâncias, cada uma com `@KafkaListener(concurrency = "3")`, no mesmo grupo. Quantos consumidores processam mensagens?',
+      opcoes: ['6', '4', '3', '2'],
+      correta: 1,
+      explicacao: 'O grupo tem 6 consumidores (2 instâncias × 3), mas cada partição vai para no máximo um consumidor do grupo. Com 4 partições, 4 trabalham e 2 ficam ociosos.',
+    },
+    {
+      pergunta: 'Com o Spring Kafka na configuração padrão, a aplicação cai depois de processar 3 registros de um lote e antes do commit. O que acontece quando outro consumidor assume a partição?',
+      opcoes: ['Os 3 registros se perdem', 'Os 3 registros são processados de novo, porque ele recomeça do último offset confirmado', 'O broker detecta o processamento e pula os 3', 'O tópico fica bloqueado até a aplicação voltar'],
+      correta: 1,
+      explicacao: 'O Spring Kafka desliga o auto commit e confirma depois do processamento (AckMode BATCH). Quem assume a partição começa do último offset confirmado: é pelo menos uma vez, e o consumidor precisa ser idempotente.',
+    },
+    {
+      pergunta: 'O que `enable.idempotence=true` no produtor resolve?',
+      opcoes: ['Duplicatas criadas quando a aplicação chama send duas vezes para o mesmo evento', 'Duplicatas e reordenação causadas pelos reenvios automáticos do próprio produtor', 'Reprocessamento no consumidor depois de um rebalanceamento', 'Perda de mensagens quando o líder da partição cai'],
+      correta: 1,
+      explicacao: 'O broker reconhece, pelo número de sequência, os lotes que o produtor reenviou e descarta os repetidos, mantendo a ordem. Dois send da aplicação são duas mensagens diferentes, e o reprocessamento no consumidor é outro problema, resolvido com idempotência no consumidor.',
+    },
+    {
+      pergunta: 'Num teste com @EmbeddedKafka, o que é verdade?',
+      opcoes: ['Ele precisa de Docker para subir o broker', 'Ele sobe um broker KRaft dentro da JVM do teste e preenche spring.kafka.bootstrap-servers', 'Ele substitui o KafkaTemplate por um mock', 'Ele só funciona com tópicos de uma partição'],
+      correta: 1,
+      explicacao: 'O @EmbeddedKafka do spring-kafka-test roda um broker de verdade (no Spring Kafka 4, só KRaft) na própria JVM, cria os tópicos pedidos e expõe o endereço em spring.kafka.bootstrap-servers. Nada é mockado: o fluxo de produção e consumo é real.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O Kafka é um **log distribuído**: tópicos divididos em **partições**, cada uma um log só de acréscimo com **offsets**. Ler não apaga; a **retenção** remove. Cada **consumer group** guarda o seu offset por partição, e reler o histórico é barato.
+- **A chave decide a partição** (`murmur2(chave) % partições`), e a **ordem só existe dentro da partição**. Escolha a chave pela entidade que precisa de ordem. Aumentar partições embaralha as chaves; diminuir não é possível.
+- No grupo, **cada partição tem um único consumidor**; partições são o teto de paralelismo. Rebalanceamentos redistribuem as partições; no Kafka 4, o protocolo novo (`group.protocol=consumer`) faz isso de forma incremental.
+- O Spring Kafka desliga o auto commit e **confirma depois de processar** (`AckMode.BATCH`): **pelo menos uma vez**. O consumidor precisa ser idempotente.
+- No produtor, **`acks=all`** e **`enable.idempotence=true`** (padrões desde o Kafka 3.0, mas declare-os). O `send` é assíncrono e devolve um futuro, e pode lançar na hora quando não obtém os metadados do tópico.
+- Spring Kafka 4: `KafkaTemplate.send(topico, chave, valor)`, `@KafkaListener(groupId, concurrency)`, `NewTopic` com `TopicBuilder`, e listener **sem `try/catch`**: quem decide sobre falhas é o error handler.
+- **`@EmbeddedKafka`** testa o fluxo real com um broker KRaft na JVM, sem Docker; Testcontainers, quando você precisa da imagem de produção.
+
+## Próximo passo
+
+O publicador desta aula tem um problema que nenhum teste com o broker de pé mostra: se o serviço de pedidos grava no banco e cai antes de publicar o evento, o banco e o Kafka ficam inconsistentes. Na próxima aula, [Transactional Outbox](../../12-mensageria/04-transactional-outbox/), você resolve a escrita dupla gravando o evento na mesma transação do banco e publicando com um relay, que usa justamente o `send` síncrono que você escreveu aqui. Depois das aulas de consumidores idempotentes e de retry e DLT, o [exercício 12.02](../../../exercicios/12-mensageria/02-estoque-kafka/) junta tudo numa projeção de estoque com chaves, ordem e tratamento de falhas.
+
+## Referências
+
+- [Apache Kafka 4.2: introdução](https://kafka.apache.org/42/getting-started/introduction/) — eventos, tópicos, partições e replicação
+- [Apache Kafka 4.2: configurações do produtor](https://kafka.apache.org/42/configuration/producer-configs/) e [do consumidor](https://kafka.apache.org/42/configuration/consumer-configs/)
+- [Apache Kafka 4.2: Consumer Rebalance Protocol (KIP-848)](https://kafka.apache.org/42/operations/consumer-rebalance-protocol/)
+- [Apache Kafka 4.2: notas de atualização](https://kafka.apache.org/42/getting-started/upgrade/) — inclui a mudança de opções das ferramentas de console
+- [Spring for Apache Kafka: documentação de referência](https://docs.spring.io/spring-kafka/reference/) — *Sending Messages*, *Receiving Messages*, *Message Listener Containers* e *Testing Applications*
+- [Spring Boot: Apache Kafka Support](https://docs.spring.io/spring-boot/reference/messaging/kafka.html)

@@ -1,0 +1,170 @@
+---
+titulo: "Saga de transferência entre bancos: compensar sem criar dinheiro"
+codigo: "15.04"
+resumo: Orquestre uma transferência para outro banco sem transação distribuída — débito local, envio ao parceiro e estorno como compensação — tratando o timeout como incerteza (PENDENTE, nunca estorno às cegas), resolvendo as pendentes por reconciliação e tornando cada passo idempotente pelo id da operação.
+modulo: 15-system-design
+ordem: 4
+dificuldade: dificil
+tempo: 2h
+conceitos: [saga, orquestração, compensação, idempotência, timeout, reconciliação, máquina de estados, consistência eventual]
+aulas: [15-system-design/05-escala-e-consistencia, 15-system-design/06-caso-pix]
+java:
+  modulo: m15-system-design
+  teste: SagaDeTransferenciaTest
+---
+
+## Contexto
+
+A Ana tem R$ 100,00 na nossa fintech e manda R$ 30,00 para o Bruno, que tem conta em outro banco. São dois sistemas: o nosso débito e o crédito no banco parceiro. Não existe transação que abranja os dois. A primeira versão do código era assim:
+
+```java
+contas.debitar(origem, valor);
+try {
+    parceiro.enviar(id, destino, valor);
+} catch (Exception e) {
+    contas.creditar(origem, valor);   // "deu erro, devolve"
+}
+```
+
+Numa sexta-feira, o parceiro ficou lento. As chamadas davam timeout depois de 5 segundos, e o código estornava. Só que o parceiro **processava** os pedidos, com atraso. Resultado: 212 clientes receberam o estorno aqui **e** o crédito lá. O dinheiro existiu duas vezes, e a fintech pagou a diferença.
+
+O erro é tratar **timeout** como **falha**. Um timeout diz só que a resposta não chegou; o pedido pode ter sido processado. Sua missão é escrever o orquestrador dessa **saga** sem esse erro.
+
+Este exercício é Java puro: sem Spring, sem Docker. O banco parceiro, nos testes, é um falso roteirizado.
+
+## O que já existe
+
+Em `dev.trilhajava.m15.saga`:
+
+- `Contas`: as contas do nosso banco, em memória. `debitar(conta, valor, idOperacao)` devolve `false` se não houver saldo (e nada muda); `creditar(conta, valor, idOperacao)`. Os dois são **idempotentes pelo id da operação**: repetir um id já aplicado não muda o saldo. Pronta; não altere;
+- `BancoParceiro`: a interface do outro banco. `enviar(idTransferencia, contaDestino, valor)` devolve `ACEITA` ou `RECUSADA`, ou lança `ParceiroIndisponivelException` (timeout ou falha de rede: **pode** ter chegado lá). `consultar(idTransferencia)` devolve o que o parceiro sabe: `Optional.of(ACEITA)`, `Optional.of(RECUSADA)`, ou vazio, se ele **nunca recebeu**. O parceiro deduplica pelo id da transferência;
+- `Transferencia(id, origem, contaDestino, valor, estado)`, com o método `com(Estado)`, que devolve uma cópia no estado novo, e o enum `Estado`;
+- `OrquestradorDeTransferencias` (esboço), com `buscar`, `iniciar` e `reconciliar`.
+
+## Os estados
+
+| Estado | Significa | O dinheiro |
+|---|---|---|
+| `CONCLUIDA` | o parceiro aceitou | saiu daqui e chegou lá |
+| `RECUSADA` | não havia saldo | nada foi debitado nem enviado |
+| `COMPENSADA` | o parceiro recusou (ou nunca recebeu) | o débito foi estornado |
+| `PENDENTE` | não sabemos o que aconteceu lá | o débito **fica**, até a reconciliação descobrir |
+
+```text
+iniciar ──► debitar origem ──── sem saldo ────────────────────────► RECUSADA
+                 │
+                 ▼
+          enviar ao parceiro ── ACEITA ───────────────────────────► CONCLUIDA
+                 │ ─────────── RECUSADA ──► estornar ─────────────► COMPENSADA
+                 │
+                 └──────────── sem resposta ──────────────────────► PENDENTE
+                                                                       │
+reconciliar ──► consultar o parceiro ── ACEITA ─────────────────────► CONCLUIDA
+                                     ── RECUSADA ou nunca recebeu ──► estornar ─► COMPENSADA
+                                     ── sem resposta ────────────────► continua PENDENTE
+```
+
+## Os requisitos
+
+**1. `iniciar(id, origem, contaDestino, valor)`.**
+
+- Valor zero ou negativo: `IllegalArgumentException`, antes de qualquer passo.
+- Debita a origem com o id de operação `"debito-" + id`. Sem saldo: `RECUSADA`, e o parceiro **nem é chamado**.
+- Envia ao parceiro com o **id da transferência**, a conta de destino e o valor, sem alterar nenhum deles.
+- `ACEITA` → `CONCLUIDA`. `RECUSADA` → estorna com o id de operação `"estorno-" + id` → `COMPENSADA`.
+- `ParceiroIndisponivelException` → `PENDENTE`. **Sem estorno.**
+- Devolve a transferência no estado final e a guarda para `buscar`.
+
+**2. Idempotência na entrada.** Se `iniciar` for chamado de novo com um id que já existe (o cliente repetiu o pedido), devolva a transferência guardada, **sem** debitar nem enviar outra vez.
+
+**3. `reconciliar(id)`.** Resolve uma transferência `PENDENTE` consultando o parceiro:
+
+| O parceiro diz | Resultado |
+|---|---|
+| `ACEITA` | `CONCLUIDA`, sem estorno |
+| `RECUSADA` | estorna → `COMPENSADA` |
+| vazio (nunca recebeu) | estorna → `COMPENSADA` |
+| lança `ParceiroIndisponivelException` | continua `PENDENTE`; dá para chamar de novo depois |
+
+Numa transferência que **não** está `PENDENTE`, `reconciliar` devolve o estado atual e **não consulta** o parceiro nem estorna de novo. Id desconhecido: `IllegalArgumentException`.
+
+**4. `buscar(id)`.** `Optional` com a transferência no estado atual, ou vazio.
+
+## Critérios de aceite
+
+- [ ] `SagaDeTransferenciaTest` passa (12 testes).
+- [ ] Em **nenhum** caminho a Ana termina com mais de R$ 100,00, nem o dinheiro é estornado com a transferência `CONCLUIDA`.
+- [ ] Timeout no envio deixa o saldo em R$ 70,00 e o estado `PENDENTE`.
+- [ ] Reconciliar duas vezes uma transferência já compensada estorna **uma** vez e consulta o parceiro **uma** vez.
+
+## Desafios opcionais
+
+- **Persista o estado.** Hoje as transferências vivem num `ConcurrentHashMap`: um deploy no meio da saga perde as pendentes, com o dinheiro debitado. Troque por uma tabela (`transferencia(id PK, origem, destino, valor, estado, atualizada_em)`) e grave o estado **na mesma transação** do débito. O que acontece se a aplicação cair entre o débito e o envio?
+- **Um job de reconciliação.** Um `@Scheduled` que busca as `PENDENTE` há mais de 1 minuto e chama `reconciliar`, com um limite de tentativas. Depois do limite, a transferência vai para um estado `EM_ANALISE` e dispara um alerta: um caso parado e visível é melhor que um estorno errado.
+- **Reenvio em vez de compensação.** Quando o parceiro diz que nunca recebeu, em vez de estornar, reenvie com o **mesmo id** (é o que a aula 5 mostra). Que testes mudam? Quando o reenvio é a escolha certa, e quando o estorno é?
+- **Concorrência.** Duas threads chamam `reconciliar("t8")` ao mesmo tempo, e as duas veem `PENDENTE`. O que o `synchronized` da solução evita? Com o estado num banco e várias instâncias, o que substituiria o `synchronized`? (Lock otimista, módulo 9.)
+
+<Dicas>
+<Dica nivel={1}>
+Desenhe a máquina de estados antes de programar (o diagrama acima ajuda) e marque, em cada seta, o que acontece com o saldo. Repare que **dois** caminhos terminam em estorno (recusa no envio e recusa ou "nunca recebeu" na reconciliação): um método privado resolve os dois.
+</Dica>
+<Dica nivel={2}>
+- Guarde as transferências num `Map<String, Transferencia>`. Como `Transferencia` é um record imutável, "mudar o estado" é `transferencia.com(Estado.CONCLUIDA)` e guardar de novo no mapa.
+- A idempotência na entrada é a primeira coisa do `iniciar`, logo depois de validar o valor: se o id já está no mapa, devolva o que está lá.
+- Os ids de operação derivados (`"debito-" + id`, `"estorno-" + id`) fazem as `Contas` ignorarem repetições: se por algum motivo o estorno rodar duas vezes, o saldo muda uma vez só.
+- O `consultar` devolve `Optional<Resposta>`: vazio e `RECUSADA` levam ao mesmo lugar.
+</Dica>
+<Dica nivel={3}>
+Um método que conclui a saga a partir de uma resposta, usado pelos dois caminhos:
+
+```java
+private Transferencia concluirCom(Transferencia t, Resposta resposta) {
+    if (resposta == Resposta.ACEITA) {
+        return salvar(t.com(Estado.CONCLUIDA));
+    }
+    contas.creditar(t.origem(), t.valor(), "estorno-" + t.id());
+    return salvar(t.com(Estado.COMPENSADA));
+}
+```
+
+No `iniciar`: `concluirCom(t, parceiro.enviar(...))` dentro de um `try`, com `catch (ParceiroIndisponivelException e)` devolvendo a transferência `PENDENTE`. No `reconciliar`: se o estado não é `PENDENTE`, devolva sem consultar; senão, `concluirCom(t, parceiro.consultar(id).orElse(Resposta.RECUSADA))`, também dentro de um `try`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/saga/OrquestradorDeTransferencias.java" />
+
+### Passo a passo
+
+1. **Validar antes de qualquer efeito.** O valor inválido é recusado antes de debitar: não há o que compensar.
+2. **Idempotência na porta.** Um id que já existe devolve o estado guardado. O cliente que repetiu o pedido (toque duplo, retry do app depois de um timeout **dele**) recebe a mesma transferência, e o parceiro não recebe dois envios.
+3. **O débito é o ponto sem volta.** Depois do débito, a saga **precisa** terminar em `CONCLUIDA` ou `COMPENSADA`, nem que seja pela reconciliação. Por isso a transferência é guardada como `PENDENTE` **antes** do envio: se algo inesperado acontecer no meio, ela está registrada e visível.
+4. **Recusa é falha confirmada; timeout, não.** `RECUSADA` do parceiro é uma resposta: o crédito **não** aconteceu, e estornar é seguro. `ParceiroIndisponivelException` é ausência de resposta: o crédito pode ter acontecido. Estornar aqui é o erro da sexta-feira.
+5. **Reconciliar é perguntar à fonte de verdade.** O parceiro sabe o que fez com o id. `ACEITA` fecha como concluída; `RECUSADA` ou "nunca recebi" permitem estornar com segurança. Se ele continua sem responder, a transferência continua `PENDENTE`, e a próxima tentativa decide.
+6. **Estados terminais são terminais.** `reconciliar` numa transferência `COMPENSADA` não consulta nem estorna de novo. E, mesmo que estornasse, o id `"estorno-" + id` faria as `Contas` ignorarem a repetição: são duas camadas de proteção.
+7. **`synchronized` em `iniciar` e `reconciliar`.** Evita que duas threads processem a mesma transferência ao mesmo tempo (duas reconciliações simultâneas veriam `PENDENTE` e consultariam o parceiro duas vezes). Numa instância, basta. Com várias instâncias, o estado vai para o banco e a proteção vira um `UPDATE ... WHERE estado = 'PENDENTE'` ou lock otimista.
+
+### Ligação com o PIX e com a Fintech Core
+
+É o mesmo raciocínio da aula 6, no sentido inverso. No recebimento de PIX, a falta de confirmação da liquidação leva o PIX para `DESCONHECIDO`, e não para crédito nem recusa; a devolução é uma saga orquestrada que **nunca compensa diante de um timeout**. Aqui, `PENDENTE` é o `DESCONHECIDO` do envio.
+
+Na Fintech Core, as transferências do marco 2 eram **internas**: débito e crédito na mesma transação do mesmo banco, e o ACID resolvia tudo. Uma transferência para **outro** banco não tem essa sorte, e é exatamente este orquestrador que entraria no lugar, com o estado persistido numa tabela, a `Idempotency-Key` do marco 2 como id da transferência, e os eventos de conclusão publicados pela outbox do marco 5.
+
+### Alternativas e trade-offs
+
+- **Orquestração × coreografia.** Aqui, um orquestrador conhece os passos, guarda o estado e decide a compensação: o fluxo inteiro está num lugar, e "onde está a transferência t8?" tem uma resposta. Na coreografia, cada serviço reage ao evento do anterior (`DebitoRealizado` → o serviço de integração envia → `EnvioAceito` ou `EnvioRecusado` → o serviço de contas estorna). Menos acoplamento, mas o fluxo fica espalhado, e o estado "pendente há 10 minutos" não mora em lugar nenhum. Para dinheiro, com compensação e reconciliação, a orquestração costuma ganhar.
+- **Estornar ou reenviar quando o parceiro nunca recebeu.** A solução estorna (os testes pedem `COMPENSADA`): o cliente vê o dinheiro de volta e pode tentar de novo. Reenviar com o mesmo id, como no exemplo da aula 5, completa a transferência que o cliente pediu, mas prolonga a incerteza se o parceiro seguir instável. Os dois são corretos **porque** o parceiro deduplica pelo id; sem essa garantia, nenhum dos dois é seguro.
+- **2PC/XA.** Uma transação distribuída de verdade exigiria que o outro banco participasse do protocolo, e bloquearia recursos dos dois lados enquanto espera. Entre instituições, não existe.
+- **Motores de workflow** (Temporal, Camunda): persistem o estado, reexecutam passos, agendam a reconciliação e mostram cada saga num painel. Valem a pena quando há muitas sagas longas; para um fluxo de três passos, uma tabela de estado e um job resolvem.
+
+### Avalie sua solução
+
+- Procure no seu código qualquer `catch (Exception e)` ou `catch (RuntimeException e)` que leve a um estorno. Ele trata um timeout (ou um `NullPointerException` seu) como recusa?
+- Se a aplicação cair **depois** do débito e **antes** de guardar a transferência, o que sobra? A ordem "guardar `PENDENTE`, depois enviar" ajuda? O que resolveria de vez? (Débito e registro na mesma transação local.)
+- Por quanto tempo uma transferência pode ficar `PENDENTE`? O que o cliente vê no app enquanto isso? Que métrica e que alerta você criaria (módulo 14)?
+- O parceiro deduplica pelo id. E se ele **não** deduplicasse, o que mudaria na reconciliação e no reenvio?
+
+</Solucao>

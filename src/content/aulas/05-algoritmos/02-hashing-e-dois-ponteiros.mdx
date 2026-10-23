@@ -1,0 +1,158 @@
+---
+titulo: Hashing e dois ponteiros
+descricao: Trocar buscas O(n) por consultas O(1) com HashMap e HashSet, o clássico Two Sum, contagem de frequências e a técnica de dois ponteiros em arrays ordenados.
+modulo: 05-algoritmos
+ordem: 2
+duracao: 50
+objetivos:
+  - Reconhecer quando um HashMap/HashSet transforma O(n²) em O(n)
+  - Resolver Two Sum e variações de "já vi isto?"
+  - Aplicar dois ponteiros em arrays ordenados
+  - Comparar as duas abordagens em tempo e memória
+tags: [hashing, two sum, dois ponteiros]
+flashcards:
+  - frente: Como resolver Two Sum em O(n)?
+    verso: Percorra o array guardando valor → índice num HashMap; para cada elemento, verifique se (alvo − elemento) já está no mapa.
+  - frente: Quando usar dois ponteiros?
+    verso: Em arrays ordenados (ou listas), quando a resposta envolve pares ou segmentos e dá para decidir qual ponteiro mover comparando com o alvo.
+  - frente: Como achar a maior sequência de inteiros consecutivos em O(n)?
+    verso: Coloque tudo num HashSet e só comece a contar a partir de números x cujo x−1 não está no conjunto.
+  - frente: Qual o trade-off entre hash e dois ponteiros?
+    verso: Hash é O(n) de tempo e O(n) de memória; ordenar + dois ponteiros é O(n log n) de tempo e O(1) de memória extra.
+---
+
+Se você só pudesse aprender uma técnica de otimização, seria esta: **quando você procura algo repetidamente numa lista, guarde o que já viu num `HashMap` ou `HashSet`**. A busca cai de O(n) para O(1), e o algoritmo inteiro de O(n²) para O(n).
+
+## O clássico: Two Sum
+
+> Dado um array de valores e um alvo, encontre os índices de dois elementos que somam o alvo.
+
+**Força bruta:** testar todos os pares, O(n²).
+
+```java
+for (int i = 0; i < v.length; i++)
+    for (int j = i + 1; j < v.length; j++)
+        if (v[i] + v[j] == alvo) return new int[] {i, j};
+```
+
+**Otimização:** para cada `v[j]`, a pergunta é "o **complemento** `alvo - v[j]` já apareceu antes?". Um `HashMap<valor, índice>` responde em O(1):
+
+```java
+Map<Long, Integer> vistos = new HashMap<>();
+for (int j = 0; j < v.length; j++) {
+    Integer i = vistos.get(alvo - v[j]);
+    if (i != null) return new int[] {i, j};
+    vistos.putIfAbsent(v[j], j);
+}
+return new int[0];
+```
+
+<Figura legenda="Two Sum com alvo 1500: ao chegar no 1200, o complemento 300 já está no mapa">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="Array 1500, 700, 300, 1200; mapa de vistos contém 1500, 700 e 300; o complemento de 1200 é 300, encontrado no índice 2">
+  <text x="20" y="30" class="d-label">valores</text>
+  <rect x="90" y="12" width="80" height="30" rx="6" class="d-box"/><text x="130" y="32" text-anchor="middle" class="d-mono">1500</text>
+  <rect x="175" y="12" width="80" height="30" rx="6" class="d-box"/><text x="215" y="32" text-anchor="middle" class="d-mono">700</text>
+  <rect x="260" y="12" width="80" height="30" rx="6" class="d-ok"/><text x="300" y="32" text-anchor="middle" class="d-mono">300</text>
+  <rect x="345" y="12" width="80" height="30" rx="6" class="d-accent"/><text x="385" y="32" text-anchor="middle" class="d-mono">1200</text>
+  <text x="130" y="60" text-anchor="middle" class="d-label">[0]</text><text x="215" y="60" text-anchor="middle" class="d-label">[1]</text><text x="300" y="60" text-anchor="middle" class="d-label">[2]</text><text x="385" y="60" text-anchor="middle" class="d-label">[3] = j</text>
+  <rect x="90" y="85" width="335" height="60" rx="10" class="d-info"/>
+  <text x="105" y="108" class="d-label">vistos (valor → índice)</text>
+  <text x="105" y="132" class="d-mono">{'{1500→0, 700→1, 300→2}'}</text>
+  <text x="450" y="108" class="d-text">1500 − 1200 = 300</text>
+  <text x="450" y="132" class="d-text">300 está no mapa → [2, 3]</text>
+</svg>
+</Figura>
+
+O(n) de tempo, O(n) de memória. É o exemplo mais citado de "trocar memória por tempo". O exercício 05.01 começa por ele, num cenário de auditoria de transações.
+
+## Variações do "já vi isto?"
+
+- **Duplicata a até k posições:** guarde a **última posição** de cada valor; ao revê-lo, compare a distância.
+- **Primeiro elemento que não se repete:** conte com um `LinkedHashMap` (que preserva a ordem de chegada) e depois procure o primeiro com contagem 1.
+- **Agrupar anagramas:** a chave do mapa é a palavra com as letras ordenadas.
+- **Maior sequência de consecutivos** (`[100, 4, 200, 1, 3, 2]` → 4, de 1 a 4): ordenar resolve em O(n log n), mas dá para fazer O(n):
+
+```java
+Set<Integer> presentes = new HashSet<>(lista);
+int maior = 0;
+for (int x : presentes) {
+    if (presentes.contains(x - 1)) continue;   // só conta a partir do INÍCIO de uma sequência
+    int tamanho = 1;
+    while (presentes.contains(x + tamanho)) tamanho++;
+    maior = Math.max(maior, tamanho);
+}
+```
+
+Parece O(n²) por causa do `while` dentro do `for`, mas **cada número é visitado no máximo duas vezes** (uma no `for`, uma no `while` da sequência a que pertence). Esse tipo de análise — contar quantas vezes cada elemento é tocado no total — se chama **análise amortizada** e impressiona em entrevista.
+
+## Dois ponteiros
+
+Quando o array está **ordenado**, dá para resolver muitos problemas de pares **sem memória extra**, com um ponteiro em cada ponta:
+
+```java
+// Array ORDENADO: existe par com soma = alvo?
+int esq = 0, dir = v.length - 1;
+while (esq < dir) {
+    long soma = v[esq] + v[dir];
+    if (soma == alvo) return true;
+    if (soma < alvo) esq++;     // precisa de um valor maior
+    else dir--;                 // precisa de um valor menor
+}
+return false;
+```
+
+A ordenação permite **descartar** metade das possibilidades a cada passo: se a soma está pequena, nenhum par com o `esq` atual e um `dir` menor vai funcionar, então só `esq` pode avançar.
+
+Outros usos de dois ponteiros:
+
+- **Remover duplicatas de um array ordenado no lugar** (um ponteiro lê, outro escreve).
+- **Verificar palíndromo** (um de cada ponta, andando para o meio).
+- **Mesclar duas listas ordenadas** (um ponteiro em cada lista — a base do *merge sort*).
+- **Ponteiros rápido e lento** em listas encadeadas (detectar ciclo, achar o meio).
+
+## Hash ou dois ponteiros?
+
+| Abordagem | Tempo | Memória extra | Precisa de ordem? |
+|---|---|---|---|
+| Força bruta | O(n²) | O(1) | não |
+| `HashMap` | O(n) | O(n) | não |
+| Ordenar + dois ponteiros | O(n log n) | O(1)* | sim (ou ordena antes) |
+
+\* sem contar a ordenação, se ela puder ser feita no lugar.
+
+Detalhe importante: ordenar **perde os índices originais**. Se o problema pede os índices (como o Two Sum clássico), o hash é a escolha natural.
+
+<Callout tipo="entrevista">
+Depois de resolver, ofereça o trade-off: *"This is O(n) time and O(n) space. If memory were tight and the input sorted, I could use two pointers for O(1) extra space."* Esse tipo de comentário mostra que você enxerga alternativas — um dos principais sinais de nível Pleno.
+</Callout>
+
+<Quiz
+  id="05-hashing"
+  questoes={[
+    {
+      pergunta: 'No Two Sum com HashMap, por que verificar o complemento ANTES de inserir o elemento atual?',
+      opcoes: ['Por desempenho', 'Para não usar o mesmo elemento duas vezes (ex.: alvo 10 e elemento 5)', 'Porque o HashMap exige', 'Não faz diferença'],
+      correta: 1,
+      explicacao: 'Se inserisse antes, o 5 encontraria a si mesmo como complemento de 10.',
+    },
+    {
+      pergunta: 'Dois ponteiros para "par com soma X" exigem que o array esteja…',
+      opcoes: ['Sem repetidos', 'Ordenado', 'Com tamanho par', 'Em um HashSet'],
+      correta: 1,
+      explicacao: 'A ordenação permite decidir qual ponteiro mover comparando a soma com o alvo.',
+    },
+    {
+      pergunta: 'Qual a complexidade da "maior sequência de consecutivos" com HashSet e checagem de início?',
+      opcoes: ['O(n²)', 'O(n log n)', 'O(n)', 'O(1)'],
+      correta: 2,
+      explicacao: 'Cada número é visitado no máximo duas vezes no total (análise amortizada).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- "Procuro algo repetidamente?" → **`HashMap`/`HashSet`**: O(n²) vira O(n), ao custo de O(n) de memória.
+- Two Sum: guarde valor → índice e procure o complemento.
+- Array ordenado + pares → **dois ponteiros**, O(1) de memória extra.
+- Análise amortizada: conte quantas vezes cada elemento é tocado no total.

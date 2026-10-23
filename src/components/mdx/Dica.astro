@@ -1,0 +1,45 @@
+---
+interface Props {
+  nivel: number;
+  titulo?: string;
+}
+const { nivel, titulo } = Astro.props;
+const rotulo = titulo ?? ['Direção', 'Caminho', 'Quase lá'][nivel - 1] ?? `Dica ${nivel}`;
+---
+
+<div class="dica" hidden tabindex="-1">
+  <p class="dica-label">Dica {nivel} · {rotulo}</p>
+  <div class="dica-body"><slot /></div>
+</div>
+
+<style>
+  .dica {
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+  .dica.revelada {
+    animation: surgir 0.3s var(--ease);
+  }
+  @keyframes surgir {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+  }
+  .dica-label {
+    margin: 0 0 4px !important;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ok);
+  }
+  .dica-body {
+    font-size: 0.96rem;
+  }
+  .dica-body > :global(* + *) {
+    margin-top: 0.6em;
+  }
+</style>

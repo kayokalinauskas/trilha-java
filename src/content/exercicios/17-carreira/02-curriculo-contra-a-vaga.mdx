@@ -1,0 +1,238 @@
+---
+titulo: "Currículo contra a vaga"
+codigo: "17.02"
+resumo: Marina está em transição de carreira, de analista financeira para backend Java, e o currículo dela não passa da triagem. Compare-o com uma vaga real de Jr, encontre o que o ATS e o recrutador não conseguem ver, reescreva-o em uma página com bullets de impacto e prepare a versão em inglês do topo do currículo.
+modulo: 17-carreira
+ordem: 2
+dificuldade: medio
+tempo: 1h30–2h
+conceitos: [currículo, ATS, bullets de impacto, adaptação à vaga, resume em inglês, LGPD, transição de carreira]
+aulas: [17-carreira/02-curriculo-ats-e-linkedin, 17-carreira/01-portfolio-e-github]
+---
+
+## Contexto
+
+### A vaga
+
+> **Pessoa Desenvolvedora Backend Java Jr** — fintech de meios de pagamento, modelo híbrido (2x por semana), São Paulo.
+>
+> **Você vai:** desenvolver e manter APIs REST do produto de conciliação de pagamentos; escrever testes automatizados; participar de code reviews; apoiar a investigação de incidentes.
+>
+> **Requisitos:** Java e Spring Boot; APIs REST; SQL e banco relacional (PostgreSQL); testes automatizados (JUnit, Mockito); Git.
+>
+> **Diferenciais:** mensageria (Kafka ou RabbitMQ); Docker; conhecimento do domínio financeiro ou de pagamentos; inglês para leitura técnica.
+
+### O currículo atual (três páginas, duas colunas)
+
+```text
+[FOTO]                        MARINA COSTA
+                              Brasileira, casada, 31 anos
+                              CPF 123.456.789-00
+                              Rua das Flores, 100, ap. 12 - São Paulo/SP
+                              marina.costa.dev.java.2026@...
+
+OBJETIVO
+Busco uma oportunidade na área de TI para crescer
+profissionalmente e contribuir com a empresa.
+
+PERFIL
+Pessoa proativa, comunicativa, resiliente e apaixonada
+por tecnologia e por aprender coisas novas.
+
+HABILIDADES  (em barras de 0 a 5 estrelas)
+Java ★★★★☆  Python ★★★☆☆  C# ★★☆☆☆  JavaScript ★★★☆☆
+React ★★☆☆☆  Angular ★☆☆☆☆  Spring ★★★★☆  SQL ★★★★☆
+Kafka ★★☆☆☆  Kubernetes ★☆☆☆☆  AWS ★☆☆☆☆  Excel ★★★★★
+
+EXPERIÊNCIA
+Analista Financeira Pleno - Distribuidora Alfa (2019-atual)
+- Responsável pela conciliação bancária.
+- Elaboração de relatórios.
+- Participação em projeto de automação.
+
+Assistente Administrativa - Loja Beta (2015-2019)
+- Atendimento ao cliente, arquivo, pagamentos a fornecedores.
+
+FORMAÇÃO
+Ciências Contábeis - Faculdade Gama (2014-2018)
+Análise e Desenvolvimento de Sistemas - EAD (2024-2026, em andamento)
+Cursos: Java Completo (40h), Spring Boot do Zero (32h),
+Lógica de Programação (20h), Excel Avançado (16h),
+Oratória (8h), Inglês Básico (60h), [+ 14 cursos]
+```
+
+### O que se sabe sobre Marina (e não está no currículo)
+
+- O "projeto de automação" foi dela: escreveu, em Python, um script que cruza o extrato bancário com o ERP e aponta divergências. A conciliação mensal caiu de **3 dias para 4 horas**, e o script é usado até hoje por 5 analistas.
+- Na conciliação, ela lida com cerca de **12 mil lançamentos por mês** e com as tarifas das adquirentes de cartão. Quando aparece uma divergência, é ela quem investiga com o banco e com a TI e documenta a causa.
+- Fez o Fintech Core até o marco 5: API REST de conta digital em Spring Boot 4 e Java 25, PostgreSQL com Flyway, lock otimista na transferência, JWT, outbox com Kafka, 70 testes (JUnit 6, Mockito, Testcontainers), Docker Compose e CI no GitHub Actions. O repositório tem README com decisões.
+- Lê documentação em inglês sem dificuldade; conversação intermediária.
+- Nunca usou C#, Angular, Kubernetes ou AWS além de tutoriais de uma tarde.
+
+## O que entregar
+
+**1. Diagnóstico.** Liste os problemas do currículo atual em três grupos: **formato e ATS**, **dados pessoais**, **conteúdo**. Para cada um, diga o efeito (some da busca? descartado pelo recrutador? pergunta difícil na entrevista?).
+
+**2. Mapa da vaga.** Uma tabela com cada requisito e diferencial da vaga, a evidência que Marina tem e onde ela vai aparecer no currículo novo.
+
+**3. O currículo novo.** Uma página, uma coluna, com cabeçalho, resumo, projetos, experiência, formação, habilidades e idiomas. Bullets no formato ação + o que e com o quê + resultado.
+
+**4. O topo em inglês.** Cabeçalho, *summary* e os três bullets mais fortes, em inglês, para vagas internacionais.
+
+## Critérios de aceite
+
+- [ ] Nenhum dado pessoal desnecessário (CPF, foto, idade, estado civil, endereço completo).
+- [ ] Todo requisito obrigatório da vaga aparece com o mesmo termo usado na vaga, **dentro de uma evidência**.
+- [ ] Nenhuma tecnologia que Marina não sabe defender numa pergunta.
+- [ ] A experiência de conciliação aparece como vantagem para **esta** vaga, com números.
+- [ ] O projeto vem antes da experiência (é a prova técnica mais forte).
+- [ ] O texto em inglês não tem foto, idade, estado civil nem "I" no início dos bullets.
+
+<Dicas>
+<Dica nivel={1}>
+Leia a vaga e grife os termos exatos: "APIs REST", "PostgreSQL", "testes automatizados", "JUnit", "Mockito", "Git", "Kafka", "Docker", "conciliação". Agora procure cada um no currículo atual. Quantos você encontra dentro de uma frase que prova experiência?
+</Dica>
+<Dica nivel={2}>
+A maior força de Marina para esta vaga não é o curso de Java: é que ela **já fez conciliação** de verdade, com volume, e automatizou o processo. É o domínio exato do produto. Isso precisa estar no resumo e no primeiro bullet da experiência.
+</Dica>
+<Dica nivel={3}>
+Estrutura sugerida: Cabeçalho (nome, "São Paulo, SP", e-mail, telefone, LinkedIn, GitHub) → Resumo (3 linhas: transição, projeto, domínio) → Projetos (Fintech Core com 4 bullets) → Experiência (analista com 3 bullets; assistente em 1 linha) → Formação (ADS em andamento, Contábeis) → Habilidades agrupadas → Idiomas. Corte a lista de cursos: fique com os que se relacionam à vaga, ou nenhum.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### 1. Diagnóstico
+
+**Formato e ATS**
+
+| Problema | Efeito |
+|---|---|
+| Duas colunas | o texto é extraído embaralhado; experiência e habilidades podem se misturar |
+| Habilidades em estrelas | o ATS não lê as barras; o recrutador lê "Java 4/5" como autoavaliação sem prova |
+| Três páginas | ninguém lê; a informação boa se perde no meio dos 20 cursos |
+| E-mail longo e com ano | parece temporário; um e-mail simples com nome e sobrenome é mais profissional |
+
+**Dados pessoais**
+
+| Problema | Efeito |
+|---|---|
+| CPF, endereço completo | exposição sem necessidade (LGPD: necessidade); risco de fraude se o PDF circular |
+| Foto, idade, estado civil, nacionalidade | abre espaço para viés e não ajuda em nada; em vagas internacionais, é motivo de descarte |
+
+**Conteúdo**
+
+| Problema | Efeito |
+|---|---|
+| Objetivo e perfil genéricos | qualquer pessoa escreve; não diz o cargo nem o que ela sabe fazer |
+| C#, Angular, Kubernetes, AWS listados | perguntas que ela não sabe responder; dilui o que ela realmente sabe |
+| O projeto Fintech Core **não aparece** | a principal prova técnica está ausente, e com ela Kafka, Docker, Testcontainers, PostgreSQL |
+| Experiência descrita como responsabilidade | "responsável pela conciliação" esconde o domínio, o volume e o resultado de 3 dias para 4 horas |
+| "Participação em projeto de automação" | o projeto foi **dela**; "participação" apaga a autoria |
+| Termos da vaga ausentes | "APIs REST", "PostgreSQL", "JUnit", "Mockito", "Git", "Docker" não aparecem: ela some das buscas |
+| Inglês "básico" (curso de 60h) | subestima: ela lê documentação técnica, que é o que a vaga pede |
+
+### 2. Mapa da vaga
+
+| Vaga | Tipo | Evidência de Marina | Onde |
+|---|---|---|---|
+| Java e Spring Boot | requisito | Fintech Core em Spring Boot 4 e Java 25 | Projetos, Habilidades |
+| APIs REST | requisito | API REST de conta digital | Resumo, Projetos |
+| SQL, PostgreSQL | requisito | PostgreSQL com Flyway; lock otimista | Projetos |
+| Testes (JUnit, Mockito) | requisito | 70 testes com JUnit 6, Mockito e Testcontainers | Projetos |
+| Git | requisito | repositório com PRs, CI | Projetos, Habilidades |
+| Kafka | diferencial | outbox publicando no Kafka | Projetos |
+| Docker | diferencial | Docker Compose, Testcontainers | Projetos |
+| Domínio financeiro | diferencial | 5 anos de conciliação, 12 mil lançamentos/mês | Resumo, Experiência |
+| Inglês para leitura | diferencial | lê documentação técnica | Idiomas |
+| Conciliação (produto) | contexto | automação da conciliação | Resumo, Experiência |
+
+### 3. O currículo novo
+
+```text
+MARINA COSTA
+Desenvolvedora Backend Java
+São Paulo, SP · marina.costa@email.com · (11) 9xxxx-xxxx
+linkedin.com/in/marinacosta · github.com/marinacosta
+
+RESUMO
+Desenvolvedora backend Java em transição de carreira, com 5 anos de
+experiência em conciliação bancária e cartões. Construí uma API REST de
+conta digital em Spring Boot 4 e PostgreSQL, com testes automatizados,
+Kafka e Docker. Busco vaga Jr em produto financeiro.
+
+PROJETOS
+Conta Digital API (Fintech Core) — github.com/marinacosta/conta-digital
+Java 25, Spring Boot 4, PostgreSQL, Kafka, Docker, JUnit 6, Testcontainers
+- Desenvolvi APIs REST de contas, transferências e extrato, com validação,
+  erros padronizados (RFC 9457) e autenticação JWT.
+- Garanti transferências concorrentes sem saldo negativo com lock
+  otimista e nova tentativa, verificado com 50 transações simultâneas.
+- Implementei publicação de eventos no Kafka com outbox, sem perda de
+  eventos em falhas entre o banco e o broker.
+- Escrevi 70 testes automatizados (JUnit, Mockito, Testcontainers com
+  PostgreSQL real), executados no CI do GitHub Actions a cada PR.
+
+EXPERIÊNCIA
+Analista Financeira — Distribuidora Alfa · 2019–atual
+- Automatizei a conciliação bancária com um script em Python que cruza
+  extrato e ERP e aponta divergências: o fechamento mensal caiu de
+  3 dias para 4 horas; a ferramenta é usada por 5 analistas.
+- Concilio cerca de 12 mil lançamentos por mês, incluindo tarifas e
+  repasses de adquirentes de cartão.
+- Investigo divergências de pagamentos com áreas de TI e bancos,
+  documentando causa e correção.
+
+Assistente Administrativa — Loja Beta · 2015–2019
+- Contas a pagar a fornecedores e atendimento ao cliente.
+
+FORMAÇÃO
+Análise e Desenvolvimento de Sistemas — em andamento (conclusão 2026)
+Ciências Contábeis — Faculdade Gama · 2018
+
+HABILIDADES
+Linguagens: Java, SQL, Python
+Backend: Spring Boot, Spring Security, Spring Data JPA, APIs REST, Flyway
+Dados e mensageria: PostgreSQL, Kafka
+Testes: JUnit, Mockito, Testcontainers
+Ferramentas: Git, GitHub Actions, Docker
+
+IDIOMAS
+Inglês: leitura técnica fluente; conversação intermediária
+```
+
+Note as escolhas:
+
+- O **resumo** junta os três trunfos (API, testes, domínio) e diz o cargo que ela busca.
+- **Projetos vêm antes** da experiência: é a prova técnica. A experiência vem logo depois, porque o domínio é um diferencial raro para esta vaga.
+- O terceiro bullet da experiência conecta com "apoiar a investigação de incidentes" da vaga.
+- Python fica, porque ela usou de verdade e com resultado. C#, Angular, Kubernetes e AWS saem.
+- Os cursos saíram: o projeto prova mais do que 20 certificados. Se quiser, uma linha com os dois mais relevantes.
+
+### 4. O topo em inglês
+
+```text
+MARINA COSTA
+Backend Developer (Java)
+São Paulo, Brazil (UTC−3) · Open to remote
+marina.costa@email.com · linkedin.com/in/marinacosta · github.com/marinacosta
+
+SUMMARY
+Backend developer transitioning from 5 years in finance operations
+(bank reconciliation and card payments). Built a digital account REST API
+with Java 25, Spring Boot 4, PostgreSQL, Kafka and Docker, covered by
+automated tests running in CI.
+
+- Built a Python tool that reconciles bank statements against the ERP,
+  cutting the monthly close from 3 days to 4 hours; used by 5 analysts.
+- Prevented negative balances under concurrent transfers using
+  optimistic locking with retries, verified with 50 parallel transactions.
+- Wrote 70 automated tests (JUnit, Mockito, Testcontainers with a real
+  PostgreSQL) running on GitHub Actions for every pull request.
+```
+
+### Avalie a sua versão
+
+Cole o texto do seu currículo num editor simples (bloco de notas). Ele continua legível, na ordem certa? Procure cada termo obrigatório da vaga com Ctrl+F. Ele aparece dentro de uma frase que prova o uso? Por último, leia cada bullet e pergunte: "consigo falar disso por cinco minutos?".
+
+</Solucao>

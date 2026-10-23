@@ -1,0 +1,316 @@
+---
+titulo: Limite de requisições com token bucket
+codigo: "11.04"
+resumo: Implemente do zero um token bucket testável (com Clock e aritmética inteira), um limitador por chave seguro para várias threads e um filtro de servlet que limita o login a 5 tentativas por minuto por IP — com 429, Retry-After e Problem Details.
+modulo: 11-seguranca
+ordem: 4
+dificuldade: medio
+tempo: 2–3h
+conceitos: [rate limiting, token bucket, Clock, concorrência, OncePerRequestFilter, "429", Retry-After]
+aulas: [11-seguranca/06-defesas-da-api, 11-seguranca/02-spring-security-7, 06-concorrencia/02-sincronizacao, 10-testes/01-por-que-e-como-testar]
+java:
+  modulo: m11-seguranca
+  arquivos:
+    - src/main/java/dev/trilhajava/m11/limite/BaldeDeFichas.java
+    - src/main/java/dev/trilhajava/m11/limite/LimitadorPorChave.java
+    - src/main/java/dev/trilhajava/m11/limite/FiltroDeLimite.java
+---
+
+## Contexto
+
+O time de segurança encontrou nos logs 40 mil tentativas de login em uma hora, vindas de poucos IPs: *credential stuffing*, o ataque que testa pares de e-mail e senha vazados de outros sites, apostando que as pessoas repetem senhas. O bloqueio por conta (o do exercício 11.01) protege cada usuário, mas aqui o atacante testa **um** palpite em **milhares** de contas diferentes, e nenhuma conta chega a cinco erros. A defesa que falta é limitar por **origem**.
+
+Antes de adotar uma biblioteca (Bucket4j, Resilience4j) ou de configurar o limite no gateway, o tech lead quer que o time entenda o algoritmo por dentro, e pediu uma implementação própria em três peças: o balde, um limitador com um balde por chave, e o filtro que protege o `POST /login`.
+
+## O que você vai praticar
+
+- **Token bucket (balde de fichas).** Um balde começa cheio de fichas; cada requisição gasta uma; as fichas voltam aos poucos, a uma taxa fixa, até a capacidade. Ele permite rajadas curtas (até a capacidade) e limita a média ao longo do tempo. Veja [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/).
+- **Reposição sob demanda (*lazy refill*).** Nenhuma thread "pinga" fichas no balde: a cada chamada, calcula-se quanto tempo passou desde a última e quantas fichas isso rende. Um balde parado não custa nada.
+- **Tempo injetado (`Clock`).** O balde lê o tempo de um `Clock` recebido no construtor, e nunca de `System.currentTimeMillis()` ou `Instant.now()`. No seu programa, um relógio que você avança à mão mostra "12 segundos depois" sem esperar 12 segundos. Veja [Por que e como testar](../../../aulas/10-testes/01-por-que-e-como-testar/).
+- **Aritmética inteira.** Frações de ficha em `double` acumulam erro de arredondamento (6 s + 6 s pode dar 0,9999 ficha). Guardar o **tempo** acumulado em nanossegundos, num `long`, resolve isso.
+- **Concorrência.** Duas requisições simultâneas não podem gastar a mesma ficha: os métodos do balde são uma seção crítica (`synchronized`), e o `ConcurrentHashMap.computeIfAbsent` cria um único balde por chave mesmo com chamadas simultâneas. Veja [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/).
+- **Filtro de servlet, `429` e `Retry-After`.** Um `OncePerRequestFilter` roda antes do Spring MVC: a requisição barrada nem chega ao controller. A resposta é `429 Too Many Requests`, com o header `Retry-After` dizendo quantos segundos esperar. Veja [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/) (a cadeia de filtros) e a aula de defesas da API.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m11.limite` (não precisa mudar):
+
+- `LimiteApplication` — a aplicação Spring Boot, que já declara um `@Bean Clock` (`Clock.systemUTC()`) para você injetar.
+- `LoginController` — um login de mentira: `POST /login` → `{"ok":true}` e `GET /status` → `{"status":"no ar"}`. Aqui importa quantas vezes ele pode ser chamado, não a senha.
+- `SegurancaAberta` — uma `SecurityFilterChain` que libera tudo e desliga o CSRF: este exercício é sobre limite, não sobre autenticação.
+- `Decisao` — `record Decisao(boolean permitida, int restantes, Duration tentarDepoisDe)`: a requisição pode seguir? Quantas fichas sobraram **depois** desta tentativa? Quanto esperar até haver uma ficha (`Duration.ZERO` se já há)?
+
+### O que você implementa
+
+Três classes, já criadas e vazias:
+
+```java
+// BaldeDeFichas
+public BaldeDeFichas(int capacidade, Duration periodo, Clock relogio)   // regras 1 e 8
+public boolean tentarConsumir()                                        // regras 1 a 5 e 7
+public int fichasDisponiveis()                                         // fichas inteiras disponíveis agora
+public Duration tempoAteProximaFicha()                                 // regra 6
+
+// LimitadorPorChave
+public LimitadorPorChave(int capacidade, Duration periodo, Clock relogio)
+public Decisao tentar(String chave)                                    // regras 9 e 10
+
+// FiltroDeLimite (@Component, estende OncePerRequestFilter)
+public FiltroDeLimite(Clock relogio, JsonMapper json)                  // tools.jackson.databind.json.JsonMapper
+protected boolean shouldNotFilter(HttpServletRequest requisicao)       // regra 11
+protected void doFilterInternal(HttpServletRequest requisicao, HttpServletResponse resposta,
+        FilterChain cadeia) throws ServletException, IOException       // regras 11 a 13
+```
+
+Com um balde `(5, 1 minuto)` (5 fichas, repostas à taxa de 5 por minuto, ou seja, 1 a cada 12 s):
+
+| Situação | Resultado |
+|---|---|
+| recém-criado | `fichasDisponiveis()` = `5`; `tempoAteProximaFicha()` = `PT0S` |
+| 5 × `tentarConsumir()` | `true` as cinco |
+| a 6ª, logo em seguida | `false`; `tempoAteProximaFicha()` = `PT12S` |
+| 5 s depois | `tempoAteProximaFicha()` = `PT7S` |
+| 11 s depois de esvaziar | `tentarConsumir()` = `false` |
+| 12 s depois de esvaziar | `tentarConsumir()` = `true` |
+| 3 horas parado | `fichasDisponiveis()` = `5` |
+
+E no `POST /login`, do mesmo IP: as cinco primeiras dão `200`; a sexta dá `429` com `Retry-After: 12`.
+
+## Regras
+
+**`BaldeDeFichas`**
+
+1. **Começa cheio, e cada consumo com sucesso gasta uma ficha.** `tentarConsumir()` devolve `true` e gasta uma ficha se houver ao menos uma inteira; senão, devolve `false` e não muda nada. Exemplo `(5, 1 min)`: cinco `true`, depois `false`, e `fichasDisponiveis()` = `0`.
+2. **Reposição contínua: `capacidade` fichas a cada `periodo`.** Uma ficha vale `periodo / capacidade` de tempo. Exemplo `(5, 1 min)`: uma ficha a cada 12 s; vazio, 11 s depois ainda `false`, 12 s depois `true` (e o consumo seguinte, no mesmo instante, `false`).
+3. **Frações de tempo se acumulam.** O tempo que ainda não completou uma ficha não se perde. Exemplo: vazio; 6 s depois, `false`; mais 6 s, `true`.
+4. **Tentativas recusadas não gastam o que já se acumulou.** Exemplo: vazio; uma tentativa por segundo, 11 vezes, todas `false`; na 12ª (aos 12 s), `true`. Recusar não "zera o relógio" do balde.
+5. **Nunca passa da capacidade.** Exemplo: gaste 1 ficha e deixe o balde 3 horas parado: `fichasDisponiveis()` = `5`, não 900.
+6. **`tempoAteProximaFicha()` diz quanto falta para haver uma ficha inteira**, ou `Duration.ZERO` se já há. Exemplos: cheio → `PT0S`; recém-esvaziado → `PT12S`; 5 s depois → `PT7S`.
+7. **O tempo vem só do `Clock`, e voltar no tempo não cria nem remove fichas.** Se o relógio andar para trás (um ajuste de NTP, por exemplo), o balde ignora a diferença negativa. Exemplo: esvazie; volte o relógio 30 s: `false`; avance 30 s (de volta ao instante em que esvaziou): ainda `false`; avance mais 12 s: `true`.
+8. **Capacidade ou período inválidos → `IllegalArgumentException`.** `capacidade <= 0` ou `periodo` zero ou negativo. Exemplos: `new BaldeDeFichas(0, Duration.ofMinutes(1), relogio)` e `new BaldeDeFichas(5, Duration.ZERO, relogio)` lançam.
+
+Além disso, o balde é **seguro para várias threads**: com 50 fichas e 100 threads chamando `tentarConsumir()` ao mesmo tempo, exatamente 50 recebem `true`.
+
+**`LimitadorPorChave`**
+
+9. **Um balde por chave**, criado na primeira tentativa daquela chave, com a capacidade, o período e o relógio do limitador. Exemplo `(2, 10 s)`: `"a"`, `"a"` → permitidas; a terceira de `"a"` → recusada; a primeira de `"b"` → permitida.
+10. **A `Decisao` reflete o balde logo depois desta tentativa:** `permitida` é o resultado do consumo; `restantes`, as fichas inteiras que sobraram; `tentarDepoisDe`, o `tempoAteProximaFicha()`. Consumir e ler acontecem como uma operação só, sem outra thread no meio. Exemplo `(2, 10 s)`, uma ficha a cada 5 s:
+
+    ```text
+    tentar("x") → Decisao[permitida=true, restantes=1, tentarDepoisDe=PT0S]
+    tentar("x") → Decisao[permitida=true, restantes=0, tentarDepoisDe=PT5S]
+    tentar("x") → Decisao[permitida=false, restantes=0, tentarDepoisDe=PT5S]
+    (2 s depois)
+    tentar("x") → Decisao[permitida=false, restantes=0, tentarDepoisDe=PT3S]
+    ```
+
+**`FiltroDeLimite`**
+
+11. **Só o `POST /login` é limitado, a 5 tentativas por minuto por IP.** A chave é `requisicao.getRemoteAddr()`. Qualquer outro método ou caminho passa direto, sem gastar ficha. Exemplos: 20 `GET /status` seguidos → todos `200`; um `GET /login` não conta; os IPs `10.0.0.2` e `10.0.0.3` têm baldes separados (o primeiro esgotado não afeta o segundo).
+12. **Dentro do limite, a requisição segue para o controller.** Exemplo: as cinco primeiras tentativas de um IP → `200` `{"ok":true}`.
+13. **Acima do limite: `429`, `Retry-After` e Problem Details, sem chamar o controller.** `Retry-After` em **segundos inteiros, arredondado para cima** (`tentarDepoisDe` de 11,2 s → `12`; nunca `0`). Corpo `application/problem+json` com `type` = `https://api.exemplo.dev/problemas/muitas-requisicoes` e `status` = `429` (`title` e `detail` livres). Exemplo:
+
+    ```http
+    HTTP/1.1 429
+    Retry-After: 12
+    Content-Type: application/problem+json;charset=UTF-8
+
+    {"type":"https://api.exemplo.dev/problemas/muitas-requisicoes","title":"Muitas requisições","status":429,"detail":"Limite de 5 tentativas de login por minuto. Tente de novo em 12 s."}
+    ```
+
+    Depois de esperar o `Retry-After`, **uma** nova tentativa passa, e a seguinte volta a dar `429`.
+
+## Passo a passo sugerido
+
+1. **Monte um jeito de experimentar.** Copie o programa do **Experimente** (com o relógio de mão) para um arquivo seu. Ele não compila ainda: escreva as assinaturas do balde e do limitador primeiro.
+2. **O balde cheio e o consumo (regras 1 e 8).** Guarde as fichas de algum jeito, valide os argumentos no construtor e faça `tentarConsumir()` gastar. Nada de reposição ainda: as cinco primeiras dão `true` e a sexta `false`.
+3. **Reposição (regras 2 a 5).** Guarde o instante da última reposição e, no começo de cada método público, um `repor()` privado soma o tempo que passou. Experimente 11 s, 12 s, 6 s + 6 s e 3 horas.
+4. **Quanto falta (regra 6) e relógio voltando (regra 7).** Duas linhas cada.
+5. **Concorrência.** Torne os métodos públicos `synchronized`. Para ver a diferença, tire o `synchronized` e dispare 100 threads contra um balde de 50 com um `ExecutorService` e um `CountDownLatch` de largada: de vez em quando, mais de 50 conseguem.
+6. **O limitador (regras 9 e 10).** Um `ConcurrentHashMap<String, BaldeDeFichas>` e `computeIfAbsent`. Confira as quatro `Decisao` do exemplo.
+7. **O filtro (regras 11 a 13).** Faça `FiltroDeLimite` estender `OncePerRequestFilter`, anote-o com `@Component` (o Spring Boot registra filtros declarados como beans) e escreva `shouldNotFilter` e `doFilterInternal`. Suba a aplicação e dispare seis `POST /login`.
+
+## Experimente
+
+As partes 1 e 2 são classes comuns: experimente com um `main`, sem subir o Spring. Este programa, num arquivo seu no pacote `dev.trilhajava.m11.limite`, usa um relógio que só anda quando você manda:
+
+```java
+package dev.trilhajava.m11.limite;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+
+public class ExperimenteLimite {
+
+    /** Um relógio que só anda quando você manda. */
+    static final class RelogioDeMao extends Clock {
+        private Instant agora = Instant.parse("2026-09-29T12:00:00Z");
+
+        void avancar(Duration quanto) {
+            agora = agora.plus(quanto);
+        }
+
+        @Override public Instant instant() { return agora; }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zona) { return this; }
+    }
+
+    public static void main(String[] args) {
+        var relogio = new RelogioDeMao();
+        var balde = new BaldeDeFichas(5, Duration.ofMinutes(1), relogio);
+
+        System.out.println("cheio: " + balde.fichasDisponiveis() + " fichas, próxima em " + balde.tempoAteProximaFicha());
+        for (int i = 1; i <= 6; i++) {
+            System.out.println("consumo " + i + ": " + balde.tentarConsumir());
+        }
+        System.out.println("vazio: próxima em " + balde.tempoAteProximaFicha());
+        relogio.avancar(Duration.ofSeconds(5));
+        System.out.println("+5 s: próxima em " + balde.tempoAteProximaFicha());
+        relogio.avancar(Duration.ofSeconds(6));
+        System.out.println("+6 s (11 s): " + balde.tentarConsumir());
+        relogio.avancar(Duration.ofSeconds(1));
+        System.out.println("+1 s (12 s): " + balde.tentarConsumir());
+        relogio.avancar(Duration.ofHours(3));
+        System.out.println("+3 h: " + balde.fichasDisponiveis() + " fichas");
+
+        var limitador = new LimitadorPorChave(2, Duration.ofSeconds(10), relogio);
+        System.out.println(limitador.tentar("x"));
+        System.out.println(limitador.tentar("x"));
+        System.out.println(limitador.tentar("x"));
+        System.out.println(limitador.tentar("y"));
+        relogio.avancar(Duration.ofSeconds(2));
+        System.out.println(limitador.tentar("x"));
+    }
+}
+```
+
+Saída com a solução de referência:
+
+```text
+cheio: 5 fichas, próxima em PT0S
+consumo 1: true
+consumo 2: true
+consumo 3: true
+consumo 4: true
+consumo 5: true
+consumo 6: false
+vazio: próxima em PT12S
++5 s: próxima em PT7S
++6 s (11 s): false
++1 s (12 s): true
++3 h: 5 fichas
+Decisao[permitida=true, restantes=1, tentarDepoisDe=PT0S]
+Decisao[permitida=true, restantes=0, tentarDepoisDe=PT5S]
+Decisao[permitida=false, restantes=0, tentarDepoisDe=PT5S]
+Decisao[permitida=true, restantes=1, tentarDepoisDe=PT0S]
+Decisao[permitida=false, restantes=0, tentarDepoisDe=PT3S]
+```
+
+Para a parte 3, suba a aplicação pelo ▶ ao lado do `main` de `LimiteApplication`, ou na pasta do starter:
+
+```bash
+mvn spring-boot:run "-Dspring-boot.run.main-class=dev.trilhajava.m11.limite.LimiteApplication"
+```
+
+Se a porta 8080 estiver ocupada, acrescente `"-Dspring-boot.run.arguments=--server.port=8081"` e troque a porta nos comandos. No Bash (no PowerShell, use `curl.exe`):
+
+```bash
+for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code} " -X POST localhost:8080/login; done; echo
+curl -i -X POST localhost:8080/login
+curl -i localhost:8080/status
+```
+
+Os resultados esperados:
+
+| Cenário | Resultado |
+|---|---|
+| a saída do programa acima | exatamente as mesmas linhas |
+| 6 `POST /login` seguidos | `200 200 200 200 200 429` |
+| a 7ª, logo depois | `429`, `Retry-After: 12` (ou menos, se você demorou para rodá-la), corpo `problem+json` com o `type` `…/muitas-requisicoes` e `"status":429` |
+| `GET /status`, quantas vezes quiser | `200` |
+| esperar o `Retry-After` e tentar de novo | uma tentativa `200`, a seguinte `429` |
+| `new BaldeDeFichas(0, …)` ou com `Duration.ZERO` | `IllegalArgumentException` |
+| 100 threads, balde de 50 fichas | exatamente 50 `true` |
+
+O que pode variar: os textos de `title` e `detail`, e o `Retry-After` da aplicação rodando de verdade, que depende de quanto tempo passou entre as chamadas (o relógio dela é o do sistema). A solução de referência também manda os headers `RateLimit-Limit` e `RateLimit-Remaining` (veja os desafios); eles não são exigidos. Um terminal do Windows que não esteja em UTF-8 pode trocar os acentos da saída.
+
+## Critérios de aceite
+
+- [ ] Todos os cenários da tabela acima dão o resultado indicado.
+- [ ] O balde não cria threads nem chama `Thread.sleep`, e o tempo vem só do `Clock`.
+- [ ] Uma requisição barrada não chega ao `LoginController`.
+- [ ] Você explica, com as suas palavras, o que acontece com este limitador numa aplicação com 3 instâncias atrás de um balanceador.
+
+## Desafios opcionais
+
+- Envie os headers `RateLimit-Limit` e `RateLimit-Remaining` em todas as respostas do login, como a solução de referência faz. Pesquise o rascunho do IETF que padroniza esses headers e o formato que ele propõe hoje.
+- Troque o `ConcurrentHashMap` por um cache Caffeine com expiração (`expireAfterAccess`), para o mapa não crescer para sempre. Quanto tempo de expiração é seguro?
+- Limite também por **usuário** (o e-mail do corpo do login), além do IP. Como você lê o corpo num filtro sem impedir o controller de lê-lo depois?
+- Reimplemente com **Bucket4j** e compare o código. Depois, pesquise como ele guarda os baldes no Redis para que várias instâncias dividam o mesmo limite.
+- Escreva a sua própria suíte: testes do balde com o relógio de mão, um teste de concorrência com `CountDownLatch`, e um `@SpringBootTest` com `MockMvcTester` para o filtro (`requisicao.setRemoteAddr(ip)` simula IPs diferentes; um `@Bean @Primary` de teste troca o `Clock` da aplicação pelo relógio de mão).
+
+<Dicas>
+<Dica nivel={1}>
+Não use uma thread que "pinga" fichas no balde. Guarde o instante da última reposição e, a cada chamada, calcule quanto tempo passou e quantas fichas isso rende. É a reposição sob demanda (*lazy refill*). Comece cada método público com uma chamada a um `repor()` privado, e o resto do método só olha o estado já atualizado.
+</Dica>
+<Dica nivel={2}>
+- Evite `double` para as fichas. Em vez de contar fichas, guarde o **tempo acumulado** em nanossegundos num `long`. Com `nanosPorFicha = periodo.toNanos() / capacidade`, há ficha quando `acumulado >= nanosPorFicha`; consumir é `acumulado -= nanosPorFicha`; o teto é `capacidade * nanosPorFicha`; as fichas inteiras são `acumulado / nanosPorFicha`; e o que falta é `nanosPorFicha - acumulado` (nunca negativo).
+- Em `repor()`: `Duration.between(ultimaReposicao, agora).toNanos()`; se for `<= 0`, não faça nada (nem atualize `ultimaReposicao`).
+</Dica>
+<Dica nivel={3}>
+- Concorrência: `synchronized` nos três métodos públicos do balde; no limitador, `baldes.computeIfAbsent(chave, k -> new BaldeDeFichas(...))` e um `synchronized (balde) { ... }` em volta de "consumir, ler as restantes e o tempo", para a `Decisao` não misturar o resultado de duas threads.
+- No filtro: `shouldNotFilter` devolve `!("POST".equals(requisicao.getMethod()) && "/login".equals(requisicao.getRequestURI()))`. Arredondar para cima em segundos: `Math.max(1, (duracao.toMillis() + 999) / 1000)`. Para o corpo: `resposta.setStatus(429)`, `setHeader("Retry-After", ...)`, `setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE)`, `setCharacterEncoding("UTF-8")` e `json.writeValue(resposta.getOutputStream(), mapa)`, **sem** chamar `cadeia.doFilter`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="BaldeDeFichas">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/limite/BaldeDeFichas.java" />
+</Tab>
+<Tab rotulo="LimitadorPorChave">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/limite/LimitadorPorChave.java" />
+</Tab>
+<Tab rotulo="FiltroDeLimite">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/limite/FiltroDeLimite.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Tempo acumulado em vez de fichas.** Com `long` em nanossegundos, não há arredondamento: 6 s + 6 s dá exatamente uma ficha de 12 s, e "fichas disponíveis" é uma divisão inteira. O mesmo número responde às três perguntas (há ficha? quantas? quanto falta?).
+- **Reposição sob demanda.** Nenhuma thread, nenhum agendador. Um balde parado não custa nada, um milhão de baldes não custam um milhão de threads, e o comportamento é determinístico com um `Clock` controlado.
+- **Relógio que volta.** `Duration.between` negativo é ignorado. Sem isso, um ajuste de NTP poderia "desrepor" fichas, ou até deixar o acumulado negativo e travar o balde por um tempo enorme.
+- **Consumir e ler numa operação só.** No limitador, `tentarConsumir()`, `fichasDisponiveis()` e `tempoAteProximaFicha()` rodam dentro do mesmo `synchronized (balde)`. Como os métodos do balde também sincronizam no próprio objeto, o bloqueio é o mesmo (reentrante), e nenhuma outra thread consome entre as três chamadas.
+- **O filtro roda antes do Spring MVC.** A requisição barrada nem chega ao controller: nenhuma consulta ao banco, nenhum BCrypt de 100 ms. É isso que faz do limite também uma defesa contra negação de serviço.
+- **`Retry-After` arredondado para cima, nunca `0`.** Um cliente bem-comportado que esperar o valor informado encontra uma ficha; arredondar para baixo o faria tentar cedo demais e tomar outro `429`.
+
+### Os limites desta solução, e o que se faz em produção
+
+- **Uma instância só.** Com 3 réplicas atrás de um balanceador, cada uma tem os seus baldes, e o limite efetivo triplica (e varia conforme o balanceamento). Em produção, o estado vai para um armazenamento compartilhado (Redis, com uma operação atômica em Lua, que é o que o Bucket4j faz) ou o limite sobe para o gateway ou o WAF, antes da aplicação.
+- **O mapa só cresce.** Cada IP novo fica para sempre na memória, e um atacante com muitos IPs (ou com IPv6, que dá a cada cliente milhões de endereços) esgota o heap. Use expiração (Caffeine, TTL no Redis) e, para IPv6, limite por prefixo (`/64`).
+- **`getRemoteAddr()` atrás de proxy** é o IP do proxy: todos os clientes dividiriam um balde, e o primeiro ataque bloquearia todo mundo. Configure `server.forward-headers-strategy` e confie no `X-Forwarded-For` **só** quando ele vier do seu proxy; senão, o atacante escreve o header que quiser e ganha um balde novo a cada requisição.
+- **IP não é identidade.** Uma botnet com 10 mil IPs passa por um limite de 5 por IP. Por isso o limite por origem se soma ao bloqueio por conta (11.01), à detecção de senhas vazadas, a CAPTCHA depois de algumas falhas e ao monitoramento de taxa de falhas global.
+
+### Alternativas
+
+- **Janela fixa** ("no máximo 5 por minuto cheio") é mais simples, mas permite 10 requisições em 2 segundos na virada do minuto. **Janela deslizante** corrige isso, ao custo de guardar os instantes de cada requisição (ou uma aproximação). O token bucket dá rajada controlada com estado de dois números.
+- **Leaky bucket** (balde furado) suaviza a saída a uma taxa constante, enfileirando o excesso; serve para proteger um recurso lento, não para recusar abuso.
+- **Bucket4j ou Resilience4j `RateLimiter`.** Em produção, prefira uma biblioteca testada (ou o gateway). Escrever a sua serviu para saber o que configurar nela e o que esperar dela.
+
+### Avalie sua solução
+
+- Um atacante com 10 mil IPs passa por este limite? Que outra chave ou sinal você usaria?
+- Por que o limite do login deveria ser mais apertado que o de `GET /status`? E o que limitaria o `GET /status`?
+- Quanto de memória cada IP ocupa na sua solução? Quantos IPs diferentes cabem num heap de 512 MB antes de virar um problema?
+- O seu limitador, sob 100 threads, faz as requisições de chaves **diferentes** esperarem umas pelas outras? (Onde está o bloqueio?)
+
+</Solucao>

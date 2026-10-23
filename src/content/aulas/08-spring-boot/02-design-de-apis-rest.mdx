@@ -1,0 +1,171 @@
+---
+titulo: Design de APIs REST
+descricao: Recursos e URIs, verbos no lugar certo, DTOs separados do modelo, paginação, filtros, ações que não são CRUD, versionamento e o que torna uma API agradável (e segura) de consumir.
+modulo: 08-spring-boot
+ordem: 2
+duracao: 45
+objetivos:
+  - Modelar uma API em torno de recursos, com URIs e verbos consistentes
+  - Separar DTOs de entrada e saída do modelo interno
+  - Projetar paginação, filtros e ordenação
+  - Decidir como versionar e evoluir uma API sem quebrar clientes
+tags: [REST, design de API, paginação, versionamento, DTO]
+flashcards:
+  - frente: Por que usar substantivos (e não verbos) nas URIs REST?
+    verso: A URI identifica um recurso; o verbo HTTP já diz a ação. POST /pedidos em vez de POST /criarPedido.
+  - frente: Por que não expor a entidade/modelo interno direto na API?
+    verso: Acopla o contrato público à estrutura interna, vaza campos sensíveis e permite mass assignment. DTOs de entrada e saída dão controle sobre o contrato.
+  - frente: Quais as formas mais comuns de versionar uma API?
+    verso: "Na URI (/v2/contas), num header (API-Version: 2), num parâmetro de consulta ou no media type (Accept com version). O Spring 7 suporta todas nativamente."
+  - frente: O que é uma mudança "compatível" numa API?
+    verso: Uma que não quebra clientes existentes, como adicionar um campo opcional na resposta ou um endpoint novo. Remover/renomear campos ou mudar tipos é incompatível.
+  - frente: Paginação por offset × por cursor?
+    verso: Offset (pagina/tamanho) é simples mas fica lento e inconsistente em tabelas grandes que mudam. Cursor (depois-de=id) é estável e eficiente, ideal para feeds e listas enormes.
+---
+
+Uma API é um **produto** cujos usuários são outros desenvolvedores. Quando ela é previsível, eles a usam sem ler a documentação duas vezes; quando não é, cada integração vira uma troca de mensagens no Slack. Esta aula reúne as convenções que o mercado espera — e que os testes dos exercícios deste módulo verificam.
+
+## Recursos e URIs
+
+REST organiza a API em torno de **recursos** (substantivos) identificados por URIs. O verbo HTTP diz o que fazer com eles.
+
+| Operação | Requisição | Resposta |
+|---|---|---|
+| Listar | `GET /pacientes?nome=ana&pagina=0` | `200` + página |
+| Criar | `POST /pacientes` | `201` + `Location: /pacientes/42` |
+| Consultar | `GET /pacientes/42` | `200` / `404` |
+| Substituir | `PUT /pacientes/42` | `200` / `404` |
+| Alterar parte | `PATCH /pacientes/42` | `200` |
+| Remover | `DELETE /pacientes/42` | `204` / `404` |
+| Sub-recurso | `GET /contas/7/extrato` | `200` |
+
+Convenções que valem a pena seguir sempre:
+
+- **plural** e minúsculas com hífen: `/contas-poupanca`, não `/ContaPoupanca`;
+- **sem verbos** no caminho: `POST /pedidos`, não `POST /criarPedido`;
+- **hierarquia só quando há dono**: `/contas/7/movimentos` faz sentido; `/clientes/3/contas/7/movimentos/9` provavelmente não;
+- **identificadores opacos** em APIs públicas (UUID), para não revelar volume de negócio nem permitir adivinhar `id + 1`.
+
+### E quando a ação não é CRUD?
+
+"Depositar", "cancelar pedido", "aprovar crédito" não são criar/ler/alterar/remover. Duas saídas idiomáticas:
+
+1. **Modelar a ação como um recurso criado**: `POST /contas/7/depositos` cria um depósito. É o que o projeto Fintech Core faz — e o depósito vira um item do extrato.
+2. **Sub-recurso de ação** quando não há "coisa" criada: `POST /pedidos/10/cancelamento`.
+
+Evite `POST /contas/7?acao=depositar`: ações escondidas em parâmetros são difíceis de documentar, de proteger e de monitorar.
+
+## DTOs: o contrato não é o seu modelo
+
+Expor a classe interna diretamente é tentador e perigoso:
+
+<Comparar antes="Modelo exposto" depois="DTOs explícitos">
+```java
+@PostMapping
+Usuario criar(@RequestBody Usuario u) {
+  return repositorio.save(u);
+}
+// o cliente envia "admin": true ... e vira admin.
+// a resposta devolve o hash da senha.
+```
+
+```java
+record NovoUsuario(@NotBlank String nome,
+                   @Email String email,
+                   @NotBlank String senha) {}
+
+record UsuarioResposta(UUID id, String nome,
+                       String email) {}
+```
+</Comparar>
+
+- **Entrada**: só os campos que o cliente pode informar. Isso evita *mass assignment* (OWASP A01/A06).
+- **Saída**: só o que o cliente precisa ver — o CPF mascarado do exercício 08.02 é um exemplo de **minimização de dados** exigida pela LGPD.
+- **Evolução independente**: você renomeia um campo interno sem quebrar o contrato.
+
+`record` é o formato ideal para DTOs em Java moderno: imutável, conciso e serializado pelo Jackson sem configuração.
+
+## Paginação, filtros e ordenação
+
+Nunca devolva uma coleção inteira: ela funciona com 50 registros e derruba o serviço com 5 milhões.
+
+```http
+GET /pacientes?nome=ana&pagina=2&tamanho=20&ordem=nome,asc
+```
+
+```json
+{
+  "itens": [ ... ],
+  "pagina": 2,
+  "tamanho": 20,
+  "totalItens": 318,
+  "totalPaginas": 16
+}
+```
+
+- **Limite o tamanho** no servidor (`@Max(100)`): o cliente não decide quanto você lê do banco.
+- **Filtros como parâmetros de consulta**, com nomes de negócio.
+- **Offset × cursor**: `pagina/tamanho` (offset) é simples e serve para telas administrativas; para feeds, extratos longos e sincronização, prefira **cursor** (`?depoisDe=<id>`), que não fica lento nem "pula" itens quando dados novos entram.
+
+## Versionamento e evolução
+
+Uma API publicada é uma promessa. Classifique toda mudança:
+
+| Compatível (pode lançar) | Incompatível (exige nova versão) |
+|---|---|
+| novo endpoint | remover ou renomear campo/endpoint |
+| novo campo **opcional** na entrada | tornar um campo obrigatório |
+| novo campo na resposta | mudar tipo ou formato (`"10.50"` → `10.5`) |
+| novo valor de enum *se o cliente tolera desconhecidos* | mudar o significado de um status |
+
+Para os clientes tolerarem mudanças compatíveis, eles devem **ignorar campos desconhecidos** (o Spring Boot já configura o Jackson assim).
+
+Quando a quebra é inevitável, versione. As estratégias mais comuns são a URI (`/v2/contas`) e um header (`API-Version: 2`). O **Spring Framework 7** passou a suportar versionamento nativamente — você verá o código na aula 6.
+
+<Callout tipo="dica" titulo="Deprecie antes de remover">
+Anuncie a remoção com antecedência: documentação, os headers padronizados `Deprecation` e `Sunset` (RFC 9745 e RFC 8594) e métricas de quem ainda usa a versão antiga. Remover um endpoint que um parceiro grande usa é uma forma rápida de conhecer o diretor comercial.
+</Callout>
+
+## Checklist de uma API agradável
+
+- nomes consistentes (se é `criadaEm` num lugar, não é `dataCriacao` em outro);
+- datas em **ISO 8601** com fuso (`2026-09-28T13:00:00Z`) e dinheiro com **2 casas** e moeda definida;
+- erros no **mesmo formato** em toda a API (aula 5);
+- status codes corretos e `Location` no 201;
+- paginação em toda coleção;
+- documentação gerada do código (OpenAPI, aula 6) com exemplos.
+
+<Callout tipo="entrevista">
+Pedidos como "desenhe a API de um sistema de reservas" são comuns em entrevistas Pleno e em *take-homes*. Comece pelos **recursos e URIs**, diga os **status** de cada operação, mostre como fica a **paginação**, trate **idempotência** do que envolve dinheiro e diga como a API vai **evoluir** sem quebrar clientes. Estrutura vale mais que decorar nomes.
+</Callout>
+
+<Quiz
+  id="08-design-api"
+  questoes={[
+    {
+      pergunta: 'Qual URI segue melhor as convenções REST para cancelar o pedido 10?',
+      opcoes: ['GET /pedidos/10/cancelar', 'POST /cancelarPedido?id=10', 'POST /pedidos/10/cancelamento', 'DELETE /pedidos?id=10&motivo=x'],
+      correta: 2,
+      explicacao: 'Uma ação não-CRUD vira um sub-recurso criado por POST. GET nunca deve alterar estado.',
+    },
+    {
+      pergunta: 'Qual mudança numa API publicada é INCOMPATÍVEL?',
+      opcoes: ['Adicionar o campo "apelido" na resposta', 'Adicionar um endpoint novo', 'Tornar obrigatório o campo "telefone" no cadastro', 'Adicionar um filtro opcional na listagem'],
+      correta: 2,
+      explicacao: 'Clientes que não enviam o campo passam a receber 400 — quebra de contrato.',
+    },
+    {
+      pergunta: 'Por que receber a entidade JPA diretamente no @RequestBody é perigoso?',
+      opcoes: ['O Spring não consegue desserializar entidades', 'O cliente pode definir campos que não deveria (mass assignment)', 'Entidades são sempre imutáveis', 'Deixa a API mais lenta'],
+      correta: 1,
+      explicacao: 'Todo campo da classe vira um campo aceito na entrada, inclusive "admin" ou "saldo".',
+    },
+  ]}
+/>
+
+## Resumo
+
+- URIs com **substantivos no plural**; o verbo HTTP diz a ação; ações não-CRUD viram sub-recursos.
+- **DTOs** (records) separam o contrato público do modelo interno e evitam mass assignment e vazamento de dados.
+- Toda coleção é **paginada** com limite no servidor; considere **cursor** para listas enormes.
+- Mudanças compatíveis evoluem a API; as incompatíveis exigem **versão** e depreciação anunciada.

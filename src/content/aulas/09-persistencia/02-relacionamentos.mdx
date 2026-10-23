@@ -1,0 +1,177 @@
+---
+titulo: Relacionamentos entre entidades
+descricao: "@ManyToOne, @OneToMany, @OneToOne e @ManyToMany: quem é o dono da relação, por que tudo deveria ser LAZY, cascade e orphanRemoval, e quando uma tabela de junção precisa virar entidade."
+modulo: 09-persistencia
+ordem: 2
+duracao: 55
+objetivos:
+  - Mapear relacionamentos um-para-muitos, muitos-para-um e muitos-para-muitos
+  - Identificar o lado dono (owning side) e usar mappedBy corretamente
+  - Configurar fetch LAZY, cascade e orphanRemoval com intenção
+  - Transformar uma associação muitos-para-muitos com atributos em entidade
+tags: [JPA, relacionamentos, ManyToOne, OneToMany, cascade, LAZY]
+flashcards:
+  - frente: Qual o fetch padrão de @ManyToOne e @OneToMany no JPA?
+    verso: "@ManyToOne e @OneToOne são EAGER por padrão; @OneToMany e @ManyToMany são LAZY. Regra prática: declare LAZY em tudo e carregue explicitamente o que precisar."
+  - frente: O que significa mappedBy?
+    verso: Indica o lado INVERSO de uma relação bidirecional. O lado dono (o que tem a chave estrangeira, em geral o @ManyToOne) é o que o Hibernate usa para gravar a FK.
+  - frente: Quando uma relação @ManyToMany deve virar uma entidade?
+    verso: Quando a associação tem dados próprios (data, status, quantidade). A tabela de junção vira uma entidade com dois @ManyToOne.
+  - frente: O que orphanRemoval = true faz?
+    verso: Remover um filho da coleção do pai gera DELETE da linha do filho. Útil para filhos que não existem sem o pai (itens de um pedido).
+  - frente: Por que CascadeType.ALL em @ManyToOne costuma ser um erro?
+    verso: Cascata do filho para o pai faz operações num item afetarem o cliente/pedido — por exemplo, remover um item removeria o pedido inteiro.
+---
+
+Tabelas se relacionam por **chaves estrangeiras**; objetos se relacionam por **referências**. Mapear uma coisa na outra é onde a maioria dos problemas de desempenho e de dados inconsistentes nasce. Esta aula mostra os mapeamentos e, principalmente, as **decisões** por trás deles.
+
+## `@ManyToOne`: o relacionamento mais comum
+
+Muitos pedidos pertencem a um cliente. No banco, `pedido.cliente_id` referencia `cliente.id`:
+
+```java
+@Entity
+public class Pedido {
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)   // ← LAZY explícito!
+    @JoinColumn(name = "cliente_id")
+    private Cliente cliente;
+}
+```
+
+O lado com a chave estrangeira é o **dono** da relação: é por ele que o Hibernate grava a FK.
+
+<Callout tipo="erro" titulo="@ManyToOne é EAGER por padrão">
+Pela especificação, `@ManyToOne` e `@OneToOne` carregam a outra ponta **sempre** (EAGER). Parece inofensivo até você listar 500 pedidos e o Hibernate carregar os 500 clientes, cada um com seu próprio SELECT, mesmo quando a tela não mostra o cliente. **Declare `fetch = LAZY` em todo `@ManyToOne`** e busque o que precisar na consulta (aula 4).
+</Callout>
+
+## `@OneToMany`: o lado inverso
+
+Se o cliente precisa navegar até os pedidos, a relação vira **bidirecional**:
+
+```java
+@Entity
+public class Pedido {
+    @OneToMany(mappedBy = "pedido", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<ItemPedido> itens = new ArrayList<>();
+
+    public void adicionar(Produto produto, int quantidade) {     // mantém os DOIS lados coerentes
+        itens.add(new ItemPedido(this, produto, quantidade));
+    }
+}
+
+@Entity
+public class ItemPedido {
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "pedido_id")
+    private Pedido pedido;                                       // ← o dono da relação
+}
+```
+
+- `mappedBy = "pedido"` diz: "esta coleção é o espelho do campo `pedido` em `ItemPedido`". Sem ele, o Hibernate criaria uma **tabela de junção** extra.
+- Só o lado dono grava a FK. Se você adicionar um item à lista sem setar `item.pedido`, **nada é gravado**. Por isso existe o método auxiliar `adicionar`.
+- `@OneToMany` já é LAZY. Nem sempre você precisa dele: um `ItemPedido` com `@ManyToOne` e uma consulta `findByPedidoId` resolvem sem carregar coleções enormes. No marco 2 do projeto, a conta **não** tem uma lista de movimentos: o extrato é uma consulta.
+
+<Figura legenda="O dono da relação é quem tem a chave estrangeira">
+<svg viewBox="0 0 640 170" width="640" role="img" aria-label="Tabela pedido com id e tabela item_pedido com pedido_id; a classe ItemPedido com ManyToOne é o lado dono; Pedido com OneToMany mappedBy é o lado inverso">
+  <defs><marker id="rel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="20" width="220" height="60" rx="10" class="d-info"/><text x="130" y="44" text-anchor="middle" class="d-mono">Pedido</text><text x="130" y="64" text-anchor="middle" class="d-label">@OneToMany(mappedBy) — inverso</text>
+  <rect x="400" y="20" width="220" height="60" rx="10" class="d-accent"/><text x="510" y="44" text-anchor="middle" class="d-mono">ItemPedido</text><text x="510" y="64" text-anchor="middle" class="d-label">@ManyToOne — DONO</text>
+  <rect x="20" y="110" width="220" height="40" rx="8" class="d-box"/><text x="130" y="135" text-anchor="middle" class="d-mono">pedido (id)</text>
+  <rect x="400" y="110" width="220" height="40" rx="8" class="d-box"/><text x="510" y="135" text-anchor="middle" class="d-mono">item_pedido (pedido_id FK)</text>
+  <path d="M400 130 H244" class="d-line" marker-end="url(#rel)"/>
+  <path d="M130 80 V106" class="d-line"/><path d="M510 80 V106" class="d-line"/>
+</svg>
+</Figura>
+
+## Cascade e orphanRemoval
+
+| Opção | Efeito | Use quando |
+|---|---|---|
+| `cascade = PERSIST` | salvar o pai salva os filhos novos | agregado criado junto (pedido + itens) |
+| `cascade = ALL` | persist, merge, remove… propagam | o filho **não existe** sem o pai |
+| `orphanRemoval = true` | tirar o filho da coleção → `DELETE` | itens de um pedido, linhas de um carrinho |
+
+Cascata vai **do pai (agregado) para os filhos**, nunca ao contrário: `CascadeType.ALL` num `@ManyToOne` para `Cliente` faria remover um item remover o cliente. E cascata entre agregados independentes (cliente → pedidos) é um convite para apagar histórico sem querer.
+
+## `@ManyToMany` e quando fugir dele
+
+Alunos e turmas: um aluno cursa várias turmas, uma turma tem vários alunos.
+
+```java
+@ManyToMany
+@JoinTable(name = "aluno_turma",
+           joinColumns = @JoinColumn(name = "aluno_id"),
+           inverseJoinColumns = @JoinColumn(name = "turma_id"))
+private Set<Turma> turmas = new HashSet<>();
+```
+
+Funciona enquanto a associação for **só** a associação. No momento em que surge um dado dela — **data** da matrícula, **status**, **nota** —, não há onde guardá-lo. E quase sempre surge. A solução é promover a tabela de junção a **entidade**, com dois `@ManyToOne`:
+
+```java
+@Entity
+public class Matricula {
+    @ManyToOne(fetch = FetchType.LAZY, optional = false) private Aluno aluno;
+    @ManyToOne(fetch = FetchType.LAZY, optional = false) private Turma turma;
+    @Enumerated(EnumType.STRING) private StatusMatricula status;
+    private Instant matriculadaEm;
+}
+```
+
+Com a constraint `UNIQUE (aluno_id, turma_id)` no banco, é o modelo do exercício 09.01. Se usar `@ManyToMany`, prefira `Set` a `List` (com `List`, o Hibernate apaga e reinsere todas as linhas da junção a cada alteração).
+
+## `@OneToOne`
+
+Raro e cheio de armadilhas: o lado inverso de um `@OneToOne` **não pode ser LAZY** de verdade (o Hibernate precisa consultar para saber se é nulo). Prefira `@MapsId` (a entidade filha compartilha a chave primária) ou modele como `@ManyToOne` com `UNIQUE` na FK.
+
+## `@Embedded`: objetos de valor na mesma tabela
+
+Nem toda classe é entidade. Um endereço sem identidade própria vive nas colunas da tabela do dono:
+
+```java
+@Embeddable
+public record Endereco(String logradouro, String cidade, String cep) { }
+
+@Entity
+public class Cliente {
+    @Embedded
+    private Endereco endereco;          // colunas logradouro, cidade, cep na tabela cliente
+}
+```
+
+Records funcionam como `@Embeddable` desde o Hibernate 6.2.
+
+<Callout tipo="entrevista">
+"Explique o lado dono de uma relação" e "por que evitar EAGER" são clássicos. Mostre o exemplo pedido–item: a FK mora em `item_pedido`, então `ItemPedido.pedido` é o dono; `mappedBy` marca o inverso; tudo LAZY, com carregamento explícito na consulta. Um diferencial: dizer que `@ManyToMany` com atributos vira entidade — e que muitas vezes a coleção bidirecional nem é necessária.
+</Callout>
+
+<Quiz
+  id="09-relacionamentos"
+  questoes={[
+    {
+      pergunta: 'Você adicionou um ItemPedido à lista pedido.getItens(), mas não setou item.pedido. O que é gravado?',
+      opcoes: ['O item com pedido_id correto', 'O item sem pedido_id (ou nada)', 'Uma tabela de junção nova', 'Lança exceção sempre'],
+      correta: 1,
+      explicacao: 'Quem grava a FK é o lado dono (ItemPedido.pedido). O lado mappedBy é ignorado na escrita.',
+    },
+    {
+      pergunta: 'A matrícula de um aluno numa turma precisa guardar a data e o status. Como mapear?',
+      opcoes: ['@ManyToMany com List', '@ManyToMany com Set', 'Uma entidade Matricula com dois @ManyToOne', '@OneToOne entre aluno e turma'],
+      correta: 2,
+      explicacao: 'Associação com atributos é uma entidade própria.',
+    },
+    {
+      pergunta: 'Qual combinação faz sentido entre Pedido e seus itens?',
+      opcoes: ['cascade = ALL e orphanRemoval = true em Pedido.itens', 'cascade = ALL em ItemPedido.pedido', 'EAGER em tudo', 'Nenhuma relação, só ids'],
+      correta: 0,
+      explicacao: 'Itens pertencem ao pedido: cascata do agregado para os filhos, e remover da lista apaga o item.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O **dono** da relação é o lado com a FK (normalmente `@ManyToOne`); o inverso usa `mappedBy` e mantém os dois lados coerentes com métodos auxiliares.
+- **LAZY em tudo**, inclusive `@ManyToOne` (EAGER por padrão); carregue explicitamente na consulta.
+- **Cascade** do agregado para os filhos; `orphanRemoval` para filhos que não existem sem o pai; nunca cascata para "cima".
+- `@ManyToMany` com dados vira **entidade** com dois `@ManyToOne`; `@Embeddable` para objetos de valor.

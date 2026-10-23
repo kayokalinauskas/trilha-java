@@ -1,0 +1,279 @@
+---
+titulo: "Fintech Core — Marco 6: pronto para produção"
+codigo: "14.05"
+resumo: A Fintech Core ganha tudo o que um time de operação pede antes de colocar um serviço no ar. Health checks e probes, métricas no Prometheus, id de correlação em cada resposta, logs em JSON e uma imagem Docker enxuta, validada com a aplicação, o PostgreSQL e o Kafka rodando juntos no Compose.
+modulo: 14-devops
+ordem: 5
+marco: 6
+dificuldade: dificil
+tempo: 8–10h
+conceitos: [projeto integrador, Actuator, health checks, liveness e readiness, Micrometer, Prometheus, logs estruturados, X-Request-Id, Docker multi-stage, Docker Compose]
+aulas: [14-devops/03-docker, 14-devops/05-observabilidade, 14-devops/06-kubernetes-e-cloud]
+java:
+  modulo: projeto-integrador
+  teste: Marco6ProducaoTest
+---
+
+## Contexto
+
+A Fintech Core vai para produção na semana que vem. Na reunião de prontidão, a pessoa de SRE fez quatro perguntas:
+
+1. *Como o Kubernetes sabe que a aplicação está viva e pronta para receber tráfego?*
+2. *Como vou saber, num painel, quantas transferências estão falhando por falta de saldo?*
+3. *Um cliente liga reclamando de um erro. Como eu acho a requisição dele nos logs?*
+4. *Onde está a imagem? Ela roda como root?*
+
+Este marco responde às quatro. Nenhuma regra de negócio muda.
+
+## O contrato
+
+### Health checks
+
+| Rota | Quem acessa | O que responde |
+|---|---|---|
+| `GET /actuator/health` | qualquer um | só `{"status": "UP"}` para anônimos e clientes comuns |
+| `GET /actuator/health` com token de **ADMIN** | ADMIN | também os `components`, entre eles `db` e `outbox` |
+| `GET /actuator/health/liveness` | qualquer um | `UP` enquanto a JVM está saudável |
+| `GET /actuator/health/readiness` | qualquer um | inclui o banco, mas **não** a outbox |
+
+O componente **`outbox`** tem o detalhe **`pendentes`**, com o número de eventos em `evento_saida` sem `publicado_em`. Ele fica **`DOWN` quando o evento pendente mais antigo tem mais de 10 minutos**, porque isso indica que o relay ou o Kafka estão com defeito. Nesse caso, o `/actuator/health` do admin responde 503, mas a **readiness continua 200**. Sem Kafka, a API continua aceitando transferências (a outbox guarda os eventos), e tirar a instância do balanceador não traria o broker de volta.
+
+### Métricas
+
+`GET /actuator/prometheus`: **401** sem token, **403** para cliente comum, **200** para ADMIN.
+
+| Série no Prometheus | Tipo | Tags |
+|---|---|---|
+| `fintech_transferencias_total` | counter | `resultado`: `sucesso`, `saldo_insuficiente`, `conta_nao_encontrada`, `invalida` |
+| `fintech_outbox_pendentes` | gauge | — |
+
+Todas as métricas têm a tag comum `aplicacao="fintech-core"`. Uma repetição idempotente (mesma `Idempotency-Key`) **não** conta de novo. Nenhum outro endpoint do Actuator fica acessível: `/actuator/env` e `/actuator/heapdump` respondem 403 ou 404, mesmo para o ADMIN.
+
+### X-Request-Id
+
+- Sem o header, a resposta ganha um `X-Request-Id` novo (um UUID).
+- Se o header vier válido (letras, números, `.`, `_` e `-`, até 64 caracteres), a resposta devolve o mesmo valor.
+- Se vier inválido, é trocado por um UUID.
+- Todo erro em Problem Details tem a propriedade **`requestId`**. Isso vale também para o **401 do Spring Security**, que nasce antes dos controllers.
+
+### Logs
+
+- Saída no console em **JSON, formato ECS**, uma linha por evento.
+- Cada linha de uma requisição tem o campo `requestId`.
+- Cada transferência **realizada** gera um log **INFO** com a mensagem `transferencia realizada` e os campos `transferencia` (o id), `origem`, `destino` e `valor`. Transferências recusadas não geram esse log.
+- Os testes capturam o console com `logging.level.dev.trilhajava=INFO`.
+
+### Entrega
+
+Na raiz do projeto ficam três arquivos:
+
+- **`Dockerfile`**:
+  - multi-stage, com imagens de tag fixa (nunca `latest`) e a imagem final só com JRE;
+  - extração em camadas (`-Djarmode=tools ... extract --layers`), copiando as dependências antes do código;
+  - `USER` que não seja root, `EXPOSE 8080`, `-XX:MaxRAMPercentage` e `ENTRYPOINT` em formato exec.
+- **`.dockerignore`**: deixa de fora `.git` e `.env`, mas não o jar.
+- **`compose.producao.yaml`**:
+  - serviços `app`, `postgres` e `kafka`;
+  - a `app` espera o Postgres ficar saudável (`condition: service_healthy`, com `pg_isready`);
+  - as senhas e o segredo do JWT vêm do ambiente (`${...}`).
+
+O `compose.yaml` de desenvolvimento, usado pelo `spring-boot:run`, continua como estava. O `Marco6EntregaTest` confere esses arquivos sem rodar o Docker. O roteiro de validação de verdade está mais abaixo.
+
+## Dependências deste marco
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Para gerar o jar executável que vai para a imagem, acrescente em `<build>`:
+
+```xml
+<finalName>fintech-core</finalName>
+<plugins>
+  <plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <executions>
+      <execution>
+        <goals><goal>repackage</goal></goals>
+      </execution>
+    </executions>
+  </plugin>
+  <!-- o surefire e o jacoco que já estavam aqui -->
+</plugins>
+```
+
+Não acrescente o `spring-boot-starter-actuator-test`. Ele desliga a exportação de métricas nos testes, e o `Marco6ProducaoTest` precisa do `/actuator/prometheus` de verdade.
+
+```bash
+cd java/projeto-integrador/starter
+mvn test -Dtest='Marco6*Test'     # o marco 6
+mvn verify                        # tudo: marcos 1 a 6, a arquitetura e a sua suíte
+```
+
+### Validando de verdade
+
+```bash
+mvn -B verify                                   # gera target/fintech-core.jar
+export POSTGRES_PASSWORD=uma-senha FINTECH_JWT_SEGREDO=um-segredo-com-32-caracteres-ou-mais
+export FINTECH_ADMIN_EMAIL=admin@fintech.dev FINTECH_ADMIN_SENHA='Admin#2026-seguro'
+docker compose -f compose.producao.yaml up --build -d
+curl localhost:8080/actuator/health/readiness   # {"status":"UP"}
+docker compose -f compose.producao.yaml logs app | grep "transferencia realizada"
+docker compose -f compose.producao.yaml exec app id   # uid=1001(...), não root
+docker compose -f compose.producao.yaml down -v
+```
+
+Faça uma transferência pelo Swagger (`/docs`) e acompanhe três coisas:
+- o `X-Request-Id` da resposta aparece no log JSON;
+- o contador aparece no `/actuator/prometheus`;
+- o `pendentes` da outbox volta a 0 depois que o relay publica.
+
+<Callout tipo="atencao" titulo="O Kafka dentro do Compose">
+A imagem `apache/kafka` anuncia por padrão `localhost:9092`, que para o container da aplicação é *ele mesmo*. Por isso o `compose.producao.yaml` configura o KRaft com `KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092`, o nome do serviço na rede do Compose. Se a porta 8080 da sua máquina estiver ocupada, defina `APP_PORTA=18080`.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] `Marco6ProducaoTest` (17 testes) e `Marco6EntregaTest` (5 testes) passam, e os marcos 1 a 5 continuam verdes.
+- [ ] `Marco3ArquiteturaTest` continua passando: o caso de uso não importa nada do Micrometer nem do SLF4J para métricas.
+- [ ] A sua suíte cobre o registro de sucesso e de recusa com testes rápidos, sem subir o Spring.
+- [ ] A imagem sobe com `docker compose`, roda com um usuário sem privilégios, e a transferência aparece no log com o `requestId`.
+
+## Desafios opcionais
+
+- **Porta de gerenciamento.** Mova o Actuator para `management.server.port=8081`, que o Ingress não expõe. O Prometheus faz o scrape por dentro do cluster, sem token. Compare as duas abordagens.
+- **Tracing.** Acrescente o Micrometer Tracing com exportação OTLP e um Jaeger no Compose. Siga uma transferência da requisição HTTP até o consumidor Kafka, com o mesmo trace.
+- **Alerta.** Escreva a regra do Prometheus que dispara quando a taxa de `saldo_insuficiente` passar de 20% das transferências em 5 minutos.
+- **Buildpacks.** Gere a imagem com `mvn spring-boot:build-image` e compare o tamanho e as camadas com a do seu Dockerfile.
+
+<Dicas>
+<Dica nivel={1}>
+Quatro partes, cada uma com os seus testes:
+
+1. **Actuator e segurança**: as dependências, a exposição, o `show-details` e as regras no `SecurityFilterChain`. Rode os testes de health e `prometheusSoParaAdmin`.
+2. **Id de correlação**: um filtro e a propriedade `requestId` nos erros. Rode os testes de `requestId`.
+3. **Métricas e log**: uma porta na aplicação e um adaptador na infra. Rode `contaTransferencias` e `logDaTransferencia`.
+4. **Entrega**: o plugin do Spring Boot, o `Dockerfile` e o Compose. Rode `Marco6EntregaTest` e depois o roteiro de validação.
+</Dica>
+<Dica nivel={2}>
+- `management.endpoint.health.show-details=when-authorized` com `management.endpoint.health.roles=ADMIN`. O papel vem da autoridade `ROLE_ADMIN` que o marco 4 já monta a partir do token.
+- No `SecurityFilterChain`, antes do `anyRequest()`:
+  - `/actuator/health` e `/actuator/health/**` com `permitAll()`;
+  - `/actuator/prometheus` com `hasRole("ADMIN")`;
+  - `/actuator/**` com `denyAll()`.
+- A readiness do Boot inclui só `readinessState`. Acrescente o `db` com `management.endpoint.health.group.readiness.include=readinessState,db`.
+- O health indicator da outbox é um `@Component("outbox")` que implementa `HealthIndicator`, do pacote `org.springframework.boot.health.contributor`. O nome do bean vira o nome do componente.
+- O filtro de correlação precisa rodar **antes** do Spring Security. Um `OncePerRequestFilter` com `@Order(Ordered.HIGHEST_PRECEDENCE)` resolve.
+</Dica>
+<Dica nivel={3}>
+- Onde contar? O caso de uso sabe **o que** aconteceu, mas não deve saber **como** isso vira métrica. Crie na `aplicacao` uma porta `ObservadorDeTransferencias`, com os métodos `realizada(Transferencia)` e `recusada(Motivo)`. A implementação com Micrometer e SLF4J fica em `infra`.
+- O sucesso só pode ser registrado **depois do commit**. Uma falha no commit desfaria a transferência, e ela já teria aparecido como realizada. Use `TransactionSynchronizationManager.registerSynchronization(...)` com `afterCommit()`. O MDC continua preenchido ali, porque é a mesma thread.
+- `fintech_outbox_pendentes`: `Gauge.builder("fintech.outbox.pendentes", this, SaudeDaOutbox::pendentes)`. A função roda a cada scrape.
+- `MIN(criado_em)` sobre nenhuma linha devolve uma linha com `NULL`, e não zero linhas.
+- O `RespostasDeSeguranca` do marco 4 escreve o JSON na mão. Acrescente `MDC.get("requestId")` ali também.
+- Nos Problem Details que o próprio Spring monta (404 de rota, 405...), sobrescreva `handleExceptionInternal` no `TratadorDeErros`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução de referência
+
+Está em `java/projeto-integrador/solucao-marco-6`: o marco 5, mais o pacote `infra/observabilidade`, a porta `ObservadorDeTransferencias`, a configuração do Actuator e os arquivos de entrega.
+
+<Tabs>
+<Tab rotulo="Porta e caso de uso">
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/aplicacao/ObservadorDeTransferencias.java" titulo="aplicacao/ObservadorDeTransferencias.java (porta)" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferencias.java" />
+</Tab>
+<Tab rotulo="Observabilidade">
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/infra/observabilidade/ObservadorDeTransferenciasMicrometer.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/infra/observabilidade/SaudeDaOutbox.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/infra/observabilidade/FiltroDeCorrelacao.java" />
+</Tab>
+<Tab rotulo="Segurança e erros">
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/infra/SegurancaConfig.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/infra/RespostasDeSeguranca.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/main/java/dev/trilhajava/fintech/api/TratadorDeErros.java" />
+</Tab>
+<Tab rotulo="Testes">
+<CodigoJava caminho="projeto-integrador/solucao-marco-6/src/test/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferenciasTest.java" />
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/Marco6ProducaoTest.java" titulo="testes/Marco6ProducaoTest.java" />
+</Tab>
+</Tabs>
+
+A configuração, em `application.yml`:
+
+```yaml
+logging:
+  structured:
+    format:
+      console: ecs
+    ecs:
+      service:
+        name: fintech-core
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      roles: ADMIN
+      group:
+        readiness:
+          include: readinessState,db
+  metrics:
+    tags:
+      aplicacao: fintech-core
+```
+
+O `Dockerfile`:
+
+```dockerfile
+FROM eclipse-temurin:25-jre-noble AS extrator
+WORKDIR /build
+COPY target/fintech-core.jar fintech-core.jar
+RUN java -Djarmode=tools -jar fintech-core.jar extract --layers --destination extraido
+
+FROM eclipse-temurin:25-jre-noble
+WORKDIR /app
+RUN groupadd --system fintech && useradd --system --gid fintech --uid 1001 fintech
+COPY --from=extrator /build/extraido/dependencies/ ./
+COPY --from=extrator /build/extraido/spring-boot-loader/ ./
+COPY --from=extrator /build/extraido/snapshot-dependencies/ ./
+COPY --from=extrator /build/extraido/application/ ./
+USER fintech
+EXPOSE 8080
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
+ENTRYPOINT ["java", "-jar", "fintech-core.jar"]
+```
+
+O `compose.producao.yaml` completo está em `java/projeto-integrador/solucao-marco-6/`.
+
+### Decisões
+
+- **Readiness sem a outbox.** A readiness responde *"posso atender agora?"*. Sem Kafka, a transferência continua funcionando e o evento espera na outbox. Uma dependência que não impede o atendimento entra no health completo e nos alertas, mas fica fora da readiness. Se entrasse, uma queda do Kafka tiraria **todas** as instâncias do balanceador ao mesmo tempo.
+- **O sintoma é a idade, não a quantidade.** Mil eventos pendentes num pico de tráfego são normais. Um evento parado há 10 minutos, não.
+- **Métrica depois do commit.** A métrica diz o que o cliente viu. Se o commit falhar, o cliente recebe erro, e a transferência não pode ter sido contada como sucesso.
+- **Poucos valores por tag.** `resultado` tem quatro valores. Um `conta` ou `usuario` como tag criaria uma série no Prometheus para cada cliente, e ainda colocaria dados pessoais no sistema de métricas.
+- **Prometheus com token de ADMIN.** Foi a opção mais simples aqui, reaproveitando a segurança do marco 4. Em Kubernetes é comum usar uma porta de gerenciamento separada (veja os desafios).
+- **Imagem a partir do jar.** O Dockerfile não roda o Maven: o CI já rodou `mvn verify` e testou exatamente esse jar. Um Dockerfile que compila por conta própria costuma pular os testes, ou rodá-los duas vezes.
+
+### Avalie sua solução
+
+- A pessoa de SRE pergunta: *"Se o PostgreSQL cair, o Kubernetes vai reiniciar os pods?"* O que acontece com a liveness e com a readiness?
+- Um cliente manda o print de um erro com `requestId`. Escreva a consulta que você faria na sua ferramenta de logs.
+- `fintech_transferencias_total{resultado="sucesso"}` subiu 1.000 em um minuto, mas o `fintech_outbox_pendentes` ficou em 0. Isso é coerente? E se ficasse em 1.000?
+
+</Solucao>

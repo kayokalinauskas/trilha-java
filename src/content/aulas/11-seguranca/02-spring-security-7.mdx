@@ -1,0 +1,896 @@
+---
+titulo: A arquitetura do Spring Security 7
+descricao: "O caminho de uma requisição do Tomcat até o controller: DelegatingFilterProxy, FilterChainProxy e SecurityFilterChain; duas cadeias numa mesma aplicação; quem autentica e onde o usuário fica guardado; a DSL do Spring Security 7; CSRF, sessão stateless, 401 e 403 em Problem Details, filtros próprios na posição certa e a matriz de acesso testada."
+modulo: 11-seguranca
+ordem: 2
+duracao: 120
+objetivos:
+  - Descrever o caminho de uma requisição pelo DelegatingFilterProxy, pelo FilterChainProxy e pela SecurityFilterChain escolhida, e imprimir a lista real de filtros de cada cadeia
+  - Configurar duas SecurityFilterChain na mesma aplicação (API stateless e console com sessão) com securityMatcher e @Order, e reconhecer o erro de duas cadeias que casam com tudo
+  - Explicar como AuthenticationManager, ProviderManager, AuthenticationProvider, UserDetailsService e PasswordEncoder produzem o Authentication que vai para o SecurityContextHolder
+  - Decidir quando desligar CSRF e sessão e quando mantê-los, inclusive em SPAs com cookie
+  - Escrever 401 e 403 em Problem Details (RFC 9457) com AuthenticationEntryPoint e AccessDeniedHandler
+  - Posicionar um filtro próprio na cadeia e provar a posição com teste
+  - Testar a segurança com spring-security-test (httpBasic, @WithMockUser, jwt, csrf) e uma matriz de acesso parametrizada
+tags: [Spring Security 7, filtros, SecurityFilterChain, CSRF, Problem Details, testes]
+flashcards:
+  - frente: Qual o papel do DelegatingFilterProxy e do FilterChainProxy?
+    verso: O DelegatingFilterProxy é o filtro de servlet que o Spring Boot registra no Tomcat (ordem -100, nome springSecurityFilterChain); ele só repassa a requisição ao bean FilterChainProxy. O FilterChainProxy escolhe a PRIMEIRA SecurityFilterChain cujo matcher casa com a requisição e executa os filtros dela.
+  - frente: Por que duas SecurityFilterChain sem securityMatcher impedem a aplicação de subir?
+    verso: A primeira casaria com qualquer requisição e a segunda nunca seria usada. O Spring Security detecta isso na subida e lança UnreachableFilterChainException. A cadeia "pega-tudo" precisa ser única e a última (@Order maior).
+  - frente: Onde fica o usuário autenticado durante a requisição?
+    verso: Num Authentication (nome, autoridades) dentro do SecurityContext, acessado pelo SecurityContextHolder, que por padrão usa uma variável da thread. Entre requisições, quem guarda e recupera o contexto é o SecurityContextRepository (sessão HTTP, por exemplo); numa API stateless, nada é guardado.
+  - frente: Quem confere usuário e senha no Spring Security?
+    verso: O filtro (ex. BasicAuthenticationFilter) monta um pedido e chama o AuthenticationManager. A implementação padrão, ProviderManager, delega ao DaoAuthenticationProvider, que carrega o usuário pelo UserDetailsService e compara a senha com o PasswordEncoder.
+  - frente: Quando é seguro desligar a proteção CSRF?
+    verso: Quando nenhuma credencial vai sozinha pelo navegador. Com token no header Authorization, sim. Com cookie de sessão (aplicação web, BFF, SPA com cookie), não; numa SPA, use csrf.spa() no Spring Security 7.
+  - frente: Por que 401 e 403 não passam pelo @RestControllerAdvice?
+    verso: Eles nascem nos filtros, antes do DispatcherServlet. O ExceptionTranslationFilter chama o AuthenticationEntryPoint (401) ou o AccessDeniedHandler (403); é neles que se escreve o Problem Details.
+  - frente: Qual a diferença entre hasRole("ADMIN") e hasAuthority("ADMIN")?
+    verso: hasRole acrescenta o prefixo ROLE_ e procura ROLE_ADMIN; hasAuthority procura o texto exato. Passar "ROLE_ADMIN" para hasRole faz a aplicação falhar na subida.
+  - frente: O que @WithMockUser e jwt() NÃO testam?
+    verso: A autenticação. Eles colocam um Authentication pronto no contexto e pulam a verificação de senha ou de token. Testam só a autorização; a autenticação precisa de testes com credenciais reais (httpBasic, tokens válidos e inválidos).
+---
+
+Uma clínica tem dois tipos de cliente falando com o mesmo backend. A recepção usa um aplicativo que marca consultas pela API, mandando a credencial em cada requisição. A equipe administrativa usa um painel web no navegador, com login, sessão e formulários. Um dia alguém pede um ajuste simples: "adicione um filtro que registre quem acessou cada consulta, para a auditoria da LGPD". O filtro entra, os testes passam, e duas semanas depois a auditoria descobre que **todas as negativas de acesso aparecem no log como `status=200`**. Em outro projeto, uma pessoa copia a configuração da API para o painel, a aplicação para de subir com uma exceção de dez linhas, e o time perde a tarde tentando entender o que é `UnreachableFilterChainException`.
+
+Nos dois casos, o código estava "certo". O que faltava era o modelo mental de **onde** o Spring Security roda, **em que ordem** as coisas acontecem e **quem** decide cada resposta. Esta aula constrói esse modelo com uma API real: duas cadeias de filtros na mesma aplicação, um filtro de auditoria posicionado com precisão, respostas 401 e 403 no padrão Problem Details e uma matriz de acesso testada linha por linha. No caminho, você vai ver as mensagens de erro reais que aparecem quando cada peça sai do lugar.
+
+## A intuição: a portaria de um hospital
+
+Pense na entrada de um hospital grande. Logo na porta da rua há uma **recepção geral** que não decide nada: ela só olha para onde a pessoa vai e a encaminha para a **portaria certa**. Quem vai ao ambulatório passa por uma portaria rápida: mostra o crachá a cada entrada, ninguém guarda nome, e quem não tem crachá recebe um "identifique-se". Quem vai à área administrativa passa por outra portaria: ali se faz cadastro uma vez, recebe-se uma pulseira válida pelo dia e os formulários assinados precisam de um carimbo que só a pulseira dá.
+
+Cada portaria é uma sequência de guichês, sempre na mesma ordem: conferir documento, registrar a entrada, verificar se a pessoa pode entrar naquela ala. Se o guichê de documentos barra alguém, os seguintes nem ficam sabendo. E o médico lá dentro (o controller) só vê quem passou por tudo.
+
+O Spring Security é exatamente isso. A recepção geral é o `FilterChainProxy`. Cada portaria é uma `SecurityFilterChain`. Os guichês são filtros de servlet. O crachá mostrado a cada vez é o HTTP Basic (ou um token, na próxima aula), a pulseira do dia é a sessão, e o carimbo dos formulários é o token CSRF. A pergunta "em que guichê eu coloco o meu fiscal de auditoria?" é a pergunta "em que posição eu coloco o meu filtro?", e a resposta errada produz exatamente o `status=200` da história acima.
+
+## Vocabulário
+
+| Termo | O que é | Na API da clínica |
+|---|---|---|
+| **Filtro de servlet** (`jakarta.servlet.Filter`) | Código que roda antes (e depois) do servlet, podendo barrar ou modificar a requisição | `FiltroDeCorrelacao`, `FiltroDeAuditoria` |
+| **`DelegatingFilterProxy`** | O único filtro do Spring Security que o Tomcat conhece; repassa tudo para um bean do Spring | Registrado pelo Boot com o nome `springSecurityFilterChain` |
+| **`FilterChainProxy`** | O bean que recebe do proxy e escolhe qual cadeia aplicar | Escolhe entre `api` e `console` |
+| **`SecurityFilterChain`** | Um *matcher* (quais requisições) + uma lista ordenada de filtros | `api` para `/api/**`; `console` para o resto |
+| **`Authentication`** | Quem é o usuário (*principal*), com que credencial e com quais **autoridades** (`GrantedAuthority`) | `recepcao` com `ROLE_RECEPCAO` e `FACTOR_PASSWORD` |
+| **`SecurityContextHolder`** | Onde o `Authentication` da requisição atual fica guardado (por padrão, numa variável da thread) | Lido pelo filtro de auditoria e pelo controller |
+| **`SecurityContextRepository`** | Quem guarda o contexto **entre** requisições (sessão HTTP) ou não guarda (stateless) | Sessão no console; nada na API |
+| **`AuthenticationManager`** / **`ProviderManager`** | Recebe um pedido de autenticação e delega a um `AuthenticationProvider` que saiba tratá-lo | Montado pelo Boot a partir do `UserDetailsService` |
+| **`UserDetailsService`** | Carrega um usuário pelo nome (do banco, da memória, de um LDAP) | `InMemoryUserDetailsManager` com três usuários |
+| **`AuthenticationEntryPoint`** | Decide a resposta quando falta autenticação (401, redirecionar para o login) | `RespostasDeSeguranca.commence` |
+| **`AccessDeniedHandler`** | Decide a resposta quando o usuário autenticado não tem permissão (403) | `RespostasDeSeguranca.handle` |
+| **CSRF** (*Cross-Site Request Forgery*) | Ataque em que outro site faz o navegador da vítima enviar uma requisição com os cookies dela | Proteção ligada no console, desligada na API |
+| **Problem Details** | Formato padrão de erro HTTP em JSON (RFC 9457), com `type`, `title`, `status`, `detail`, `instance` | Corpo de todo 401 e 403 da API |
+
+Dois termos de autorização aparecem o tempo todo. **Autoridade** é um texto qualquer que o `Authentication` carrega (`ROLE_ADMIN`, `SCOPE_consultas:ler`, `FACTOR_PASSWORD`). **Papel** (*role*) é só uma convenção: uma autoridade que começa com `ROLE_`. É por isso que `hasRole("ADMIN")` procura `ROLE_ADMIN`, e `hasAuthority("ADMIN")` procura `ADMIN` literalmente.
+
+## O caminho de uma requisição
+
+Quando uma requisição chega ao Tomcat, ela passa por uma lista de filtros de servlet antes de chegar ao `DispatcherServlet` do Spring MVC (aquele que chama os controllers, do módulo 08). O Spring Security entra nessa lista como **um único filtro**: o `DelegatingFilterProxy`. O Spring Boot o registra com o nome `springSecurityFilterChain` e a ordem `-100` (configurável pela propriedade `spring.security.filter.order`). Ele existe por um motivo técnico: o Tomcat cria os filtros antes de o contexto do Spring existir, então o proxy só guarda o nome do bean e, na primeira requisição, passa a delegar para ele.
+
+Esse bean é o `FilterChainProxy`. Ele tem uma lista de `SecurityFilterChain`, em ordem, e faz uma coisa só: percorre a lista e usa **a primeira cadeia cujo matcher casa** com a requisição. As outras são ignoradas. Depois, executa os filtros da cadeia escolhida, um após o outro. Se nenhum filtro barrar a requisição, ela segue para o `DispatcherServlet` e chega ao controller.
+
+<Figura legenda="O Tomcat conhece só o DelegatingFilterProxy; o FilterChainProxy escolhe a primeira cadeia que casa, e só os filtros dela rodam">
+<svg viewBox="0 0 900 470" width="900" role="img" aria-labelledby="caminho-titulo caminho-desc">
+  <title id="caminho-titulo">Caminho de uma requisição pelo Spring Security</title>
+  <desc id="caminho-desc">A requisição passa pelo FiltroDeCorrelacao, um filtro comum com ordem alta, depois pelo DelegatingFilterProxy, registrado com ordem -100, que repassa ao FilterChainProxy. O FilterChainProxy escolhe uma de duas cadeias: a cadeia api, de ordem 1, para /api/**, com BasicAuthenticationFilter, AnonymousAuthenticationFilter, FiltroDeAuditoria, ExceptionTranslationFilter e AuthorizationFilter; ou a cadeia console, de ordem 2, para todo o resto, com CsrfFilter, UsernamePasswordAuthenticationFilter, DefaultLoginPageGeneratingFilter, ExceptionTranslationFilter e AuthorizationFilter. As duas terminam no DispatcherServlet, que chama o controller.</desc>
+  <defs><marker id="mk-caminho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="150" height="60" rx="10" class="d-box"/>
+  <text x="85" y="46" text-anchor="middle" class="d-title">requisição</text>
+  <text x="85" y="66" text-anchor="middle" class="d-label">GET /api/consultas</text>
+  <rect x="195" y="20" width="200" height="60" rx="10" class="d-box"/>
+  <text x="295" y="46" text-anchor="middle" class="d-mono">FiltroDeCorrelacao</text>
+  <text x="295" y="66" text-anchor="middle" class="d-label">filtro comum, ordem alta</text>
+  <rect x="430" y="20" width="210" height="60" rx="10" class="d-info"/>
+  <text x="535" y="46" text-anchor="middle" class="d-mono">DelegatingFilterProxy</text>
+  <text x="535" y="66" text-anchor="middle" class="d-label">ordem -100 (Boot)</text>
+  <rect x="675" y="20" width="215" height="60" rx="10" class="d-info"/>
+  <text x="782" y="46" text-anchor="middle" class="d-mono">FilterChainProxy</text>
+  <text x="782" y="66" text-anchor="middle" class="d-label">1ª cadeia que casar</text>
+  <path d="M160 50 L193 50" class="d-line" marker-end="url(#mk-caminho)"/>
+  <path d="M395 50 L428 50" class="d-line" marker-end="url(#mk-caminho)"/>
+  <path d="M640 50 L673 50" class="d-line" marker-end="url(#mk-caminho)"/>
+  <path d="M740 80 L260 128" class="d-line" marker-end="url(#mk-caminho)"/>
+  <path d="M800 80 L700 128" class="d-line" marker-end="url(#mk-caminho)"/>
+  <rect x="30" y="130" width="400" height="232" rx="12" class="d-accent"/>
+  <text x="230" y="156" text-anchor="middle" class="d-title">@Order(1) api: /api/**</text>
+  <text x="230" y="176" text-anchor="middle" class="d-label">stateless, sem CSRF, HTTP Basic</text>
+  <text x="60" y="206" class="d-mono">BasicAuthenticationFilter</text>
+  <text x="60" y="232" class="d-mono">AnonymousAuthenticationFilter</text>
+  <text x="60" y="258" class="d-mono">FiltroDeAuditoria</text>
+  <text x="60" y="284" class="d-mono">ExceptionTranslationFilter</text>
+  <text x="60" y="310" class="d-mono">AuthorizationFilter</text>
+  <text x="230" y="344" text-anchor="middle" class="d-label">(mais 8 filtros de infraestrutura)</text>
+  <rect x="470" y="130" width="410" height="232" rx="12" class="d-violet"/>
+  <text x="675" y="156" text-anchor="middle" class="d-title">@Order(2) console: o resto</text>
+  <text x="675" y="176" text-anchor="middle" class="d-label">sessão, CSRF, login por formulário</text>
+  <text x="495" y="206" class="d-mono">CsrfFilter</text>
+  <text x="495" y="232" class="d-mono">UsernamePasswordAuthenticationFilter</text>
+  <text x="495" y="258" class="d-mono">DefaultLoginPageGeneratingFilter</text>
+  <text x="495" y="284" class="d-mono">ExceptionTranslationFilter</text>
+  <text x="495" y="310" class="d-mono">AuthorizationFilter</text>
+  <text x="675" y="344" text-anchor="middle" class="d-label">(mais 10 filtros de infraestrutura)</text>
+  <path d="M230 362 L400 398" class="d-line" marker-end="url(#mk-caminho)"/>
+  <path d="M675 362 L510 398" class="d-line" marker-end="url(#mk-caminho)"/>
+  <rect x="300" y="400" width="300" height="56" rx="10" class="d-ok"/>
+  <text x="450" y="424" text-anchor="middle" class="d-mono">DispatcherServlet</text>
+  <text x="450" y="444" text-anchor="middle" class="d-label">só agora chega ao controller</text>
+</svg>
+</Figura>
+
+Três consequências práticas saem dessa figura, e as três aparecem em entrevista e em incidente:
+
+- **Os filtros rodam antes do Spring MVC.** Se um filtro barra a requisição, nenhum controller, nenhum `@ControllerAdvice` e nenhum interceptor do MVC fica sabendo. É por isso que um 401 gerado pela segurança nunca passa pelo seu `@RestControllerAdvice`.
+- **Só uma cadeia roda por requisição.** Regras escritas na cadeia `console` não protegem `/api/**`, mesmo que pareçam mais gerais. E a ordem das cadeias é a ordem dos beans (`@Order`): a mais específica vem primeiro.
+- **Dentro da cadeia, a ordem dos filtros é fixa e importa.** O Spring Security tem uma ordem registrada para cada filtro que ele conhece. Um filtro seu precisa ser encaixado relativamente a um deles (antes, depois ou no lugar), e a posição define o que ele consegue ver.
+
+### Os filtros que importam, na ordem
+
+A lista real da cadeia `api` desta aula tem treze filtros (você vai imprimi-la no passo 2). Nem todos merecem atenção no dia a dia. Os que você precisa conhecer pelo nome, na ordem em que rodam:
+
+| Filtro | O que faz | Se ele barrar |
+|---|---|---|
+| `SecurityContextHolderFilter` | Carrega o `SecurityContext` do `SecurityContextRepository` (da sessão, por exemplo) e limpa o `SecurityContextHolder` no fim | — |
+| `HeaderWriterFilter` | Escreve os headers de segurança (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control`...) | — |
+| `CsrfFilter` | Exige o token CSRF em métodos que alteram estado (POST, PUT, PATCH, DELETE) | 403 pelo `AccessDeniedHandler` |
+| `LogoutFilter` | Trata `POST /logout` | — |
+| `BasicAuthenticationFilter`, `UsernamePasswordAuthenticationFilter`, `BearerTokenAuthenticationFilter` | **Autenticam**: leem a credencial, chamam o `AuthenticationManager` e, se der certo, põem o `Authentication` no contexto | 401 pelo `AuthenticationEntryPoint` (credencial inválida) |
+| `AnonymousAuthenticationFilter` | Se ninguém autenticou, coloca um `AnonymousAuthenticationToken` (usuário `anonymousUser`) | — |
+| `ExceptionTranslationFilter` | Envolve os filtros seguintes num `try/catch` e traduz exceções de segurança em resposta | Escreve o 401 ou o 403 |
+| `AuthorizationFilter` | **Autoriza**: aplica as regras de `authorizeHttpRequests` | Lança `AccessDeniedException` |
+
+Repare em dois detalhes. Primeiro, a autorização é o **último** filtro: tudo o que vem antes serve para descobrir quem é a pessoa. Segundo, o `AuthorizationFilter` não escreve a resposta: ele lança uma exceção, e quem a transforma em HTTP é o `ExceptionTranslationFilter`, que está logo antes. Funciona assim (pseudocódigo da documentação, simplificado):
+
+```java
+try {
+    cadeia.doFilter(requisicao, resposta);      // AuthorizationFilter e o resto
+} catch (AuthenticationException | AccessDeniedException erro) {
+    if (naoAutenticado || erro instanceof AuthenticationException) {
+        entryPoint.commence(...);               // 401 (ou redirecionar para o login)
+    } else {
+        accessDeniedHandler.handle(...);        // 403
+    }
+}
+```
+
+"Não autenticado" inclui o usuário anônimo: se o `AnonymousAuthenticationFilter` pôs um `anonymousUser` no contexto e a regra exige um papel, o resultado é **401**, não 403. O raciocínio é que um anônimo ainda pode resolver o problema se autenticando; um usuário autenticado sem permissão, não.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula existe no projeto Maven da trilha, em `java/m11-seguranca/aulas`, pacote `dev.trilhajava.m11.aulas.filtros`, e roda no CI. A aplicação é a API da clínica:
+
+| Rota | Quem pode | Cadeia |
+|---|---|---|
+| `GET /api/status` | qualquer um | `api` |
+| `GET /api/consultas` | `RECEPCAO`, `MEDICO` | `api` |
+| `POST /api/consultas` | `RECEPCAO` | `api` |
+| `GET /api/consultas/{id}/prontuario` | rota: `RECEPCAO`, `MEDICO`; método: só `MEDICO` | `api` |
+| `GET /admin/painel`, `POST /admin/cache/limpar` | `ADMIN`, com login por formulário | `console` |
+| qualquer outra | ninguém | a que casar |
+
+Os três usuários de exemplo são `recepcao` (papel `RECEPCAO`), `dra.helena` (`MEDICO`) e `admin` (`ADMIN`). O administrador **não** lê consultas: ele cuida do sistema, não dos pacientes. Esse é o **princípio do menor privilégio** (cada perfil recebe só o acesso de que precisa), e ele vai aparecer na matriz de acesso como uma linha de 403 que muita gente acha estranha à primeira vista.
+
+O controller da API é comum, sem nenhuma anotação de segurança:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/ConsultaController.java" semImports destacar="38-44" />
+
+O parâmetro `Authentication quem` (linha 39) é preenchido pelo Spring MVC com o usuário que a segurança autenticou. O nome dele vai num header de resposta só para você ver, nos testes, que a informação chega até o controller. O prontuário é dado sensível de saúde, então a regra dele também fica no serviço, com `@PreAuthorize`:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/ServicoDeProntuario.java" semImports />
+
+`@PreAuthorize` é a **segurança de método** (*method security*): o Spring cria um proxy em volta do bean e avalia a expressão antes de cada chamada. Ela só funciona com `@EnableMethodSecurity` numa classe de configuração, que você vai ver no passo 1. A regra da rota (`RECEPCAO` ou `MEDICO` em `GET /api/consultas/**`) é ampla; a do método é estreita. Essa redundância é proposital: se amanhã alguém criar outra rota ou um job que chame `resumo`, a regra continua valendo.
+
+## Mão na massa
+
+Os comandos abaixo partem da pasta do módulo:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test                                         # todos os testes da aula
+mvn test -Dtest=MatrizDeAcessoTest               # uma classe
+```
+
+### Passo 1: as duas cadeias
+
+**O que vamos fazer e por quê.** A API e o console têm necessidades opostas. A API é usada por programas: cada requisição traz a credencial, não há navegador guardando cookies, e o servidor não deve criar sessão (assim qualquer instância atende qualquer requisição). O console é usado por pessoas num navegador: login uma vez, sessão, formulários protegidos contra CSRF. Tentar servir os dois com uma cadeia só obriga a escolher o pior dos dois mundos. A solução é ter **duas cadeias**, uma por tipo de cliente.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/SegurancaConfig.java" semImports destacar="27, 30, 35, 37-38, 42, 48, 54" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- **Linhas 27 e 48:** `@Order(1)` e `@Order(2)` definem a ordem das cadeias no `FilterChainProxy`. Número menor, prioridade maior.
+- **Linha 30:** `securityMatcher("/api/**")` diz **quais requisições pertencem a esta cadeia**. Não confunda com `requestMatchers` dentro de `authorizeHttpRequests`: o `securityMatcher` decide se a cadeia roda; os `requestMatchers` decidem, dentro da cadeia, qual regra de autorização vale. A cadeia `console` não tem `securityMatcher`, então casa com qualquer requisição. Por isso ela é a **última**.
+- **Linhas 32 a 35:** as regras são avaliadas **de cima para baixo**, e vale a primeira que casar. `GET /api/status` é público; `POST /api/consultas` exige `RECEPCAO`; leitura exige `RECEPCAO` ou `MEDICO`. A linha 35, `anyRequest().denyAll()`, fecha o resto: uma rota nova sob `/api` nasce **negada** até alguém escrever a regra dela. Esse padrão (negar por padrão) é o que separa uma configuração segura de uma que vaza a cada endpoint novo.
+- **Linha 36:** `httpBasic` liga o `BasicAuthenticationFilter`, que lê o header `Authorization: Basic base64(usuario:senha)`. Ele recebe o nosso `AuthenticationEntryPoint` para que uma senha errada também responda em Problem Details. HTTP Basic aparece aqui porque é o mecanismo mais simples para enxergar a arquitetura; na próxima aula, a mesma cadeia passa a aceitar JWT trocando esta linha.
+- **Linha 37:** `SessionCreationPolicy.STATELESS` faz a cadeia não criar nem usar sessão HTTP. Cada requisição é autenticada do zero.
+- **Linha 38:** CSRF desligado **só nesta cadeia**. A justificativa vem na seção sobre CSRF; por ora, guarde que ela depende da linha 37.
+- **Linhas 39 a 41:** `exceptionHandling` conecta o `ExceptionTranslationFilter` às nossas respostas de 401 e 403 (passo 3).
+- **Linha 42:** o filtro de auditoria entra **antes do `ExceptionTranslationFilter`**. O passo 4 explica por que exatamente ali.
+- **Linhas 51 a 55:** a cadeia `console` libera `/error` (o Spring Boot encaminha erros para essa rota; se ela exigisse login, um 400 viraria um redirecionamento para a página de login), exige `ADMIN` em `/admin/**` e nega o resto. `formLogin(Customizer.withDefaults())` liga o login por formulário com a página padrão gerada pelo Spring Security. CSRF e sessão ficam com os padrões: ligados.
+- **Linhas 59 a 71:** um `PasswordEncoder` delegante (gera hashes BCrypt com o prefixo `{bcrypt}`, como na [aula anterior](../../11-seguranca/01-autenticacao-e-senhas/)) e um `UserDetailsService` em memória. Como existe exatamente um bean de cada, o Spring Boot monta sozinho o `AuthenticationManager` global que as duas cadeias usam.
+
+<Callout tipo="novidade" titulo="O que mudou do Spring Security 6 para o 7">
+A versão 7 (que acompanha o Spring Boot 4) terminou várias migrações que a 6 tinha começado. As mudanças que você vai sentir em código antigo:
+
+- **`and()` foi removido.** A DSL é só com lambdas: cada bloco (`csrf`, `sessionManagement`, `authorizeHttpRequests`...) recebe um `Customizer`. Código no estilo `http.csrf().disable().and().httpBasic()` não compila mais.
+- **`authorizeRequests()` foi removido.** Use `authorizeHttpRequests()`, que é baseado em `AuthorizationManager` e roda no `AuthorizationFilter` (o antigo `FilterSecurityInterceptor` saiu de cena).
+- **`AntPathRequestMatcher` e `MvcRequestMatcher` foram removidos**, substituídos por `PathPatternRequestMatcher`. Quando você passa uma `String` para `securityMatcher` ou `requestMatchers`, é ele que é criado: o log da subida mostra `PathPattern [/api/**]`. Para criar um à mão: `PathPatternRequestMatcher.pathPattern(HttpMethod.GET, "/api/**")`.
+- **CSRF para SPAs** ganhou um atalho: `csrf(csrf -> csrf.spa())`.
+- **Autenticação multifator nativa:** ao autenticar com senha, o `Authentication` ganha também a autoridade `FACTOR_PASSWORD` (você vai vê-la no passo 5). Código que converte **todas** as autoridades em papéis precisa filtrar pelo prefixo `ROLE_`; o exercício 11.02 cobra exatamente isso.
+- A API antiga de `AccessDecisionManager`/`AccessDecisionVoter` foi para um módulo separado, `spring-security-access`.
+</Callout>
+
+### Passo 2: inspecionando as cadeias
+
+**O que vamos fazer e por quê.** Antes de testar comportamento, confira a **estrutura**: quantas cadeias existem, com quais filtros e em que ordem. Isso responde de cara metade das dúvidas do tipo "por que o CSRF está barrando minha API?". Há três formas de ver isso.
+
+**Forma 1: o log da subida.** O Spring Security registra, em nível DEBUG, a lista de filtros de cada cadeia. Suba a aplicação com esse logger ligado:
+
+```bash
+mvn spring-boot:run \
+  -Dspring-boot.run.main-class=dev.trilhajava.m11.aulas.filtros.ClinicaApplication \
+  "-Dspring-boot.run.arguments=--logging.level.org.springframework.security.web.DefaultSecurityFilterChain=DEBUG"
+```
+
+Saída real (sem a data, e com as linhas quebradas para caber):
+
+```text
+INFO  r$InitializeUserDetailsManagerConfigurer : Global AuthenticationManager configured
+      with UserDetailsService bean with name usuarios
+DEBUG o.s.s.web.DefaultSecurityFilterChain : Will secure Or [PathPattern [/api/**]] with filters:
+      DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter,
+      HeaderWriterFilter, LogoutFilter, BasicAuthenticationFilter, RequestCacheAwareFilter,
+      SecurityContextHolderAwareRequestFilter, AnonymousAuthenticationFilter,
+      SessionManagementFilter, FiltroDeAuditoria, ExceptionTranslationFilter, AuthorizationFilter
+DEBUG o.s.s.web.DefaultSecurityFilterChain : Will secure any request with filters:
+      DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter,
+      HeaderWriterFilter, CsrfFilter, LogoutFilter, UsernamePasswordAuthenticationFilter,
+      DefaultResourcesFilter, DefaultLoginPageGeneratingFilter, DefaultLogoutPageGeneratingFilter,
+      RequestCacheAwareFilter, SecurityContextHolderAwareRequestFilter,
+      AnonymousAuthenticationFilter, ExceptionTranslationFilter, AuthorizationFilter
+```
+
+Leia as duas listas lado a lado. A da API **não tem** `CsrfFilter` (desligamos) nem filtros de login por formulário, tem `BasicAuthenticationFilter` e mostra o `FiltroDeAuditoria` exatamente antes do `ExceptionTranslationFilter`. A do console tem CSRF, login e as páginas geradas. A primeira linha confirma que o Boot encontrou o `UserDetailsService` e montou o `AuthenticationManager` com ele.
+
+**Forma 2: o log de cada requisição.** Com `logging.level.org.springframework.security=DEBUG`, cada requisição deixa um rastro. Com `admin` tentando listar consultas:
+
+```text
+o.s.security.web.FilterChainProxy       : Securing GET /api/consultas
+o.s.s.a.dao.DaoAuthenticationProvider   : Authenticated user
+o.s.s.w.a.www.BasicAuthenticationFilter : Set SecurityContextHolder to UsernamePasswordAuthenticationToken
+    [Principal=...User [Username=admin, Password=[PROTECTED], ...], Credentials=[PROTECTED],
+    Authenticated=true, ..., Granted Authorities=[ROLE_ADMIN, FactorGrantedAuthority
+    [authority=FACTOR_PASSWORD, issuedAt=2026-10-05T14:36:35.745088500Z]]]
+d.t.m11.aulas.filtros.FiltroDeAuditoria : auditoria usuario=admin metodo=GET caminho=/api/consultas status=403
+```
+
+Em TRACE, o log mostra também cada filtro sendo invocado, um por linha. É o nível certo para depurar, e nunca para deixar ligado em produção: o volume é enorme.
+
+**Forma 3: `@EnableWebSecurity(debug = true)`.** A anotação tem um atributo `debug` que liga um filtro de depuração: a cada requisição, ele imprime a requisição recebida (com headers) e a cadeia escolhida. O próprio Spring Security avisa no log, em letras grandes, que "Security debugging is enabled. This may include sensitive information". Use só na sua máquina, e prefira o log em TRACE, que dá a mesma informação sem mudar código.
+
+**Forma 4, a que fica: um teste.** Logs servem para explorar; para garantir que ninguém mude a estrutura sem perceber, escreva um teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/CadeiasDeFiltrosTest.java" semImports destacar="17-18, 22, 27-29, 33-37, 41-48" />
+
+```bash
+mvn test -Dtest=CadeiasDeFiltrosTest
+```
+
+```text
+[DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter, HeaderWriterFilter, LogoutFilter, BasicAuthenticationFilter, RequestCacheAwareFilter, SecurityContextHolderAwareRequestFilter, AnonymousAuthenticationFilter, SessionManagementFilter, FiltroDeAuditoria, ExceptionTranslationFilter, AuthorizationFilter]
+[DisableEncodeUrlFilter, WebAsyncManagerIntegrationFilter, SecurityContextHolderFilter, HeaderWriterFilter, CsrfFilter, LogoutFilter, UsernamePasswordAuthenticationFilter, DefaultResourcesFilter, DefaultLoginPageGeneratingFilter, DefaultLogoutPageGeneratingFilter, RequestCacheAwareFilter, SecurityContextHolderAwareRequestFilter, AnonymousAuthenticationFilter, ExceptionTranslationFilter, AuthorizationFilter]
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.** O `FilterChainProxy` é um bean comum, então o teste pode injetá-lo. `getFilterChains()` devolve as cadeias na ordem em que serão tentadas; `getFilters("/api/consultas")` devolve os filtros que **rodariam** para aquela URL, ou seja, simula a escolha da cadeia. O terceiro teste prende a posição do filtro de auditoria: depois da autenticação, imediatamente antes do `ExceptionTranslationFilter`. Se alguém "arrumar" a configuração e mover o filtro, o teste quebra com uma mensagem que aponta o problema, em vez de a auditoria passar semanas registrando dados errados.
+
+### Passo 3: 401 e 403 no padrão da API
+
+**O que vamos fazer e por quê.** Sem configuração, o `ExceptionTranslationFilter` da API responde 401 com um header `WWW-Authenticate` e corpo vazio, e o 403 sai pela página de erro padrão. O resto da API responde erros em Problem Details (RFC 9457, que substituiu a RFC 7807). Um cliente que trata `application/problem+json` em todo lugar não deveria ter um caso especial para a segurança. E como 401 e 403 nascem nos filtros, o `@RestControllerAdvice` não tem como ajudar: quem escreve a resposta precisa ser a própria segurança.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/RespostasDeSeguranca.java" semImports destacar="31, 36-41, 45-49, 51-60" />
+
+**O que acabou de acontecer.**
+
+- A classe implementa as duas interfaces. `commence` é chamado para **401**: falta credencial, a credencial é inválida, ou o usuário é anônimo e a rota exige alguém. `handle` é chamado para **403**: o usuário está autenticado, mas não tem a autoridade exigida.
+- **Linha 38:** um 401 deve dizer ao cliente **como** se autenticar, no header `WWW-Authenticate` (RFC 9110). Para HTTP Basic, `Basic realm="clinica"`. Na próxima aula, com tokens, o valor passa a ser `Bearer`. O 403 não leva esse header: autenticar de novo não resolve.
+- **Linha 31:** o `ProblemDetail` do Spring guarda campos extras num mapa interno. Para que `correlationId` saia no nível de cima do JSON (e não dentro de um objeto `properties`), o objeto precisa ser escrito pelo `JacksonJsonHttpMessageConverter`, que aplica a configuração própria do `ProblemDetail`, e não por um `JsonMapper` cru.
+- **Linhas 51 a 60:** `type` é uma URI que identifica o tipo de problema (o cliente decide por ela, não pelo texto); `instance` é o recurso acessado; `correlationId` liga a resposta ao log do servidor.
+- O detalhe da mensagem é genérico de propósito. Um 401 que diz "usuário não existe" ou "senha errada" ensina um atacante a descobrir quais usuários existem (enumeração de usuários, da aula anterior).
+
+Na configuração, a mesma instância entra em dois lugares: em `httpBasic(...)` (senha errada é tratada pelo próprio `BasicAuthenticationFilter`, que chama o entry point sem passar pelo `ExceptionTranslationFilter`) e em `exceptionHandling(...)`. Esquecer o primeiro é um erro comum: a requisição sem credencial sai em Problem Details, mas a com senha errada sai com corpo vazio.
+
+Suba a aplicação (o comando do passo 2, sem o argumento de log) e experimente com `curl`. Sem credencial, mandando um identificador de correlação próprio:
+
+```bash
+curl -i http://localhost:8080/api/consultas -H "X-Correlation-Id: pedido-7f3a"
+```
+
+```text
+HTTP/1.1 401
+X-Correlation-Id: pedido-7f3a
+WWW-Authenticate: Basic realm="clinica"
+Content-Type: application/problem+json
+
+{"detail":"Envie credenciais válidas para acessar a API.","instance":"/api/consultas","status":401,"title":"Não autenticado","type":"https://clinica.exemplo.dev/problemas/nao-autenticado","correlationId":"pedido-7f3a"}
+```
+
+Com o administrador, que está autenticado mas não lê consultas:
+
+```bash
+curl -i -u admin:admin-123 http://localhost:8080/api/consultas
+```
+
+```text
+HTTP/1.1 403
+X-Correlation-Id: 807befd3-5897-4b39-9b9a-e149067e1698
+Content-Type: application/problem+json
+
+{"detail":"Seu perfil não tem permissão para esta operação.","instance":"/api/consultas","status":403,"title":"Acesso negado","type":"https://clinica.exemplo.dev/problemas/acesso-negado","correlationId":"807befd3-5897-4b39-9b9a-e149067e1698"}
+```
+
+E com a recepção, que pode:
+
+```bash
+curl -i -u recepcao:recepcao-123 http://localhost:8080/api/consultas
+```
+
+```text
+HTTP/1.1 200
+X-Correlation-Id: c0a2b0ba-c00f-4f0e-b087-1db5bf3625f4
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 0
+Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+Pragma: no-cache
+Expires: 0
+X-Frame-Options: DENY
+Content-Type: application/json
+
+[{"id":1,"paciente":"Marina Alves","medico":"dra.helena","horario":"2026-10-20T09:00:00"}]
+```
+
+Três coisas para notar nessa última resposta. Os headers `X-Content-Type-Options`, `Cache-Control` e `X-Frame-Options` foram escritos pelo `HeaderWriterFilter`, sem nenhuma configuração (eles também estão nas respostas 401 e 403; foram omitidos acima para encurtar). **Não há `Set-Cookie`**: a cadeia é stateless e não criou sessão. E o `X-Correlation-Id` foi gerado pelo servidor, porque o cliente não mandou um.
+
+O identificador vem do `FiltroDeCorrelacao`, que **não** está em nenhuma cadeia de segurança:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/FiltroDeCorrelacao.java" semImports destacar="22-23, 32-35, 36-40" />
+
+Ele é um `@Component` com `@Order(Ordered.HIGHEST_PRECEDENCE + 10)`: o Spring Boot registra todo bean do tipo `Filter` no Tomcat, respeitando a ordem, e essa ordem fica bem antes do `-100` do `DelegatingFilterProxy`. Por isso até um 401 gerado no meio da cadeia de segurança sai com o header, e os logs da segurança já encontram o identificador no MDC (o *Mapped Diagnostic Context* do SLF4J, um mapa por thread que o padrão de log pode incluir em cada linha). O método `valido` recusa identificadores longos ou com caracteres estranhos: o valor vem do cliente e vai para o log, e aceitar qualquer coisa abriria espaço para injeção de linhas falsas no log.
+
+### Passo 4: um filtro de auditoria na posição certa
+
+**O que vamos fazer e por quê.** A LGPD exige saber quem acessou dados pessoais de saúde. O filtro de auditoria registra, para cada requisição da API, o usuário, o método, o caminho e o status final. E põe o usuário no MDC, para que qualquer log feito durante a requisição (no controller, no serviço) diga quem a fez.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/filtros/FiltroDeAuditoria.java" semImports destacar="32-33, 35, 37-39" />
+
+O filtro precisa de duas informações que ficam prontas em momentos diferentes da cadeia:
+
+- **Quem é o usuário** (linha 32) só existe **depois** dos filtros de autenticação. Antes do `BasicAuthenticationFilter`, o `SecurityContextHolder` está vazio.
+- **O status final** (linha 38) só existe depois que alguém escreveu a resposta. Se a autorização falhar, quem escreve o 403 é o `ExceptionTranslationFilter`, no `catch`. Então o filtro de auditoria precisa estar **fora** desse `try/catch`, ou seja, **antes** do `ExceptionTranslationFilter`. Assim, quando a exceção sobe, o tradutor escreve o 403 e só depois o `finally` da auditoria lê o status.
+
+A única janela que satisfaz as duas condições é entre o `AnonymousAuthenticationFilter` e o `ExceptionTranslationFilter`. Daí `addFilterBefore(new FiltroDeAuditoria(), ExceptionTranslationFilter.class)`. Os três métodos de posicionamento do `HttpSecurity` são `addFilterBefore`, `addFilterAfter` e `addFilterAt` (este último coloca o seu filtro na mesma posição de um filtro conhecido, normalmente para substituí-lo). O segundo argumento precisa ser uma classe que o Spring Security conhece; você verá o erro do contrário em "Quando dá errado".
+
+<Figura legenda="O filtro de auditoria precisa ver o usuário (depois da autenticação) e o status final (fora do try/catch do ExceptionTranslationFilter)">
+<svg viewBox="0 0 860 330" width="860" role="img" aria-labelledby="posicao-titulo posicao-desc">
+  <title id="posicao-titulo">As três posições possíveis do filtro de auditoria</title>
+  <desc id="posicao-desc">Uma linha horizontal mostra, em ordem, BasicAuthenticationFilter, AnonymousAuthenticationFilter, ExceptionTranslationFilter e AuthorizationFilter. A posição A, antes do BasicAuthenticationFilter, registra usuário nenhum. A posição B, entre AnonymousAuthenticationFilter e ExceptionTranslationFilter, registra o usuário certo e o status certo. A posição C, depois do ExceptionTranslationFilter, registra status 200 para uma requisição que recebeu 403, porque a exceção passa pelo filtro antes de o tradutor escrever a resposta.</desc>
+  <defs><marker id="mk-posicao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="110" width="200" height="56" rx="10" class="d-box"/>
+  <text x="110" y="135" text-anchor="middle" class="d-mono" textLength="180" lengthAdjust="spacingAndGlyphs">BasicAuthenticationFilter</text>
+  <text x="110" y="155" text-anchor="middle" class="d-label">põe o usuário no contexto</text>
+  <rect x="230" y="110" width="200" height="56" rx="10" class="d-box"/>
+  <text x="330" y="135" text-anchor="middle" class="d-mono" textLength="180" lengthAdjust="spacingAndGlyphs">AnonymousAuthentication</text>
+  <text x="330" y="155" text-anchor="middle" class="d-label">ou anonymousUser</text>
+  <rect x="450" y="110" width="200" height="56" rx="10" class="d-info"/>
+  <text x="550" y="135" text-anchor="middle" class="d-mono" textLength="180" lengthAdjust="spacingAndGlyphs">ExceptionTranslation</text>
+  <text x="550" y="155" text-anchor="middle" class="d-label">try/catch: escreve 401/403</text>
+  <rect x="670" y="110" width="180" height="56" rx="10" class="d-box"/>
+  <text x="760" y="135" text-anchor="middle" class="d-mono">Authorization</text>
+  <text x="760" y="155" text-anchor="middle" class="d-label">lança AccessDenied</text>
+  <path d="M210 138 L228 138" class="d-line" marker-end="url(#mk-posicao)"/>
+  <path d="M430 138 L448 138" class="d-line" marker-end="url(#mk-posicao)"/>
+  <path d="M650 138 L668 138" class="d-line" marker-end="url(#mk-posicao)"/>
+  <rect x="10" y="10" width="200" height="74" rx="10" class="d-accent"/>
+  <text x="110" y="34" text-anchor="middle" class="d-title">A: antes do Basic</text>
+  <text x="110" y="56" text-anchor="middle" class="d-label">usuario=(nenhum)</text>
+  <text x="110" y="74" text-anchor="middle" class="d-label">quem é? ainda não se sabe</text>
+  <path d="M110 84 L110 108" class="d-line" marker-end="url(#mk-posicao)"/>
+  <rect x="330" y="212" width="240" height="74" rx="10" class="d-ok"/>
+  <text x="450" y="236" text-anchor="middle" class="d-title">B: a posição certa</text>
+  <text x="450" y="258" text-anchor="middle" class="d-label">usuario=admin status=403</text>
+  <text x="450" y="276" text-anchor="middle" class="d-label">vê o usuário e o status final</text>
+  <path d="M440 212 L440 168" class="d-line" marker-end="url(#mk-posicao)"/>
+  <rect x="600" y="212" width="250" height="74" rx="10" class="d-accent"/>
+  <text x="725" y="236" text-anchor="middle" class="d-title">C: depois do tradutor</text>
+  <text x="725" y="258" text-anchor="middle" class="d-label">usuario=admin status=200</text>
+  <text x="725" y="276" text-anchor="middle" class="d-label">o 403 ainda não foi escrito</text>
+  <path d="M660 212 L660 168" class="d-line" marker-end="url(#mk-posicao)"/>
+  <text x="430" y="316" text-anchor="middle" class="d-text">As três versões foram rodadas de verdade; os logs estão em "Quando dá errado"</text>
+</svg>
+</Figura>
+
+O teste usa o `OutputCaptureExtension` do Spring Boot, que captura o que a aplicação escreve no console durante o teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/AuditoriaTest.java" semImports destacar="16, 18, 25-28, 39-42" />
+
+```bash
+mvn test -Dtest=AuditoriaTest
+```
+
+```text
+INFO ... d.t.m11.aulas.filtros.FiltroDeAuditoria : auditoria usuario=admin metodo=GET caminho=/api/consultas status=403
+INFO ... d.t.m11.aulas.filtros.FiltroDeAuditoria : auditoria usuario=dra.helena metodo=GET caminho=/api/consultas status=200
+INFO ... d.t.m11.aulas.filtros.FiltroDeAuditoria : auditoria usuario=anonymousUser metodo=GET caminho=/api/status status=200
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- A propriedade `logging.level.dev.trilhajava.m11.aulas.filtros=INFO` no `@SpringBootTest` é necessária porque o `pom.xml` pai da trilha deixa o log dos testes em WARN, para a saída ficar limpa.
+- O terceiro teste, `registraUmaVezSo`, parece bobo, mas protege contra um erro real: se alguém anotar `FiltroDeAuditoria` com `@Component`, ele roda duas vezes (você vai ver a saída em "Quando dá errado"). O jeito de conferir é contar as linhas: `split` com o trecho procurado devolve duas partes quando há exatamente uma ocorrência.
+- Repare no que **não** aparece: uma requisição com senha errada não gera linha de auditoria. O `BasicAuthenticationFilter` chama o entry point e encerra a requisição ali, antes de chegar ao nosso filtro. Para registrar falhas de login, o caminho certo são os eventos de autenticação do Spring Security (`AuthenticationFailureBadCredentialsEvent`, publicado pelo `ProviderManager`), assunto da aula de defesas da API.
+
+### Passo 5: dentro da autenticação
+
+**O que vamos fazer e por quê.** O `BasicAuthenticationFilter` não confere senha nenhuma: ele só extrai usuário e senha do header, monta um pedido de autenticação e entrega ao `AuthenticationManager`. Entender essa delegação explica como trocar a fonte de usuários (banco em vez de memória), como ter dois mecanismos de autenticação na mesma aplicação e de onde vem cada mensagem de erro.
+
+<Figura legenda="O filtro só extrai a credencial; quem decide é o AuthenticationManager, que delega a um provider, que consulta o UserDetailsService e o PasswordEncoder">
+<svg viewBox="0 0 860 340" width="860" role="img" aria-labelledby="autenticacao-titulo autenticacao-desc">
+  <title id="autenticacao-titulo">As peças da autenticação por usuário e senha</title>
+  <desc id="autenticacao-desc">O BasicAuthenticationFilter lê o header Authorization e chama o ProviderManager, a implementação padrão de AuthenticationManager. O ProviderManager delega ao DaoAuthenticationProvider, que carrega o usuário pelo UserDetailsService e confere o hash com o PasswordEncoder. Em caso de sucesso, o Authentication autenticado volta ao filtro, que o guarda no SecurityContext dentro do SecurityContextHolder. Em caso de falha, o filtro chama o AuthenticationEntryPoint, que responde 401.</desc>
+  <defs><marker id="mk-autenticacao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="230" height="60" rx="10" class="d-box"/>
+  <text x="125" y="46" text-anchor="middle" class="d-mono">BasicAuthenticationFilter</text>
+  <text x="125" y="66" text-anchor="middle" class="d-label">lê Authorization: Basic</text>
+  <rect x="290" y="20" width="220" height="60" rx="10" class="d-info"/>
+  <text x="400" y="46" text-anchor="middle" class="d-mono">ProviderManager</text>
+  <text x="400" y="66" text-anchor="middle" class="d-label">o AuthenticationManager</text>
+  <rect x="560" y="20" width="290" height="60" rx="10" class="d-violet"/>
+  <text x="705" y="46" text-anchor="middle" class="d-mono">DaoAuthenticationProvider</text>
+  <text x="705" y="66" text-anchor="middle" class="d-label">um AuthenticationProvider</text>
+  <path d="M240 50 L288 50" class="d-line" marker-end="url(#mk-autenticacao)"/>
+  <path d="M510 50 L558 50" class="d-line" marker-end="url(#mk-autenticacao)"/>
+  <rect x="440" y="140" width="200" height="60" rx="10" class="d-box"/>
+  <text x="540" y="166" text-anchor="middle" class="d-mono">UserDetailsService</text>
+  <text x="540" y="186" text-anchor="middle" class="d-label">carrega o usuário</text>
+  <rect x="660" y="140" width="190" height="60" rx="10" class="d-box"/>
+  <text x="755" y="166" text-anchor="middle" class="d-mono">PasswordEncoder</text>
+  <text x="755" y="186" text-anchor="middle" class="d-label">confere o hash</text>
+  <path d="M650 80 L560 138" class="d-line" marker-end="url(#mk-autenticacao)"/>
+  <path d="M740 80 L755 138" class="d-line" marker-end="url(#mk-autenticacao)"/>
+  <rect x="10" y="250" width="420" height="70" rx="10" class="d-ok"/>
+  <text x="220" y="276" text-anchor="middle" class="d-mono">SecurityContextHolder</text>
+  <text x="220" y="298" text-anchor="middle" class="d-label">SecurityContext com o Authentication (nome, autoridades)</text>
+  <path d="M100 80 L100 248" class="d-line" marker-end="url(#mk-autenticacao)"/>
+  <text x="110" y="168" class="d-label">sucesso: guarda</text>
+  <rect x="250" y="140" width="170" height="60" rx="10" class="d-accent"/>
+  <text x="335" y="166" text-anchor="middle" class="d-mono">EntryPoint</text>
+  <text x="335" y="186" text-anchor="middle" class="d-label">falha: 401</text>
+  <path d="M200 80 L280 138" class="d-line" marker-end="url(#mk-autenticacao)"/>
+</svg>
+</Figura>
+
+O teste a seguir monta essas peças **à mão**, sem Spring Boot, para você ver cada uma trabalhando:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/AutenticacaoTest.java" semImports destacar="26-28, 38, 40, 47-50, 54-64, 72-74" />
+
+```bash
+mvn test -Dtest=AutenticacaoTest
+```
+
+```text
+autenticado=true nome=recepcao autoridades=[FACTOR_PASSWORD, ROLE_RECEPCAO] credenciais=null
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- `UsernamePasswordAuthenticationToken.unauthenticated(...)` cria o **pedido**: um `Authentication` com `isAuthenticated() == false`, carregando usuário e senha. O `AuthenticationManager` devolve **outro** objeto, autenticado, com as autoridades. A mesma interface (`Authentication`) representa os dois momentos, o que confunde no começo.
+- O `ProviderManager` mantém uma lista de `AuthenticationProvider` e pergunta a cada um se ele trata aquele tipo de pedido (`supports`). O `DaoAuthenticationProvider` trata usuário e senha; num resource server, um `JwtAuthenticationProvider` trata tokens. Para autenticar contra um banco, você não reescreve nada disso: implementa um `UserDetailsService` que busca o usuário no repositório.
+- As autoridades vieram com `FACTOR_PASSWORD`, a autoridade de fator do Spring Security 7, além do papel. E `credenciais=null`: o `ProviderManager` apaga a senha do `Authentication` depois de conferida, para que ela não fique na memória nem vaze num log.
+- Senha errada e usuário inexistente lançam a **mesma** exceção, com a **mesma** mensagem. O teste compara as duas mensagens entre si em vez de fixar o texto, porque o Spring Security traduz mensagens para o idioma da JVM: rodando em português, a mensagem é "Usuário inexistente ou senha inválida". Por trás dessa igualdade, o `DaoAuthenticationProvider` também gasta tempo com um hash falso quando o usuário não existe, para que o tempo de resposta não denuncie quais usuários existem.
+- O último teste põe o resultado no `SecurityContextHolder`, como o filtro faz. Ele limpa o contexto no `@AfterEach`: o holder é uma variável da thread, e o JUnit reaproveita threads.
+
+<Callout tipo="info" titulo="SecurityContextHolder e SecurityContextRepository">
+O `SecurityContextHolder` guarda o contexto **durante** a requisição, numa variável da thread (`ThreadLocal`). Quem guarda o contexto **entre** requisições é o `SecurityContextRepository`, e é o `SecurityContextHolderFilter` que o consulta no início de cada requisição. No console, o repositório usa a sessão HTTP: o login acontece uma vez e as próximas requisições recuperam o usuário pelo cookie `JSESSIONID`. Na API stateless, nada é salvo, e cada requisição precisa trazer a credencial. Desde o Spring Security 6, salvar o contexto é **explícito**: se você escrever um filtro de login próprio que põe um `Authentication` no holder, precisa também chamar `securityContextRepository.saveContext(...)`, ou o usuário "esquece" o login na requisição seguinte. Uma consequência do `ThreadLocal`: código que roda em outra thread (um `@Async`, um `CompletableFuture`) não enxerga o usuário, a menos que você propague o contexto (por exemplo, com `DelegatingSecurityContextExecutor`).
+</Callout>
+
+### Passo 6: a matriz de acesso
+
+**O que vamos fazer e por quê.** Segurança de API se prova com uma **matriz de acesso**: cada linha é um perfil tentando uma operação, com o status esperado. Escrever a matriz força o time a decidir cada combinação ("o admin lê consultas?") e, testada, ela vira documentação que não fica desatualizada. O teste usa credenciais reais pelo HTTP Basic: a requisição passa pelo filtro, pelo `UserDetailsService` e pelo `PasswordEncoder`, sem atalho.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/MatrizDeAcessoTest.java" semImports destacar="22-23, 37-53, 58-63" />
+
+```bash
+mvn test -Dtest=MatrizDeAcessoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.filtros.MatrizDeAcessoTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.703 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@SpringBootTest` com `@AutoConfigureMockMvc` sobe a aplicação inteira (sem servidor HTTP) e configura um `MockMvcTester`, a API de testes MVC com AssertJ que você conheceu nos [testes de fatia](../../10-testes/04-testes-de-fatia-no-spring/). O Spring Boot já aplica a configuração do Spring Security ao MockMvc: todas as cadeias e filtros rodam.
+- Por que não `@WebMvcTest`? Uma fatia web carrega controllers e alguns tipos de componente, mas não as classes de configuração da aplicação; para testar as regras reais, você precisaria importar a `SegurancaConfig` e cada bean de que ela depende. Para uma matriz de acesso, que é um teste de integração da segurança, subir a aplicação é mais honesto. Em projetos grandes, a alternativa é uma fatia com `@Import` explícito da configuração de segurança e os serviços como `@MockitoBean`.
+- `httpBasic(usuario, senha)` é um *post-processor* do `spring-security-test`: ele monta o header `Authorization` antes de a requisição entrar na cadeia. Não simula a autenticação: ela acontece de verdade.
+- O nome de cada caso (`{2} {0} {1} -> {3}`) vira, na IDE e no relatório, algo como `admin GET /api/consultas -> 403`. Quando uma linha falhar, você sabe qual célula da matriz quebrou sem abrir o código.
+- Repare nas linhas que não são óbvias: `admin` recebe 403 em tudo da API (menor privilégio); `recepcao` recebe 403 no prontuário, que passa pela regra de rota e é barrado pela de método; uma rota inexistente sob `/api` (`/api/relatorios`) recebe 403, porque `denyAll()` decide antes de qualquer controller dizer 404.
+
+A última observação merece uma pausa. Para um usuário autenticado, `GET /api/relatorios` dá **403**, não 404. Isso é bom (não revela quais rotas existem para quem não pode usá-las) e às vezes confunde quem está integrando. Documente esse comportamento no contrato da API.
+
+### Passo 7: o console, a sessão e o CSRF
+
+**O que vamos fazer e por quê.** A cadeia do console é o oposto da API: o navegador guarda um cookie de sessão e o envia sozinho em toda requisição para o domínio. É exatamente essa "carona automática" que o CSRF explora, e por isso a proteção fica ligada.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/RespostasDeErroTest.java" semImports destacar="77-84, 86-91, 93-98" />
+
+```bash
+mvn test -Dtest=RespostasDeErroTest
+```
+
+```text
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- `aApiEStatelessENaoCriaSessao` confere duas coisas: a resposta não tem `Set-Cookie` e a requisição terminou sem sessão (`getSession(false)` devolve `null`, ou seja, ninguém criou uma).
+- `oConsoleRedirecionaQuemNaoEstaLogadoParaOLogin`: na cadeia do console, o entry point padrão do `formLogin` é um redirecionamento (302) para `/login`, não um 401. Para um navegador, é o comportamento certo; para uma API, seria péssimo (o cliente receberia HTML de uma página de login). É mais um motivo para não misturar os dois clientes numa cadeia só. No MockMvc, o `Location` aparece relativo (`/login`); rodando no Tomcat, o curl mostrou `http://localhost:8080/login`.
+- `oConsoleExigeTokenCsrfEmPost`: com `@WithMockUser` como `ADMIN`, um POST sem token CSRF recebe 403, mesmo com o papel certo. O post-processor `csrf()` acrescenta um token válido, e a mesma requisição passa.
+
+Para ver o fluxo completo do navegador com `curl`, guarde os cookies num arquivo:
+
+```bash
+curl -s -c cookies.txt -b cookies.txt http://localhost:8080/login | grep _csrf
+# name="_csrf" type="hidden" value="0gCAQoTAqcaPET66iitUm_vc0yXub1y9..." />
+curl -i -c cookies.txt -b cookies.txt \
+     -d "username=admin&password=admin-123&_csrf=<token-da-linha-acima>" http://localhost:8080/login
+# HTTP/1.1 302
+# Set-Cookie: JSESSIONID=A88A7C0B1DAF7962422BCC5EACCE6443; Path=/; HttpOnly
+curl -b cookies.txt http://localhost:8080/admin/painel
+# Painel da clínica. Olá, admin.
+curl -i -b cookies.txt -X POST http://localhost:8080/admin/cache/limpar
+# HTTP/1.1 403
+```
+
+O formulário de login traz o token CSRF num campo escondido; o login bem-sucedido emite um **novo** `JSESSIONID` (proteção contra *session fixation*, em que um atacante planta um identificador de sessão conhecido antes do login da vítima); e um POST com o cookie, mas sem o token, é recusado. É exatamente o que aconteceria se outro site tentasse fazer o navegador do administrador limpar o cache.
+
+### Passo 8: usuários simulados e o que eles não testam
+
+**O que vamos fazer e por quê.** Montar credenciais reais em cada teste é verboso, e com tokens (próxima aula) seria preciso gerar um JWT assinado por teste. O `spring-security-test` oferece atalhos que colocam um `Authentication` pronto no contexto.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/filtros/UsuarioSimuladoTest.java" semImports destacar="31-34, 37-42, 45-49, 52-57" />
+
+```bash
+mvn test -Dtest=UsuarioSimuladoTest
+```
+
+```text
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- `@WithMockUser(username = "dra.helena", roles = "MEDICO")` cria um usuário com `ROLE_MEDICO` no contexto de teste **antes** de o teste rodar. Funciona tanto em requisições MockMvc quanto em chamadas diretas a beans.
+- `jwt()` cria um `JwtAuthenticationToken` com o `sub` e as autoridades que você escolher. Repare: **esta API nem aceita JWT** (ela usa HTTP Basic) e mesmo assim o teste passou. É a prova de que esses atalhos pulam a autenticação inteira e exercitam só a autorização. São ótimos para testar regras ("quem tem `ROLE_RECEPCAO` lista consultas") e inúteis para provar que a autenticação está configurada.
+- `jwtSemOPapelCertoLeva403` mostra o erro clássico de quem migra para tokens: as autoridades de um JWT, por padrão, vêm do claim `scope` com prefixo `SCOPE_`, e nenhuma regra `hasRole` casa com elas. A próxima aula resolve isso com um conversor de autoridades.
+- Os dois últimos testes chamam o `ServicoDeProntuario` **sem HTTP**: a regra do `@PreAuthorize` vale do mesmo jeito e lança `AuthorizationDeniedException` (uma subclasse de `AccessDeniedException`). Via HTTP, essa exceção sobe pelo `DispatcherServlet`, chega ao `ExceptionTranslationFilter` e vira o mesmo 403 em Problem Details; a matriz do passo 6 já provou isso na linha do prontuário.
+
+A divisão de trabalho que funciona: **matriz com credenciais reais** para as combinações que importam (ela prova autenticação e autorização juntas), **usuários simulados** para testes de regra mais finos e para testes de serviço, e na próxima aula, **testes com tokens de verdade** (válido, expirado, de outro emissor, assinatura adulterada) para provar a validação.
+
+### Passo 9: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.AuditoriaTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.AutenticacaoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.CadeiasDeFiltrosTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.MatrizDeAcessoTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.RespostasDeErroTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ...filtros.UsuarioSimuladoTest
+[INFO] Tests run: 35, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Trinta e cinco testes, que cobrem a estrutura (cadeias e posição dos filtros), a autenticação (peças isoladas), a autorização (matriz e método), o formato das respostas, a ausência de sessão na API e o CSRF no console.
+
+## Quando dá errado
+
+Todas as mensagens abaixo são reais: foram geradas alterando a configuração desta aula de propósito e rodando os testes. As linhas foram encurtadas onde indicado com `...`.
+
+### Duas cadeias que casam com tudo
+
+Removendo o `securityMatcher("/api/**")` da cadeia `api`, as duas cadeias passam a casar com qualquer requisição:
+
+```text
+Caused by: org.springframework.security.web.UnreachableFilterChainException: A filter chain that
+matches any request [DefaultSecurityFilterChain defined as 'api' in [class path resource
+[dev/trilhajava/m11/aulas/filtros/SegurancaConfig.class]] matching [any request] and having filters
+[DisableEncodeUrl, ..., FiltroDeAuditoria, ExceptionTranslation, Authorization]] has already been
+configured, which means that this filter chain [DefaultSecurityFilterChain defined as 'console' in
+[class path resource [dev/trilhajava/m11/aulas/filtros/SegurancaConfig.class]] matching
+[any request] and having filters [...]] will never get invoked. Please use
+`HttpSecurity#securityMatcher` to ensure that there is only one filter chain configured for
+'any request' and that the 'any request' filter chain is published last.
+```
+
+**Como ler:** a mensagem nomeia as duas cadeias pelo nome do método `@Bean` (`api` e `console`) e diz que a segunda "nunca será invocada". **Como corrigir:** só uma cadeia pode ficar sem `securityMatcher`, e ela precisa ter o `@Order` mais alto. Se a cadeia pega-tudo ficar com `@Order(1)` e a da API com `@Order(2)`, o erro é o mesmo, porque a ordem dos beans é que decide.
+
+### Regras depois de `anyRequest()`
+
+Acrescentando `.anyRequest().authenticated()` antes de `.requestMatchers("/admin/**")` no console:
+
+```text
+Caused by: java.lang.IllegalStateException: Can't configure requestMatchers after anyRequest
+```
+
+**Como ler:** as regras valem na ordem em que aparecem, e `anyRequest()` casa com tudo; uma regra depois dele seria código morto. O Spring Security recusa a configuração na subida. **Como corrigir:** regras específicas primeiro, `anyRequest()` por último, uma vez só.
+
+### `hasRole` com o prefixo
+
+Trocando `hasRole("ADMIN")` por `hasRole("ROLE_ADMIN")`:
+
+```text
+Caused by: java.lang.IllegalArgumentException: ROLE_ADMIN should not start with ROLE_ since ROLE_ is
+automatically prepended when using hasAnyRole. Consider using hasAnyAuthority instead.
+```
+
+**Como ler:** `hasRole` acrescenta `ROLE_` sozinho e recusa quem já o escreveu. O erro silencioso é o inverso: `hasAuthority("ADMIN")` compila, sobe e nega acesso a todo mundo, porque a autoridade real é `ROLE_ADMIN`. **Como corrigir:** use `hasRole("ADMIN")` ou `hasAuthority("ROLE_ADMIN")`, e escolha um estilo para o projeto inteiro.
+
+### Filtro posicionado relativo a uma classe desconhecida
+
+`addFilterBefore(new FiltroDeAuditoria(), FiltroDeCorrelacao.class)`:
+
+```text
+Caused by: java.lang.IllegalArgumentException: The Filter class
+dev.trilhajava.m11.aulas.filtros.FiltroDeCorrelacao does not have a registered order
+```
+
+**Como ler:** o segundo argumento precisa ser um filtro que o Spring Security conhece (os da lista do passo 2) ou um filtro seu que **já** foi adicionado à mesma cadeia. O `FiltroDeCorrelacao` vive fora da cadeia, no Tomcat. **Como corrigir:** posicione relativo a um filtro do framework.
+
+### Auditoria antes da autenticação
+
+`addFilterBefore(new FiltroDeAuditoria(), BasicAuthenticationFilter.class)`. A aplicação sobe, as respostas são as mesmas, e o log fica assim:
+
+```text
+FiltroDeAuditoria : auditoria usuario=(nenhum) metodo=GET caminho=/api/consultas status=200
+FiltroDeAuditoria : auditoria usuario=(nenhum) metodo=GET caminho=/api/status status=200
+FiltroDeAuditoria : auditoria usuario=(nenhum) metodo=GET caminho=/api/consultas status=403
+[ERROR] Tests run: 3, Failures: 2, Errors: 0, Skipped: 0
+```
+
+**Como ler:** o filtro leu o usuário antes de o `BasicAuthenticationFilter` colocá-lo no contexto. Todo acesso vira "ninguém". Um log de auditoria assim é pior que nenhum: passa a impressão de que existe controle. **Como corrigir:** depois da autenticação. O `AuditoriaTest` pegou o erro; sem ele, a descoberta seria na auditoria.
+
+### Auditoria depois do `ExceptionTranslationFilter`
+
+`addFilterAfter(new FiltroDeAuditoria(), ExceptionTranslationFilter.class)`:
+
+```text
+FiltroDeAuditoria : auditoria usuario=dra.helena metodo=GET caminho=/api/consultas status=200
+FiltroDeAuditoria : auditoria usuario=anonymousUser metodo=GET caminho=/api/status status=200
+FiltroDeAuditoria : auditoria usuario=admin metodo=GET caminho=/api/consultas status=200
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0
+```
+
+**Como ler:** a terceira linha é a história do começo da aula. O `admin` recebeu 403, mas o log diz 200. O `AuthorizationFilter` lançou a exceção, ela atravessou o `finally` da auditoria (que leu o status ainda não escrito, 200) e só então o `ExceptionTranslationFilter` escreveu o 403. **Como corrigir:** antes do `ExceptionTranslationFilter`.
+
+### O filtro como `@Component`
+
+Anotando `FiltroDeAuditoria` com `@Component` e mantendo o `addFilterBefore(new FiltroDeAuditoria(), ...)`:
+
+```text
+FiltroDeAuditoria : auditoria usuario=anonymousUser metodo=GET caminho=/api/status status=200
+FiltroDeAuditoria : auditoria usuario=anonymousUser metodo=GET caminho=/api/status status=200
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0
+```
+
+**Como ler:** o Spring Boot registra no Tomcat **todo** bean do tipo `Filter`. O filtro roda uma vez como filtro de servlet comum, fora da segurança, e outra dentro da cadeia. O `OncePerRequestFilter` não impede, porque são duas instâncias com nomes diferentes. **Como corrigir:** não declare como bean um filtro que vai para a cadeia, ou, se ele precisar de injeção de dependências, mantenha o bean e desligue o registro automático com um `FilterRegistrationBean` com `setEnabled(false)`, como manda a documentação.
+
+### CSRF esquecido na API
+
+Removendo `.csrf(csrf -> csrf.disable())` da cadeia `api`:
+
+```text
+[ERROR] Tests run: 14, Failures: 2, Errors: 0, Skipped: 0
+[ERROR] MatrizDeAcessoTest.matriz(String, String, String, int)[6] <<< FAILURE!   anonimo POST /api/consultas
+expected: 401
+ but was: 403
+[ERROR] MatrizDeAcessoTest.matriz(String, String, String, int)[7] <<< FAILURE!   recepcao POST /api/consultas
+expected: 201
+ but was: 403
+```
+
+E o corpo da resposta da recepção:
+
+```text
+Status = 403
+Content type = application/problem+json
+"detail":"Seu perfil não tem permissão para esta operação."
+```
+
+**Como ler:** todo POST da API passou a exigir um token CSRF que nenhum cliente da API tem. O `CsrfFilter` roda **antes** da autenticação, então até o anônimo recebe 403 em vez de 401. E a mensagem engana: o CSRF negado vai para o mesmo `AccessDeniedHandler`, que diz "seu perfil não tem permissão". Quem estiver integrando vai procurar um problema de papel que não existe. **Como corrigir:** desligue o CSRF na cadeia stateless. E vale melhorar o handler: o `AccessDeniedException` que chega nesse caso é um `CsrfException` (por exemplo, `MissingCsrfTokenException`), e o `handle` pode devolver um `type` próprio para ele.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Uma cadeia para tudo, com exceções" depois="Uma cadeia por tipo de cliente">
+```java
+http
+    .csrf(csrf -> csrf.ignoringRequestMatchers("/api/**"))
+    .authorizeHttpRequests(r -> r
+        .requestMatchers("/api/**").hasAnyRole("RECEPCAO", "MEDICO")
+        .requestMatchers("/admin/**").hasRole("ADMIN")
+        .anyRequest().denyAll())
+    .httpBasic(Customizer.withDefaults())
+    .formLogin(Customizer.withDefaults());
+// sessão criada para a API, redirecionamento
+// para /login num cliente de API, Basic aceito
+// no console...
+```
+
+```java
+@Bean @Order(1)
+SecurityFilterChain api(HttpSecurity http) { /*
+    securityMatcher("/api/**"), Basic,
+    STATELESS, sem CSRF, Problem Details */ }
+
+@Bean @Order(2)
+SecurityFilterChain console(HttpSecurity http) { /*
+    sem matcher (pega-tudo, por último),
+    formLogin, sessão, CSRF */ }
+```
+</Comparar>
+
+A versão da esquerda funciona no caminho feliz e falha nas bordas: o console aceita HTTP Basic (um navegador vai abrir aquela janela cinza de usuário e senha), a API cria sessão para clientes que nunca vão usá-la, e um cliente da API sem credencial recebe um redirecionamento para uma página HTML. Cada exceção que você acrescenta (`ignoringRequestMatchers`, entry points por caminho) é uma regra a mais para esquecer.
+
+As armadilhas de bolso:
+
+- **Desligar CSRF por reflexo.** `csrf.disable()` é correto **só** onde nenhuma credencial vai sozinha pelo navegador. Se a sua SPA guarda a sessão num cookie (inclusive no padrão BFF, *Backend for Frontend*, em que o backend guarda o token e o navegador só tem um cookie), o CSRF precisa ficar ligado. No Spring Security 7, `csrf(csrf -> csrf.spa())` configura o padrão para SPAs: o token vai num cookie legível pelo JavaScript, que o devolve num header a cada requisição que altera estado.
+- **Achar que `SameSite` resolve tudo.** Cookies com `SameSite=Lax` (o padrão de vários navegadores) barram boa parte dos ataques CSRF, mas não todos: requisições do mesmo site (outro subdomínio comprometido) e navegadores antigos escapam. Trate `SameSite` como camada extra, não como substituto do token.
+- **`permitAll()` não desliga a segurança.** Uma rota com `permitAll()` ainda passa por toda a cadeia: headers, CSRF, autenticação (uma credencial inválida ainda gera 401). Para que a segurança ignore uma rota de vez (arquivos estáticos, por exemplo), o caminho moderno é uma cadeia própria com `securityMatcher` e `permitAll()`, e não o antigo `WebSecurityCustomizer.ignoring()`, que tira a rota até dos headers de segurança.
+- **Esquecer o `/error`.** Sem liberá-lo, qualquer erro do MVC em uma rota pública (um 400 de validação, um 404) é encaminhado para `/error`, que exige login, e o cliente vê 401 ou um redirecionamento.
+- **`@ExceptionHandler(Exception.class)` no `@RestControllerAdvice`.** Um handler "pega-tudo" captura também o `AuthorizationDeniedException` lançado pelo `@PreAuthorize` dentro do controller, e o 403 vira 500. Se você tem um handler genérico, relance as exceções de segurança ou trate `AccessDeniedException` explicitamente.
+- **Só segurança de URL.** Regras de rota protegem a porta de entrada HTTP. Um job agendado, um consumidor de fila ou outra rota que chame o mesmo serviço passam por fora delas. Dados sensíveis merecem regra no método, como o prontuário.
+
+**Quando NÃO usar o que você viu aqui:**
+
+- **Não use HTTP Basic em produção para usuários finais.** A senha viaja em cada requisição (em Base64, que não é criptografia) e não há como revogar uma sessão sem trocar a senha. Basic é aceitável para integração entre sistemas, sempre com TLS e credenciais próprias para cada sistema; para usuários, use tokens (próxima aula) ou sessão.
+- **Não escreva um filtro de autenticação próprio** se um mecanismo do framework resolve: `httpBasic`, `formLogin`, `oauth2ResourceServer`, `oauth2Login`. Um filtro próprio precisa tratar salvamento de contexto, eventos, mensagens uniformes, tempo constante e sessão, e é onde os bugs de segurança moram.
+- **Não use `@EnableWebSecurity(debug = true)` fora da sua máquina**, nem log da segurança em TRACE em produção: os dois registram headers, incluindo `Authorization`.
+- **Não crie uma segunda cadeia só para uma rota pública.** Se é uma rota dentro do mesmo tipo de cliente, um `permitAll()` resolve. Cadeias separadas são para clientes com necessidades diferentes (sessão contra stateless, mecanismos de autenticação diferentes).
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Uma cadeia ou várias.** A regra que funciona: uma cadeia por **tipo de cliente**, não por recurso. API para aplicativos (stateless, token), console para pessoas (sessão, CSRF), talvez uma terceira para o Actuator (rede interna, autenticação própria, sem CSRF). Mais cadeias significam mais configuração duplicada (headers, CORS, handlers de erro); extraia essas partes para métodos ou para *modular configuration* (o Spring Security 7 aplica a todas as cadeias os beans `Customizer<HttpSecurity>` e os customizadores de bloco, como um `Customizer<HeadersConfigurer<HttpSecurity>>`). Menos cadeias significam exceções dentro de uma cadeia só, que é como a maioria das brechas nasce. Ao justificar para o time, mostre a lista de filtros de cada cadeia, lado a lado: ela torna a diferença concreta.
+
+**Stateless ou sessão.** Stateless escala horizontalmente sem esforço (qualquer instância atende qualquer requisição) e não exige CSRF, mas transfere o problema para o token: revogação, expiração, armazenamento no cliente. Sessão dá revogação imediata (invalidou a sessão, acabou) e é o modelo mais seguro para navegadores, mas exige sessão compartilhada entre instâncias (Spring Session com Redis ou banco, ou *sticky sessions* no balanceador, que tornam o deploy e a queda de uma instância mais dolorosos). Para uma SPA do próprio produto, muitos times sêniores escolhem **sessão com cookie no padrão BFF** em vez de guardar JWT no navegador, justamente por causa da revogação e de não expor o token ao JavaScript. A decisão deve ser registrada num ADR, com o motivo.
+
+**Custo de autenticação por requisição.** Com HTTP Basic e BCrypt, **cada requisição** calcula um hash de senha de propósito lento (dezenas a centenas de milissegundos com fator de custo 10 a 12). Numa API de alto volume, isso vira CPU e latência: mil requisições por segundo podem exigir dezenas de núcleos só para hashes. É um dos motivos para trocar a senha por um token emitido uma vez e validado barato a cada requisição (uma verificação de assinatura, na próxima aula). Se precisar manter Basic entre sistemas, use credenciais longas e aleatórias, que permitem um hash mais rápido sem perder segurança.
+
+**Observabilidade da segurança.** Em produção, as perguntas são "quantas requisições estão sendo negadas, por quem, em quais rotas" e "houve pico de falhas de login". Logs de auditoria como o desta aula respondem a primeira; eventos de autenticação (`AuthenticationSuccessEvent`, `AbstractAuthenticationFailureEvent`) e de autorização (`AuthorizationDeniedEvent`, publicado quando você registra um `AuthorizationEventPublisher`) respondem a segunda e alimentam métricas e alertas. Um salto de 403 depois de um deploy é sinal de regra quebrada; um salto de 401 com usuários variados é sinal de ataque de *credential stuffing* (testar listas de senhas vazadas). Em logs, nunca registre o header `Authorization`, cookies de sessão nem o corpo de requisições de login.
+
+**Falhar fechado.** A configuração desta aula termina as duas cadeias com `anyRequest().denyAll()`. O custo é atrito: cada endpoint novo precisa de uma regra explícita, e alguém vai reclamar de um 403 inesperado. O ganho é que o erro de esquecer uma regra resulta em acesso **negado**, que aparece no primeiro teste, e não em dado vazado, que aparece num relatório de incidente. Em revisão de código, trate `anyRequest().permitAll()` e `anyRequest().authenticated()` em APIs com várias rotas sensíveis como pontos de atenção.
+
+**Matriz de acesso como contrato.** Em times grandes, a matriz de acesso é a forma de a área de negócio, a segurança e o desenvolvimento concordarem sobre quem pode o quê. Mantida como teste parametrizado (passo 6), ela quebra o build quando alguém altera uma regra sem discutir. O custo é que testes com `@SpringBootTest` são mais lentos que testes de fatia; o contexto é reaproveitado entre as classes com a mesma configuração (o cache de contexto do Spring), então o custo real é uma subida por configuração diferente, não por teste. Evite variar propriedades à toa entre classes de teste.
+
+**Quando trocar de abordagem.** HTTP Basic com usuários em memória serve para esta aula e para ferramentas internas pequenas. Sinais de que está na hora de mudar: mais de um cliente externo (vá para OAuth2 com tokens), necessidade de login único entre sistemas (OpenID Connect, aula 07), requisitos de multifator (o suporte nativo a MFA do Spring Security 7, construído sobre as autoridades de fator), ou autorização que depende do **dono** do recurso e não só do papel ("a recepção só vê consultas da própria unidade"), que é o tema da aula 04.
+
+<Callout tipo="entrevista">
+**"Explique como o Spring Security funciona."** Uma boa resposta segue o caminho da requisição: o `DelegatingFilterProxy` registrado no contêiner repassa ao `FilterChainProxy`, que escolhe a primeira `SecurityFilterChain` que casa; filtros de autenticação usam o `AuthenticationManager` (`ProviderManager`, providers, `UserDetailsService`, `PasswordEncoder`) para pôr um `Authentication` no `SecurityContextHolder`; o `AuthorizationFilter` aplica as regras e o `ExceptionTranslationFilter` traduz falhas em 401 ou 403. Tudo antes do `DispatcherServlet`, e por isso o `@ControllerAdvice` não vê 401 e 403.
+
+**"Quando você desliga o CSRF?"** Quando nenhuma credencial vai automaticamente pelo navegador (token no header `Authorization`, cadeia stateless). Com cookie de sessão, nunca; em SPA com cookie, `csrf.spa()`. Bônus: o `CsrfFilter` roda antes da autenticação, e por isso um POST sem token dá 403 até para quem não está autenticado.
+
+**"Como você testa a segurança de uma API?"** Matriz de acesso com credenciais reais, cobrindo cada perfil em cada operação; testes de formato para 401 e 403; `@WithMockUser` e `jwt()` para regras finas, sabendo que eles pulam a autenticação; e testes com tokens inválidos para provar a validação. Bônus: um teste que confere a posição dos filtros próprios.
+
+**"Qual a diferença entre 401 e 403?"** 401: não sei quem você é (sem credencial, credencial inválida ou anônimo), e a resposta traz `WWW-Authenticate`. 403: sei quem você é e você não pode. Armadilha que vale citar: um POST sem CSRF dá 403 com a mesma mensagem de "sem permissão", se o handler não distinguir.
+
+**"Por que um filtro customizado pode rodar duas vezes?"** Porque o Spring Boot registra todo bean `Filter` no contêiner; se ele também for adicionado à cadeia, roda nas duas. Solução: não declarar como bean ou desligar o registro com `FilterRegistrationBean.setEnabled(false)`.
+</Callout>
+
+## Checkpoint
+
+A clínica contratou um laboratório parceiro, que vai consultar resultados de exame pela API. Um colega propôs esta alteração na cadeia `api` (o resto da configuração continua igual):
+
+```java
+.authorizeHttpRequests(regras -> regras
+        .requestMatchers(GET, "/api/status").permitAll()
+        .requestMatchers("/api/**").hasAnyRole("RECEPCAO", "MEDICO")
+        .requestMatchers(GET, "/api/exames/**").hasRole("LABORATORIO")
+        .requestMatchers(POST, "/api/consultas").hasRole("RECEPCAO")
+        .anyRequest().denyAll())
+```
+
+Sem rodar nada, preencha o status de cada linha e diga o que está errado e como corrigir:
+
+1. Usuário com `ROLE_LABORATORIO`, `GET /api/exames/55`, com credenciais válidas.
+2. `dra.helena` (`MEDICO`), `POST /api/consultas`.
+3. `recepcao`, `GET /api/consultas/1/prontuario`.
+4. Requisição anônima, `GET /api/exames/55`.
+
+<details>
+<summary>Solução</summary>
+
+1. **403.** A regra `/api/**` vem antes e casa com `/api/exames/55`; como vale a primeira que casar, o papel `LABORATORIO` nunca é consultado. A regra de exames é código morto.
+2. **201.** A mesma regra ampla casa com `POST /api/consultas` e aceita `MEDICO`. A regra que restringia o POST à recepção também virou código morto, e uma médica agora marca consultas. Isso é escalação de privilégio silenciosa: nenhum erro, nenhum log diferente.
+3. **403.** A rota passa (a regra ampla aceita `RECEPCAO`), mas o `@PreAuthorize("hasRole('MEDICO')")` do serviço barra. É a segurança de método funcionando como segunda camada, e o motivo de ela existir.
+4. **401.** O anônimo não satisfaz `hasAnyRole`, e o `ExceptionTranslationFilter` trata anônimo como não autenticado.
+
+**Correção:** regras específicas antes das amplas, e nada de regra ampla que case com métodos de escrita:
+
+```java
+.requestMatchers(GET, "/api/status").permitAll()
+.requestMatchers(GET, "/api/exames/**").hasRole("LABORATORIO")
+.requestMatchers(POST, "/api/consultas").hasRole("RECEPCAO")
+.requestMatchers(GET, "/api/consultas/**").hasAnyRole("RECEPCAO", "MEDICO")
+.anyRequest().denyAll()
+```
+
+**Como provar:** acrescente à `MatrizDeAcessoTest` as linhas `GET, /api/exames/55, laboratorio, 200` (com um usuário `laboratorio` no `UserDetailsService`) e confira que a linha `POST, /api/consultas, dra.helena, 403` já existente falharia com a configuração do colega. Uma matriz completa teria pegado o erro antes do code review.
+
+</details>
+
+<Quiz
+  id="11-spring-security"
+  questoes={[
+    {
+      pergunta: 'A aplicação tem duas SecurityFilterChain: uma com securityMatcher("/api/**") e @Order(2), outra sem securityMatcher e @Order(1). O que acontece?',
+      opcoes: ['Funciona: o Spring escolhe a cadeia mais específica', 'A aplicação não sobe: a cadeia que casa com tudo vem primeiro e a outra nunca seria usada (UnreachableFilterChainException)', 'As duas cadeias rodam em sequência', 'Só a cadeia da API roda, para todas as URLs'],
+      correta: 1,
+      explicacao: 'O `FilterChainProxy` usa a primeira cadeia que casar, na ordem dos beans. A cadeia sem matcher casa com tudo, então a da API ficaria inalcançável, e o Spring Security recusa a configuração na subida. A cadeia pega-tudo precisa ser a última.',
+    },
+    {
+      pergunta: 'Um filtro de auditoria registra o status da resposta num bloco finally. Em qual posição ele registra corretamente um 403 gerado pela autorização?',
+      opcoes: ['Antes do BasicAuthenticationFilter', 'Depois do ExceptionTranslationFilter', 'Antes do ExceptionTranslationFilter e depois dos filtros de autenticação', 'Depois do AuthorizationFilter'],
+      correta: 2,
+      explicacao: 'O `AuthorizationFilter` lança a exceção e quem escreve o 403 é o `ExceptionTranslationFilter`. Um filtro depois do tradutor vê a exceção passar com o status ainda em 200; um filtro antes da autenticação não sabe quem é o usuário.',
+    },
+    {
+      pergunta: 'Sua API stateless autentica só com Bearer token no header Authorization. Um colega quer manter o CSRF ligado "por segurança". O que acontece?',
+      opcoes: ['Nada muda: o CSRF só afeta formulários HTML', 'Todo POST, PUT, PATCH e DELETE passa a receber 403, inclusive de clientes anônimos, porque nenhum cliente da API envia token CSRF', 'A API fica mais segura sem efeito colateral', 'Os GETs passam a exigir token'],
+      correta: 1,
+      explicacao: 'O `CsrfFilter` roda antes da autenticação e exige o token em métodos que alteram estado. Sem cookie de sessão, não há o que o CSRF proteja; desligá-lo numa cadeia stateless com token no header é a escolha certa.',
+    },
+    {
+      pergunta: 'Um teste com jwt().authorities(new SimpleGrantedAuthority("ROLE_RECEPCAO")) passa contra uma API que só aceita HTTP Basic. O que isso mostra?',
+      opcoes: ['Um bug no Spring Security', 'Que a API aceita JWT sem configuração', 'Que jwt() pula a autenticação e testa só a autorização; a autenticação precisa de testes com credenciais reais', 'Que o teste está errado e deveria falhar com 401'],
+      correta: 2,
+      explicacao: 'Os post-processors `jwt()`, `user()` e a anotação `@WithMockUser` colocam um `Authentication` pronto no contexto. Eles servem para testar regras de autorização; a matriz com `httpBasic()` (ou tokens reais) é que prova a autenticação.',
+    },
+    {
+      pergunta: 'Por que a resposta 401 da API inclui o header WWW-Authenticate e a 403 não?',
+      opcoes: ['Por convenção do Spring, sem motivo técnico', 'Porque o 401 diz como se autenticar (o cliente pode resolver enviando credenciais); no 403 o cliente já está autenticado e autenticar de novo não resolve', 'Porque o 403 é gerado pelo controller', 'Porque o header só funciona com HTTP Basic'],
+      correta: 1,
+      explicacao: 'A RFC 9110 exige `WWW-Authenticate` no 401, indicando o esquema (`Basic`, `Bearer`). O 403 significa que a identidade é conhecida e não tem permissão.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O Tomcat conhece um único filtro do Spring Security, o `DelegatingFilterProxy` (ordem -100), que repassa ao `FilterChainProxy`. Ele usa **a primeira** `SecurityFilterChain` que casa; só os filtros dela rodam, antes do `DispatcherServlet`.
+- Várias cadeias: `securityMatcher` decide quem entra, `@Order` decide a ordem, e só a última pode casar com tudo. Uma cadeia por tipo de cliente: API stateless sem CSRF, console com sessão e CSRF.
+- Inspecione as cadeias pelo log DEBUG de `DefaultSecurityFilterChain`, pelo TRACE de `org.springframework.security` e, de forma permanente, com um teste sobre o `FilterChainProxy`.
+- Autenticação: o filtro extrai a credencial, o `ProviderManager` delega ao `DaoAuthenticationProvider`, que usa `UserDetailsService` e `PasswordEncoder`. O resultado vai para o `SecurityContextHolder` (por thread); o `SecurityContextRepository` guarda entre requisições, ou não guarda nada na API stateless.
+- DSL do Spring Security 7: só lambdas, `authorizeHttpRequests`, `PathPatternRequestMatcher`, `csrf.spa()`, autoridade `FACTOR_PASSWORD`. Regras em ordem, específicas primeiro, `anyRequest().denyAll()` no fim, `/error` liberado.
+- 401 e 403 nascem nos filtros: escreva Problem Details no `AuthenticationEntryPoint` (com `WWW-Authenticate`) e no `AccessDeniedHandler`, e passe o entry point também ao mecanismo de autenticação.
+- Filtro próprio: posicione relativo a um filtro do framework, pela informação de que ele precisa; não o declare como bean; prove a posição com teste.
+- Teste com matriz de acesso e credenciais reais; `@WithMockUser` e `jwt()` testam só a autorização.
+
+## Próximo passo
+
+Na próxima aula, [JWT e OAuth2 Resource Server](../../11-seguranca/03-jwt-e-resource-server/), a cadeia `api` troca o HTTP Basic por tokens JWT validados pelo `oauth2ResourceServer`: o `BearerTokenAuthenticationFilter` entra no lugar do `BasicAuthenticationFilter`, o `WWW-Authenticate` passa a ser `Bearer`, e você vai converter os claims do token nas autoridades `ROLE_` que a matriz desta aula exige. Depois, no [exercício 11.02, API com JWT](../../../exercicios/11-seguranca/02-api-com-jwt/), você aplica as duas aulas juntas.
+
+## Referências
+
+- Spring Security Reference: [Architecture](https://docs.spring.io/spring-security/reference/servlet/architecture.html) (DelegatingFilterProxy, FilterChainProxy, várias SecurityFilterChain, filtros próprios, log)
+- Spring Security Reference: [Authentication Architecture](https://docs.spring.io/spring-security/reference/servlet/authentication/architecture.html) e [Username/Password: DaoAuthenticationProvider](https://docs.spring.io/spring-security/reference/servlet/authentication/passwords/dao-authentication-provider.html)
+- Spring Security Reference: [Authorize HttpServletRequests](https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html) e [Method Security](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html)
+- Spring Security Reference: [Cross Site Request Forgery (CSRF)](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html) e [Persisting Authentication](https://docs.spring.io/spring-security/reference/servlet/authentication/persistence.html)
+- Spring Security Reference: [Testing: MockMvc Support](https://docs.spring.io/spring-security/reference/servlet/test/mockmvc/index.html)
+- Spring Security Reference: [What's New in Spring Security 7.0](https://docs.spring.io/spring-security/reference/7.0/whats-new.html)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457) e [RFC 9110, seções 15.5.2 (401) e 15.5.4 (403)](https://www.rfc-editor.org/rfc/rfc9110)

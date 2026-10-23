@@ -1,0 +1,135 @@
+---
+titulo: Erros padronizados com Problem Details
+codigo: "08.03"
+resumo: Uma API de reservas de hotel responde erros em cinco formatos diferentes e vaza stack traces. Centralize tudo num tratador que fala RFC 9457 — inclusive para as exceções do próprio Spring.
+modulo: 08-spring-boot
+ordem: 3
+dificuldade: medio
+tempo: 2–3h
+conceitos: [ProblemDetail, RFC 9457, "@RestControllerAdvice", ResponseEntityExceptionHandler, segurança]
+aulas: [08-spring-boot/05-validacao-e-erros]
+java:
+  modulo: m08-spring-boot
+  teste: ErrosPadronizadosTest
+---
+
+## Contexto
+
+O aplicativo de uma rede de hotéis mostra, na tela de reserva, mensagens como `JSON parse error: Cannot deserialize value of type 'java.lang.Long'`. Numa auditoria de segurança, um erro 500 devolveu a senha do banco dentro da mensagem de exceção. E o time do app reclama que cada erro chega num formato: às vezes o corpo padrão do Spring, às vezes texto, às vezes vazio.
+
+A API de reservas **já funciona** (controller, serviço e exceções prontos). O seu trabalho é uma única classe: **`TratadorDeErros`**, que padroniza todas as falhas no formato **Problem Details (RFC 9457)**.
+
+## A API (pronta)
+
+| Requisição | Sucesso |
+|---|---|
+| `POST /reservas` com `{"quartoId", "hospede", "checkIn", "checkOut"}` | `201` + reserva |
+| `GET /reservas/{id}` | `200` |
+| `DELETE /reservas/{id}` | `204` |
+
+Exceções que o serviço lança: `ReservaNaoEncontradaException`, `QuartoIndisponivelException` (com `quartoId()`) e `PeriodoInvalidoException`. O DTO `NovaReserva` tem Bean Validation com mensagens em português.
+
+## O catálogo de erros
+
+Todos com `Content-Type: application/problem+json`, `type` = `https://api.hotel.dev/problemas/<slug>`, `title` fixo e `status` no corpo.
+
+| Situação | Status | slug | title | Extras |
+|---|---|---|---|---|
+| `ReservaNaoEncontradaException` | 404 | `reserva-nao-encontrada` | Reserva não encontrada | `detail` = mensagem da exceção, `instance` = caminho |
+| Bean Validation | 400 | `dados-invalidos` | Dados inválidos | `erros`: `[{campo, mensagem}]` **em ordem alfabética de campo** |
+| JSON malformado ou com tipo errado | 400 | `requisicao-malformada` | Requisição malformada | `detail` fixo, **sem** detalhes do Jackson |
+| `QuartoIndisponivelException` | 409 | `quarto-indisponivel` | Quarto indisponível | `quartoId` |
+| `PeriodoInvalidoException` | 422 | `periodo-invalido` | Período inválido | `detail` = mensagem da exceção |
+| qualquer outra exceção | 500 | `erro-interno` | Erro interno | `codigoRastreio` (UUID); **nada** da mensagem original |
+
+Além disso, os erros do **próprio Spring MVC** — 405 (método não permitido), 400 (parâmetro de caminho com tipo errado) e 404 (rota inexistente) — também precisam sair como `application/problem+json`.
+
+## Exemplos
+
+```json
+{
+  "type": "https://api.hotel.dev/problemas/dados-invalidos",
+  "title": "Dados inválidos",
+  "status": 400,
+  "detail": "Um ou mais campos estão inválidos.",
+  "instance": "/reservas",
+  "erros": [
+    {"campo": "checkIn", "mensagem": "check-in é obrigatório"},
+    {"campo": "hospede", "mensagem": "hóspede é obrigatório"}
+  ]
+}
+```
+
+```json
+{
+  "type": "https://api.hotel.dev/problemas/erro-interno",
+  "title": "Erro interno",
+  "status": 500,
+  "detail": "Ocorreu um erro inesperado. Informe o código de rastreio ao suporte.",
+  "instance": "/teste/falha",
+  "codigoRastreio": "3f1c9a52-8d0e-4c1b-9f7a-2e6b1d4a7c90"
+}
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ErrosPadronizadosTest` passam.
+- [ ] Nenhum `try/catch` foi adicionado ao controller ou ao serviço.
+- [ ] O erro 500 é **logado** com o stack trace e o código de rastreio (confira a saída do teste).
+- [ ] Os `type` e `title` estão em constantes ou num método auxiliar, não repetidos.
+
+## Desafios opcionais
+
+- Faça o `detail` e o `title` saírem em inglês quando o cliente enviar `Accept-Language: en` (dica: `MessageSource` e o `Locale` do `WebRequest`).
+- Adicione o header `X-Request-Id` recebido (ou um gerado) como extensão `requestId` em todos os problemas.
+- Publique uma página HTML para cada `type` (a RFC recomenda que a URI seja resolvível e documente o problema).
+
+<Dicas>
+<Dica nivel={1}>
+Faça `TratadorDeErros` estender `ResponseEntityExceptionHandler`. Só isso já faz os erros do framework (405, rota inexistente, tipo errado no caminho) saírem como Problem Details. Depois, escreva um `@ExceptionHandler` para cada exceção de negócio, devolvendo um `ProblemDetail`.
+</Dica>
+<Dica nivel={2}>
+- `ProblemDetail.forStatusAndDetail(status, detalhe)`, depois `setType(URI.create(...))`, `setTitle(...)` e `setProperty("quartoId", ...)`.
+- Para Bean Validation e JSON malformado, **sobrescreva** `handleMethodArgumentNotValid` e `handleHttpMessageNotReadable`, e termine com `handleExceptionInternal(ex, problema, headers, status, request)`.
+- O `instance` é preenchido pelo Spring com o caminho da requisição.
+</Dica>
+<Dica nivel={3}>
+A lista de erros:
+
+```java
+List<ErroDeCampo> erros = ex.getBindingResult().getFieldErrors().stream()
+        .sorted(Comparator.comparing(FieldError::getField))
+        .map(e -> new ErroDeCampo(e.getField(), e.getDefaultMessage()))
+        .toList();
+problema.setProperty("erros", erros);
+```
+
+Com `record ErroDeCampo(String campo, String mensagem)`, o Jackson gera `{"campo": ..., "mensagem": ...}`. Para o 500: `@ExceptionHandler(Exception.class)`, gere um `UUID`, faça `log.error("... {}", codigo, e)` e devolva só o código.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/reservas/TratadorDeErros.java" />
+
+### Por que assim
+
+- **Um ponto de tradução**: o controller e o serviço lançam exceções com significado de negócio; só o tratador sabe de HTTP. Mudar o formato de erro da API inteira é mudar uma classe.
+- **`ResponseEntityExceptionHandler`** já conhece dezenas de exceções do Spring MVC e produz `ProblemDetail` para todas. Sobrescrevemos só as duas que precisavam de personalização.
+- **Handlers específicos vencem o genérico**: dentro do mesmo advice, o Spring escolhe o `@ExceptionHandler` mais específico. O `Exception.class` só pega o que ninguém tratou.
+- **Sem vazamento**: o 400 de JSON malformado e o 500 usam textos fixos. O detalhe técnico vai para o log, amarrado ao `codigoRastreio` — o suporte encontra a ocorrência exata sem que o cliente veja nada interno.
+- **Erros ordenados**: listas em ordem estável tornam respostas e testes determinísticos.
+
+### 422 ou 400 para o período inválido?
+
+Os dois aparecem no mercado. Aqui, o JSON é válido e os campos passaram no Bean Validation: o que falhou foi uma **regra de negócio** (check-out antes do check-in, estadia longa demais) — por isso 422. Se a regra fosse de formato, seria 400. O importante é a API ser **consistente** e o `type` distinguir os casos.
+
+### Avalie sua solução
+
+- Existe algum caminho em que uma exceção chega ao cliente sem passar pelo seu tratador?
+- Se amanhã surgir a `HospedeBloqueadoException`, quantas linhas você precisa escrever?
+- Seu log de erro 500 tem informação suficiente para depurar sem reproduzir o problema?
+
+</Solucao>

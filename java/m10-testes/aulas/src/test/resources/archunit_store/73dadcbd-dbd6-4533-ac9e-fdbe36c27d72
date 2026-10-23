@@ -1,0 +1,1 @@
+Method <dev.trilhajava.m10.aulas.arquitetura.legado.consultorio.aplicacao.AgendamentoDeConsultas.agendar(dev.trilhajava.m10.aulas.arquitetura.legado.consultorio.dominio.paciente.Paciente, java.time.LocalDateTime)> calls method <java.time.LocalDateTime.now()> in (AgendamentoDeConsultas.java:20)

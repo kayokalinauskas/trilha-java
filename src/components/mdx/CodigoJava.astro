@@ -1,0 +1,42 @@
+---
+/**
+ * Mostra um arquivo real do projeto Maven em /java. Assim o código exibido no site é
+ * exatamente o código que compila e passa nos testes do CI — nunca fica desatualizado.
+ *
+ * Uso: <CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/conta/ContaCorrente.java" />
+ * Também aceita arquivos .sql (ex.: m07-sql/solucao/src/main/resources/sql/0702/q1-....sql).
+ */
+import { Code } from 'astro-expressive-code/components';
+
+interface Props {
+  caminho: string;
+  /** linhas para destacar, ex.: "12-18" ou "3, 7-9" */
+  destacar?: string;
+  /** título alternativo (padrão: caminho encurtado) */
+  titulo?: string;
+  /** remove o bloco de imports para focar no essencial */
+  semImports?: boolean;
+}
+
+const arquivos = import.meta.glob(['/java/**/*.java', '/java/**/*.sql', '!/java/**/target/**'], {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+}) as Record<string, string>;
+
+const { caminho, destacar, titulo, semImports = false } = Astro.props;
+let codigo = arquivos[`/java/${caminho}`];
+if (codigo === undefined) {
+  throw new Error(`CodigoJava: arquivo não encontrado: java/${caminho}`);
+}
+if (semImports) {
+  codigo = codigo.replace(/^(package .*;\s*)(import .*;\s*)+/m, '$1');
+}
+const partes = caminho.split('/');
+const tipo = partes[1];
+const nome = partes.at(-1);
+const rotulo = titulo ?? `${tipo === 'solucao' ? 'solução' : tipo}/${nome}`;
+const meta = destacar ? `{${destacar}}` : undefined;
+---
+
+<Code code={codigo.trimEnd()} lang={caminho.endsWith('.sql') ? 'sql' : 'java'} title={rotulo} meta={meta} />

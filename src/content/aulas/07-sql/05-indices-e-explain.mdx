@@ -1,0 +1,137 @@
+---
+titulo: Índices e EXPLAIN
+descricao: Como um índice B-tree funciona, índices compostos e a ordem das colunas, quando o índice não é usado, e como ler um plano de execução com EXPLAIN ANALYZE.
+modulo: 07-sql
+ordem: 5
+duracao: 50
+objetivos:
+  - Explicar como um índice B-tree acelera buscas e o custo que ele traz
+  - Criar índices compostos na ordem certa
+  - Reconhecer consultas que não conseguem usar o índice
+  - Ler um plano de execução e confirmar a melhoria
+tags: [índices, B-tree, EXPLAIN, performance]
+flashcards:
+  - frente: Qual o custo de um índice?
+    verso: Espaço em disco e escrita mais lenta — todo INSERT, UPDATE e DELETE precisa atualizar os índices da tabela.
+  - frente: Um índice em (cliente_id, criado_em) serve para quais filtros?
+    verso: Para cliente_id sozinho e para cliente_id + criado_em (inclusive intervalo e ordenação por data). Não serve bem para criado_em sozinho.
+  - frente: Por que WHERE lower(email) = ? não usa o índice de email?
+    verso: Porque a função muda o valor indexado. Solução — índice de expressão CREATE INDEX ... ON cliente (lower(email)).
+  - frente: Qual a diferença entre Seq Scan e Index Scan no plano?
+    verso: Seq Scan lê a tabela inteira; Index Scan navega pelo índice até as linhas desejadas.
+  - frente: O que EXPLAIN ANALYZE faz além do EXPLAIN?
+    verso: Executa a consulta de verdade e mostra tempos e quantidades reais de linhas, além das estimativas.
+---
+
+A consulta que roda em 3 ms com 1.000 linhas no seu computador pode levar 8 segundos com 20 milhões em produção. Na maioria das vezes, a diferença é **um índice** — ou a falta dele.
+
+## Como um índice funciona
+
+Sem índice, para achar `WHERE cpf = '52998224725'` o banco lê **a tabela inteira** (*sequential scan*): O(n). Um índice **B-tree** é uma árvore ordenada e balanceada, como o `TreeMap` do módulo 03: o banco desce poucos níveis até a folha com o valor e de lá vai direto à linha. O(log n) — com milhões de linhas, 3 ou 4 níveis.
+
+<Figura legenda="Um B-tree: poucos níveis levam de milhões de linhas ao registro certo">
+<svg viewBox="0 0 640 190" width="640" role="img" aria-label="Raiz com faixas de valores, nós intermediários e folhas que apontam para as linhas da tabela">
+  <rect x="250" y="15" width="140" height="36" rx="8" class="d-accent"/><text x="320" y="38" text-anchor="middle" class="d-mono">raiz: M | T</text>
+  <rect x="60" y="85" width="140" height="36" rx="8" class="d-info"/><text x="130" y="108" text-anchor="middle" class="d-mono">A … L</text>
+  <rect x="250" y="85" width="140" height="36" rx="8" class="d-info"/><text x="320" y="108" text-anchor="middle" class="d-mono">M … S</text>
+  <rect x="440" y="85" width="140" height="36" rx="8" class="d-info"/><text x="510" y="108" text-anchor="middle" class="d-mono">T … Z</text>
+  <path d="M290 51 L140 83" class="d-line"/><path d="M320 51 V83" class="d-line"/><path d="M350 51 L500 83" class="d-line"/>
+  <rect x="200" y="150" width="240" height="30" rx="6" class="d-ok"/><text x="320" y="170" text-anchor="middle" class="d-label">folhas → ponteiros para as linhas</text>
+  <path d="M320 121 V148" class="d-line"/>
+</svg>
+</Figura>
+
+Índices B-tree servem para `=`, `<`, `>`, `BETWEEN`, `IN`, `ORDER BY` e `LIKE 'prefixo%'`.
+
+## O custo
+
+Nada é de graça: cada índice ocupa espaço e **toda escrita** na tabela precisa atualizá-lo. Uma tabela de eventos com 15 índices "por via das dúvidas" fica lenta para inserir. Crie índices para **consultas reais e frequentes**, e remova os que ninguém usa (o PostgreSQL mostra isso em `pg_stat_user_indexes`).
+
+## Índices compostos: a ordem importa
+
+```sql
+CREATE INDEX ix_pedido_cliente_data ON pedido (cliente_id, data);
+```
+
+Esse índice é ordenado primeiro por `cliente_id` e, dentro de cada cliente, por `data` — como uma lista telefônica ordenada por sobrenome e depois por nome.
+
+| Consulta | Usa bem o índice? |
+|---|---|
+| `WHERE cliente_id = 42` | sim |
+| `WHERE cliente_id = 42 AND data >= '2026-01-01'` | sim |
+| `WHERE cliente_id = 42 ORDER BY data DESC LIMIT 10` | sim, e evita ordenar |
+| `WHERE data >= '2026-01-01'` | não (a data não é a primeira coluna) |
+
+Regra prática: colunas de **igualdade** primeiro, depois as de **intervalo** ou **ordenação**.
+
+## Quando o índice não é usado
+
+- **Função na coluna**: `WHERE lower(email) = ?` ou `WHERE date(criado_em) = ?`. Solução: índice de expressão (`CREATE INDEX … ON cliente (lower(email))`) ou reescrever como intervalo (`criado_em >= '2026-03-02' AND criado_em < '2026-03-03'`).
+- **Curinga no início**: `LIKE '%silva'`. Para busca textual, use índices de texto (`pg_trgm`, *full-text search*).
+- **Baixa seletividade**: se `status = 'ATIVO'` corresponde a 90% da tabela, ler a tabela inteira é mais barato — e o planejador sabe disso.
+- **Tipos diferentes**: comparar uma coluna `BIGINT` com um parâmetro texto pode exigir conversão e anular o índice.
+- **Estatísticas desatualizadas**: o planejador estima mal; `ANALYZE tabela` atualiza.
+
+## EXPLAIN: pergunte ao banco
+
+Nunca adivinhe; peça o **plano de execução**:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM pedido WHERE cliente_id = 42 ORDER BY data DESC LIMIT 10;
+```
+
+```text
+Limit  (cost=0.43..8.61 rows=10) (actual time=0.031..0.045 rows=10 loops=1)
+  ->  Index Scan Backward using ix_pedido_cliente_data on pedido
+        (actual time=0.030..0.042 rows=10 loops=1)
+        Index Cond: (cliente_id = 42)
+Planning Time: 0.120 ms
+Execution Time: 0.068 ms
+```
+
+O que procurar:
+
+- **`Seq Scan`** em tabela grande com filtro seletivo → provável índice faltando.
+- **Estimativa × real** (`rows=10` × `actual rows=48000`) muito diferentes → estatísticas ruins.
+- **`Sort`** caro → um índice na ordem certa pode eliminá-lo.
+- **Nested Loop** com milhares de repetições (`loops=`) → o N+1 do banco.
+
+<Callout tipo="atencao">
+`EXPLAIN ANALYZE` **executa** a consulta. Com `UPDATE`/`DELETE`, faça dentro de uma transação e dê `ROLLBACK`.
+</Callout>
+
+<Callout tipo="entrevista">
+"Uma consulta ficou lenta em produção. O que você faz?" Resposta estruturada: **medir** (log de consultas lentas, `pg_stat_statements`, tracing), **explicar** (`EXPLAIN ANALYZE`), **agir** (índice composto na ordem certa, reescrever a consulta, eliminar N+1 na aplicação) e **validar** comparando os planos — sem esquecer o custo do índice nas escritas.
+</Callout>
+
+<Quiz
+  id="07-indices"
+  questoes={[
+    {
+      pergunta: 'Com o índice (cliente_id, data), qual consulta NÃO aproveita bem o índice?',
+      opcoes: ['WHERE cliente_id = 1', 'WHERE cliente_id = 1 AND data > X', 'WHERE data > X', 'WHERE cliente_id = 1 ORDER BY data'],
+      correta: 2,
+      explicacao: 'A primeira coluna do índice é cliente_id; filtrar só pela segunda não permite navegar na árvore.',
+    },
+    {
+      pergunta: 'WHERE date(criado_em) = \'2026-03-02\' está lento apesar do índice em criado_em. Melhor correção?',
+      opcoes: ['Remover o índice', 'Reescrever como criado_em >= \'2026-03-02\' AND criado_em < \'2026-03-03\'', 'Usar LIKE', 'Aumentar a memória'],
+      correta: 1,
+      explicacao: 'Sem função sobre a coluna, a condição vira um intervalo que o B-tree resolve.',
+    },
+    {
+      pergunta: 'Por que não criar índice em todas as colunas?',
+      opcoes: ['O PostgreSQL limita a 3 índices', 'Cada índice ocupa espaço e deixa INSERT/UPDATE/DELETE mais lentos', 'Índices só funcionam em PK', 'Não há desvantagem'],
+      correta: 1,
+      explicacao: 'Índices são um trade-off entre leitura e escrita.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- B-tree: busca O(log n) para igualdade, intervalos, ordenação e prefixos — ao custo de espaço e escritas mais lentas.
+- Índice composto: igualdade primeiro, depois intervalo/ordenação.
+- Funções na coluna, `LIKE '%x'`, baixa seletividade e tipos diferentes impedem o uso.
+- `EXPLAIN ANALYZE`: procure `Seq Scan`, estimativas erradas, `Sort` caro e loops repetidos.

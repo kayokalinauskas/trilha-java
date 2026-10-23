@@ -1,0 +1,538 @@
+---
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import RoadmapMap from '../components/RoadmapMap.astro';
+import { getCollection } from 'astro:content';
+import { NIVEL_PROJETO, getAulas, getExercicios, getModulos, getProjetos } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const [modulos, aulas, exercicios, perguntas, projetos] = await Promise.all([
+  getModulos(),
+  getAulas(),
+  getExercicios(),
+  getCollection('entrevista'),
+  getProjetos(),
+]);
+const primeiraAula = aulas[0];
+
+const passos = [
+  { icon: 'book' as const, titulo: 'Aprenda', texto: 'Aulas com intuição, código executável, diagramas, armadilhas comuns e um quiz no final.' },
+  { icon: 'code' as const, titulo: 'Pratique', texto: 'Exercícios com projeto Maven e testes JUnit: seu trabalho é deixar tudo verde. Os de revisão e carreira pedem uma entrega escrita.' },
+  { icon: 'bulb' as const, titulo: 'Destrave', texto: 'Dicas em três níveis. A solução comentada só aparece se você pedir.' },
+  { icon: 'cards' as const, titulo: 'Fixe', texto: 'Flashcards com repetição espaçada e simulador de entrevista com resposta-modelo.' },
+];
+---
+
+<Base title="Trilha Java Backend">
+  <section class="hero">
+    <div class="hero-bg" aria-hidden="true"></div>
+    <div class="container hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Edição 2026 · Java 25 LTS · Spring Boot 4</p>
+        <h1>Do básico à sua vaga de <span class="grad">backend Java</span>.</h1>
+        <p class="lead">
+          Uma trilha completa e gratuita para quem já sabe o básico de programação e quer chegar a Júnior e depois a Pleno — com
+          aulas de verdade, exercícios que simulam o trabalho real e soluções testadas que você só vê quando pedir.
+        </p>
+        <div class="row hero-cta">
+          <a class="btn btn-primary" href={url(`aulas/${primeiraAula?.id ?? ''}`)} data-continuar>
+            <Icon name="play" size={16} /> <span>Começar pelo módulo 00</span>
+          </a>
+          <a class="btn" href="#mapa"><Icon name="map" size={16} /> Ver o mapa</a>
+        </div>
+        <dl class="stats">
+          <div><dt>Módulos</dt><dd>{modulos.length}</dd></div>
+          <div><dt>Aulas prontas</dt><dd>{aulas.length}</dd></div>
+          <div><dt>Exercícios com testes</dt><dd>{exercicios.length}</dd></div>
+          <div><dt>Perguntas de entrevista</dt><dd>{perguntas.length}</dd></div>
+        </dl>
+      </div>
+
+      <div class="terminal" aria-label="Exemplo: rodando os testes de um exercício" role="img">
+        <div class="term-bar"><span></span><span></span><span></span><p>java/m02-poo/starter</p></div>
+        <pre class="term-body"><code><span class="p">$</span> mvn test -Dtest=ContaCorrenteTest
+<span class="dim">[INFO] Running ContaCorrenteTest</span>
+<span class="l1"><span class="ok">✔</span> depósito aumenta o saldo</span>
+<span class="l2"><span class="ok">✔</span> saque pode usar o cheque especial</span>
+<span class="l3"><span class="ok">✔</span> saque além do limite é recusado</span>
+<span class="l4"><span class="ok">✔</span> transferência que falha não muda nada</span>
+<span class="l5 dim">[INFO] Tests run: 15, Failures: 0, Errors: 0</span>
+<span class="l6 okb"> BUILD SUCCESS </span> <span class="l6 dim">— exercício concluído</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="container section-sm como">
+    <ol class="passos">
+      {
+        passos.map((p, i) => (
+          <li class="card passo">
+            <span class="passo-n" data-n={`0${i + 1}`} aria-hidden="true"></span>
+            <span class="passo-icon"><Icon name={p.icon} size={20} /></span>
+            <h2>{p.titulo}</h2>
+            <p>{p.texto}</p>
+          </li>
+        ))
+      }
+    </ol>
+  </section>
+
+  <section class="section" id="mapa" aria-labelledby="mapa-titulo">
+    <div class="container">
+      <div class="map-wrap">
+      <header class="map-head">
+        <div>
+          <p class="eyebrow">O mapa</p>
+          <h2 id="mapa-titulo">18 módulos, do primeiro <code>main</code> ao system design</h2>
+          <p class="lead">
+            Siga as setas: cada módulo depende dos anteriores. A bandeira <Icon name="flag" size={14} class="inline-ic" /> marca um marco do
+            projeto integrador <strong>Fintech Core</strong>, que vai para o seu portfólio.
+          </p>
+        </div>
+        <ul class="legend" aria-label="Legenda de níveis">
+          <li><span class="lvl-dot lvl-base"></span>Base</li>
+          <li><span class="lvl-dot lvl-jr"></span>Júnior</li>
+          <li><span class="lvl-dot lvl-pleno"></span>Pleno</li>
+          {modulos.some((m) => m.data.status === 'em-breve') && <li><span class="lvl-dot soon"></span>Em breve</li>}
+        </ul>
+      </header>
+      <RoadmapMap />
+      </div>
+    </div>
+  </section>
+
+  {
+    projetos.length > 0 && (
+      <section class="container section-sm" aria-labelledby="projetos-titulo">
+        <header class="pj-home-head">
+          <p class="eyebrow">Portfólio</p>
+          <h2 id="projetos-titulo">Projetos para mostrar na entrevista</h2>
+          <p class="lead">
+            Especificações completas, com requisitos, marcos, rubrica e roteiro de apresentação, para você construir do zero no seu GitHub.
+          </p>
+        </header>
+        <ul class="pj-home">
+          {projetos.map((p) => (
+            <li>
+              <a class={`card card-link pj-home-card pjh-${p.data.nivel}`} href={url(`projetos/${p.id}`)}>
+                <span class="pjh-nivel">{NIVEL_PROJETO[p.data.nivel]}</span>
+                <strong>{p.data.titulo}</strong>
+                <span class="pjh-dom">
+                  {p.data.dominio} · ~{p.data.horas}h
+                </span>
+              </a>
+            </li>
+          ))}
+        </ul>
+        <p class="pj-home-mais">
+          <a class="btn" href={url('projetos')}>
+            <Icon name="briefcase" size={16} /> Ver todos os projetos
+          </a>
+        </p>
+      </section>
+    )
+  }
+
+  <section class="container section-sm">
+    <div class="card cta-final">
+      <div>
+        <h2>Uma trilha honesta sobre o que o mercado pede</h2>
+        <p class="muted">
+          O conteúdo foi revisado em setembro de 2026 com base nas versões atuais (Java 25 LTS, Spring Boot 4.1, JUnit 6, Kafka 4) e no que
+          aparece em vagas de backend no Brasil e em vagas remotas internacionais.
+        </p>
+      </div>
+      <div class="row">
+        <a class="btn btn-primary" href={url('painel')}><Icon name="gauge" size={16} /> Meu painel</a>
+        <a class="btn" href={url('sobre')}>Metodologia</a>
+      </div>
+    </div>
+  </section>
+</Base>
+
+<script>
+  import { ler } from '../lib/progresso';
+  // "Continuar de onde parei": leva para a última aula concluída + 1 (aproximação pela ordem do índice)
+  const p = ler();
+  const concluidas = Object.keys(p.aulas);
+  const botao = document.querySelector<HTMLAnchorElement>('[data-continuar]');
+  if (botao && concluidas.length) {
+    const indice = JSON.parse(document.getElementById('indice-navegacao')?.textContent || '[]') as { h: string; k: string }[];
+    const aulas = indice.filter((i) => i.k === 'Aula');
+    const proxima = aulas.find((a) => !concluidas.some((c) => a.h.endsWith(`/aulas/${c}/`)));
+    if (proxima) {
+      botao.href = proxima.h;
+      botao.querySelector('span')!.textContent = 'Continuar de onde parei';
+    }
+  }
+</script>
+
+<style>
+  .hero {
+    position: relative;
+    overflow: hidden;
+    padding-block: clamp(48px, 9vw, 110px) clamp(40px, 6vw, 72px);
+    border-bottom: 1px solid var(--border);
+  }
+  .hero-bg {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(600px 380px at 85% 10%, var(--glow), transparent 70%),
+      radial-gradient(500px 300px at 5% 90%, color-mix(in srgb, var(--violet) 18%, transparent), transparent 70%),
+      linear-gradient(var(--border) 1px, transparent 1px) 0 0 / 44px 44px,
+      linear-gradient(90deg, var(--border) 1px, transparent 1px) 0 0 / 44px 44px;
+    mask-image: radial-gradient(ellipse 90% 80% at 50% 30%, #000 30%, transparent 85%);
+    opacity: 0.6;
+  }
+  .hero-grid {
+    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+    gap: clamp(32px, 5vw, 64px);
+    align-items: center;
+  }
+  h1 {
+    font-size: var(--step-4);
+    margin-block: 14px 18px;
+    letter-spacing: -0.035em;
+  }
+  .grad {
+    background: linear-gradient(100deg, var(--accent), #ffc36b 60%, var(--accent-strong));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  :global([data-theme='light']) .grad {
+    background: linear-gradient(100deg, #c2410c, #b45309);
+    -webkit-background-clip: text;
+    background-clip: text;
+  }
+  .hero-cta {
+    margin-top: 28px;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 40px;
+    max-width: 560px;
+  }
+  .stats div {
+    padding-left: 12px;
+    border-left: 2px solid var(--border-strong);
+  }
+  .stats dt {
+    font-size: 0.75rem;
+    color: var(--text-3);
+    line-height: 1.3;
+  }
+  .stats dd {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 1.9rem;
+    font-weight: 700;
+    order: -1;
+  }
+  .stats div {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .terminal {
+    border-radius: var(--radius-l);
+    border: 1px solid var(--border-strong);
+    background: #0b0a08;
+    box-shadow:
+      var(--shadow-lift),
+      0 30px 80px -30px var(--glow);
+    overflow: hidden;
+    transform: rotate(1.2deg);
+  }
+  .term-bar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 12px 14px;
+    background: #16130f;
+    border-bottom: 1px solid #2a251f;
+  }
+  .term-bar span {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #3a332b;
+  }
+  .term-bar span:first-child {
+    background: #ff5f57;
+  }
+  .term-bar span:nth-child(2) {
+    background: #febc2e;
+  }
+  .term-bar span:nth-child(3) {
+    background: #28c840;
+  }
+  .term-bar p {
+    margin-left: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: #8a8074;
+  }
+  .term-body {
+    margin: 0;
+    padding: 18px 20px 22px;
+    font-family: var(--font-mono);
+    font-size: clamp(0.72rem, 0.65rem + 0.3vw, 0.86rem);
+    line-height: 1.85;
+    color: #f4efe8;
+    overflow-x: auto;
+  }
+  .term-body .p {
+    color: #ff8a3d;
+  }
+  .term-body .dim {
+    color: #8a8074;
+  }
+  .term-body .ok {
+    color: #4ade80;
+  }
+  .term-body .okb {
+    background: #4ade80;
+    color: #0b0a08;
+    font-weight: 700;
+    border-radius: 3px;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .term-body [class^='l'] {
+      opacity: 0;
+      animation: linha 0.4s var(--ease) forwards;
+    }
+    .l1 { animation-delay: 0.5s !important; }
+    .l2 { animation-delay: 0.9s !important; }
+    .l3 { animation-delay: 1.3s !important; }
+    .l4 { animation-delay: 1.7s !important; }
+    .l5 { animation-delay: 2.1s !important; }
+    .l6 { animation-delay: 2.5s !important; }
+  }
+  @keyframes linha {
+    from {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .section-sm {
+    padding-block: clamp(36px, 5vw, 56px);
+  }
+  .passos {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 16px;
+  }
+  .passo {
+    padding: 22px;
+    overflow: hidden;
+  }
+  .passo-n {
+    position: absolute;
+    top: 10px;
+    right: 16px;
+    font-family: var(--font-display);
+    font-size: 2.6rem;
+    font-weight: 800;
+    color: var(--surface-3);
+    line-height: 1;
+  }
+  /* número decorativo (marca d'água): a ordem já vem da lista <ol> */
+  .passo-n::before {
+    content: attr(data-n);
+  }
+  .passo-icon {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    margin-bottom: 14px;
+  }
+  .passo h2 {
+    font-size: 1.15rem;
+    margin-bottom: 6px;
+  }
+  .passo p {
+    color: var(--text-2);
+    font-size: 0.93rem;
+    line-height: 1.55;
+  }
+
+  .map-wrap {
+    display: grid;
+    gap: 44px;
+  }
+  .map-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  @media (min-width: 1100px) {
+    .map-wrap {
+      grid-template-columns: 340px minmax(0, 1fr);
+      align-items: start;
+    }
+    .map-head {
+      position: sticky;
+      top: calc(var(--header-h) + 32px);
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .map-head .legend {
+      flex-direction: column;
+      gap: 10px;
+    }
+  }
+  .map-head h2 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+    max-width: 22ch;
+  }
+  .map-head h2 code {
+    font-size: 0.85em;
+    color: var(--accent);
+  }
+  .map-head .lead {
+    max-width: 60ch;
+    font-size: 1.02rem;
+  }
+  .map-head :global(.inline-ic) {
+    display: inline;
+    vertical-align: -2px;
+    color: var(--accent);
+  }
+  .legend {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+    color: var(--text-2);
+  }
+  .legend li {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .lvl-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .lvl-dot.soon {
+    background: transparent;
+    border: 1.5px dashed var(--text-3);
+  }
+
+  .cta-final {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 24px;
+    flex-wrap: wrap;
+    padding: clamp(22px, 4vw, 36px);
+    background:
+      radial-gradient(400px 200px at 100% 0%, var(--accent-soft), transparent 70%),
+      var(--surface);
+  }
+  .cta-final h2 {
+    font-size: var(--step-2);
+    margin-bottom: 8px;
+  }
+  .cta-final p {
+    max-width: 62ch;
+  }
+
+  @media (max-width: 960px) {
+    .hero-grid {
+      grid-template-columns: 1fr;
+    }
+    .terminal {
+      transform: none;
+    }
+    .passos {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (max-width: 560px) {
+    .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px 12px;
+    }
+    .passos {
+      grid-template-columns: 1fr;
+    }
+  }
+  .pj-home-head {
+    margin-bottom: 20px;
+  }
+  .pj-home-head h2 {
+    font-size: var(--step-2);
+    margin-block: 6px 8px;
+  }
+  .pj-home {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr));
+  }
+  .pj-home li {
+    display: flex;
+  }
+  .pj-home-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding: 18px 20px;
+    border-top: 3px solid var(--c);
+  }
+  .pjh-junior {
+    --c: var(--lvl-jr);
+  }
+  .pjh-pleno {
+    --c: var(--lvl-pleno);
+  }
+  .pjh-senior {
+    --c: var(--lvl-senior);
+  }
+  .pjh-nivel {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c);
+  }
+  .pj-home-card strong {
+    font-size: 1.02rem;
+    line-height: 1.35;
+  }
+  .pjh-dom {
+    font-size: 0.82rem;
+    color: var(--text-3);
+  }
+  .pj-home-mais {
+    margin-top: 16px;
+  }
+</style>

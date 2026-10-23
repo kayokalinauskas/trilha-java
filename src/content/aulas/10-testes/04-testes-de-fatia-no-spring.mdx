@@ -1,0 +1,708 @@
+---
+titulo: Testes de fatia no Spring Boot
+descricao: "Como testar o controller sem subir o banco e o repositório sem subir a web: @WebMvcTest com MockMvcTester e @MockitoBean, @DataJpaTest com TestEntityManager, flush e clear, o N+1 pego por um teste, o cache de contexto que mantém a suíte rápida e quando vale subir tudo com @SpringBootTest. Passo a passo, com as mensagens de erro reais."
+modulo: 10-testes
+ordem: 4
+duracao: 100
+objetivos:
+  - Explicar o que é o contexto de teste do Spring, quanto ele custa e como o cache de contexto o reaproveita entre classes
+  - Escrever testes com @WebMvcTest, MockMvcTester e @MockitoBean que verificam status, cabeçalhos, JSON e erros no formato ProblemDetail
+  - Testar consultas derivadas e @Query com @DataJpaTest, preparando dados com TestEntityManager e usando flush e clear para enxergar o SQL real
+  - Transformar um problema N+1 em teste vermelho contando os comandos SQL com as estatísticas do Hibernate
+  - Diagnosticar NoSuchBeanDefinitionException e contextos que falham ao subir, lendo a mensagem até a causa
+  - Decidir entre fatia, @SpringBootTest e teste de unidade para cada comportamento
+tags: [Spring Boot Test, WebMvcTest, DataJpaTest, MockMvcTester, MockitoBean, cache de contexto, N+1]
+flashcards:
+  - frente: O que @WebMvcTest sobe e o que ele deixa de fora?
+    verso: Sobe a camada web — controllers, @ControllerAdvice, conversores Jackson, validação, filtros e o MockMvc. Deixa de fora @Service, @Repository, JPA e banco. O que o controller injeta precisa vir de um @MockitoBean.
+  - frente: O que @MockitoBean faz?
+    verso: Registra um mock do Mockito como bean no contexto de teste, no lugar do bean daquele tipo (ou criando um, se não existir). Veio do Spring Framework e substituiu o @MockBean, removido no Spring Boot 4.
+  - frente: "@DataJpaTest: o que sobe e o que acontece com os dados de cada teste?"
+    verso: Sobe JPA, entidades, repositórios Spring Data, um banco embutido no lugar do DataSource (por padrão) e o TestEntityManager. Cada teste roda numa transação que é desfeita (rollback) no final.
+  - frente: Para que servem flush() e clear() num teste JPA?
+    verso: flush() manda para o banco os INSERT/UPDATE pendentes (e é aí que restrições como UNIQUE disparam). clear() esvazia o cache de primeiro nível, para que a próxima leitura faça um SELECT de verdade em vez de devolver o objeto que já estava na memória.
+  - frente: Como o Spring decide se reaproveita um contexto de teste?
+    verso: Pela configuração da classe (anotação de fatia, classes, @MockitoBean, propriedades, perfis). Configuração igual reaproveita o contexto em cache; qualquer diferença cria outro. @DirtiesContext descarta o contexto.
+  - frente: Um @WebMvcTest falha com NoSuchBeanDefinitionException para o serviço. Por quê?
+    verso: A fatia web não cria @Service. O controller pede o serviço no construtor e ninguém o fornece. A correção é declarar um @MockitoBean do serviço no teste, não trocar para @SpringBootTest.
+  - frente: Por que os erros de @Query aparecem antes de qualquer teste rodar?
+    verso: O Spring Data valida o JPQL quando cria o repositório, na subida do contexto. Um atributo errado vira "Query validation failed" e o contexto não sobe; é por isso que um @DataJpaTest simples já protege as consultas escritas à mão.
+---
+
+Você terminou a API de produtos da loja: um controller com quatro endpoints, um serviço, dois repositórios JPA e um tratador de erros que devolve tudo no formato ProblemDetail. Chegou a hora de testar. A primeira ideia costuma ser anotar a classe de teste com `@SpringBootTest`, que sobe a aplicação inteira, e disparar requisições. Funciona. Aí o projeto cresce: entram Spring Security, Kafka, um cliente HTTP para o gateway de pagamento, o Flyway com oitenta migrações. Cada teste passa a esperar tudo isso subir, e para testar se o controller devolve 400 quando o preço é negativo você precisa de um banco, de um broker e de credenciais que nada têm a ver com a pergunta.
+
+O Spring Boot tem uma resposta para isso: os **testes de fatia** (*test slices*). Cada anotação de fatia sobe **só uma camada** da aplicação, com a infraestrutura de que essa camada precisa, e deixa o resto de fora. `@WebMvcTest` testa o contrato HTTP sem banco. `@DataJpaTest` testa as consultas sem web. E `@SpringBootTest` fica para os poucos testes que precisam ver tudo funcionando junto.
+
+Nesta aula você vai escrever, passo a passo, a suíte de testes da API de produtos: controller, erros, repositório, o problema N+1 e um teste de ponta a ponta. Vai ver o SQL que o Hibernate gera, os logs do cache de contexto e as mensagens de erro que aparecem quando a fatia não tem o bean que o teste pede. A aula 3 ensinou dublês com Mockito numa classe sem Spring; aqui o Mockito entra **dentro** do contexto do Spring.
+
+## A intuição: o teste de bancada
+
+Pense numa oficina que monta carros. Para saber se o motor novo entrega a potência prometida, ninguém monta o carro inteiro e sai para a estrada: o motor vai para um **dinamômetro de bancada**, que simula a carga das rodas e mede o que importa. Para testar o sistema de freio, outra bancada, com um pedal e sensores de pressão. Só no fim, com cada peça aprovada, o carro completo faz o **teste de pista**.
+
+Cada bancada tem três características:
+
+- **Monta só a peça que interessa**, mais o mínimo para ela funcionar (o motor precisa de combustível e de arrefecimento; não precisa de bancos nem de rádio).
+- **Simula o que está em volta**: o dinamômetro faz o papel das rodas. No teste, esse papel é de um dublê, como os da aula 3.
+- **É rápida e diz exatamente onde está o problema.** Se o motor falha na bancada, a culpa é do motor.
+
+O teste de pista continua existindo, mas é caro, e você faz poucos. Com testes de fatia, a lógica é a mesma: `@WebMvcTest` é a bancada da camada web, `@DataJpaTest` é a bancada da persistência e `@SpringBootTest` é o teste de pista.
+
+<Figura legenda="Cada anotação de teste sobe uma parte diferente da aplicação: a fatia web troca o serviço por um mock; a fatia JPA sobe só repositórios e banco; @SpringBootTest sobe tudo">
+<svg viewBox="0 0 720 400" width="720" role="img" aria-labelledby="fatias-titulo fatias-desc">
+  <title id="fatias-titulo">As quatro camadas da API de produtos e o que cada anotação de teste sobe</title>
+  <desc id="fatias-desc">No centro, empilhadas de cima para baixo, as camadas da aplicação: ProdutoController com o TratadorDeErros, o serviço CatalogoDeProdutos, o ProdutoRepository e o banco. Uma moldura tracejada em volta de todas indica o @SpringBootTest, que sobe tudo. À esquerda, o @WebMvcTest aponta só para a camada web, e um @MockitoBean ocupa o lugar do serviço. À direita, o @DataJpaTest cobre o repositório e o banco, com TestEntityManager e rollback a cada teste.</desc>
+  <defs><marker id="mk-fatias" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="360" y="26" text-anchor="middle" class="d-title">@SpringBootTest: todas as camadas</text>
+  <rect x="232" y="40" width="256" height="344" rx="12" class="d-line" stroke-dasharray="6 5"/>
+  <rect x="250" y="60" width="220" height="56" rx="10" class="d-box"/>
+  <text x="360" y="84" text-anchor="middle" class="d-mono">ProdutoController</text>
+  <text x="360" y="104" text-anchor="middle" class="d-label">+ TratadorDeErros, Jackson, validação</text>
+  <path d="M360 116 L360 144" class="d-line" marker-end="url(#mk-fatias)"/>
+  <rect x="250" y="146" width="220" height="56" rx="10" class="d-box"/>
+  <text x="360" y="170" text-anchor="middle" class="d-mono">CatalogoDeProdutos</text>
+  <text x="360" y="190" text-anchor="middle" class="d-label">@Service, regras e transações</text>
+  <path d="M360 202 L360 230" class="d-line" marker-end="url(#mk-fatias)"/>
+  <rect x="250" y="232" width="220" height="56" rx="10" class="d-box"/>
+  <text x="360" y="256" text-anchor="middle" class="d-mono">ProdutoRepository</text>
+  <text x="360" y="276" text-anchor="middle" class="d-label">Spring Data JPA + Hibernate</text>
+  <path d="M360 288 L360 306" class="d-line" marker-end="url(#mk-fatias)"/>
+  <rect x="250" y="308" width="220" height="56" rx="10" class="d-box"/>
+  <text x="360" y="332" text-anchor="middle" class="d-text">Banco</text>
+  <text x="360" y="352" text-anchor="middle" class="d-label">H2 em memória ou PostgreSQL</text>
+  <rect x="16" y="60" width="196" height="56" rx="10" class="d-info"/>
+  <text x="114" y="84" text-anchor="middle" class="d-title">@WebMvcTest</text>
+  <text x="114" y="104" text-anchor="middle" class="d-label">sobe só a camada web</text>
+  <path d="M212 88 L248 88" class="d-line" marker-end="url(#mk-fatias)"/>
+  <rect x="16" y="146" width="196" height="56" rx="10" class="d-violet"/>
+  <text x="114" y="170" text-anchor="middle" class="d-title">@MockitoBean</text>
+  <text x="114" y="190" text-anchor="middle" class="d-label">mock no lugar do serviço</text>
+  <path d="M212 174 L248 174" class="d-line" stroke-dasharray="4 4" marker-end="url(#mk-fatias)"/>
+  <rect x="508" y="232" width="196" height="132" rx="10" class="d-ok"/>
+  <text x="606" y="266" text-anchor="middle" class="d-title">@DataJpaTest</text>
+  <text x="606" y="292" text-anchor="middle" class="d-label">repositórios e entidades</text>
+  <text x="606" y="312" text-anchor="middle" class="d-label">TestEntityManager</text>
+  <text x="606" y="332" text-anchor="middle" class="d-label">rollback a cada teste</text>
+  <path d="M506 298 L472 298" class="d-line" marker-end="url(#mk-fatias)"/>
+</svg>
+</Figura>
+
+Repare no que cada fatia **não** vê. O `@WebMvcTest` não sabe que existe banco: se o controller devolve o JSON errado, o problema está no controller, no DTO ou no Jackson. O `@DataJpaTest` não sabe que existe HTTP: se a consulta devolve o produto errado, o problema está no JPQL ou no mapeamento. Essa separação é o que torna a falha fácil de diagnosticar.
+
+## Vocabulário
+
+| Termo | O que é |
+|---|---|
+| **Contexto de aplicação** (`ApplicationContext`) | O "recipiente" que o Spring monta com todos os beans, já ligados entre si. Em produção existe um; nos testes, um por configuração diferente. |
+| **Contexto de teste** | Um `ApplicationContext` montado para uma classe de teste, a partir das anotações dela. |
+| **Cache de contexto** | O mapa em que o Spring guarda os contextos de teste já montados para reaproveitá-los em outras classes com a mesma configuração. |
+| **Fatia** (*slice*) | Uma anotação que sobe um contexto parcial: só os beans e as autoconfigurações de uma camada. |
+| **Autoconfiguração** | As classes do Spring Boot que criam beans de infraestrutura (Jackson, `DataSource`, `MockMvc`...). Cada fatia liga só as que interessam a ela. |
+| **`MockMvc` / `MockMvcTester`** | Executa uma requisição HTTP simulada contra o `DispatcherServlet`, sem abrir porta nem subir Tomcat. O `MockMvcTester` é a versão com asserções AssertJ. |
+| **`@MockitoBean`** | Coloca um mock do Mockito **dentro** do contexto, no lugar de um bean. |
+| **Cache de primeiro nível** | O `EntityManager` guarda as entidades que já carregou ou salvou na transação. Enquanto elas estão lá, buscar de novo não vai ao banco. |
+| **`flush` / `clear`** | `flush` envia ao banco os comandos pendentes; `clear` esvazia o cache de primeiro nível. |
+
+## O que o contexto de teste custa
+
+Toda classe anotada com `@SpringBootTest` ou com uma fatia faz o Spring **montar um contexto**: ler as classes, avaliar as condições de centenas de autoconfigurações, criar os beans, conectar no banco, gerar o esquema, validar as consultas dos repositórios. Numa aplicação pequena como a desta aula, isso leva poucos segundos. Numa aplicação real, com segurança, mensageria, Flyway e clientes HTTP, leva de dez a trinta segundos, e depende de infraestrutura (banco, broker) estar disponível.
+
+Duas coisas tornam esse custo suportável:
+
+1. **Subir menos.** Uma fatia cria só os beans de uma camada: o `@WebMvcTest` desta aula não cria `DataSource`, `EntityManagerFactory`, repositórios nem serviço. Menos beans, menos tempo, e nenhuma dependência de banco.
+2. **Subir menos vezes.** O Spring guarda cada contexto montado num **cache** e o reaproveita em toda classe de teste com a **mesma configuração**. Se vinte classes usam `@WebMvcTest(ProdutoController.class)` com o mesmo `@MockitoBean`, o contexto é montado uma vez e usado vinte.
+
+O segundo ponto é o que mais pesa numa suíte grande, e você vai vê-lo acontecendo no passo 6.
+
+<Callout tipo="novidade" titulo="Spring Boot 4: um starter de teste por tecnologia">
+Com a modularização do Boot 4, cada fatia mora no módulo da sua tecnologia, e você declara o starter de teste correspondente ao lado do starter normal: `spring-boot-starter-webmvc-test` (traz `@WebMvcTest`, `@AutoConfigureMockMvc` e o `MockMvcTester`) e `spring-boot-starter-data-jpa-test` (traz `@DataJpaTest`, `TestEntityManager` e `@AutoConfigureTestDatabase`). Os pacotes também mudaram: `org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest`, `org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest`, `org.springframework.boot.jpa.test.autoconfigure.TestEntityManager`. Se você copiar um exemplo antigo com `org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest`, ele não compila.
+</Callout>
+
+## O código que vamos testar
+
+Tudo o que esta aula mostra existe no projeto Maven da trilha, em `java/m10-testes/aulas`, pacote `dev.trilhajava.m10.aulas.fatias`, e roda no CI. As dependências que a API usa estão no `pom.xml` do módulo (as versões vêm do BOM do Spring Boot):
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-webmvc</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-validation</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+<dependency>
+  <groupId>com.h2database</groupId>
+  <artifactId>h2</artifactId>
+  <scope>runtime</scope>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-webmvc-test</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-jpa-test</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+O `spring-boot-starter-test` (JUnit 6, AssertJ, Mockito, JSONAssert) já vem do POM pai. O banco é um **H2 em memória**, e isso é uma escolha desta aula para rodar sem Docker; os limites dessa escolha aparecem nas armadilhas, e a aula 5 mostra a alternativa.
+
+O domínio: uma `Categoria` e um `Produto` com SKU único, preço, quantidade em estoque, um indicador de ativo e a categoria carregada de forma preguiçosa (`LAZY`). Guarde este detalhe, porque ele vai produzir um N+1 no passo 5.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/Produto.java" semImports destacar="10-11, 16-17, 25-26" />
+
+O repositório tem as três consultas derivadas e as duas consultas escritas à mão que vamos testar:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/ProdutoRepository.java" />
+
+O serviço recebe os repositórios pelo construtor e devolve DTOs (`record`s), nunca entidades:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/CatalogoDeProdutos.java" semImports />
+
+O controller não tem regra de negócio: recebe, valida (`@Valid`), delega ao serviço e monta a resposta.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/ProdutoController.java" semImports destacar="23-33" />
+
+E o corpo do `POST /produtos`, com as anotações de validação. As mensagens são fixas para o teste não depender do idioma da JVM (em inglês, `@NotBlank` diria *must not be blank*):
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/NovoProduto.java" semImports />
+
+Por último, o tratador de erros. Ele estende `ResponseEntityExceptionHandler`, que já converte as exceções do Spring MVC (JSON ilegível, método não suportado, falha de `@Valid`) em `ProblemDetail`; os dois `@ExceptionHandler` cuidam das exceções do domínio, e o `handleMethodArgumentNotValid` acrescenta ao 400 um mapa com o erro de cada campo.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fatias/TratadorDeErros.java" semImports destacar="7-8, 15-16, 26-38" />
+
+A classe `AplicacaoDeProdutos`, com `@SpringBootApplication`, fica no mesmo pacote. Ela é importante para os testes: **toda fatia procura a classe `@SpringBootConfiguration` subindo pelos pacotes a partir do pacote do teste**, e é dela que tira o ponto de partida da varredura de componentes. Teste fora da árvore de pacotes da aplicação não encontra configuração nenhuma. No projeto da aula, ela também aponta (com `@PropertySource`) para um `aulas-fatias.properties` com duas linhas: `spring.jpa.hibernate.ddl-auto=create-drop` e `spring.flyway.enabled=false`. O mesmo módulo Maven traz o Flyway da aula 10.05, e, com o Flyway no classpath, o Spring Boot deixa de gerar o esquema do H2 sozinho; num projeto só seu, sem Flyway, essas linhas não seriam necessárias.
+
+## Mão na massa
+
+Os testes ficam em `java/m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/`. Para rodar uma classe, entre na pasta do módulo e filtre com `-Dtest`:
+
+```bash
+cd java/m10-testes/aulas
+mvn test -Dtest=ProdutoControllerTest     # uma classe
+mvn test                                   # o módulo inteiro
+```
+
+### Passo 1: o primeiro @WebMvcTest
+
+**O que vamos fazer e por quê.** Testar o contrato HTTP de dois endpoints: `GET /produtos/{sku}` devolve 200 com o JSON do produto, e `POST /produtos` devolve 201 com o cabeçalho `Location`. O serviço não interessa aqui (ele terá seus próprios testes de unidade, como os da aula 3), então ele vira um mock.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/ProdutoControllerTest.java" destacar="18, 21-25, 32, 34, 36-45, 59-63" />
+
+```bash
+mvn test -Dtest=ProdutoControllerTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoControllerTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- `@WebMvcTest(ProdutoController.class)` monta um contexto só com a camada web e, dentro dela, **só** esse controller (sem o argumento, entrariam todos os controllers da aplicação). Entram também, automaticamente, os `@ControllerAdvice` (o `TratadorDeErros`), os conversores Jackson, o validador, os filtros e um `MockMvc` pronto. Ficam de fora `@Service`, `@Repository`, `@Component` comuns, JPA e banco.
+- `@Autowired MockMvcTester mvc` injeta o cliente de testes. Ele monta a requisição (`mvc.get().uri(...)`), entrega ao `DispatcherServlet` **no mesmo processo**, sem rede e sem Tomcat, e devolve um `MvcTestResult`. A requisição passa por todo o caminho real do Spring MVC: roteamento, conversão do `@PathVariable`, desserialização do corpo, validação, advice e serialização da resposta.
+- `@MockitoBean CatalogoDeProdutos catalogo` cria um mock do Mockito e o **registra como bean** no contexto. O controller pede um `CatalogoDeProdutos` no construtor e recebe esse mock. No teste, é o mesmo objeto do campo, então `given(...)` e `then(...)` funcionam exatamente como na aula 3. Entre um teste e outro, o Spring reinicia o mock (stubs e chamadas registradas são apagados).
+- `uri("/produtos/{sku}", "CAFE-1KG")` usa um modelo de URI; o valor é codificado corretamente, como faria um cliente real.
+- `assertThat(resposta).hasStatusOk()` e `hasContentType(...)` são asserções AssertJ sobre a resposta. `bodyJson()` abre o corpo como JSON, e `isLenientlyEqualTo(...)` compara com o esperado de forma **tolerante**: a ordem das chaves não importa, e campos a mais na resposta não quebram o teste (o modo estrito é `isStrictlyEqualTo`).
+- No segundo teste, `extractingPath("$.sku")` extrai um único valor com JSONPath. E `then(catalogo).should().cadastrar(new NovoProduto(...))` confere que o JSON do corpo chegou ao serviço convertido no `record` certo, com `BigDecimal` e tudo: prova de que a desserialização funciona.
+
+<Callout tipo="info" titulo="MockMvcTester ou MockMvc clássico?">
+O `MockMvcTester` chegou no Spring Framework 6.2 e é a API recomendada com AssertJ. Você ainda vai encontrar muito código com o `MockMvc` clássico: `mvc.perform(get("/produtos/CAFE-1KG")).andExpect(status().isOk()).andExpect(jsonPath("$.sku").value("CAFE-1KG"))`. Os dois executam a mesma coisa por baixo. Se o projeto já usa um estilo, siga o projeto; em código novo, prefira o `MockMvcTester`, que dá mensagens de falha melhores e se integra ao resto das asserções AssertJ.
+</Callout>
+
+### Passo 2: erros também são contrato
+
+**O que vamos fazer e por quê.** Um cliente da API (o front-end, outro serviço) depende tanto dos erros quanto dos acertos: ele lê o `status`, o `Content-Type` e os campos do ProblemDetail para decidir o que mostrar. Vamos garantir três respostas de erro: 404 para SKU inexistente, 400 com a lista de campos para um corpo inválido, e 400 para um JSON que nem pode ser lido.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/ProdutoControllerErrosTest.java" semImports destacar="15, 19-20, 36, 39-50, 51, 59, 62-63" />
+
+```bash
+mvn test -Dtest=ProdutoControllerErrosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoControllerErrosTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- No 404, o stub **lança** a exceção de domínio: `willThrow(new ProdutoNaoEncontradoException(...))`. O controller não a trata; ela sobe até o `TratadorDeErros`, que está na fatia porque é um `@RestControllerAdvice`. O teste confere o resultado final: status, `application/problem+json` e o corpo completo, incluindo o `instance`, que o Spring preenche sozinho com o caminho da requisição.
+- No 400 de validação, o teste **não programa stub nenhum**: o corpo tem `sku` vazio, preço negativo e não tem `quantidadeInicial`. O `@Valid` barra a requisição antes do controller executar, e o `handleMethodArgumentNotValid` monta o mapa `erros`. A última linha, `then(catalogo).shouldHaveNoInteractions()`, é a garantia mais importante: **dado inválido não chega ao serviço**.
+- O terceiro teste manda `"preco": "quarenta"`. O Jackson não consegue converter isso num `BigDecimal`, o Spring lança `HttpMessageNotReadableException` e o `ResponseEntityExceptionHandler` responde 400 com `"detail": "Failed to read request"`. Repare na diferença: esse erro acontece **antes** da validação, e por isso não tem o mapa `erros`.
+
+<Callout tipo="erro" titulo="O 400 que não vinha da validação">
+Na primeira versão desta API, `quantidadeInicial` era um `int`. O teste de validação mandou um corpo sem esse campo e esperava o mapa `erros`, mas recebeu isto (o `MockMvcTester` imprime a requisição e a resposta quando a asserção falha):
+
+```text
+           Status = 400
+     Content type = application/problem+json
+             Body = {"detail":"Failed to read request","instance":"/produtos","status":400,"title":"Bad Request"}
+...
+[JSON content] JSON comparison failure:
+Expected: erros
+     but none found
+```
+
+A causa real só aparece desserializando o JSON à mão: `MismatchedInputException: Cannot map null into type int (set DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES to 'false' to allow)`. O **Jackson 3**, que vem com o Boot 4, recusa por padrão um campo primitivo ausente. A correção foi trocar para `Integer` com `@NotNull`: agora quem responde é a validação, com a mensagem certa para o cliente. Moral: em DTOs de entrada, prefira tipos *wrapper* e deixe a validação dizer o que falta. Um teste de fatia pega isso em milissegundos; um teste do serviço nunca pegaria.
+</Callout>
+
+### Passo 3: a fatia JPA com @DataJpaTest
+
+**O que vamos fazer e por quê.** Agora a outra ponta: o repositório. Consultas derivadas e `@Query` são código, podem estar erradas, e o único jeito de saber é executá-las contra um banco. Vamos preparar um catálogo pequeno e testar busca por SKU, a consulta de estoque baixo (com o caso da borda), o relatório de valor em estoque e o isolamento entre testes.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/ProdutoRepositoryTest.java" semImports destacar="3, 6-7, 12-23, 38-42, 52-56, 60-62" />
+
+```bash
+mvn test -Dtest=ProdutoRepositoryTest
+```
+
+Com `@DataJpaTest`, o Hibernate imprime cada comando SQL (a anotação liga `spring.jpa.show-sql` por padrão). Um trecho da saída real, correspondente ao teste de estoque baixo:
+
+```text
+Hibernate: insert into categoria (nome,id) values (?,?)
+Hibernate: insert into categoria (nome,id) values (?,?)
+Hibernate: insert into produto (ativo,categoria_id,nome,preco,quantidade_em_estoque,sku,id) values (?,?,?,?,?,?,?)
+…
+Hibernate: update produto set ativo=?,categoria_id=?,nome=?,preco=?,quantidade_em_estoque=?,sku=? where id=?
+Hibernate: select p1_0.id,p1_0.ativo,p1_0.categoria_id,p1_0.nome,p1_0.preco,p1_0.quantidade_em_estoque,p1_0.sku from produto p1_0 where p1_0.ativo=true and p1_0.quantidade_em_estoque<? order by p1_0.sku
+…
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- `@DataJpaTest` monta um contexto com JPA, as entidades, os repositórios Spring Data e o `TestEntityManager`. Web, serviço e advice ficam de fora. Por padrão, ele **troca o `DataSource` por um banco embutido** (aqui, o H2 que está no classpath) e o Hibernate gera o esquema a partir das entidades. Se o projeto usa Flyway, as migrações rodam de verdade, como no módulo 9.
+- **Cada teste roda numa transação que é desfeita no fim.** O `@BeforeEach` roda dentro da mesma transação, então os quatro produtos inseridos nele somem depois de cada teste. É isso que o teste `cadaTesteComecaSoComOsDadosDoBeforeEach` prova: a contagem é sempre 4, não 8, 12 ou 16. Ligando o log do `TransactionContext` (`-Dlogging.level.org.springframework.test.context.transaction=DEBUG`), você vê isso acontecer:
+
+```text
+o.s.t.c.transaction.TransactionContext : Began transaction (1) for test class [...ProdutoRepositoryTest]; test method [cadaTesteComecaSoComOsDadosDoBeforeEach]; transaction manager [org.springframework.orm.jpa.JpaTransactionManager@7890324e]; rollback [true]
+o.s.t.c.transaction.TransactionContext : Rolled back transaction (1) for test class [...ProdutoRepositoryTest]; test method [cadaTesteComecaSoComOsDadosDoBeforeEach]
+```
+
+- `TestEntityManager` é um `EntityManager` pensado para testes: `persist` devolve a própria entidade (dá para encadear), e há atalhos como `persistAndFlush` e `persistFlushFind`. Use-o para **preparar dados** sem depender do repositório que você está testando: se o `save` do repositório estivesse quebrado, os testes de consulta falhariam por um motivo que não é deles.
+- `em.flush()` e `em.clear()` no fim do `@BeforeEach` são o detalhe mais importante do arquivo. O primeiro envia os `INSERT` e o `UPDATE` ao banco; o segundo esvazia o cache de primeiro nível. Sem o `clear()`, as consultas ainda executariam o SQL, mas devolveriam as **mesmas instâncias Java** criadas no `@BeforeEach`, e você estaria conferindo o que você mesmo montou, não o que o banco guardou. O passo 4 mostra essa diferença com um exemplo.
+- O teste de estoque baixo escolhe dados **na borda**: o filtro tem exatamente 5 unidades e o limite é 5. `LessThan` significa "menor que", então o filtro não entra. Se alguém trocar o método por `LessThanEqual`, o teste fica vermelho. E a garrafa, com 1 unidade, está inativa: prova de que o `AtivoTrue` do nome do método funciona.
+- O relatório compara `record`s com `usingRecursiveFieldByFieldElementComparator` e um comparador de `BigDecimal` por `compareTo`, pela mesma razão da aula 3: `615.3` e `615.30` são diferentes para `equals`.
+
+<Callout tipo="dica" titulo="Consultas derivadas também merecem teste?">
+O Spring Data valida o **nome** do método quando cria o repositório: um `findBySkuu` nem deixa o contexto subir. Mas ele não valida a **intenção**. `LessThan` em vez de `LessThanEqual`, `OrderByNome` em vez de `OrderByNomeDesc`, esquecer o `AtivoTrue`: tudo isso compila, sobe e devolve a resposta errada. Teste as consultas que têm regra (filtros, bordas, ordenação); um `findById` herdado do `JpaRepository` não precisa.
+</Callout>
+
+### Passo 4: flush e clear para ver o SQL de verdade
+
+**O que vamos fazer e por quê.** O JPA não executa um `INSERT` na hora em que você chama `persist` ou `save`: ele anota a mudança e só a envia ao banco no `flush`, que acontece antes de uma consulta que precise dela ou no commit. Num teste com rollback, **o commit nunca acontece**. Isso tem duas consequências perigosas, e este passo mostra as duas.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/FlushEClearTest.java" semImports destacar="22, 25, 27-28, 30-32, 40" />
+
+```bash
+mvn test -Dtest=FlushEClearTest
+```
+
+O SQL do primeiro teste, copiado da execução:
+
+```text
+Hibernate: select next value for categoria_seq
+Hibernate: insert into categoria (nome,id) values (?,?)
+Hibernate: insert into produto (ativo,categoria_id,nome,preco,quantidade_em_estoque,sku,id) values (?,?,?,?,?,?,?)
+Hibernate: select p1_0.id,p1_0.ativo,p1_0.categoria_id,p1_0.nome,p1_0.preco,p1_0.quantidade_em_estoque,p1_0.sku from produto p1_0 where p1_0.id=?
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- O `persist` do chá **não** gerou `INSERT`. O identificador veio da sequência (as entidades usam `@GeneratedValue`, que no H2 vira uma sequência com blocos de 50), e o comando ficou pendente.
+- O primeiro `findById` **não** gerou `SELECT`: o produto estava no cache de primeiro nível, e o repositório devolveu a mesma instância (`containsSame`). Um teste que parasse aí "provaria" que o produto foi salvo sem que nada tivesse ido ao banco.
+- `em.flush()` produziu o `INSERT`. `em.clear()` esqueceu as instâncias. O segundo `findById` fez o `SELECT` e devolveu **outro objeto**, montado a partir das colunas.
+- E a prova de que ele veio do banco: o preço foi gravado como `19.9` e voltou como `19.90`, porque a coluna é `numeric(10,2)`. É o tipo de diferença que só aparece quando o dado dá a volta completa: mapeamento de colunas, conversores, enums gravados como texto, fusos de datas.
+- No segundo teste, a restrição `UNIQUE` do SKU só dispara no `saveAndFlush`. A saída mostra o aviso do Hibernate e depois a exceção traduzida pelo Spring em `DataIntegrityViolationException`:
+
+```text
+WARN ... org.hibernate.orm.jdbc.error : HHH000247: ErrorCode: 23505, SQLState: 23505
+WARN ... org.hibernate.orm.jdbc.error : Unique index or primary key violation: "PUBLIC.CONSTRAINT_1 INDEX PUBLIC.CONSTRAINT_INDEX_1 ON PUBLIC.PRODUTO(SKU NULLS FIRST) VALUES ( /* 1 */ 'CAFE-1KG' )"; SQL statement:
+```
+
+Com `save` no lugar de `saveAndFlush`, o teste falha, e a mensagem está em "Quando o teste falha", mais abaixo. (Com ids `IDENTITY`, o Hibernate faria o `INSERT` já no `persist`, mas não conte com isso: sempre que o teste verifica algo que o **banco** decide, force o `flush`.)
+
+### Passo 5: o N+1 aparecendo num teste
+
+**O que vamos fazer e por quê.** No módulo 9 você viu o problema N+1: uma consulta traz N entidades e, ao acessar uma associação `LAZY` de cada uma, o Hibernate faz mais N consultas. Ele não quebra nada funcionalmente, então nenhum teste de resultado o pega; ele só deixa a listagem lenta em produção, quando N vira mil. O jeito de pegá-lo cedo é **contar os comandos SQL** num teste.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/NMaisUmTest.java" semImports destacar="4, 13-14, 24-27, 32-33, 37, 42, 47" />
+
+```bash
+mvn test -Dtest=NMaisUmTest
+```
+
+O SQL dos dois testes, lado a lado na saída:
+
+```text
+Hibernate: select p1_0.id,p1_0.ativo,p1_0.categoria_id,p1_0.nome,p1_0.preco,p1_0.quantidade_em_estoque,p1_0.sku from produto p1_0 where p1_0.ativo=true order by p1_0.nome
+Hibernate: select c1_0.id,c1_0.nome from categoria c1_0 where c1_0.id=?
+Hibernate: select c1_0.id,c1_0.nome from categoria c1_0 where c1_0.id=?
+Hibernate: select c1_0.id,c1_0.nome from categoria c1_0 where c1_0.id=?
+…
+Hibernate: select p1_0.id,p1_0.ativo,p1_0.categoria_id,c1_0.id,c1_0.nome,p1_0.nome,p1_0.preco,p1_0.quantidade_em_estoque,p1_0.sku from produto p1_0 join categoria c1_0 on c1_0.id=p1_0.categoria_id where p1_0.ativo=true order by p1_0.nome
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- `@DataJpaTest(properties = "spring.jpa.properties.hibernate.generate_statistics=true")` liga as estatísticas do Hibernate só para esta classe. Guarde esse `properties`: ele vai aparecer de novo no passo 6, porque tem um custo.
+- O `EntityManagerFactory` é injetado e desembrulhado para o `SessionFactory` do Hibernate, que expõe as `Statistics`. No `@BeforeEach`, depois de preparar e limpar os dados, `estatisticas.clear()` zera os contadores: o teste só conta o que acontece no *When*.
+- `getPrepareStatementCount()` é o número de comandos SQL preparados. Com a consulta derivada, foram 4: um `SELECT` de produtos e um por categoria, exatamente como o log mostra. Com a `@Query` com `join fetch`, foi 1: produto e categoria vieram juntos.
+- O primeiro teste **documenta** o N+1 (serve de aula e de comparação). O segundo é o que protege o sistema: o serviço usa `listarAtivosComCategoria()`, e se alguém "simplificar" a consulta tirando o `join fetch`, o teste fica vermelho. Foi o que aconteceu quando o `join fetch` foi removido de propósito:
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.fatias.NMaisUmTest.joinFetchResolveComUmaConsulta -- Time elapsed: 1.536 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+[comandos SQL]
+expected: 1L
+ but was: 4L
+	at dev.trilhajava.m10.aulas.fatias.NMaisUmTest.joinFetchResolveComUmaConsulta(NMaisUmTest.java:60)
+```
+
+O `.as("comandos SQL")` é o que faz a primeira linha da mensagem dizer **o que** estava sendo contado. Sem ele, a falha seria só "expected: 1L but was: 4L".
+
+<Callout tipo="dica" titulo="Três produtos bastam">
+O teste usa três produtos de três categorias **diferentes**. Com os três produtos na mesma categoria, o Hibernate carregaria a categoria uma vez e reaproveitaria do cache de primeiro nível, e o N+1 viraria "1+1", mais difícil de enxergar. Assim como na aula 3, escolher dados que revelam o bug é metade do trabalho.
+</Callout>
+
+### Passo 6: o cache de contexto, visto no log
+
+**O que vamos fazer e por quê.** Até aqui você tem sete classes de teste no pacote. Quantos contextos o Spring monta para rodá-las? A resposta está num log de nível DEBUG que o próprio Spring oferece. Vamos ligá-lo pela linha de comando:
+
+```bash
+mvn test "-Dlogging.level.org.springframework.test.context.cache=DEBUG"
+```
+
+A saída mostra uma linha de estatísticas a cada uso do cache. Filtrando só a primeira linha de cada classe (a execução inclui o teste de ponta a ponta do passo 7 e a solução do checkpoint):
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fatias.FlushEClearTest
+  [... size = 1, ... hitCount = 0, missCount = 1, failureCount = 0]
+[INFO] Running dev.trilhajava.m10.aulas.fatias.NMaisUmTest
+  [... size = 2, ... hitCount = 23, missCount = 2, failureCount = 0]
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoControllerBaixaTest
+  [... size = 3, ... hitCount = 46, missCount = 3, failureCount = 0]
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 15.24 s -- in ...ProdutoControllerBaixaTest
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoControllerErrosTest
+  [... size = 3, ... hitCount = 81, missCount = 3, failureCount = 0]
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.930 s -- in ...ProdutoControllerErrosTest
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoControllerTest
+  [... size = 3, ... hitCount = 117, missCount = 3, failureCount = 0]
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.907 s -- in ...ProdutoControllerTest
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutoRepositoryTest
+  [... size = 3, ... hitCount = 142, missCount = 3, failureCount = 0]
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutosDePontaAPontaTest
+  [... size = 4, ... hitCount = 188, missCount = 4, failureCount = 0]
+```
+
+**Como ler.** `missCount` é o número de contextos **montados**; `hitCount`, quantas vezes um contexto pronto foi reaproveitado (o Spring consulta o cache várias vezes por teste, por isso o número cresce rápido); `size`, quantos contextos estão guardados.
+
+- **Sete classes, quatro contextos.** Os três testes de controller têm a mesma configuração (`@WebMvcTest(ProdutoController.class)` e o mesmo `@MockitoBean`), então o primeiro monta e os outros dois reaproveitam: o `ProdutoControllerBaixaTest` levou 15 segundos, os seguintes menos de um. Os tempos variam muito de máquina para máquina; a proporção é o que importa.
+- `FlushEClearTest` e `ProdutoRepositoryTest` têm a mesma configuração (`@DataJpaTest` puro) e dividem um contexto.
+- O `NMaisUmTest` difere **só** pela propriedade das estatísticas, e isso bastou para um contexto novo (`missCount` foi de 1 para 2). Toda propriedade, perfil, `@MockitoBean` ou `@Import` diferente muda a "chave" do cache.
+- O `@SpringBootTest` do passo 7 é outra configuração, então outro contexto.
+
+É por isso que suítes grandes ficam lentas: não por ter muitos testes, mas por ter **muitas configurações diferentes**. Um `@MockitoBean` a mais numa classe, uma propriedade num teste, um `@ActiveProfiles` em outro, e cada um sobe o próprio contexto. E `@DirtiesContext` é pior: ele **descarta** o contexto depois da classe, obrigando a próxima a montar outro.
+
+<Callout tipo="dica" titulo="Padronize a configuração">
+Três práticas mantêm o `missCount` baixo: (1) uma meta-anotação ou classe base por tipo de teste, com as mesmas anotações, como a `@TesteDeAceitacao` do projeto integrador; (2) mocks comuns declarados no mesmo lugar, em vez de cada classe inventar os seus; (3) propriedades de teste num `application-test.properties` com um perfil único, em vez de `properties = ...` espalhados. O `NMaisUmTest` desta aula é uma exceção consciente: as estatísticas custam um pouco de desempenho, e só essa classe precisa delas.
+</Callout>
+
+### Passo 7: @SpringBootTest, o teste de pista
+
+**O que vamos fazer e por quê.** As fatias testaram cada camada com a vizinha trocada por um dublê. Falta uma pergunta que nenhuma delas responde: **as camadas funcionam juntas?** O controller chama o serviço certo? A transação do serviço grava a baixa de estoque? A categoria é criada quando não existe? Para isso, um teste com tudo de verdade.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/ProdutosDePontaAPontaTest.java" semImports destacar="8-9, 17-22, 31-37" />
+
+```bash
+mvn test -Dtest=ProdutosDePontaAPontaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fatias.ProdutosDePontaAPontaTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@SpringBootTest` monta o contexto completo a partir da `AplicacaoDeProdutos`: controller, advice, serviço, repositórios, transações e o H2. Por padrão, ele não abre porta (`webEnvironment = MOCK`); `@AutoConfigureMockMvc` acrescenta o mesmo `MockMvcTester` das fatias, agora apontando para a aplicação inteira.
+- **Sem `@Transactional` no teste, e de propósito.** Cada requisição abre e confirma a própria transação, como em produção. É isso que permite ver a segunda baixa falhar com 422 e `disponivel = 1`: a primeira baixa foi **confirmada** no banco. Com `@Transactional` no teste, tudo rodaria numa transação só, e você não estaria testando o comportamento transacional real.
+- O preço dessa escolha: os dados ficam no banco entre os testes (o contexto, e com ele o H2 em memória, é reaproveitado pelo cache). Por isso o teste usa um SKU só dele, `MOEDOR-01`, em vez de supor um banco vazio. Com mais testes, gere dados únicos (UUIDs, sufixos aleatórios) ou limpe as tabelas num `@BeforeEach`.
+- Um teste, um fluxo completo. Não repita aqui o que as fatias já cobrem (cada erro de validação, cada campo do JSON): o `@SpringBootTest` confere a **integração**, e os detalhes ficam nas fatias.
+
+<Callout tipo="info" titulo="E com um servidor de verdade?">
+Com `@SpringBootTest(webEnvironment = RANDOM_PORT)`, o Tomcat sobe numa porta livre e o teste fala HTTP de verdade, com o `RestTestClient` do Spring Framework 7 (via `@AutoConfigureRestTestClient`). Só vale quando o teste precisa do servidor real; no resto, o `MockMvc` é mais rápido e dá o mesmo resultado.
+</Callout>
+
+### Passo 8: a suíte inteira
+
+```bash
+mvn -q -f java/pom.xml -pl m10-testes/aulas -am test
+```
+
+Sem o `-q`, o resumo:
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.FlushEClearTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.NMaisUmTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.ProdutoControllerBaixaTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.ProdutoControllerErrosTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.ProdutoControllerTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.ProdutoRepositoryTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...fatias.ProdutosDePontaAPontaTest
+…
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Os 30 incluem os 13 testes de Mockito da aula 3, que rodam no mesmo módulo. A distribuição é a da pirâmide da aula 1: a maior parte das verificações nas fatias e na unidade, um único teste de ponta a ponta. (O `ProdutoControllerBaixaTest` é a solução do checkpoint; não o abra ainda.)
+
+## Quando o teste falha: as mensagens do Spring
+
+As mensagens abaixo são reais: foram produzidas com testes temporários (já removidos do projeto) ou quebrando o código de propósito. Mensagens do Spring são longas; o segredo é ir direto às linhas certas.
+
+### NoSuchBeanDefinitionException na fatia web
+
+Um `@WebMvcTest(ProdutoController.class)` sem o `@MockitoBean` do serviço:
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Parameter 0 of constructor in dev.trilhajava.m10.aulas.fatias.ProdutoController required a bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' that could not be found.
+
+
+Action:
+
+Consider defining a bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' in your configuration.
+…
+[ERROR] ...TemporarioSemMockTest.buscaUmProdutoExistente -- Time elapsed: 0.004 s <<< ERROR!
+java.lang.IllegalStateException: Failed to load ApplicationContext for [WebMergedContextConfiguration@4363f0ee testClass = ...TemporarioSemMockTest, …]
+Caused by: org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'produtoController' …: Unsatisfied dependency expressed through constructor parameter 0: No qualifying bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' available: expected at least 1 bean which qualifies as autowire candidate. Dependency annotations: {}
+Caused by: org.springframework.beans.factory.NoSuchBeanDefinitionException: No qualifying bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' available: …
+```
+
+**Como ler.** Comece pelo quadro **APPLICATION FAILED TO START**: ele diz quem precisava (o construtor do `ProdutoController`) e o que faltou (um `CatalogoDeProdutos`). Na pilha, a última linha `Caused by` é a causa raiz; as de cima são as consequências, até o `Failed to load ApplicationContext` que o JUnit mostra. Antes do quadro, o Spring imprime um enorme **CONDITIONS EVALUATION REPORT** com cada autoconfiguração avaliada: é útil quando falta um bean de infraestrutura, e pode ser pulado quando falta um bean seu.
+
+**Como corrigir.** O serviço não está lá **por projeto**: a fatia web não cria `@Service`. Declare `@MockitoBean CatalogoDeProdutos catalogo`. A tentação é trocar para `@SpringBootTest` "porque aí funciona", mas isso transforma o teste do controller num teste de tudo, com banco, mais lento e mais frágil.
+
+### NoSuchBeanDefinitionException na fatia JPA
+
+Um `@DataJpaTest` que tenta injetar o serviço:
+
+```text
+[ERROR] ...TemporarioServicoNaFatiaJpaTest.listaVazia -- Time elapsed: 0.005 s <<< ERROR!
+org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'dev.trilhajava.m10.aulas.fatias.TemporarioServicoNaFatiaJpaTest': Unsatisfied dependency expressed through field 'catalogo': No qualifying bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' available: …
+Caused by: org.springframework.beans.factory.NoSuchBeanDefinitionException: No qualifying bean of type 'dev.trilhajava.m10.aulas.fatias.CatalogoDeProdutos' available: expected at least 1 bean which qualifies as autowire candidate. Dependency annotations: {@org.springframework.beans.factory.annotation.Autowired(required=true)}
+```
+
+**Como ler.** Repare na diferença para o caso anterior: aqui o contexto **subiu**; quem falhou foi a injeção no **campo do teste** (`expressed through field 'catalogo'`, e o `@Autowired(required=true)` nas anotações). A fatia JPA não cria serviços. **Como corrigir:** depende do que você queria testar. Se era o repositório, injete o repositório. Se era o serviço com o banco de verdade, há duas saídas: `@Import(CatalogoDeProdutos.class)` no `@DataJpaTest` (entra só esse bean, e as dependências dele precisam existir na fatia) ou um `@SpringBootTest`. O mesmo vale para uma classe `@Repository` escrita à mão com `EntityManager`, que não é um repositório Spring Data: ela também precisa de `@Import`, como no exercício 10.05.
+
+### Contexto que falha ao subir: @Query inválida
+
+Trocando `p.ativo` por `p.ativa` na `@Query` de `listarAtivosComCategoria`:
+
+```text
+Caused by: org.springframework.data.repository.query.QueryCreationException: Cannot create query for method [ProdutoRepository.listarAtivosComCategoria()]; Query validation failed for 'select p from Produto p join fetch p.categoria where p.ativa = true order by p.nome'
+…
+Caused by: org.hibernate.query.sqm.PathElementException: Could not resolve attribute 'ativa' of 'dev.trilhajava.m10.aulas.fatias.Produto'
+…
+[ERROR] ...ProdutoRepositoryTest.cadaTesteComecaSoComOsDadosDoBeforeEach -- Time elapsed: 0.002 s <<< ERROR!
+java.lang.IllegalStateException: ApplicationContext failure threshold (1) exceeded: skipping repeated attempt to load context for [MergedContextConfiguration@5707ce70 testClass = ...ProdutoRepositoryTest, …]
+…
+[ERROR] Tests run: 6, Failures: 0, Errors: 6, Skipped: 0
+```
+
+**Como ler.** A consulta com erro nem é usada pelo `ProdutoRepositoryTest`, e mesmo assim **todos** os testes falharam: o Spring Data valida todas as `@Query` do repositório quando o cria, e sem repositório não há contexto. A causa está na última linha `Caused by`: o atributo `ativa` não existe em `Produto` (o JPQL fala de atributos Java, não de colunas). Repare também na segunda mensagem: depois da primeira falha, o Spring **não tenta montar o mesmo contexto de novo** (`failure threshold (1) exceeded`) e falha os outros testes na hora. Quando você vê essa mensagem, role para cima até a **primeira** falha: é lá que está a causa. **Como corrigir:** acerte o JPQL. E aproveite a lição: um `@DataJpaTest` qualquer do repositório já protege todas as consultas escritas à mão contra erros de digitação.
+
+### Expecting code to raise a throwable
+
+O teste de SKU duplicado com `save` em vez de `saveAndFlush`:
+
+```java
+produtos.save(new Produto("CAFE-1KG", "Café torrado 1 kg", new BigDecimal("49.90"), 12, mercearia));
+Produto duplicado = new Produto("CAFE-1KG", "Outro café", new BigDecimal("10.00"), 1, mercearia);
+
+assertThatThrownBy(() -> produtos.save(duplicado))
+        .isInstanceOf(DataIntegrityViolationException.class);
+```
+
+```text
+[ERROR] ...TemporarioSemFlushTest.skuDuplicadoEsbarraNaRestricaoUnique -- Time elapsed: 0.608 s <<< FAILURE!
+java.lang.AssertionError:
+
+Expecting code to raise a throwable.
+```
+
+**Como ler.** A regra existe no banco, mas o `INSERT` nunca foi enviado: o log dessa execução só tem `select next value for produto_seq`, nenhum `insert into produto`. O teste terminou, a transação foi desfeita e a restrição nunca foi consultada. **Como corrigir:** `saveAndFlush`, ou `em.flush()` dentro do `assertThatThrownBy`. O caso inverso é pior: um teste que espera **sucesso** passa sem flush mesmo quando o dado violaria uma restrição, e o bug só aparece em produção, no commit.
+
+## Armadilhas e quando NÃO usar cada ferramenta
+
+<Comparar antes="@SpringBootTest para testar um controller" depois="@WebMvcTest com o serviço como @MockitoBean">
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+@Transactional
+class ProdutoControllerTest {
+
+    @Autowired MockMvcTester mvc;
+    @Autowired ProdutoRepository produtos;
+    @Autowired CategoriaRepository categorias;
+
+    @Test
+    void produtoInexistente() {
+        // sobe banco, JPA, serviço...
+        // para testar um 404
+        assertThat(mvc.get().uri("/produtos/X"))
+                .hasStatus(HttpStatus.NOT_FOUND);
+    }
+}
+```
+
+```java
+@WebMvcTest(ProdutoController.class)
+class ProdutoControllerErrosTest {
+
+    @Autowired MockMvcTester mvc;
+    @MockitoBean CatalogoDeProdutos catalogo;
+
+    @Test
+    void produtoInexistente() {
+        given(catalogo.buscar("X"))
+                .willThrow(new ProdutoNaoEncontradoException("X"));
+        assertThat(mvc.get().uri("/produtos/X"))
+                .hasStatus(HttpStatus.NOT_FOUND);
+    }
+}
+```
+</Comparar>
+
+O da esquerda funciona, mas paga por tudo: sobe o banco para testar uma tradução de exceção em status HTTP, depende de dados (e de nenhum outro teste ter criado um produto `X`), e quando falha você não sabe se o problema está no controller, no serviço ou no banco. O da direita isola a pergunta. E o `@Transactional` da esquerda ainda esconde o comportamento real das transações, como vimos no passo 7.
+
+As regras de bolso:
+
+- **Não mocke o que a fatia deveria testar.** Um `@MockitoBean ProdutoRepository` num `@DataJpaTest` não faz sentido: o repositório é o objeto sob teste. Na fatia web, mocke o serviço; na fatia JPA, não mocke nada.
+- **Não teste regra de negócio no controller.** Se o teste do controller precisa de muitos stubs para montar um cenário, a regra provavelmente está no lugar errado. Controller fino, testes de controller simples; regras no serviço ou no domínio, com testes de unidade.
+- **`@MockitoBean` não é de graça.** Cada combinação diferente de mocks é um contexto a mais no cache. Não declare mocks "por via das dúvidas".
+- **Cuidado com `@Transactional` em `@SpringBootTest`.** Ele desfaz os dados (bom), mas faz o teste e o código rodarem na mesma transação: `LazyInitializationException`, commit e isolamento deixam de aparecer. Use para testes de serviço com banco; evite em testes de fluxo HTTP.
+- **Evite `@DirtiesContext`.** Ele descarta o contexto e obriga a próxima classe a montar outro. Quase sempre há uma alternativa: limpar os dados, reiniciar um estado explicitamente.
+- **H2 não é PostgreSQL.** Esta aula usa H2 para rodar sem Docker, e para consultas JPQL simples isso basta. Mas o H2 não tem `jsonb`, não trata locks e `FOR UPDATE SKIP LOCKED` como o PostgreSQL, e dá mensagens de erro diferentes. Uma consulta nativa ou um recurso específico do banco testado no H2 prova pouco. A aula 5 mostra como rodar o mesmo `@DataJpaTest` contra um PostgreSQL de verdade, com Testcontainers e `@AutoConfigureTestDatabase(replace = Replace.NONE)`.
+
+| Pergunta | Ferramenta |
+|---|---|
+| A regra de desconto calcula certo? | Teste de unidade, sem Spring (aulas 2 e 3) |
+| O endpoint devolve 422 com ProblemDetail quando falta estoque? | `@WebMvcTest` + `@MockitoBean` |
+| A consulta de estoque baixo respeita a borda? A listagem tem N+1? | `@DataJpaTest` |
+| O JSON de um DTO tem o formato de data certo? | `@JsonTest` (fatia só do Jackson) |
+| O cliente HTTP do gateway monta a requisição certa? | `@RestClientTest` com `MockRestServiceServer` |
+| Cadastrar, baixar e consultar funciona de ponta a ponta? | `@SpringBootTest` (poucos) |
+
+<Callout tipo="erro" titulo="Teste de controller que não testa o controller">
+Um `@WebMvcTest` em que o stub devolve um objeto e a asserção só confere que esse objeto voltou no JSON **testa alguma coisa** (roteamento, serialização), mas pouco. Os testes de fatia web mais valiosos são os de **borda do contrato**: validação, erros, cabeçalhos, códigos de status, campos que não podem vazar. Pergunte sempre: se eu apagar o `@Valid`, mudar o status do `TratadorDeErros` ou renomear um campo do DTO, algum teste quebra?
+</Callout>
+
+## Checkpoint: o endpoint de baixa de estoque
+
+Agora é a sua vez. O endpoint `POST /produtos/{sku}/baixas` ainda não tem teste de fatia. Ele recebe `{"quantidade": N}`, chama `catalogo.baixarEstoque(sku, N)` e devolve `{"sku": ..., "quantidadeEmEstoque": saldo}`.
+
+**O desafio:** crie a classe `MeuTesteDeBaixaTest` no pacote de testes `fatias`, com três testes:
+
+1. Baixa de 3 unidades de `CAFE-1KG` quando o serviço devolve saldo 9: status 200 e o JSON `{"sku": "CAFE-1KG", "quantidadeEmEstoque": 9}`.
+2. Baixa de 50 unidades quando o serviço lança `EstoqueInsuficienteException("CAFE-1KG", 50, 12)`: status 422, `application/problem+json`, `type` terminando em `estoque-insuficiente`, `solicitado` 50 e `disponivel` 12.
+3. Baixa com `quantidade` 0: status 400 com `erros.quantidade` igual a `"deve ser maior que zero"`, e o serviço **nunca** chamado.
+
+Rode com `mvn test -Dtest=MeuTesteDeBaixaTest`. Depois, rode junto com o log do cache (`"-Dlogging.level.org.springframework.test.context.cache=DEBUG"`) e confira se a sua classe reaproveitou o contexto das outras fatias web ou montou um novo. Se montou, descubra por quê.
+
+<Dicas>
+<Dica nivel={1}>
+A configuração é idêntica à do `ProdutoControllerTest`: a mesma anotação de fatia, o mesmo `MockMvcTester`, o mesmo `@MockitoBean`. É isso também que garante o reaproveitamento do contexto.
+</Dica>
+<Dica nivel={2}>
+Os três testes fazem a mesma requisição com corpos diferentes. Um método auxiliar `MvcTestResult baixar(String sku, String corpo)` deixa cada teste com três linhas. Para o 422, use `willThrow(...)` no stub; para o 400, não programe stub nenhum.
+</Dica>
+<Dica nivel={3}>
+Para o terceiro teste: `bodyJson().extractingPath("$.erros.quantidade").isEqualTo("deve ser maior que zero")` e depois `then(catalogo).should(never()).baixarEstoque(anyString(), anyInt())`. Lembre dos matchers da aula 3: ou todos os argumentos, ou nenhum.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fatias/ProdutoControllerBaixaTest.java" semImports />
+
+**Por que assim.** Cada teste cobre uma saída diferente do contrato: sucesso, erro de negócio e erro de entrada. O primeiro prova que o saldo do serviço vira o JSON certo. O segundo prova que a exceção de domínio chega ao cliente como 422, com os campos extras (`solicitado`, `disponivel`) que o front-end usa para montar a mensagem. O terceiro prova que a validação barra a requisição **antes** do serviço, e o `should(never())` é o que torna isso verificável.
+
+**O cache.** Com a configuração idêntica, sua classe aparece no log sem aumentar o `missCount`. Se aumentou, compare as anotações: um `@MockitoBean` a mais, outro controller na lista do `@WebMvcTest` ou um `properties` diferente bastam para criar outro contexto.
+
+**Alternativa.** Os casos de 400 poderiam virar um `@ParameterizedTest` com vários corpos inválidos (`{"quantidade": 0}`, `{"quantidade": -1}`, `{}`), cada um com o campo esperado em `erros`. Vale quando a lista de casos cresce.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+"Como você testa uma aplicação Spring Boot?" é pergunta certa em entrevista de backend Java, e a resposta que impressiona fala de camadas e de custo. Algo como: regras de negócio com testes de unidade, sem Spring; o contrato HTTP com `@WebMvcTest`, o serviço como `@MockitoBean` e o `MockMvcTester` verificando status, JSON e o formato dos erros, porque o `@ControllerAdvice` entra na fatia; repositórios com `@DataJpaTest`, usando `flush` e `clear` para testar o que realmente foi ao banco, contando comandos SQL quando o N+1 é um risco, e contra o banco de produção com Testcontainers, porque H2 não é PostgreSQL; e poucos `@SpringBootTest` de fluxos críticos. Para a suíte ficar rápida, padronizo a configuração dos testes para aproveitar o cache de contexto e evito `@DirtiesContext`. Bônus: saber que o `@MockBean` foi removido no Boot 4 em favor do `@MockitoBean`, e explicar por que um `NoSuchBeanDefinitionException` numa fatia quase nunca se resolve trocando para `@SpringBootTest`.
+</Callout>
+
+<Quiz
+  id="10-fatias"
+  questoes={[
+    {
+      pergunta: 'Num @WebMvcTest(ProdutoController.class), o CatalogoDeProdutos (um @Service) é criado?',
+      opcoes: ['Sim, com todas as dependências', 'Não: a fatia web não cria serviços, e o teste precisa declarar um @MockitoBean', 'Sim, mas sem banco', 'Só se o serviço estiver no mesmo pacote do controller'],
+      correta: 1,
+      explicacao: 'A fatia web sobe controllers, advice, Jackson, validação e MockMvc. Sem o `@MockitoBean`, o contexto falha com `NoSuchBeanDefinitionException` ao criar o controller.',
+    },
+    {
+      pergunta: 'Um teste @DataJpaTest espera DataIntegrityViolationException ao salvar um SKU duplicado com save(), mas falha com "Expecting code to raise a throwable". Qual a causa?',
+      opcoes: ['O H2 não suporta UNIQUE', 'O INSERT ainda não foi enviado ao banco: sem flush, a restrição nunca é consultada, e o rollback desfaz tudo no fim', 'O Spring Data não traduz exceções', 'Falta @Transactional no teste'],
+      correta: 1,
+      explicacao: 'O JPA adia o INSERT até o flush. Num teste com rollback, o commit nunca acontece. Use `saveAndFlush` ou `em.flush()`.',
+    },
+    {
+      pergunta: 'Duas classes de teste são idênticas, exceto que uma tem @DataJpaTest(properties = "spring.jpa.properties.hibernate.generate_statistics=true"). Quantos contextos o Spring monta para as duas?',
+      opcoes: ['Um, porque as duas são @DataJpaTest', 'Dois, porque a propriedade muda a configuração e, com ela, a chave do cache', 'Nenhum, porque @DataJpaTest não usa contexto', 'Um por método de teste'],
+      correta: 1,
+      explicacao: 'O cache de contexto usa toda a configuração como chave: anotação, propriedades, perfis, mocks, imports. Qualquer diferença cria um contexto novo.',
+    },
+    {
+      pergunta: 'Todos os testes de ProdutoRepositoryTest falham; o primeiro com "Query validation failed" e os outros com "ApplicationContext failure threshold (1) exceeded". Onde está a causa?',
+      opcoes: ['Nos testes que falharam com "threshold exceeded"', 'Numa @Query do repositório com JPQL inválido; o contexto não sobe e o Spring não tenta de novo', 'No H2, que precisa ser reiniciado', 'No cache de contexto, que precisa de @DirtiesContext'],
+      correta: 1,
+      explicacao: 'O Spring Data valida as `@Query` ao criar o repositório. A primeira falha tem a causa (a última linha `Caused by`); as seguintes só dizem que o contexto já falhou antes.',
+    },
+    {
+      pergunta: 'Qual teste deve pegar um N+1 na listagem de produtos ativos?',
+      opcoes: ['Um @WebMvcTest conferindo o JSON da listagem', 'Um @DataJpaTest que conta os comandos SQL (estatísticas do Hibernate) ao listar e acessar a categoria', 'Um teste de unidade do serviço com o repositório mockado', 'Nenhum: N+1 só aparece em produção'],
+      correta: 1,
+      explicacao: 'N+1 não muda o resultado, só a quantidade de SQL. A fatia web e o teste com mock nem executam SQL; é preciso contar os comandos contra um banco.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Todo teste Spring monta um **contexto**, e isso custa. Fatias sobem menos; o **cache de contexto** sobe menos vezes, desde que as classes tenham **a mesma configuração**. Cada `@MockitoBean`, propriedade ou perfil diferente é um contexto a mais; `@DirtiesContext` descarta o contexto.
+- **`@WebMvcTest(Controller.class)`**: controllers, advice, Jackson, validação e `MockMvcTester`, sem serviços nem banco. O serviço entra como **`@MockitoBean`**. Teste status, cabeçalhos, JSON (`bodyJson().isLenientlyEqualTo`) e os erros em **ProblemDetail**, inclusive que dado inválido não chega ao serviço.
+- **`@DataJpaTest`**: JPA, repositórios, banco embutido e `TestEntityManager`, com **rollback por teste**. Prepare dados com o `TestEntityManager`, e use **`flush()`** (para o SQL ir ao banco e as restrições dispararem) e **`clear()`** (para ler do banco, não do cache de primeiro nível).
+- **N+1** vira teste vermelho contando comandos com as estatísticas do Hibernate; `join fetch` resolve.
+- **`@SpringBootTest`** para poucos fluxos de ponta a ponta, sem `@Transactional` quando o comportamento transacional importa, com dados únicos por teste.
+- `NoSuchBeanDefinitionException` numa fatia quase sempre significa "este bean não pertence a esta fatia": forneça um `@MockitoBean` ou um `@Import`, não troque para `@SpringBootTest`. Num contexto que não sobe, a causa está na **primeira** falha, na última linha `Caused by`.
+- No Boot 4: starters `spring-boot-starter-webmvc-test` e `spring-boot-starter-data-jpa-test`, e `@MockitoBean` no lugar do `@MockBean` removido.
+
+## Próximo passo
+
+H2 serviu para esta aula, mas não é o banco de produção. Na [aula 5, Testes de integração com Testcontainers](../05-testcontainers/), o mesmo `@DataJpaTest` passa a rodar contra um PostgreSQL de verdade, num container descartável. Depois, no [exercício 10.05, Fintech Core — Marco 3](../../../exercicios/10-testes/05-fintech-marco-3/), você escreve a suíte do projeto integrador com tudo o que viu aqui: `@WebMvcTest` para o contrato de transferências (201 com `Location`, 422 como ProblemDetail), `@DataJpaTest` para o repositório de contas e o cache de contexto trabalhando a seu favor.

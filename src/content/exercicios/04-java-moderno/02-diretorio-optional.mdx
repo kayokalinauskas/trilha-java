@@ -1,0 +1,86 @@
+---
+titulo: Diretório de funcionários com Optional
+codigo: "04.02"
+resumo: Navegue por um cadastro de RH cheio de dados faltando — gestores inexistentes, e-mails em branco, matrículas erradas — sem nenhum null check e sem get().
+modulo: 04-java-moderno
+ordem: 2
+dificuldade: facil
+tempo: 1–1,5h
+conceitos: [Optional, flatMap, orElseThrow, Streams]
+aulas: [04-java-moderno/04-optional]
+java:
+  modulo: m04-java-moderno
+  teste: DiretorioTest
+---
+
+## Contexto
+
+O sistema de RH de uma empresa de 3 mil funcionários tem dados legados: pessoas sem e-mail, e-mails preenchidos com espaços em branco, gestores que saíram da empresa (matrícula que não existe mais). O serviço de notificações quebra toda semana com `NullPointerException`. Você vai reescrever o **diretório** que responde "quem é o gestor de X?" e "para quem mando este aviso?".
+
+## O modelo
+
+`Funcionario` é um record com `matricula`, `nome`, `email` (pode ser `null` ou em branco), `matriculaGestor` (pode ser `null`) e `ativo`. Ele já expõe:
+
+- `emailOpcional()` — `Optional<String>`, vazio se o e-mail for nulo **ou em branco**;
+- `gestor()` — `Optional<String>` com a matrícula do gestor.
+
+## Requisitos
+
+| Método | Comportamento |
+|---|---|
+| `buscar(matricula)` | `Optional<Funcionario>`; vazio se não existir **ou se a matrícula for `null`** |
+| `buscarObrigatorio(matricula)` | O funcionário, ou `FuncionarioNaoEncontradoException` (pronta) |
+| `emailDoGestor(matricula)` | `Optional<String>` com o e-mail do gestor direto |
+| `nomeParaExibicao(matricula)` | O nome, ou `"Funcionário não encontrado"` |
+| `contatoPara(matricula)` | E-mail do funcionário → senão, do gestor → senão, `EMAIL_RH` |
+| `superior(matricula, niveis)` | O superior `n` níveis acima (0 = o próprio); vazio se a cadeia acabar |
+| `emailsAtivos(matriculas)` | E-mails dos existentes, **ativos** e com e-mail, na ordem recebida |
+
+## Regra do exercício
+
+**Proibido:** `if (x == null)`, `x != null`, `Optional.get()` e `Optional.isPresent()`. Use `map`, `flatMap`, `filter`, `or`, `orElse`, `orElseGet`, `orElseThrow` e `Optional::stream`.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `DiretorioTest` passam.
+- [ ] Nenhuma das construções proibidas aparece no código.
+- [ ] `contatoPara` não busca o gestor quando o próprio funcionário tem e-mail (a alternativa é preguiçosa).
+
+## Desafios opcionais
+
+- `cadeiaDeGestores(matricula)`: a lista de todos os superiores até o topo, protegida contra ciclos no cadastro (A é gestor de B, que é gestor de A).
+- Faça `buscar` registrar em log as matrículas não encontradas, sem quebrar o encadeamento (dica: `Optional.or` com um `Supplier` que loga e devolve vazio).
+
+<Dicas>
+<Dica nivel={1}>
+Pense no caminho como uma sequência de "talvez": talvez exista o funcionário → talvez ele tenha gestor → talvez o gestor exista → talvez o gestor tenha e-mail. Cada "talvez" é um `flatMap`.
+</Dica>
+<Dica nivel={2}>
+Guarde os funcionários em um `Map<String, Funcionario>` (por exemplo com `Collectors.toUnmodifiableMap`). Cuidado: `Map.get(null)` em mapas imutáveis lança exceção — por isso `buscar` começa com `Optional.ofNullable(matricula).map(porMatricula::get)`.
+</Dica>
+<Dica nivel={3}>
+`contatoPara`: `buscar(m).flatMap(Funcionario::emailOpcional).or(() -> emailDoGestor(m)).orElse(EMAIL_RH)`. `emailsAtivos`: `.map(this::buscar).flatMap(Optional::stream).filter(Funcionario::ativo).map(Funcionario::emailOpcional).flatMap(Optional::stream).toList()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m04-java-moderno/solucao/src/main/java/dev/trilhajava/m04/diretorio/Diretorio.java" />
+
+### Por que assim
+
+- **O record guarda `null`, a API expõe `Optional`.** É o equilíbrio recomendado: `Optional` como atributo não é serializável nem foi feito para isso, mas quem usa a classe nunca vê o `null`.
+- **`emailOpcional()` trata o "em branco"** com `filter(e -> !e.isBlank())`. Regras de "valor ausente" ficam em um lugar só.
+- **`Optional.or`** (Java 9) é a alternativa preguiçosa que também devolve `Optional`: o gestor só é consultado se o funcionário não tiver e-mail.
+- **`superior` usa um laço** de propósito: a quantidade de níveis é um número, e um `for` com `flatMap` dentro é mais legível que uma recursão ou `Stream.iterate`.
+- **`flatMap(Optional::stream)`** é a forma idiomática de descartar os vazios dentro de uma Stream.
+
+### Avalie sua solução
+
+- Busque por `.get()`, `isPresent` e `== null` no seu código. Nenhum deveria aparecer.
+- `emailDoGestor("040")` (gestor inexistente) devolve vazio na sua versão, sem exceção?
+- Você usou `orElse(emailDoGestor(...))` em algum lugar? Essa chamada seria executada sempre.
+
+</Solucao>

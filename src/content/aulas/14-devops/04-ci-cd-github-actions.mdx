@@ -1,0 +1,259 @@
+---
+titulo: "CI/CD com GitHub Actions: do pull request à produção"
+descricao: Integração contínua, entrega contínua e deploy contínuo; a anatomia de um workflow do GitHub Actions (gatilhos, jobs, steps), o pipeline do exercício 14.04 com setup-java e cache do Maven, segredos, matriz, proteção de branch, ambientes com aprovação, rollback e estratégias de deploy (rolling, blue-green, canary).
+modulo: 14-devops
+ordem: 4
+duracao: 55
+objetivos:
+  - Diferenciar integração contínua, entrega contínua e deploy contínuo
+  - Escrever um workflow do GitHub Actions que testa, empacota e gera a imagem a cada push e pull request
+  - Usar segredos, matriz, proteção de branch e ambientes com aprovação
+  - Planejar rollback e escolher entre rolling update, blue-green e canary
+tags: [CI, CD, github actions, pipeline, workflow, secrets, deploy, blue-green, canary, rollback]
+flashcards:
+  - frente: CI × entrega contínua × deploy contínuo
+    verso: CI - cada mudança é integrada na main e verificada automaticamente (build + testes). Entrega contínua - a main está sempre pronta para ir para produção, e o deploy é um clique. Deploy contínuo - todo commit aprovado vai para produção sem intervenção humana.
+  - frente: Qual a hierarquia de um workflow do GitHub Actions?
+    verso: Um workflow (arquivo em .github/workflows) é disparado por eventos (on) e tem jobs. Cada job roda numa máquina própria (runs-on) e tem steps executados em sequência - uma action (uses) ou um comando (run). Jobs rodam em paralelo, salvo quando declaram needs.
+  - frente: O que o cache maven do actions/setup-java guarda?
+    verso: O repositório local do Maven (~/.m2/repository), com a chave calculada a partir do hash dos pom.xml. Enquanto os pom não mudam, as dependências não são baixadas de novo.
+  - frente: Por que o SnakeYAML lê a chave on de um workflow como true?
+    verso: O SnakeYAML segue o YAML 1.1, em que on, off, yes e no sem aspas são booleanos. O GitHub interpreta corretamente, mas uma ferramenta própria que lê o workflow precisa procurar a chave Boolean.TRUE (ou você escreve "on" entre aspas).
+  - frente: Blue-green × canary
+    verso: Blue-green - duas cópias completas do ambiente; o tráfego vira de uma vez da versão antiga para a nova, e o rollback é virar de volta. Canary - a versão nova recebe primeiro uma fração pequena do tráfego (por exemplo 5%), e cresce se as métricas continuarem boas.
+  - frente: Como fazer rollback quando a versão nova mudou o banco?
+    verso: Com migrações compatíveis nos dois sentidos (expand/contract) - primeiro só adicione (coluna nova, opcional), publique o código que usa as duas, e só remova o antigo num deploy posterior. Assim a versão anterior continua funcionando com o banco novo.
+---
+
+Você já tem um build reproduzível (aula 2) e uma imagem (aula 3). Falta tirar o humano do caminho: **toda mudança** deve ser compilada, testada e empacotada **automaticamente**, do mesmo jeito, antes de qualquer pessoa aprovar o merge. É isso que um pipeline faz.
+
+**Pré-requisitos:** as aulas 1 a 3 deste módulo e os testes com Testcontainers do módulo 10.
+
+## Intuição: a esteira com inspeção
+
+Numa fábrica, cada peça passa por pontos de inspeção automáticos antes de chegar à embalagem; uma peça com defeito é barrada cedo, quando é barato consertar. O pipeline é a esteira: o PR só pode entrar na `main` se passar pelas inspeções (compilar, testar, empacotar), e só vai para produção se passar pelas seguintes.
+
+## CI, entrega contínua e deploy contínuo
+
+| Prática | O que garante | Quem aperta o botão de produção |
+|---|---|---|
+| **Integração contínua (CI)** | cada mudança é integrada na `main` e verificada (build + testes) | ninguém; CI não faz deploy |
+| **Entrega contínua** (*continuous delivery*) | a `main` está **sempre pronta** para produção; o deploy é um clique | uma pessoa, quando o negócio quiser |
+| **Deploy contínuo** (*continuous deployment*) | todo commit que passa no pipeline **vai** para produção | ninguém: é automático |
+
+A sigla **CD** serve para as duas últimas; na entrevista, deixe claro de qual está falando.
+
+<Figura legenda="Um pipeline típico. O CI roda em todo pull request; a entrega segue depois do merge na main">
+<svg viewBox="0 0 680 230" width="680" role="img" aria-label="Pull request dispara build e testes; depois do merge, a imagem vai para o registro, é implantada em homologação e, com aprovação, em produção">
+  <defs><marker id="m1404" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="20" class="d-title">CI (todo push e PR)</text>
+  <rect x="10" y="35" width="120" height="50" rx="8" class="d-box"/><text x="70" y="57" text-anchor="middle" class="d-mono">checkout</text><text x="70" y="75" text-anchor="middle" class="d-label">+ setup-java</text>
+  <rect x="160" y="35" width="120" height="50" rx="8" class="d-info"/><text x="220" y="57" text-anchor="middle" class="d-mono">mvn -B verify</text><text x="220" y="75" text-anchor="middle" class="d-label">testes + jar</text>
+  <rect x="310" y="35" width="120" height="50" rx="8" class="d-info"/><text x="370" y="57" text-anchor="middle" class="d-mono">docker build</text><text x="370" y="75" text-anchor="middle" class="d-label">tag = sha</text>
+  <path d="M130 60 H156" class="d-line" marker-end="url(#m1404)"/>
+  <path d="M280 60 H306" class="d-line" marker-end="url(#m1404)"/>
+  <text x="460" y="55" class="d-label">falhou? o PR não</text>
+  <text x="460" y="73" class="d-label">pode ser mesclado</text>
+  <text x="10" y="125" class="d-title">CD (depois do merge na main)</text>
+  <rect x="10" y="140" width="120" height="50" rx="8" class="d-info"/><text x="70" y="162" text-anchor="middle" class="d-mono">push</text><text x="70" y="180" text-anchor="middle" class="d-label">no registro</text>
+  <rect x="160" y="140" width="120" height="50" rx="8" class="d-ok"/><text x="220" y="162" text-anchor="middle" class="d-mono">homologação</text><text x="220" y="180" text-anchor="middle" class="d-label">smoke test</text>
+  <rect x="310" y="140" width="120" height="50" rx="8" class="d-box"/><text x="370" y="162" text-anchor="middle" class="d-mono">aprovação</text><text x="370" y="180" text-anchor="middle" class="d-label">environment</text>
+  <rect x="460" y="140" width="120" height="50" rx="8" class="d-accent"/><text x="520" y="162" text-anchor="middle" class="d-mono">produção</text><text x="520" y="180" text-anchor="middle" class="d-label">canary/rolling</text>
+  <path d="M130 165 H156" class="d-line" marker-end="url(#m1404)"/>
+  <path d="M280 165 H306" class="d-line" marker-end="url(#m1404)"/>
+  <path d="M430 165 H456" class="d-line" marker-end="url(#m1404)"/>
+  <text x="10" y="220" class="d-label">Sem a etapa de aprovação, é deploy contínuo; com ela, entrega contínua.</text>
+</svg>
+</Figura>
+
+## Anatomia de um workflow
+
+Um **workflow** é um arquivo YAML em `.github/workflows/`. O do exercício 14.04 (`entrega/ci.yml`):
+
+```yaml
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Testes e empacotamento
+        run: mvn -B verify
+
+      - name: Imagem Docker
+        run: docker build -f entrega/Dockerfile -t trilha-m14:${{ github.sha }} .
+```
+
+| Peça | Papel |
+|---|---|
+| `on` | os **eventos** que disparam: push na `main` e qualquer pull request |
+| `jobs.build` | um **job**: roda numa máquina virtual nova (`runs-on: ubuntu-latest`) |
+| `steps` | executados **em sequência**; `uses` chama uma *action* pronta, `run` executa um comando |
+| `actions/checkout@v5` | baixa o código do repositório (sem ele, a máquina está vazia) |
+| `actions/setup-java@v5` | instala o Temurin 25 e, com `cache: maven`, guarda o `~/.m2` entre execuções (chave pelo hash dos `pom.xml`) |
+| `mvn -B verify` | compila, roda **todos** os testes (os com Testcontainers também: o runner Ubuntu tem Docker) e empacota |
+| `${{ github.sha }}` | uma **expressão**: o hash do commit vira a tag da imagem, rastreável até o código |
+
+Detalhes que valem ouro:
+
+- `java-version: "25"` vai **entre aspas**. Sem elas, um valor como `21.10` seria lido como número, e não como texto.
+- Fixe as actions numa versão (`@v5`). Para rigor máximo, times fixam o **hash do commit** da action, porque uma tag pode ser movida.
+- Jobs diferentes rodam **em paralelo** e em máquinas separadas; use `needs: build` para criar ordem e passe arquivos entre eles com artefatos ou pelo registro de imagens.
+
+<Callout tipo="info" titulo="Curiosidade: a chave on vira true">
+O teste do exercício lê o `ci.yml` com o **SnakeYAML**, que implementa o YAML 1.1. Nessa versão da especificação, `on`, `off`, `yes` e `no` sem aspas são **booleanos**: a chave `on:` é lida como `true`. O GitHub trata o arquivo corretamente, mas qualquer ferramenta sua que leia workflows precisa lembrar disso (o teste procura `"on"` e, se não achar, `Boolean.TRUE`).
+</Callout>
+
+## Segredos e permissões
+
+```yaml
+permissions:
+  contents: read          # o GITHUB_TOKEN só lê o repositório
+  packages: write         # ... e pode publicar no GitHub Container Registry
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Login no registro
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Push
+        run: |
+          docker build -t ghcr.io/minha-org/fintech-core:${{ github.sha }} .
+          docker push ghcr.io/minha-org/fintech-core:${{ github.sha }}
+```
+
+- **Segredos** são cadastrados nas configurações do repositório (ou da organização, ou de um *environment*) e lidos com `secrets.NOME`. O GitHub mascara o valor nos logs, mas não conte com isso: nunca faça `echo` de um segredo.
+- Pull requests vindos de **forks** não recebem os segredos do repositório: um estranho não pode abrir um PR que imprime as suas chaves.
+- Dê ao `GITHUB_TOKEN` o **mínimo** de `permissions`. Em nuvem, prefira **OIDC** (o workflow troca um token temporário por credenciais do provedor) a guardar chaves de longa duração como segredo.
+
+## Matriz
+
+Para testar em mais de uma versão ou sistema, uma **matriz** gera um job por combinação:
+
+```yaml
+jobs:
+  build:
+    strategy:
+      matrix:
+        java: ["21", "25"]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "${{ matrix.java }}", cache: maven }
+      - run: mvn -B verify
+```
+
+Faz sentido em **bibliotecas** que precisam funcionar em vários ambientes. Um serviço que roda só numa imagem com Java 25 não precisa de matriz: ela só gasta minutos de CI.
+
+## Proteção de branch
+
+O pipeline só protege se for **obrigatório**. Nas configurações do repositório (*branch protection rules* ou *rulesets*), para a `main`:
+
+- exigir **pull request** com pelo menos uma aprovação;
+- exigir que os **status checks** (o job `build`) passem antes do merge;
+- bloquear **push direto** e **force push**.
+
+## Deploy: ambientes, aprovação e rollback
+
+```yaml
+  deploy-producao:
+    needs: publicar
+    runs-on: ubuntu-latest
+    environment: producao        # regras do environment: revisores obrigatórios, segredos próprios
+    steps:
+      - run: kubectl set image deployment/fintech-core app=ghcr.io/minha-org/fintech-core:${{ github.sha }}
+```
+
+Um **environment** no GitHub (homologação, produção) pode exigir **aprovação** de pessoas específicas, restringir quais branches fazem deploy nele e ter **segredos próprios**: a credencial de produção só existe para o job que passou pela aprovação.
+
+**Rollback** é voltar a rodar a imagem anterior, e fica fácil porque cada imagem tem a tag do commit: basta implantar o `sha` anterior. O que complica o rollback é o **banco**: se a versão nova removeu uma coluna, a antiga não funciona mais. Por isso, migrações seguem o padrão **expand/contract**: primeiro só adicione, publique o código que convive com os dois formatos, e remova o que sobrou num deploy posterior.
+
+| Estratégia | Como funciona | Rollback | Custo |
+|---|---|---|---|
+| **Rolling update** | troca as instâncias aos poucos (padrão do Kubernetes) | novo rolling para a versão anterior | baixo |
+| **Blue-green** | dois ambientes completos; o tráfego vira de uma vez para o novo | virar o tráfego de volta, em segundos | dobro de infraestrutura durante a troca |
+| **Canary** | a versão nova recebe uma fração pequena do tráfego e cresce se as métricas estiverem boas | tirar o canário | exige métricas e roteamento por peso |
+
+**Feature flags** completam o quadro: o código vai para produção desligado (*deploy*), e a funcionalidade é ligada depois (*release*), para uma parte dos clientes ou para todos, sem novo deploy.
+
+## Armadilhas comuns
+
+- **Pipeline lento** (20 minutos por PR): o time para de esperar e começa a mesclar sem ver o resultado. Use cache, paralelize jobs e mantenha os testes rápidos.
+- **Testes instáveis** (*flaky*) ignorados com "roda de novo": em pouco tempo ninguém confia no vermelho. Corrija ou isole o teste.
+- **Pipeline opcional**: sem proteção de branch, o botão de merge funciona mesmo com o CI vermelho.
+- **Segredo impresso no log** ou passado como argumento de linha de comando.
+- **Deploy de `latest`**: não há como saber o que está rodando, nem para onde voltar.
+- **Migração destrutiva junto com o código novo**: o rollback deixa de ser possível.
+
+<Callout tipo="entrevista">
+"Descreva um pipeline de CI/CD que você montaria." Estruture em etapas: **PR** dispara build, testes (unitários e de integração) e análise; a **proteção de branch** exige o verde; após o **merge**, a imagem é gerada com a tag do commit e publicada; deploy em **homologação** com testes de fumaça (*smoke tests*); **aprovação** e deploy em produção com **canary** ou rolling; **métricas** decidem seguir ou voltar. Cite **rollback** pela tag anterior e **migrações compatíveis**. Saber a diferença entre *continuous delivery* e *continuous deployment* costuma ser o critério de desempate.
+</Callout>
+
+<Quiz
+  id="14-ci-cd"
+  questoes={[
+    {
+      pergunta: 'Todo commit aprovado no pipeline vai para produção automaticamente, sem ninguém apertar botão. Isso é:',
+      opcoes: ['Integração contínua', 'Entrega contínua', 'Deploy contínuo', 'Git Flow'],
+      correta: 2,
+      explicacao: 'Na entrega contínua, a main está pronta e alguém decide quando publicar. No deploy contínuo, a publicação é automática.',
+    },
+    {
+      pergunta: 'Por que o primeiro step do job é actions/checkout?',
+      opcoes: ['Para instalar o Java', 'Porque o runner começa vazio e precisa baixar o código do repositório', 'Para fazer login no registro', 'Para ativar o cache do Maven'],
+      correta: 1,
+      explicacao: 'Cada job roda numa máquina nova. Sem o checkout, não há pom.xml nem código para compilar.',
+    },
+    {
+      pergunta: 'Qual a vantagem de usar o sha do commit como tag da imagem?',
+      opcoes: ['A imagem fica menor', 'Cada imagem é rastreável até o código exato, e o rollback é implantar o sha anterior', 'Dispensa testes', 'É exigido pelo Docker'],
+      correta: 1,
+      explicacao: 'Tags imutáveis e rastreáveis são a base do rollback e da investigação de incidentes.',
+    },
+    {
+      pergunta: 'Na estratégia canary, o que decide se a versão nova recebe mais tráfego?',
+      opcoes: ['O horário do deploy', 'As métricas (erros, latência) da fração que já recebe tráfego', 'O número de commits', 'A aprovação do code review'],
+      correta: 1,
+      explicacao: 'O canário expõe poucos usuários à versão nova; se os sinais pioram, ela é retirada antes de afetar todos.',
+    },
+    {
+      pergunta: 'Um teste Java que lê o ci.yml com SnakeYAML não encontra a chave "on". Por quê?',
+      opcoes: ['O arquivo está errado', 'No YAML 1.1, on sem aspas é o booleano true', 'O SnakeYAML ignora chaves curtas', 'O GitHub remove a chave'],
+      correta: 1,
+      explicacao: 'O SnakeYAML segue o YAML 1.1: a chave vira Boolean.TRUE. O GitHub interpreta o arquivo à sua maneira e não tem esse problema.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **CI** verifica cada mudança; **entrega contínua** deixa a main sempre publicável; **deploy contínuo** publica sozinho.
+- Workflow = **eventos** (`on`) → **jobs** (máquinas, em paralelo, `needs` para ordem) → **steps** (`uses` ou `run`).
+- `actions/checkout@v5`, `actions/setup-java@v5` (`temurin`, `"25"`, `cache: maven`) e `mvn -B verify`; imagem com a tag do commit.
+- **Segredos** com permissões mínimas; **matriz** para bibliotecas; **proteção de branch** torna o pipeline obrigatório.
+- **Environments** com aprovação; **rollback** pela tag anterior; migrações **expand/contract**; rolling, **blue-green** e **canary**.
+
+## Referências
+
+- Documentação do GitHub Actions — *Understanding GitHub Actions*, *Workflow syntax for GitHub Actions* e *Using a matrix for your jobs* (docs.github.com)
+- Documentação do GitHub — *Using secrets in GitHub Actions*, *Managing environments for deployment* e *About protected branches* (docs.github.com)
+- Repositório `actions/setup-java` — seção *Caching packages dependencies* (github.com/actions/setup-java)
+- Jez Humble e David Farley — *Continuous Delivery* (Addison-Wesley)
+- Especificação YAML 1.1 — *Boolean Language-Independent Type* (yaml.org/type/bool.html)

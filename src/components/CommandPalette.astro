@@ -1,0 +1,352 @@
+---
+import { NIVEL_PROJETO, getAulas, getExercicios, getModulos, getProjetos, pad2 } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const [modulos, aulas, exercicios, projetos] = await Promise.all([getModulos(), getAulas(), getExercicios(), getProjetos()]);
+const titulosModulo = new Map(modulos.map((m) => [m.id, m.data.titulo]));
+
+const indice = [
+  { t: 'Mapa da trilha', s: 'Página inicial', h: url(''), k: 'Página' },
+  { t: 'Painel e backup do progresso', s: 'Prontidão, sequência, exportar/importar', h: url('painel'), k: 'Página' },
+  { t: 'Catálogo de exercícios', s: 'Filtre por módulo e dificuldade', h: url('exercicios'), k: 'Página' },
+  { t: 'Projetos de portfólio', s: 'Júnior, Pleno e Sênior, do começo ao deploy', h: url('projetos'), k: 'Página' },
+  { t: 'Simulador de entrevista', s: 'Perguntas técnicas com resposta-modelo', h: url('entrevista'), k: 'Página' },
+  { t: 'Flashcards', s: 'Revisão espaçada', h: url('flashcards'), k: 'Página' },
+  { t: 'Sobre e metodologia', s: 'Como a trilha foi pensada', h: url('sobre'), k: 'Página' },
+  ...modulos.map((m) => ({
+    t: `${pad2(m.data.numero)} · ${m.data.titulo}`,
+    s: m.data.status === 'em-breve' ? 'Em breve · ' + m.data.topicos.join(', ') : m.data.topicos.join(', '),
+    h: url(`modulos/${m.id}`),
+    k: 'Módulo',
+  })),
+  ...aulas.map((a) => ({
+    t: a.data.titulo,
+    s: `${titulosModulo.get(a.data.modulo.id)} · ${a.data.tags.join(', ')}`,
+    h: url(`aulas/${a.id}`),
+    k: 'Aula',
+  })),
+  ...projetos.map((p) => ({
+    t: p.data.titulo,
+    s: `Projeto ${NIVEL_PROJETO[p.data.nivel]} · ${p.data.dominio}`,
+    h: url(`projetos/${p.id}`),
+    k: 'Projeto',
+  })),
+  ...exercicios.map((e) => ({
+    t: `${e.data.codigo} · ${e.data.titulo}`,
+    s: `${titulosModulo.get(e.data.modulo.id)} · ${e.data.conceitos.join(', ')}`,
+    h: url(`exercicios/${e.id}`),
+    k: 'Exercício',
+  })),
+];
+---
+
+<dialog class="palette" id="busca" aria-label="Buscar na trilha">
+  <div class="palette-box">
+    <div class="palette-input">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"
+        ><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg
+      >
+      <input
+        type="search"
+        id="busca-input"
+        placeholder="Busque por tema: HashMap, record, N+1…"
+        autocomplete="off"
+        spellcheck="false"
+        role="combobox"
+        aria-expanded="true"
+        aria-controls="busca-resultados"
+        aria-autocomplete="list"
+      />
+      <kbd>Esc</kbd>
+    </div>
+    <ul class="palette-results" id="busca-resultados" role="listbox" aria-label="Resultados"></ul>
+    <p class="palette-foot">
+      <span><kbd>↑</kbd><kbd>↓</kbd> navegar</span>
+      <span><kbd>Enter</kbd> abrir</span>
+      <span class="ft-status" id="busca-status" role="status"></span>
+    </p>
+  </div>
+</dialog>
+
+<script type="application/json" id="indice-navegacao" set:html={JSON.stringify(indice)} />
+
+<script>
+  type Item = { t: string; s: string; h: string; k: string };
+  const dialog = document.getElementById('busca') as HTMLDialogElement;
+  const input = document.getElementById('busca-input') as HTMLInputElement;
+  const lista = document.getElementById('busca-resultados') as HTMLUListElement;
+  const status = document.getElementById('busca-status') as HTMLElement;
+  const indice: Item[] = JSON.parse(document.getElementById('indice-navegacao')!.textContent || '[]');
+  const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+  const norm = (s: string) =>
+    s
+      .normalize('NFD')
+      .replace(/[̀-ͯ]/g, '')
+      .toLowerCase();
+
+  let pagefind: any = null;
+  let ativo = 0;
+  let itens: Item[] = [];
+  let seq = 0;
+
+  async function carregarPagefind() {
+    if (pagefind !== null) return pagefind;
+    try {
+      // O índice do Pagefind só existe depois do build, fora do grafo do Vite. Um import "opaco"
+      // evita que o bundler tente reescrevê-lo (em scripts inline ele deixava um placeholder quebrado).
+      const importarModulo = new Function('caminho', 'return import(caminho)') as (c: string) => Promise<any>;
+      pagefind = await importarModulo(`${base}/pagefind/pagefind.js`);
+      await pagefind.init?.();
+    } catch {
+      pagefind = false;
+    }
+    return pagefind;
+  }
+
+  function pontuar(item: Item, termos: string[]) {
+    const t = norm(item.t);
+    const s = norm(item.s);
+    let score = 0;
+    for (const termo of termos) {
+      if (t.includes(termo)) score += t.startsWith(termo) ? 6 : 4;
+      else if (s.includes(termo)) score += 2;
+      else return 0;
+    }
+    return score;
+  }
+
+  function escapar(s: string) {
+    return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+  }
+
+  function render() {
+    lista.innerHTML = itens
+      .map(
+        (i, n) => `<li role="option" id="op-${n}" aria-selected="${n === ativo}">
+          <a href="${i.h}"><span class="k">${escapar(i.k)}</span><span class="tx"><strong>${escapar(i.t)}</strong><small>${i.s}</small></span></a></li>`,
+      )
+      .join('');
+    if (!itens.length) lista.innerHTML = '<li class="vazio">Nada encontrado. Tente outro termo.</li>';
+    input.setAttribute('aria-activedescendant', itens.length ? `op-${ativo}` : '');
+    lista.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function buscar() {
+    const q = input.value.trim();
+    const minha = ++seq;
+    ativo = 0;
+    if (!q) {
+      itens = indice
+        .filter((i) => i.k !== 'Exercício')
+        .slice(0, 12)
+        .map((i) => ({ ...i, s: escapar(i.s) }));
+      status.textContent = '';
+      render();
+      return;
+    }
+    const termos = norm(q).split(/\s+/).filter(Boolean);
+    itens = indice
+      .map((i) => ({ i, sc: pontuar(i, termos) }))
+      .filter((x) => x.sc > 0)
+      .sort((a, b) => b.sc - a.sc)
+      .slice(0, 8)
+      .map((x) => ({ ...x.i, s: escapar(x.i.s) }));
+    status.textContent = `${itens.length} resultado(s)`;
+    render();
+
+    const pf = await carregarPagefind();
+    if (!pf || minha !== seq) {
+      if (pf === false) status.textContent = `${itens.length} resultado(s) · busca por título (texto completo disponível no build)`;
+      return;
+    }
+    const r = await pf.debouncedSearch?.(q, {}, 180);
+    if (!r || minha !== seq) return;
+    const dados = await Promise.all(r.results.slice(0, 8).map((x: any) => x.data()));
+    const vistos = new Set(itens.map((i) => i.h));
+    const extras: Item[] = dados
+      .filter((d: any) => !vistos.has(d.url))
+      .map((d: any) => ({ t: d.meta?.title?.replace(/ · Trilha Java Backend$/, '') ?? d.url, s: d.excerpt, h: d.url, k: 'Texto' }));
+    itens = [...itens, ...extras].slice(0, 14);
+    status.textContent = `${itens.length} resultado(s)`;
+    render();
+  }
+
+  let focoAnterior: HTMLElement | null = null;
+
+  function abrir() {
+    if (dialog.open) return;
+    focoAnterior = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+    dialog.showModal();
+    input.value = '';
+    buscar();
+    input.focus();
+    carregarPagefind();
+  }
+
+  document.addEventListener('keydown', (e) => {
+    const alvo = e.target as HTMLElement;
+    const digitando = alvo.closest('input, textarea, [contenteditable]');
+    if ((e.key === 'k' && (e.ctrlKey || e.metaKey)) || (e.key === '/' && !digitando)) {
+      e.preventDefault();
+      abrir();
+    }
+  });
+  document.querySelectorAll('[data-abrir-busca]').forEach((b) => b.addEventListener('click', abrir));
+  dialog.addEventListener('click', (e) => {
+    if (e.target === dialog) dialog.close();
+  });
+  // Ao fechar, o foco volta para onde estava (ou sai do campo, que ficou invisível).
+  dialog.addEventListener('close', () => {
+    if (focoAnterior?.isConnected) focoAnterior.focus();
+    else input.blur();
+  });
+  input.addEventListener('input', buscar);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!itens.length) return;
+      ativo = (ativo + (e.key === 'ArrowDown' ? 1 : -1) + itens.length) % itens.length;
+      render();
+    } else if (e.key === 'Enter' && itens[ativo]) {
+      e.preventDefault();
+      location.href = itens[ativo].h;
+    } else if (e.key === 'Escape') {
+      // Num campo de busca, o primeiro Esc só limparia o texto; aqui ele fecha, como a dica promete.
+      e.preventDefault();
+      dialog.close();
+    }
+  });
+</script>
+
+<style>
+  .palette {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    width: min(640px, calc(100vw - 32px));
+    max-height: min(560px, calc(100dvh - 80px));
+    margin: 10vh auto auto;
+    color: var(--text);
+  }
+  .palette::backdrop {
+    background: rgb(10 8 6 / 0.55);
+    backdrop-filter: blur(3px);
+  }
+  .palette[open] {
+    animation: pop 0.18s var(--ease);
+  }
+  @keyframes pop {
+    from {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.98);
+    }
+  }
+  .palette-box {
+    display: flex;
+    flex-direction: column;
+    max-height: inherit;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-lift);
+    overflow: hidden;
+  }
+  .palette-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-3);
+  }
+  .palette-input input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    background: transparent;
+    font-size: 1.05rem;
+    outline: none;
+    color: var(--text);
+  }
+  .palette-input input::-webkit-search-cancel-button {
+    display: none;
+  }
+  .palette-results {
+    list-style: none;
+    padding: 8px;
+    overflow-y: auto;
+    flex: 1;
+  }
+  .palette-results :global(li a) {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 10px 12px;
+    border-radius: 10px;
+    text-decoration: none;
+  }
+  .palette-results :global(li[aria-selected='true'] a),
+  .palette-results :global(li a:hover) {
+    background: var(--surface-2);
+  }
+  .palette-results :global(li[aria-selected='true'] a) {
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .palette-results :global(.k) {
+    flex-shrink: 0;
+    width: 72px;
+    margin-top: 2px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent);
+  }
+  .palette-results :global(.tx) {
+    display: grid;
+    min-width: 0;
+  }
+  .palette-results :global(.tx strong) {
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .palette-results :global(.tx small) {
+    color: var(--text-3);
+    font-size: 0.8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .palette-results :global(mark) {
+    background: var(--accent-soft);
+    color: var(--text);
+    border-radius: 3px;
+  }
+  .palette-results :global(.vazio) {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-3);
+  }
+  .palette-foot {
+    display: flex;
+    gap: 16px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .ft-status {
+    margin-left: auto;
+  }
+  @media (max-width: 560px) {
+    .palette {
+      margin-top: 12px;
+    }
+    .palette-foot span:not(.ft-status) {
+      display: none;
+    }
+  }
+</style>

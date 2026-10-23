@@ -1,0 +1,193 @@
+---
+titulo: O custo de cada coleção (Big-O na prática)
+descricao: Notação Big-O sem matemática assustadora, como ArrayList e HashMap funcionam por dentro, por que LinkedList quase nunca vale a pena e como escolher pela operação mais frequente.
+modulo: 03-colecoes-generics-excecoes
+ordem: 2
+duracao: 50
+objetivos:
+  - Ler e comparar complexidades O(1), O(log n), O(n) e O(n²)
+  - Explicar como ArrayList e HashMap funcionam internamente
+  - Escolher a coleção pela operação dominante do problema
+tags: [Big-O, ArrayList, HashMap, desempenho]
+flashcards:
+  - frente: Qual a complexidade de get(i) em ArrayList e em LinkedList?
+    verso: ArrayList O(1) (acesso direto ao array); LinkedList O(n) (percorre nó a nó).
+  - frente: Qual a complexidade média de get/put/containsKey em HashMap?
+    verso: O(1) em média. No pior caso, com muitas colisões, O(log n) desde o Java 8 (buckets viram árvores).
+  - frente: Qual a complexidade de get/put em TreeMap?
+    verso: O(log n) — é uma árvore rubro-negra balanceada.
+  - frente: Por que list.contains dentro de um laço pode ser um problema?
+    verso: contains em lista é O(n); dentro de um laço de n elementos vira O(n²). Troque a lista por um HashSet.
+  - frente: O que acontece quando um ArrayList enche?
+    verso: Ele cria um array maior (cerca de 1,5x) e copia os elementos. O custo é amortizado — em média, add continua O(1).
+---
+
+Duas soluções podem dar o mesmo resultado nos testes e ter desempenhos radicalmente diferentes em produção. Com 100 registros, tanto faz. Com 1 milhão, uma responde em milissegundos e a outra derruba o servidor. A notação **Big-O** é a ferramenta para prever isso **antes** de acontecer.
+
+## Big-O em uma frase
+
+Big-O descreve **como o tempo (ou a memória) cresce quando a entrada cresce**. Não mede segundos; mede a **forma** da curva.
+
+| Notação | Nome | Exemplo | 1 mil itens | 1 milhão de itens |
+|---|---|---|---|---|
+| O(1) | constante | `array[i]`, `hashMap.get(k)` | 1 passo | 1 passo |
+| O(log n) | logarítmica | busca binária, `TreeMap.get` | ~10 | ~20 |
+| O(n) | linear | percorrer a lista, `list.contains` | 1 mil | 1 milhão |
+| O(n log n) | — | ordenar (`list.sort`) | ~10 mil | ~20 milhões |
+| O(n²) | quadrática | laço dentro de laço sobre os mesmos dados | 1 milhão | **1 trilhão** |
+
+A última linha é a que derruba sistemas. E ela aparece com muita facilidade:
+
+<Comparar antes="O(n²) sem perceber" depois="O(n)">
+```java
+List<String> jaVistos = new ArrayList<>();
+for (Pedido p : pedidos) {                    // n vezes
+    if (!jaVistos.contains(p.clienteId())) {  // contains: O(n)
+        jaVistos.add(p.clienteId());
+    }
+}
+```
+
+```java
+Set<String> jaVistos = new HashSet<>();
+for (Pedido p : pedidos) {                    // n vezes
+    jaVistos.add(p.clienteId());              // O(1)
+}
+```
+</Comparar>
+
+Com 200 mil pedidos, a versão da esquerda faz na ordem de **20 bilhões** de comparações; a da direita, 200 mil operações. A troca de uma palavra (`ArrayList` → `HashSet`) muda tudo.
+
+## Como o `ArrayList` funciona
+
+Por dentro, um `ArrayList` é um **array comum** com espaço sobrando:
+
+<Figura legenda="ArrayList: array interno com capacidade maior que o tamanho">
+<svg viewBox="0 0 620 120" width="620" role="img" aria-label="Array interno com 5 posições ocupadas e 3 livres; quando enche, é copiado para um array 1,5 vez maior">
+  <rect x="20" y="20" width="60" height="44" rx="6" class="d-accent"/><text x="50" y="47" text-anchor="middle" class="d-mono">A</text>
+  <rect x="85" y="20" width="60" height="44" rx="6" class="d-accent"/><text x="115" y="47" text-anchor="middle" class="d-mono">B</text>
+  <rect x="150" y="20" width="60" height="44" rx="6" class="d-accent"/><text x="180" y="47" text-anchor="middle" class="d-mono">C</text>
+  <rect x="215" y="20" width="60" height="44" rx="6" class="d-accent"/><text x="245" y="47" text-anchor="middle" class="d-mono">D</text>
+  <rect x="280" y="20" width="60" height="44" rx="6" class="d-accent"/><text x="310" y="47" text-anchor="middle" class="d-mono">E</text>
+  <rect x="345" y="20" width="60" height="44" rx="6" class="d-box"/>
+  <rect x="410" y="20" width="60" height="44" rx="6" class="d-box"/>
+  <rect x="475" y="20" width="60" height="44" rx="6" class="d-box"/>
+  <text x="180" y="92" text-anchor="middle" class="d-label">size = 5</text>
+  <text x="440" y="92" text-anchor="middle" class="d-label">capacidade livre</text>
+</svg>
+</Figura>
+
+- **`get(i)`: O(1).** Acesso direto à posição do array.
+- **`add(x)` no fim: O(1) amortizado.** Quando o array enche, a lista cria um novo, cerca de 1,5 vez maior, e copia tudo. Isso é raro o bastante para que, **em média**, cada `add` custe O(1).
+- **`add(0, x)` ou `remove(0)`: O(n).** Todos os elementos precisam andar uma posição.
+- **`contains(x)`: O(n).** Não há atalho: é preciso olhar um por um.
+
+<Callout tipo="dica">
+Se você sabe quantos elementos vai inserir, diga ao construtor: `new ArrayList<>(pedidos.size())`. Isso evita todas as cópias intermediárias.
+</Callout>
+
+## E a `LinkedList`?
+
+Na teoria, a `LinkedList` (lista duplamente encadeada) insere e remove no meio em O(1). Na prática:
+
+- para chegar ao meio, ela precisa **percorrer os nós**: O(n);
+- cada nó é um objeto separado na memória, o que é **péssimo para o cache do processador**;
+- ela usa várias vezes mais memória que um `ArrayList`.
+
+Resultado: `ArrayList` ganha na grande maioria dos casos reais. Para filas, use `ArrayDeque`. O próprio autor da `LinkedList`, Joshua Bloch, brincou publicamente que nunca a usa.
+
+## Como o `HashMap` funciona
+
+O `HashMap` é a estrutura mais importante do backend Java. Por dentro:
+
+<Figura legenda="HashMap: o hashCode da chave escolhe o bucket; equals encontra a chave certa dentro dele">
+<svg viewBox="0 0 680 230" width="680" role="img" aria-label="A chave CAFE-500 passa pelo hashCode, que aponta para o bucket 3; dentro do bucket, equals compara com as chaves que colidiram">
+  <defs><marker id="s8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="85" width="140" height="50" rx="10" class="d-info"/><text x="80" y="115" text-anchor="middle" class="d-mono">"CAFE-500"</text>
+  <path d="M150 110 H200" class="d-line" marker-end="url(#s8)"/>
+  <text x="248" y="98" text-anchor="middle" class="d-mono">hashCode()</text>
+  <text x="248" y="130" text-anchor="middle" class="d-label">% nº de buckets</text>
+  <path d="M300 110 H340" class="d-line" marker-end="url(#s8)"/>
+  <g>
+    <rect x="345" y="10" width="70" height="36" rx="6" class="d-box"/><text x="380" y="33" text-anchor="middle" class="d-label">0</text>
+    <rect x="345" y="52" width="70" height="36" rx="6" class="d-box"/><text x="380" y="75" text-anchor="middle" class="d-label">1</text>
+    <rect x="345" y="94" width="70" height="36" rx="6" class="d-box"/><text x="380" y="117" text-anchor="middle" class="d-label">2</text>
+    <rect x="345" y="136" width="70" height="36" rx="6" class="d-accent"/><text x="380" y="159" text-anchor="middle" class="d-label">3</text>
+    <rect x="345" y="178" width="70" height="36" rx="6" class="d-box"/><text x="380" y="201" text-anchor="middle" class="d-label">4</text>
+  </g>
+  <rect x="450" y="136" width="100" height="36" rx="6" class="d-ok"/><text x="500" y="159" text-anchor="middle" class="d-mono">CAFE-500</text>
+  <rect x="570" y="136" width="100" height="36" rx="6" class="d-box"/><text x="620" y="159" text-anchor="middle" class="d-mono">XY-9</text>
+  <path d="M415 154 H446" class="d-line" marker-end="url(#s8)"/>
+  <path d="M550 154 H566" class="d-line" marker-end="url(#s8)"/>
+  <text x="560" y="200" text-anchor="middle" class="d-label">colisão: equals decide qual é</text>
+</svg>
+</Figura>
+
+1. O `hashCode()` da chave é transformado em um **índice de bucket**.
+2. O `HashMap` vai direto ao bucket: O(1).
+3. Se mais de uma chave cair no mesmo bucket (**colisão**), ele compara com `equals()` até achar a certa.
+4. Quando o mapa passa de 75% de ocupação (*load factor* 0,75), ele dobra o número de buckets e redistribui as chaves (*rehash*).
+5. Desde o Java 8, um bucket com muitas colisões vira uma **árvore**, então o pior caso é O(log n), não O(n).
+
+Duas consequências práticas:
+
+- **`hashCode` ruim = `HashMap` lento.** Se todas as chaves tiverem o mesmo hash, tudo cai no mesmo bucket.
+- **`equals`/`hashCode` inconsistentes = `HashMap` errado.** Você coloca uma chave e não consegue achá-la de volta. A próxima aula é inteira sobre isso.
+
+## Tabela de referência
+
+| Operação | `ArrayList` | `LinkedList` | `HashSet`/`HashMap` | `TreeSet`/`TreeMap` | `ArrayDeque` |
+|---|---|---|---|---|---|
+| Acesso por índice | **O(1)** | O(n) | — | — | — |
+| Adicionar no fim | **O(1)*** | O(1) | **O(1)*** | O(log n) | **O(1)*** |
+| Adicionar/remover no início | O(n) | O(1) | — | — | **O(1)*** |
+| Buscar (`contains`/`get`) | O(n) | O(n) | **O(1)*** | O(log n) | O(n) |
+| Iterar em ordem | inserção | inserção | nenhuma | **classificada** | inserção |
+
+\* amortizado ou em média.
+
+## Escolha pela operação dominante
+
+Antes de escolher, pergunte: **qual operação o código vai fazer milhões de vezes?**
+
+- "Existe?" → `HashSet`.
+- "Qual o valor para X?" → `HashMap`.
+- "Preciso dos itens ordenados o tempo todo" ou "qual o menor maior que X?" → `TreeMap`/`TreeSet`.
+- "Percorrer na ordem em que chegaram" → `ArrayList` ou `LinkedHashMap`.
+- "Próximo da fila" → `ArrayDeque`; "o de maior prioridade" → `PriorityQueue`.
+
+<Callout tipo="entrevista">
+Em entrevistas de algoritmos (módulo 05), **quase toda otimização de O(n²) para O(n) usa um `HashMap` ou `HashSet`**. Ao propor uma solução, diga a complexidade de tempo e de espaço. Ex.: "uso um HashSet para lembrar o que já vi, então fica O(n) de tempo e O(n) de memória".
+</Callout>
+
+<Quiz
+  id="03-complexidade"
+  questoes={[
+    {
+      pergunta: 'Um laço sobre 100 mil pedidos chama `lista.contains(...)` em uma lista de 100 mil clientes. Qual a complexidade?',
+      opcoes: ['O(n)', 'O(n log n)', 'O(n²)', 'O(1)'],
+      correta: 2,
+      explicacao: 'n iterações × contains O(n) = O(n²): cerca de 10 bilhões de comparações. Um HashSet resolveria em O(n).',
+    },
+    {
+      pergunta: 'Por que `ArrayList.add` no fim é O(1) "amortizado"?',
+      opcoes: ['Porque nunca copia nada', 'Porque cópias ao crescer são raras e, diluídas, o custo médio é constante', 'Porque usa hash', 'Porque o Java otimiza o laço'],
+      correta: 1,
+      explicacao: 'Crescer 1,5x a cada vez faz com que o custo total de cópias seja proporcional a n, então cada add custa O(1) em média.',
+    },
+    {
+      pergunta: 'Você precisa, repetidamente, achar o primeiro horário livre maior ou igual a 14h em uma agenda. Qual estrutura?',
+      opcoes: ['HashSet', 'TreeSet (método ceiling)', 'ArrayList sem ordenação', 'LinkedList'],
+      correta: 1,
+      explicacao: 'TreeSet mantém a ordem e oferece ceiling/floor em O(log n).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Big-O descreve **como o custo cresce**. Cuidado com O(n²): laço dentro de laço ou `contains` em lista dentro de laço.
+- `ArrayList`: índice O(1), `contains` O(n). `LinkedList` quase nunca compensa.
+- `HashMap`/`HashSet`: O(1) em média, **se** `hashCode` e `equals` estiverem corretos.
+- `TreeMap`/`TreeSet`: O(log n) com ordem classificada.
+- Escolha pela **operação dominante** do seu problema.

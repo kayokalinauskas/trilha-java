@@ -1,0 +1,991 @@
+---
+titulo: OWASP Top 10:2025 para quem escreve backend Java
+descricao: "As dez categorias da edição 2025 do OWASP Top 10 vistas de dentro de um backend Spring: como cada uma aparece no código, um exemplo vulnerável e a correção, e como detectar com teste, SAST, DAST e revisão. Na prática, pares vulnerável/corrigido com testes que provam o ataque e o bloqueio: SQL injection, ordenação dinâmica, injeção em log, path traversal, SSRF, XXE, desserialização (Jackson 3 e nativa) e tratamento de exceções."
+modulo: 11-seguranca
+ordem: 5
+duracao: 150
+objetivos:
+  - Citar as dez categorias do OWASP Top 10:2025 na ordem oficial e explicar o que mudou em relação à edição 2021
+  - Reconhecer, num trecho de código Java/Spring, a categoria e a CWE de uma falha e propor a correção
+  - Escrever um teste que demonstra um ataque na versão vulnerável e o bloqueio na versão corrigida
+  - Corrigir SQL injection com parâmetros de bind e ordenação dinâmica com allowlist, usando JdbcClient
+  - Validar URLs de saída contra SSRF (parser, allowlist, resolução DNS e faixas internas) e caminhos de arquivo contra path traversal
+  - Configurar parser XML, Jackson 3 e ObjectInputStream para recusar entidades externas e tipos não esperados
+  - Montar um tratador de erros que devolve Problem Details genérico, registra o detalhe com um código de rastreio e falha fechado
+  - Usar o OWASP API Security Top 10 e o ASVS 5.0 como checklist de revisão e de requisitos
+tags: [OWASP, Top 10, ASVS, injeção, SSRF, XXE, desserialização, path traversal, code review]
+flashcards:
+  - frente: Quais são as dez categorias do OWASP Top 10:2025, na ordem?
+    verso: "A01 Broken Access Control, A02 Security Misconfiguration, A03 Software Supply Chain Failures, A04 Cryptographic Failures, A05 Injection, A06 Insecure Design, A07 Authentication Failures, A08 Software or Data Integrity Failures, A09 Security Logging and Alerting Failures, A10 Mishandling of Exceptional Conditions."
+  - frente: O que mudou do Top 10 2021 para o 2025?
+    verso: "Entraram A03 Software Supply Chain Failures (ampliando o antigo 'componentes vulneráveis') e A10 Mishandling of Exceptional Conditions. SSRF deixou de ser categoria própria e foi para A01. Security Misconfiguration subiu de 5º para 2º. A07 e A09 mudaram de nome."
+  - frente: Por que parâmetro de bind não resolve ORDER BY dinâmico?
+    verso: "Parâmetros de bind substituem VALORES, não identificadores (nomes de coluna e tabela). A solução é uma allowlist: o cliente manda um nome público ('saldo', '-saldo') e o código traduz para um trecho de SQL escrito pela equipe; qualquer outra coisa vira 400."
+  - frente: Quais as quatro camadas de uma validação de URL contra SSRF?
+    verso: "1) interpretar a URL com um parser (URI), nunca como texto; 2) esquema, porta e ausência de usuário/senha; 3) host numa allowlist; 4) resolver o DNS e recusar se QUALQUER IP for interno (loopback, privado, link-local 169.254, CGNAT, ULA). E conectar no IP conferido, contra DNS rebinding."
+  - frente: Como impedir path traversal num download de arquivo em Java?
+    verso: "O ideal é não aceitar nome: receber o id, conferir o dono e buscar o caminho no banco. Se precisar de nome: formato fechado, depois resolve + normalize + startsWith(pasta) com Path (compara segmentos), e toRealPath para links simbólicos. Cuidado: Path.resolve com caminho absoluto descarta a pasta base."
+  - frente: O que o Jackson 3 faz por padrão com @JsonTypeInfo(use = CLASS) num campo Object?
+    verso: "Recusa. O PolymorphicTypeValidator padrão (DefaultBaseTypeLimitingValidator) nega subtipos de bases genéricas como Object, com InvalidDefinitionException. O correto é Id.NAME com @JsonSubTypes (ou interface selada); afrouxar o validador para Object reabre a falha."
+  - frente: Como fechar XXE num DocumentBuilderFactory?
+    verso: "Ligar a feature http://apache.org/xml/features/disallow-doctype-decl (recomendação do OWASP), mais FEATURE_SECURE_PROCESSING, ACCESS_EXTERNAL_DTD e ACCESS_EXTERNAL_SCHEMA vazios, XInclude desligado. No JDK 25 a configuração padrão ainda resolve entidade externa de arquivo local."
+  - frente: O que um tratador de erros de último recurso deve devolver?
+    verso: "Um Problem Details (RFC 9457) com status, mensagem genérica e um código de rastreio; nada de mensagem da exceção, classe ou stack trace. O detalhe completo vai para o log com o mesmo código. Em dependência que falha numa decisão de segurança, falhe fechado (negue)."
+---
+
+Uma fintech pequena recebe, numa sexta-feira, o e-mail de um pesquisador de segurança: "a busca de contas do painel do atendente devolve contas de todas as agências se eu digitar `x' OR '1'='1` no campo de titular". Na segunda, o time descobre mais três coisas enquanto investiga. O endpoint de download de notas fiscais aceita `../config/application.properties`. A tela de cadastro de webhooks aceita `https://169.254.169.254/...`, o endereço de metadados da nuvem que entrega credenciais temporárias de quem roda o serviço. E qualquer erro do banco volta para o cliente com host, porta e usuário do PostgreSQL de produção. Nenhum desses bugs é exótico. Todos estão no **OWASP Top 10**, e todos têm a mesma raiz: o código tratou dado de fora como se fosse instrução, ou tratou uma falha como se fosse sucesso.
+
+O OWASP Top 10 é a lista de referência dos riscos mais críticos em aplicações web, publicada pela OWASP (*Open Worldwide Application Security Project*, uma fundação sem fins lucrativos) a partir de dados de milhões de aplicações e de uma pesquisa com a comunidade. A edição **2025** é a oitava. Nesta aula você vai passar pelas dez categorias do ponto de vista de quem escreve backend Java com Spring: como cada uma aparece num projeto de verdade, um exemplo vulnerável e a correção, e como detectar antes da produção. Depois vai pôr a mão em oito pares de código **vulnerável e corrigido**, cada um com um teste que prova o ataque na primeira versão e o bloqueio na segunda. No fim, você vai saber usar o Top 10, o OWASP API Security Top 10 e o ASVS como ferramentas de trabalho, e não como uma lista para decorar.
+
+## A intuição: o protocolo da recepção
+
+Pense na recepção de um prédio comercial. Visitantes chegam com pedidos escritos num papel, e a recepcionista lê e age. Agora imagine visitantes espertos:
+
+- Um escreve: "quero a sala 1204 **ou qualquer outra sala**". Se a recepcionista lê o papel em voz alta para um interfone que obedece a qualquer frase, todas as portas se abrem. É a **injeção**: o dado foi lido como **ordem**. A defesa não é desconfiar da palavra "ou"; é um formulário com campos (andar, sala) que o interfone só aceita **como valor**. Isso é o parâmetro de bind.
+- Outro pede "o envelope que está em `../../diretoria/cofre`". Seguindo o caminho escrito, a recepcionista entra onde o visitante não pode. É o **path traversal**.
+- Um terceiro pede: "ligue para este número e leia o que responderem". O número é o ramal da tesouraria, que só atende chamadas de dentro. A recepcionista vira o braço do visitante. É o **SSRF**.
+- E se o sistema de crachás cai? Liberar todo mundo "para não atrasar" é falhar aberto; barrar até o sistema voltar é falhar fechado. É o **A10**.
+
+O protocolo de uma boa recepção tem quatro regras, e elas atravessam a aula inteira: **dado de fora nunca vira instrução** (formulário com campos, não frases livres), **a lista de destinos é fechada** (allowlist, não lista de proibidos), **o que importa é onde a ação de fato acontece** (a sala real, o IP real, o caminho real) e **na dúvida, a porta fica fechada**.
+
+## Vocabulário
+
+| Termo | O que é |
+|---|---|
+| **Vulnerabilidade** | Um defeito que alguém pode explorar para fazer o sistema agir contra a vontade do dono |
+| **CWE** | *Common Weakness Enumeration*: catálogo de **tipos** de falha (CWE-89 é SQL injection). Cada categoria do Top 10 agrupa várias CWEs |
+| **CVE** | *Common Vulnerabilities and Exposures*: uma falha **específica** num produto específico (o Log4Shell é a CVE-2021-44228) |
+| **Fonte e destino** (*source* e *sink*) | Fonte é por onde o dado de fora entra (parâmetro, cabeçalho, corpo, arquivo, fila). Destino é onde ele vira ação perigosa (SQL, caminho de arquivo, URL, log, desserializador) |
+| **Allowlist** e **denylist** | Lista do que é permitido e lista do que é proibido. Allowlist falha fechada: o que ninguém previu fica de fora. Denylist falha aberta: o que ninguém previu passa |
+| **Parâmetro de bind** | Um marcador (`?` ou `:nome`) no SQL cujo valor viaja separado do texto da consulta; o banco nunca o interpreta como SQL |
+| **SAST** | *Static Application Security Testing*: análise do código-fonte sem executá-lo (Semgrep, CodeQL, SpotBugs com Find Security Bugs, SonarQube) |
+| **DAST** | *Dynamic Application Security Testing*: ataque automatizado à aplicação rodando (OWASP ZAP, Burp Suite) |
+| **SCA** | *Software Composition Analysis*: varredura das dependências contra bases de CVEs (Dependabot, OWASP Dependency-Check, Trivy) |
+| **Gadget** | Uma classe legítima do classpath cujo construtor, setter ou `readObject` faz algo perigoso quando instanciada com dados do atacante |
+| **Falhar fechado** (*fail closed*) | Diante de erro, negar a operação. O oposto, falhar aberto, é a CWE-636 |
+| **ASVS** | *Application Security Verification Standard*: o padrão da OWASP com cerca de 350 requisitos verificáveis, em três níveis |
+
+Uma distinção que organiza a aula: o Top 10 é uma **lista de conscientização** (o que mais dá errado, para priorizar), não um padrão. Quem quer saber "o que exatamente minha aplicação precisa cumprir" usa o ASVS. Voltamos a isso no fim.
+
+## A lista de 2025
+
+| # | Categoria | Em uma frase | CWEs ou exemplos |
+|---|---|---|---|
+| A01 | **Broken Access Control** | alguém faz ou vê o que não devia, incluindo SSRF | 22 (path traversal), 200, 201, 352 (CSRF), 918 (SSRF) |
+| A02 | **Security Misconfiguration** | padrões inseguros, diagnóstico aberto, XXE | 16, 611 (XXE) |
+| A03 | **Software Supply Chain Failures** | dependências, build e pipeline comprometidos *(nova)* | componentes vulneráveis ou maliciosos |
+| A04 | **Cryptographic Failures** | dado sensível sem proteção ou com algoritmo fraco | algoritmos e aleatoriedade fracos |
+| A05 | **Injection** | dado vira código: SQL, comando, LDAP, XSS | 78, 79, 89, 90, 94 |
+| A06 | **Insecure Design** | a falha está no desenho, não na linha | regras de negócio abusáveis |
+| A07 | **Authentication Failures** | senhas, sessões e tokens mal protegidos | força bruta, credenciais fracas |
+| A08 | **Software or Data Integrity Failures** | confiar em código ou dado sem verificar a integridade | 502 (desserialização), 829, 915 |
+| A09 | **Security Logging and Alerting Failures** | ataque acontecendo e ninguém fica sabendo | 117 (injeção em log), 532, 778 |
+| A10 | **Mishandling of Exceptional Conditions** | erro tratado de um jeito que abre brecha *(nova)* | 209, 476, 636 (falhar aberto) |
+
+O que mudou em relação a 2021, segundo a própria introdução da edição:
+
+- **Duas categorias novas.** *Software Supply Chain Failures* amplia o antigo "componentes vulneráveis e desatualizados": não é só a biblioteca com CVE, é também o pacote malicioso, a action do CI trocada, o artefato publicado sem verificação. *Mishandling of Exceptional Conditions* reúne o que antes estava espalhado como "qualidade de código": mensagens de erro reveladoras, falhar aberto, estado inconsistente depois de uma exceção.
+- **SSRF foi consolidado em A01.** Na edição 2021 ele era a A10. Faz sentido: SSRF é o servidor acessando, em nome do atacante, um recurso que o atacante não alcança.
+- **Security Misconfiguration subiu de 5º para 2º.** Configuração é cada vez mais código (YAML, Terraform, Helm), e um padrão errado se replica em todos os ambientes.
+- **Renomes.** A07 virou só *Authentication Failures*; A09 trocou *Monitoring* por *Alerting*, porque log que ninguém olha não protege nada.
+
+<Figura legenda="Onde cada risco mora numa requisição a um backend Spring: a maioria aparece no ponto em que um dado de fora encontra um destino perigoso">
+<svg viewBox="0 0 760 420" width="760" role="img" aria-labelledby="owasp-mapa-titulo owasp-mapa-desc">
+  <title id="owasp-mapa-titulo">Mapa das categorias do Top 10:2025 sobre o caminho de uma requisição</title>
+  <desc id="owasp-mapa-desc">Da esquerda para a direita: o cliente envia a requisição; a borda (filtros do Spring Security) concentra A07 autenticação e A01 controle de acesso; o controller e o serviço concentram A06 desenho inseguro e A10 tratamento de exceções; dali saem quatro destinos perigosos: banco de dados (A05 injeção), sistema de arquivos (A01 path traversal), chamadas HTTP de saída (A01 SSRF) e desserializadores e parsers (A08 e A02 XXE). Embaixo, atravessando tudo, três faixas: A02 configuração, A03 cadeia de suprimentos e A04 criptografia, e A09 logs e alertas.</desc>
+  <defs><marker id="mk-owasp-mapa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="110" width="110" height="70" rx="10" class="d-box"/>
+  <text x="65" y="140" text-anchor="middle" class="d-title">Cliente</text>
+  <text x="65" y="162" text-anchor="middle" class="d-label">dado de fora</text>
+  <path d="M120 145 L158 145" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <rect x="160" y="90" width="150" height="110" rx="10" class="d-info"/>
+  <text x="235" y="116" text-anchor="middle" class="d-title">Borda</text>
+  <text x="235" y="138" text-anchor="middle" class="d-label">Spring Security</text>
+  <text x="235" y="162" text-anchor="middle" class="d-mono">A07 · A01</text>
+  <text x="235" y="184" text-anchor="middle" class="d-label">quem é, pode?</text>
+  <path d="M310 145 L348 145" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <rect x="350" y="90" width="160" height="110" rx="10" class="d-accent"/>
+  <text x="430" y="116" text-anchor="middle" class="d-title">Controller</text>
+  <text x="430" y="138" text-anchor="middle" class="d-title">e serviço</text>
+  <text x="430" y="162" text-anchor="middle" class="d-mono">A06 · A10</text>
+  <text x="430" y="184" text-anchor="middle" class="d-label">regras e erros</text>
+  <path d="M510 110 L568 40" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <path d="M510 135 L568 110" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <path d="M510 160 L568 180" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <path d="M510 185 L568 250" class="d-line" marker-end="url(#mk-owasp-mapa)"/>
+  <rect x="570" y="12" width="180" height="56" rx="10" class="d-violet"/>
+  <text x="660" y="36" text-anchor="middle" class="d-text">Banco (SQL)</text>
+  <text x="660" y="56" text-anchor="middle" class="d-mono">A05</text>
+  <rect x="570" y="82" width="180" height="56" rx="10" class="d-violet"/>
+  <text x="660" y="106" text-anchor="middle" class="d-text">Arquivos</text>
+  <text x="660" y="126" text-anchor="middle" class="d-mono">A01 · CWE-22</text>
+  <rect x="570" y="152" width="180" height="56" rx="10" class="d-violet"/>
+  <text x="660" y="176" text-anchor="middle" class="d-text">HTTP de saída</text>
+  <text x="660" y="196" text-anchor="middle" class="d-mono">A01 · CWE-918</text>
+  <rect x="570" y="222" width="180" height="56" rx="10" class="d-violet"/>
+  <text x="660" y="246" text-anchor="middle" class="d-text">JSON, XML, bytes</text>
+  <text x="660" y="266" text-anchor="middle" class="d-mono">A08 · A02 (XXE)</text>
+  <rect x="10" y="300" width="740" height="32" rx="8" class="d-ok"/>
+  <text x="380" y="321" text-anchor="middle" class="d-text">A02 configuração: perfis, Actuator, CORS, erros, parsers</text>
+  <rect x="10" y="338" width="740" height="32" rx="8" class="d-ok"/>
+  <text x="380" y="359" text-anchor="middle" class="d-text">A03 dependências e pipeline · A04 TLS, hashes, chaves</text>
+  <rect x="10" y="376" width="740" height="32" rx="8" class="d-ok"/>
+  <text x="380" y="397" text-anchor="middle" class="d-text">A09 eventos de segurança registrados, sem segredos, com alerta</text>
+</svg>
+</Figura>
+
+Repare no desenho: os riscos que dão mais trabalho no dia a dia (injeção, path traversal, SSRF, desserialização, XXE) estão todos na **seta que sai do serviço para um destino perigoso**. É por isso que revisão de código de segurança começa procurando os destinos (`sql(`, `Files.`, `uri(`, `readValue`, `readObject`, `newDocumentBuilder`) e volta até a fonte, perguntando: "o que chega aqui pode ter vindo de fora sem passar por uma allowlist?".
+
+## Os dez itens, um por um
+
+Para cada categoria: o que é, como aparece num backend Java/Spring, o par vulnerável/correção e como detectar. Os itens que o backend mais erra ganham código testado na seção "Mão na massa"; os que outras aulas aprofundam aparecem aqui só com o essencial e o link.
+
+### A01 — Broken Access Control
+
+**O que é.** O sistema deixa alguém agir fora do que a política permite: ver o pedido de outro cliente, chamar uma rota administrativa, trocar o `id` na URL. Continua em primeiro lugar, com 40 CWEs mapeadas, e agora inclui o SSRF.
+
+**Como aparece no Spring.** Três formas dominam. A primeira é o **BOLA/IDOR**: `GET /contas/{id}` que busca por id sem conferir o dono. A [aula 11.04](../../11-seguranca/04-autorizacao-e-bola/) trata disso a fundo, com a matriz de testes de autorização; aqui não repetimos. A segunda é o **path traversal** (CWE-22): um nome de arquivo vindo da requisição que vira caminho no disco. A terceira é o **SSRF** (CWE-918): uma URL vinda da requisição que o servidor busca.
+
+```java
+// Path traversal: o nome do arquivo vem da URL
+@GetMapping("/notas/{arquivo}")
+byte[] nota(@PathVariable String arquivo) throws IOException {
+    return Files.readAllBytes(pasta.resolve(arquivo));   // "../config/application.properties"
+}
+
+// SSRF: a URL vem do corpo
+@PostMapping("/webhooks")
+void cadastrar(@RequestBody NovoWebhook pedido) {
+    restClient.post().uri(pedido.url()).body(TESTE).retrieve().toBodilessEntity();
+}
+```
+
+**Correção.** Para arquivos: não aceitar nome nenhum (receber o id do documento, conferir o dono, buscar o caminho no banco) ou, se o nome for inevitável, formato fechado mais confinamento à pasta. Para URLs: parser, allowlist de domínios, resolução DNS e recusa de faixas internas. Os dois estão nos passos 4 e 5.
+
+**Como detectar.** Testes de autorização (aula 11.04) e testes de path traversal e SSRF como os desta aula; SAST com regras de *taint* (Semgrep e CodeQL rastreiam parâmetros até `Files.*` e clientes HTTP); DAST, que tenta `../` e IPs internos sozinho. Na revisão: "alguma rota lê arquivo ou busca URL com dado do cliente?".
+
+### A02 — Security Misconfiguration
+
+**O que é.** A aplicação está certa, mas foi ligada errado: endpoint de diagnóstico aberto, mensagem de erro detalhada, CORS liberado para qualquer origem, parser XML com recursos perigosos ligados, conta padrão. Subiu para segundo lugar. A CWE-611 (XXE) mora aqui, porque é um problema de **configuração do parser**.
+
+**Como aparece no Spring.** O Spring Boot tem padrões bons, e quase toda falha desta categoria é alguém desligando um padrão bom:
+
+```properties
+# Vulnerável em produção
+management.endpoints.web.exposure.include=*       # /actuator/heapdump, /env, /loggers, /threaddump...
+server.error.include-stacktrace=always            # o padrão é never
+server.error.include-message=always               # o padrão é never
+spring.h2.console.enabled=true
+```
+
+Por padrão, o Actuator expõe só `health` pela web. O `heapdump` entrega um retrato da memória com tokens, senhas e dados de clientes; o `loggers` permite ligar `DEBUG` em produção. Exponha só o necessário, de preferência numa porta de gerenciamento separada (`management.server.port`) fechada na rede interna, e proteja o resto com autenticação.
+
+**XXE** é um padrão perigoso que **não** é do Spring: a `DocumentBuilderFactory` do JDK, sem configuração, aceita entidades externas (passo 6). **CORS** com `*` e cabeçalhos de segurança estão na [aula 11.06](../../11-seguranca/06-defesas-da-api/).
+
+**Como detectar.** Teste de fumaça contra a configuração de produção (`GET /actuator/env` dá 401/404; erro não devolve `trace`), varredura de configuração no CI (Trivy, Checkov) e DAST, que acha `/actuator/*` e erros verbosos em minutos. Na revisão: "algum padrão de segurança foi desligado, e por quê?".
+
+### A03 — Software Supply Chain Failures *(nova)*
+
+**O que é.** O seu código é uma fração pequena do que roda. Uma dependência com CVE conhecida (o Log4Shell, em 2021), um pacote malicioso com nome parecido com o original (*typosquatting*), uma action do GitHub que alguém sequestrou, um build que não é reproduzível, um artefato publicado sem assinatura: tudo isso compromete a aplicação sem que uma linha sua esteja errada.
+
+**Como aparece no Spring.** Dependência transitiva antiga que ninguém escolheu, versão fixada à mão no `pom.xml` que impede o BOM do Spring Boot de atualizar, repositório Maven extra sem HTTPS, `uses: alguma-action@main` no workflow.
+
+**Correção e detecção.** Atualização contínua, SCA no CI que quebra o build, SBOM e actions fixadas por hash: a [aula 11.06](../../11-seguranca/06-defesas-da-api/) mostra a configuração. Na revisão: "precisamos mesmo dessa dependência? Quem a mantém? Quantas transitivas ela traz?".
+
+### A04 — Cryptographic Failures
+
+**O que é.** Dado sensível sem proteção, ou protegido com algoritmo, modo ou aleatoriedade fracos.
+
+```java
+// Vulnerável
+String hash = DigestUtils.md5Hex(senha);                     // senha com hash rápido e sem sal
+Cipher cifra = Cipher.getInstance("AES/ECB/PKCS5Padding");   // ECB repete padrões do texto
+String token = Long.toString(new Random().nextLong());       // previsível
+
+// Correto
+String hash = passwordEncoder.encode(senha);                 // BCrypt/Argon2id (aula 11.01)
+Cipher cifra = Cipher.getInstance("AES/GCM/NoPadding");      // com IV de 12 bytes aleatório por mensagem
+byte[] bytes = new byte[32];
+new SecureRandom().nextBytes(bytes);                         // token de recuperação
+```
+
+Senhas estão na [aula 11.01](../../11-seguranca/01-autenticacao-e-senhas/). O resto da categoria é operacional: TLS em todo lugar (inclusive entre serviços e até o banco), chaves num cofre e não no repositório, dado pessoal cifrado em repouso quando a regulação exige (LGPD, PCI DSS). **Como detectar:** SAST encontra `MD5`, `SHA1`, `ECB` e `new Random()` com facilidade; na revisão, pergunte de onde vem cada chave e quem consegue lê-la.
+
+### A05 — Injection
+
+**O que é.** Dado de fora interpretado como código por um interpretador: SQL, JPQL, comando do sistema operacional, LDAP, SpEL, HTML no navegador (XSS). Caiu para quinto, mas continua sendo a categoria com mais CVEs, puxada pelo XSS.
+
+**Como aparece no Spring.** Quase nunca é o `Statement` cru do JDBC dos anos 2000. É concatenação **em lugares que parecem seguros**:
+
+```java
+// JdbcTemplate com concatenação
+jdbcTemplate.query("SELECT * FROM conta WHERE titular = '" + titular + "'", mapper);
+
+// JPQL concatenada (o JPA não protege texto que você montou)
+em.createQuery("SELECT c FROM Conta c WHERE c.titular = '" + titular + "'", Conta.class);
+
+// Consulta nativa no Spring Data montada com String.format
+@Query(value = "...", nativeQuery = true)   // ok, se usar :parametro; vulnerável se o texto for montado fora
+
+// ORDER BY dinâmico: a armadilha mais comum em APIs com ordenação e paginação
+jdbc.sql("SELECT ... ORDER BY " + ordenarPor)
+```
+
+**Correção.** Parâmetro de bind para **valores**, sempre: `?` no `JdbcTemplate`, `:nome` no `JdbcClient` e na JPQL, `@Param` no Spring Data, Criteria API para filtros dinâmicos. Para **identificadores** (coluna, tabela, direção), que não podem ser parâmetros, **allowlist** (passos 1 e 2). **Injeção em log** (CWE-117, mapeada em A09) tem a mesma mecânica: um `\r\n` no e-mail forja uma linha de log (passo 3). **XSS** numa API JSON é defendido principalmente no front, mas o backend ajuda com `Content-Type` correto, `X-Content-Type-Options: nosniff` (padrão do Spring Security) e validação de formato.
+
+**Como detectar.** SAST: todo `sql(` ou `createQuery(` com argumento não constante merece olhar humano. Testes com `'`, `' OR '1'='1` e `D'Ávila` em todo campo de busca. DAST para o que escapar.
+
+### A06 — Insecure Design
+
+**O que é.** Nenhuma linha está errada, mas o desenho permite abuso: transferência sem idempotência que debita duas vezes quando o cliente repete; recuperação de senha que confirma se o e-mail existe; cupom aplicável infinitas vezes; preço que vem do front; limite de valor por operação que se contorna com cem operações pequenas.
+
+**Correção e detecção.** Modelagem de ameaças no desenho da funcionalidade (assunto da [aula 11.08](../../11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/), mais adiante neste módulo) e **casos de abuso como critérios de aceite**: "dado que o cliente reenvia a mesma transferência com a mesma chave de idempotência, então só um débito acontece". Ferramenta nenhuma encontra falha de desenho; quem encontra é a pergunta "como alguém abusaria disto?" feita antes do código.
+
+### A07 — Authentication Failures
+
+**O que é.** Senha fraca aceita, falta de proteção contra força bruta, enumeração de usuários, token sem expiração, sessão válida depois do logout, segredo de JWT fraco. Tudo isso foi tratado nas aulas [11.01](../../11-seguranca/01-autenticacao-e-senhas/) (hash adaptativo, NIST, mesma resposta e mesmo tempo no login), [11.02](../../11-seguranca/02-spring-security-7/) e [11.03](../../11-seguranca/03-jwt-e-resource-server/) (algoritmo, emissor e `exp` validados). **Como detectar:** testes que provam a mesma resposta para usuário inexistente e senha errada, testes de token expirado e de algoritmo trocado, e o limite de tentativas da aula 11.06.
+
+### A08 — Software or Data Integrity Failures
+
+**O que é.** Confiar em código ou dado que alguém pode ter alterado, sem verificar. Inclui a **desserialização de dados não confiáveis** (CWE-502), a **atribuição em massa** (CWE-915, o famoso `"admin": true` no JSON que o Jackson aplica num campo da entidade) e a inclusão de funcionalidade de fonte não confiável (CWE-829).
+
+**Como aparece no Spring.**
+
+- `ObjectInputStream.readObject()` sobre bytes de fora: cache, fila, cookie, um "token" serializado. O objeto é **criado antes** de qualquer cast, e uma classe *gadget* do classpath pode fazer o estrago já na criação.
+- Jackson com polimorfismo por **nome de classe** (`@JsonTypeInfo(use = Id.CLASS)`) em campo genérico. O Jackson 3 recusa isso por padrão, como o passo 7 prova, mas é comum alguém "consertar" o erro afrouxando o validador.
+- Webhook de pagamento sem verificação de assinatura: qualquer um envia "pagamento aprovado".
+- Entidade JPA usada como corpo de requisição: o cliente manda campos que você nunca quis que ele mudasse (atribuição em massa; DTOs resolvem, como na aula 11.04).
+
+**Correção.** Não desserialize formato nativo de fonte não confiável; se precisar, `ObjectInputFilter` com allowlist. No Jackson, polimorfismo por **nome lógico** com subtipos fechados. Webhook com HMAC conferido em tempo constante (`MessageDigest.isEqual`). DTO de entrada com só os campos editáveis. **Como detectar:** SAST acha `readObject` e `Id.CLASS`; SCA acha bibliotecas com gadgets conhecidos; na revisão, pergunte "quem consegue alterar estes bytes antes de chegarem aqui?".
+
+### A09 — Security Logging and Alerting Failures
+
+**O que é.** Um ataque de força bruta com 50 mil tentativas que não gera alerta nenhum. Ou o contrário: o log registra o corpo das requisições, com senhas e tokens (CWE-532). Ou ainda: o log pode ser forjado com quebras de linha (CWE-117).
+
+```java
+log.warn("login-falhou email={} ip={}", email, ip);       // evento útil... se o e-mail for neutralizado
+log.info("requisição recebida: {}", pedido);              // perigoso se o toString() do DTO incluir a senha
+```
+
+**Correção.** Registre eventos de segurança (login com falha, bloqueio, acesso negado, mudança de permissão, exportação de dados) em formato estruturado, sem segredos, com identificador de correlação; crie alertas para picos; guarde os logs onde quem atacou a aplicação não consegue apagá-los. O Spring Boot tem log estruturado nativo (`logging.structured.format.console=ecs`, por exemplo), que escapa quebras de linha por ser JSON; com log de texto, neutralize você mesmo (passo 3). E sobrescreva o `toString()` de records com campos sensíveis. **Como detectar:** teste que confere que o evento é registrado; busca por `password`, `token`, `authorization` nos logs de homologação; um exercício de "simulação de incidente" em que alguém pergunta "como saberíamos?".
+
+### A10 — Mishandling of Exceptional Conditions *(nova)*
+
+**O que é.** A aplicação não previne, não detecta ou responde mal a situações anormais. As CWEs destacadas pela OWASP incluem a 209 (mensagem de erro com informação sensível), a 476 (`NullPointerException` como caminho de execução) e a 636 (falhar aberto). Os cenários de ataque da própria página da categoria são instrutivos: erro de banco que revela detalhes e facilita reconhecimento para injeção; transação financeira de várias etapas interrompida sem rollback; recurso que fica preso após exceção até esgotar.
+
+**Como aparece no Spring.**
+
+```java
+// 1) Falhar aberto
+try {
+    autorizado = servicoDeLimites.pode(atendente, valor);
+} catch (Exception e) {
+    autorizado = true;                 // "para não travar o atendimento"
+}
+
+// 2) Tratador "amigável" que entrega a infraestrutura
+@ExceptionHandler(Exception.class)
+Map<String, Object> erro(Exception e) {
+    return Map.of("erro", e.getMessage(), "tipo", e.getClass().getName());
+}
+
+// 3) Duas escritas sem transação: a primeira fica, a segunda não acontece
+contas.debitar(origem, valor);
+contas.creditar(destino, valor);       // lança exceção: dinheiro sumiu
+```
+
+**Correção.** Falhe fechado em toda decisão de segurança. Um tratador global (`@RestControllerAdvice`) que devolve Problem Details genérico com código de rastreio e registra o detalhe no log. `@Transactional` em operações de várias escritas. Limites explícitos (tamanho de payload, timeouts, paginação máxima) para que condição anormal não vire esgotamento. Passo 8. **Como detectar:** testes que **injetam a falha** (a dependência lança exceção) e conferem o resultado; DAST que manda entradas malformadas e procura `Exception`, `at org.` e nomes de host na resposta; na revisão, todo `catch` merece a pergunta "e depois daqui, o sistema está num estado seguro?".
+
+## O código que vamos testar
+
+Tudo o que a seção seguinte mostra está em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.owasp`, e roda no CI. Cada subpacote tem a versão vulnerável (com "VULNERÁVEL DE PROPÓSITO" no Javadoc), a corrigida e um teste que exercita as duas.
+
+| Subpacote | Vulnerável | Corrigido | Teste |
+|---|---|---|---|
+| `injecao` | `ContasVulneraveis` | `ContasSeguras`, `OrdenacaoDeContas` | `SqlInjectionTest`, `OrdenacaoDinamicaTest` |
+| `logs` | `AuditoriaDeLogin.vulneravel` | `NeutralizadorDeLog`, `AuditoriaDeLogin.segura` | `InjecaoEmLogTest` |
+| `arquivos` | `NotasFiscaisVulneravel` | `NotasFiscaisSeguras` | `PathTraversalTest` |
+| `ssrf` | `ValidacaoIngenuaDeUrl` | `ValidadorDeDestino` | `SsrfTest` |
+| `xml` | `LeitorDeNotaFiscalXml.padrao` | `LeitorDeNotaFiscalXml.endurecido` | `XxeTest` |
+| `desserializacao` | `EventoComTipoLivre`, `CarrinhoSalvo.lerSemFiltro` | `MeioDePagamento`, `CarrinhoSalvo.lerComFiltro` | `JacksonPolimorfismoTest`, `SerializacaoNativaTest` |
+| `erros` | `TratadorQueVaza`, `AutorizadorDeEstorno.falhandoAberto` | `TratadorSeguro`, `AutorizadorDeEstorno.falhandoFechado` | `VazamentoDeErroTest`, `FalharFechadoTest` |
+
+Duas decisões valem para todos os pares. **O teste prova o ataque antes de provar a defesa**: um teste que só diz "a versão segura recusa `../`" não mostra que `../` era perigoso. Ver a versão vulnerável cair transforma o teste em documentação executável do risco, e se alguém "simplificar" a correção, o mesmo payload a derruba. **As dependências externas são substituíveis**: DNS de teste, lambda que lança exceção, H2 em memória. Nada sai para a rede.
+
+Os payloads usados são os clássicos da documentação da OWASP. O objetivo é demonstrar a classe de falha e a defesa, não montar exploração.
+
+## Mão na massa
+
+Para rodar qualquer teste, entre na pasta do módulo e filtre pela classe. Na primeira vez, rode o build do módulo a partir de `java/` para instalar o pai:
+
+```bash
+cd java
+mvn -q -pl m11-seguranca/aulas -am verify      # tudo, a primeira vez
+cd m11-seguranca/aulas
+mvn test -Dtest=SqlInjectionTest               # uma classe
+```
+
+### Passo 1: SQL injection com JdbcClient
+
+**O que vamos fazer e por quê.** O painel do atendente busca contas de uma agência pelo nome do titular. A versão vulnerável monta o SQL concatenando; a corrigida usa parâmetros. Para o banco, usamos H2 em memória: a falha é de montagem de texto, não de um banco específico, e o mesmo teste funcionaria contra o PostgreSQL com Testcontainers. A dependência de JDBC entrou no `pom.xml` do módulo como `spring-jdbc` (sem o starter), com o H2 só no escopo de teste.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/injecao/ContasVulneraveis.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/injecao/ContasSeguras.java" semImports />
+
+O teste sobe um H2 com quatro contas em duas agências (0001 e 0002) e faz o atendente da agência 0001 buscar pelo "nome" `x' OR '1'='1`:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/injecao/SqlInjectionTest.java" semImports />
+
+```bash
+mvn test -Dtest=SqlInjectionTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.injecao.SqlInjectionTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.319 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Na versão vulnerável, o texto final é `WHERE agencia = '0001' AND titular = 'x' OR '1'='1'`. Como `AND` tem precedência sobre `OR`, a condição vira "(agência 0001 e titular x) **ou** verdadeiro": todas as quatro linhas voltam, inclusive as da agência 0002. Foi o vazamento do e-mail do pesquisador.
+- Na versão corrigida, `:titular` é um marcador. O `JdbcClient` envia o texto da consulta e o valor **separados** ao driver (por baixo, um `PreparedStatement`). O banco procura um titular chamado literalmente `x' OR '1'='1` e não encontra ninguém.
+- O quarto teste é o argumento que convence o time de produto: o sobrenome `D'Ávila` **quebra** a versão vulnerável com `BadSqlGrammarException`. SQL injection não é só segurança; é um bug funcional esperando um cliente com apóstrofo no nome.
+- Escapar aspas à mão (`replace("'", "''")`) não é a correção. Cada banco tem regras próprias de escape, codificações e modos (barra invertida no MySQL, por exemplo), e a lista de exceções nunca termina. Parâmetro de bind elimina a classe inteira do problema.
+
+<Callout tipo="atencao" titulo="LIKE também precisa de cuidado">
+Em `WHERE titular LIKE :prefixo`, o parâmetro protege contra injeção, mas `%` e `_` digitados pelo cliente continuam funcionando como curingas: `%` sozinho lista tudo, e `%a%b%c%...` pode gerar uma consulta cara. Escape os curingas antes de acrescentar o seu `%` (com `ESCAPE '\'` no SQL) e limite o tamanho do termo.
+</Callout>
+
+### Passo 2: ordenação dinâmica com allowlist
+
+**O que vamos fazer e por quê.** A listagem aceita `?ordenarPor=saldo`. A tentação é passar o nome da coluna como parâmetro de bind, mas parâmetros substituem **valores**: no `ORDER BY ?`, o banco recebe uma constante (ou, no H2, tenta interpretá-la como número da coluna, como você vê em "Quando dá errado"). Então o time concatena, e a injeção volta. A solução é uma allowlist que traduz nomes **públicos** para trechos de SQL **escritos pela equipe**.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/injecao/OrdenacaoDeContas.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/injecao/OrdenacaoDinamicaTest.java" semImports />
+
+```bash
+mvn test -Dtest=OrdenacaoDinamicaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.injecao.OrdenacaoDinamicaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.845 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O primeiro teste manda `(SELECT COUNT(*) FROM conta)` como critério de ordenação, e a versão vulnerável executa. É a prova de que o texto do cliente virou SQL: uma subconsulta escrita por quem chama a API rodou no banco. Num banco real, isso permite inferir dados de outras tabelas pela **ordem** do resultado, sem nenhuma mensagem de erro.
+- O segundo teste mostra o vazamento que acompanha: um apóstrofo no campo gera `BadSqlGrammarException`, cuja mensagem traz o SQL completo. Se essa mensagem chegar ao cliente (passo 8), o atacante aprende o nome da tabela e das colunas.
+- A allowlist expõe **nomes públicos** (`abertura`) que não precisam coincidir com as colunas (`id`). Isso desacopla o contrato da API do esquema do banco e impede ordenar por colunas internas: o teste confere que `id`, uma coluna real, é recusado. A exceção vira 400 com a lista dos nomes aceitos, uma mensagem útil para o cliente legítimo e inútil para o atacante.
+- O desempate por `id` não é segurança, é correção: sem ele, duas contas com o mesmo saldo podem trocar de posição entre páginas, e a paginação repete ou pula registros.
+
+<Callout tipo="dica" titulo="No Spring Data">
+Com repositórios derivados e `Pageable`, o Spring Data monta o `ORDER BY` a partir de propriedades da entidade e recusa propriedades inexistentes. O risco volta quando você recebe `Sort` do cliente e o aplica numa `@Query(nativeQuery = true)` ou em SQL próprio. Nesse caso, filtre `sort.stream()` pela mesma allowlist antes de usar.
+</Callout>
+
+### Passo 3: injeção em log
+
+**O que vamos fazer e por quê.** A auditoria de login grava uma linha por tentativa com o e-mail digitado. Se o e-mail contém `\r\n`, quem atacou escreve uma **segunda linha** no arquivo, por exemplo um falso "login-ok" do administrador, que confunde a investigação de um incidente ou dispara (ou esconde) um alerta baseado em texto.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/logs/NeutralizadorDeLog.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/logs/InjecaoEmLogTest.java" semImports />
+
+```bash
+mvn test -Dtest=InjecaoEmLogTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.logs.InjecaoEmLogTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.089 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Na versão vulnerável, o arquivo ganhou duas linhas, e a segunda começa com `INFO login-ok email=admin@fintech.com`. Uma ferramenta que conta logins por linha vê um sucesso do administrador que nunca aconteceu.
+- A versão segura troca quebras de linha por `\r` e `\n` **visíveis**: a informação continua lá (quem investiga vê que alguém tentou forjar), mas não forma uma linha nova.
+- Os outros caracteres de controle também importam: `\u001b` inicia sequências ANSI que mudam cores e apagam texto em terminais, e `\u2028` quebra linha em alguns visualizadores. O corte em 200 caracteres impede que um campo gigante encha o disco ou esconda o resto da linha.
+- O destino do log é um `Consumer<String>` para o teste capturar as linhas. Em produção, a mesma neutralização vale antes de passar o valor para `log.warn(...)`. Com log **estruturado** em JSON (o Spring Boot oferece `logging.structured.format.console` com os formatos `ecs`, `gelf` e `logstash`), o próprio codificador JSON escapa as quebras, e a neutralização manual passa a ser só o corte de tamanho. Esse é o caminho recomendado para serviços novos: além de seguro, é o formato que as ferramentas de observabilidade leem.
+
+### Passo 4: path traversal no download de nota fiscal
+
+**O que vamos fazer e por quê.** O endpoint `GET /notas/{arquivo}` devolve o PDF de uma nota. A pasta de notas fica ao lado de uma pasta de configuração com a senha do banco. Vamos provar dois caminhos de fuga e a correção em três camadas.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/arquivos/NotasFiscaisSeguras.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/arquivos/PathTraversalTest.java" semImports />
+
+```bash
+mvn test -Dtest=PathTraversalTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.arquivos.PathTraversalTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.343 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `../config/application.properties` sobe um nível e entra na pasta vizinha: a versão vulnerável devolveu a senha do banco.
+- O segundo ataque é menos conhecido e mais perigoso: **`Path.resolve` com um caminho absoluto descarta a pasta base** e devolve o caminho absoluto. Quem só procura `..` na string deixa passar `/etc/passwd` ou `C:\app\config\application.properties`.
+- A primeira camada da correção é o **formato fechado**: nome de nota tem letras, dígitos, hífen e `.pdf`. Barra, barra invertida, ponto extra e dois-pontos (unidade do Windows) caem aqui. A validação percorre os caracteres; não precisa de regex.
+- A segunda camada é **confinamento**: `resolve` + `normalize` resolve os `..` e `startsWith(pasta)` confere que o resultado continua dentro. O último teste mostra por que tem de ser `Path.startsWith`, que compara **segmentos**, e não `String.startsWith`: como texto, `/dados/notas-antigas/x.pdf` "começa com" `/dados/notas`.
+- A terceira camada é o **caminho real**: `toRealPath()` resolve links simbólicos. Sem ela, um link `notas/atalho.pdf → /etc/shadow`, criado por outro processo ou por um upload mal feito, passa pela segunda camada.
+- A pasta base também passa por `toRealPath()` no construtor, para que a comparação seja entre caminhos reais dos dois lados.
+
+A melhor correção, porém, está no Javadoc: **não aceite nome de arquivo**. Receba `GET /notas/{id}`, busque a nota no banco, confira que ela pertence a quem pediu (BOLA, aula 11.04) e leia o caminho gravado pelo próprio sistema. Assim a superfície de ataque some. Ao devolver o arquivo, defina `Content-Disposition` com um nome gerado por você e `Content-Type` fixo, como pede o requisito 5.4.1 do ASVS.
+
+### Passo 5: SSRF no cadastro de webhook
+
+**O que vamos fazer e por quê.** Lojistas cadastram uma URL para receber eventos de pagamento. O servidor vai fazer `POST` nessa URL. Se ela apontar para `169.254.169.254` (o serviço de metadados das nuvens), para `localhost:8080/actuator` ou para um banco na rede interna, o servidor vira o braço de quem cadastrou.
+
+<Figura legenda="As quatro camadas do validador de destino: cada uma recusa uma família de truques, e o IP aprovado é o que a conexão deve usar">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="ssrf-camadas-titulo ssrf-camadas-desc">
+  <title id="ssrf-camadas-titulo">Pipeline de validação de URL contra SSRF</title>
+  <desc id="ssrf-camadas-desc">Uma URL entra à esquerda e passa por quatro caixas em sequência: 1, parser URI, que recusa URL malformada; 2, esquema, porta e usuário, que recusa http, file, porta 8080 e arroba; 3, allowlist de domínio, que recusa parceiro.com.br.atacante.net e IP literal; 4, resolução DNS e faixas, que recusa nomes que apontam para 10.0.0.5 ou 169.254.169.254. Na saída, o destino aprovado traz a URI e o IP conferido, e a conexão deve ir para esse IP, sem seguir redirecionamentos.</desc>
+  <defs><marker id="mk-ssrf-camadas" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="160" height="80" rx="10" class="d-info"/>
+  <text x="90" y="48" text-anchor="middle" class="d-title">1 · Parser</text>
+  <text x="90" y="72" text-anchor="middle" class="d-mono">new URI(url)</text>
+  <path d="M170 60 L198 60" class="d-line" marker-end="url(#mk-ssrf-camadas)"/>
+  <rect x="200" y="20" width="170" height="80" rx="10" class="d-info"/>
+  <text x="285" y="48" text-anchor="middle" class="d-title">2 · Forma</text>
+  <text x="285" y="72" text-anchor="middle" class="d-label">https, 443, sem @</text>
+  <path d="M370 60 L398 60" class="d-line" marker-end="url(#mk-ssrf-camadas)"/>
+  <rect x="400" y="20" width="160" height="80" rx="10" class="d-info"/>
+  <text x="480" y="48" text-anchor="middle" class="d-title">3 · Domínio</text>
+  <text x="480" y="72" text-anchor="middle" class="d-mono">*.parceiro.com.br</text>
+  <path d="M560 60 L588 60" class="d-line" marker-end="url(#mk-ssrf-camadas)"/>
+  <rect x="590" y="20" width="160" height="80" rx="10" class="d-info"/>
+  <text x="670" y="48" text-anchor="middle" class="d-title">4 · DNS e IP</text>
+  <text x="670" y="72" text-anchor="middle" class="d-label">todos públicos?</text>
+  <text x="90" y="128" text-anchor="middle" class="d-label">recusa:</text>
+  <text x="90" y="148" text-anchor="middle" class="d-mono">malformada</text>
+  <text x="285" y="128" text-anchor="middle" class="d-label">recusa:</text>
+  <text x="285" y="148" text-anchor="middle" class="d-mono">http · file · :8080</text>
+  <text x="285" y="168" text-anchor="middle" class="d-mono">user@host</text>
+  <text x="480" y="128" text-anchor="middle" class="d-label">recusa:</text>
+  <text x="480" y="148" text-anchor="middle" class="d-mono">...com.br.atacante</text>
+  <text x="480" y="168" text-anchor="middle" class="d-mono">169.254.169.254</text>
+  <text x="670" y="128" text-anchor="middle" class="d-label">recusa nome que</text>
+  <text x="670" y="148" text-anchor="middle" class="d-label">resolve para</text>
+  <text x="670" y="168" text-anchor="middle" class="d-mono">10/8 · 169.254/16</text>
+  <path d="M670 100 L670 106" class="d-line"/>
+  <path d="M670 185 L670 218" class="d-line" marker-end="url(#mk-ssrf-camadas)"/>
+  <rect x="340" y="220" width="410" height="90" rx="10" class="d-ok"/>
+  <text x="545" y="248" text-anchor="middle" class="d-title">DestinoAprovado(uri, ip)</text>
+  <text x="545" y="272" text-anchor="middle" class="d-text">conectar NESSE ip, sem redirecionamento,</text>
+  <text x="545" y="294" text-anchor="middle" class="d-text">com timeout curto e resposta limitada</text>
+  <rect x="10" y="220" width="300" height="90" rx="10" class="d-accent"/>
+  <text x="160" y="248" text-anchor="middle" class="d-title">Validação por texto</text>
+  <text x="160" y="272" text-anchor="middle" class="d-mono">url.contains("parceiro")</text>
+  <text x="160" y="294" text-anchor="middle" class="d-text">aceita os três truques</text>
+</svg>
+</Figura>
+
+Primeiro, a validação ingênua, que aparece em muito código de produção:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/ssrf/ValidacaoIngenuaDeUrl.java" semImports />
+
+E o validador em camadas:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/ssrf/ValidadorDeDestino.java" semImports />
+
+O teste usa um resolvedor de DNS de mentira, para controlar para onde cada nome aponta sem tocar na rede:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/ssrf/SsrfTest.java" semImports />
+
+```bash
+mvn test -Dtest=SsrfTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.ssrf.SsrfTest
+[INFO] Tests run: 27, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.706 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- A validação por texto aceitou os três truques. `parceiro.com.br.atacante.net` contém o domínio, mas pertence a quem registrou `atacante.net`. Em `https://api.parceiro.com.br@169.254.169.254/`, tudo antes do `@` é **usuário e senha** da URL; o host é o IP de metadados. E `?parceiro.com.br` na query string satisfaz o `contains`.
+- A camada 1 usa `java.net.URI`, que separa esquema, usuário, host e porta como o cliente HTTP vai separar. A URL nunca é comparada como texto.
+- A camada 2 fecha o esquema em `https` (sem `http`, `file`, `jar`), a porta em 443 e recusa usuário/senha na URL. Cada restrição remove uma família de truques que ninguém precisa num webhook.
+- A camada 3 é a allowlist de domínios, com curinga só no começo. IP literal nunca está na lista, então `https://169.254.169.254` cai aqui.
+- A camada 4 é a que mais gente esquece: **um domínio permitido pode apontar para dentro**. Quem controla o DNS de `interno.parceiro.com.br` pode fazê-lo resolver para `10.0.0.5`. O validador resolve o nome e recusa se **qualquer** IP for interno: loopback, privados (10/8, 172.16/12, 192.168/16), link-local (169.254/16, onde moram os metadados das nuvens), CGNAT (100.64/10), multicast e, em IPv6, `::1`, `fe80::/10` e `fc00::/7`. O caso `::ffff:169.254.169.254` (IPv4 embrulhado em IPv6) é detectado porque o `InetAddress` já o converte para `Inet4Address`.
+- O validador devolve o IP conferido por causa do **DNS rebinding**: entre a validação e a conexão, o atacante troca o registro DNS (com TTL zero) para um IP interno. Se o cliente HTTP resolver de novo, a validação foi inútil. A conexão deve ir para o IP aprovado, mantendo o nome no `Host` e na verificação do certificado; na prática, com um resolvedor customizado no cliente HTTP ou, mais robusto, com um **proxy de saída** que aplica a mesma política na rede.
+
+Dois complementos de produção: **não seguir redirecionamentos** (um `302` para o IP de metadados contorna tudo; no Spring Boot, `spring.http.clients.redirects=dont-follow` configura os clientes HTTP que ele cria) e **limitar a resposta** (timeout curto, tamanho máximo, e nunca devolver o corpo ao lojista).
+
+<Callout tipo="info" titulo="E na nuvem?">
+Use a versão do serviço de metadados que exige token de sessão (na AWS, IMDSv2 obrigatório), dê ao serviço a menor permissão possível e, se o provedor permitir, bloqueie o acesso aos metadados para os contêineres que não precisam dele. Essas medidas não substituem a validação, mas reduzem o estrago se ela falhar.
+</Callout>
+
+### Passo 6: XXE no recebimento de XML
+
+**O que vamos fazer e por quê.** Fornecedores enviam notas fiscais em XML, e o backend lê o emitente. XML permite declarar, no `DOCTYPE`, uma **entidade externa**: um apelido cujo conteúdo vem de um arquivo ou URL. Se o parser resolve a entidade, o XML enviado pelo fornecedor (ou por quem se passa por ele) faz o servidor ler um arquivo local e devolvê-lo dentro do documento.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/xml/LeitorDeNotaFiscalXml.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/xml/XxeTest.java" semImports />
+
+```bash
+mvn test -Dtest=XxeTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.xml.XxeTest
+[Fatal Error] :2:10: DOCTYPE fica desativado quando o recurso "http://apache.org/xml/features/disallow-doctype-decl" é definido como verdadeiro.
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.346 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O teste `parserPadraoLeArquivoDoServidor` **passou**, ou seja: no JDK 25, com `DocumentBuilderFactory.newInstance()` sem configuração, o parser leu o arquivo apontado pela entidade e o conteúdo apareceu como nome do emitente. Não confie em "as versões novas já vêm seguras": confira com um teste como este.
+- A versão endurecida segue o *XML External Entity Prevention Cheat Sheet* da OWASP: proibir `DOCTYPE` por completo é a defesa mais forte, porque elimina entidades externas, entidades internas recursivas (o ataque *billion laughs*, que esgota memória) e DTDs remotos de uma vez. As outras linhas (processamento seguro, acesso externo a DTD e schema vazio, XInclude desligado) são defesa em profundidade, caso alguém precise reabrir o `DOCTYPE` no futuro.
+- A linha `[Fatal Error]` no console vem do parser, que imprime o erro antes de lançar a exceção. A mensagem está em português porque segue o idioma da JVM; por isso o teste confere só o nome da feature, que não muda.
+- O mesmo cuidado vale para `SAXParserFactory`, `XMLInputFactory` (StAX), `TransformerFactory`, `SchemaFactory` e bibliotecas que os usam por baixo (leitores de planilhas e de SOAP, por exemplo). Se o seu serviço não precisa de XML, a melhor configuração é não aceitar `application/xml` em lugar nenhum.
+
+### Passo 7: desserialização insegura, com Jackson 3 e com o Java nativo
+
+**O que vamos fazer e por quê.** Desserializar é transformar bytes em objetos. O perigo aparece quando **os bytes escolhem a classe**: o atacante não pode escrever código novo no seu servidor, mas pode escolher, entre as milhares de classes do classpath, uma cuja criação faz algo útil para ele. Vamos ver isso no JSON (Jackson 3) e na serialização nativa do Java.
+
+Primeiro, o Jackson. A classe vulnerável deixa o cliente dizer, na propriedade `@class`, qual classe Java instanciar:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/desserializacao/EventoComTipoLivre.java" semImports />
+
+A correção é polimorfismo por **nome lógico**, com os subtipos fechados numa interface selada:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/desserializacao/MeioDePagamento.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/desserializacao/JacksonPolimorfismoTest.java" semImports />
+
+```bash
+mvn test -Dtest=JacksonPolimorfismoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.desserializacao.JacksonPolimorfismoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.449 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- A boa notícia do **Jackson 3**: com o `JsonMapper` padrão, `Id.CLASS` num campo `Object` é recusado com `InvalidDefinitionException`. O validador padrão (`DefaultBaseTypeLimitingValidator`) nega subtipos de bases genéricas como `Object`.
+- A má notícia: quando esse erro aparece, a "solução" que circula é um validador que aceita tudo. Com `allowIfBaseType(Object.class)`, o cliente instanciou `ConfiguracaoInterna` com `modoAdministrador = true`. Aqui a classe é inofensiva; num ataque real, seria uma classe de biblioteca cujo setter faz algo perigoso. No Jackson 3, o antigo `LaissezFaireSubTypeValidator` nem é mais público, o que dificulta, mas não impede, o erro.
+- A correção: com `Id.NAME`, o JSON traz `"tipo": "pix"`, e só os nomes de `@JsonSubTypes` existem. `boleto` ou um nome de classe dão `InvalidTypeIdException`. A interface `sealed` dá a mesma garantia ao compilador.
+- Regra de revisão: **`Id.CLASS` ou `Id.MINIMAL_CLASS` em dado que vem de fora bloqueia o merge**, assim como `activateDefaultTyping(...)` sem um validador que liste subtipos específicos.
+
+Agora a serialização nativa. Um carrinho é guardado num cache com `ObjectOutputStream` (código legado é cheio disso) e lido de volta:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/desserializacao/CarrinhoSalvo.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/desserializacao/SerializacaoNativaTest.java" semImports />
+
+```bash
+mvn test -Dtest=SerializacaoNativaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.desserializacao.SerializacaoNativaTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.047 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Sem filtro, `readObject()` criou uma `ConfiguracaoInterna`. O cast para `CarrinhoSalvo` falharia **depois**, tarde demais: a criação e o `readObject` das classes envolvidas já rodaram. É por isso que cadeias de gadgets funcionam mesmo quando o código "espera" outro tipo.
+- Com o `ObjectInputFilter` (JEP 290, ampliado pela JEP 415), cada classe é conferida **antes** de ser instanciada: uma allowlist terminada em `!*` (rejeite o resto), mais limites de profundidade, referências e bytes.
+- Montar a lista não é óbvio: `List.of(...)` viaja como `java.util.CollSer` com um `Object[]` e volta como `ImmutableCollections$List12`; `BigDecimal` carrega um `BigInteger`. Foi preciso uma sonda para descobrir. Se até a lista correta é difícil, o melhor é **não usar serialização nativa em dado que cruza uma fronteira de confiança**: JSON com DTOs só cria os tipos que você declarou.
+- Em legados que não podem mudar, a propriedade `jdk.serialFilter` aplica um filtro à JVM inteira, como rede de proteção até a migração.
+
+### Passo 8: tratamento de exceções sem vazamento e falhando fechado
+
+**O que vamos fazer e por quê.** O banco cai, e o driver lança uma exceção cuja mensagem tem host, porta e usuário de produção. Vamos comparar um tratador que "ajuda o suporte" devolvendo os detalhes com um que devolve Problem Details genérico e guarda o detalhe no log. Depois, a decisão de autorização quando a dependência falha.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/erros/TratadorQueVaza.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/erros/TratadorSeguro.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/erros/VazamentoDeErroTest.java" semImports />
+
+```bash
+mvn test -Dtest=VazamentoDeErroTest
+```
+
+As respostas das duas versões para `GET /pedidos/42`, capturadas na execução:
+
+```text
+HTTP 500 application/json;charset=UTF-8
+{"erro":"Connection to db-pedidos-prod.interno:5432 refused (user=app_pedidos)","tipo":"java.lang.IllegalStateException","pilha":["...","dev.trilhajava.m11.aulas.owasp.erros.PedidoController.buscar(PedidoController.java:24)","java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:104)"]}
+
+HTTP 500 application/problem+json;charset=UTF-8
+{"detail":"Não foi possível concluir a operação. Informe o código ao suporte.","instance":"/pedidos/42","status":500,"title":"Internal Server Error","type":"https://api.fintech.exemplo/erros/interno","codigoDeRastreio":"4e754d1f-3fd4-4054-a264-58ea8d7bb031"}
+```
+
+E o que foi para o log, com o mesmo código:
+
+```text
+ERROR dev.trilhajava.m11.aulas.owasp.erros.TratadorSeguro -- erro-inesperado codigo=4e754d1f-3fd4-4054-a264-58ea8d7bb031
+java.lang.IllegalStateException: Connection to db-pedidos-prod.interno:5432 refused (user=app_pedidos)
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.erros.VazamentoDeErroTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.385 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- A versão que vaza entregou host, porta e usuário do banco, o tipo da exceção e nomes de classes internas. Para quem ataca, é reconhecimento grátis: confirma a tecnologia, dá alvos na rede interna (que um SSRF poderia alcançar) e mostra se uma entrada provocou erro de SQL. É a CWE-209, destacada em A10.
+- A versão segura devolveu um `ProblemDetail` (RFC 9457): status, título padrão, mensagem genérica e `codigoDeRastreio`. O teste confere a **ausência** dos detalhes no corpo e a **presença** do mesmo código e da mensagem original no log (com o `OutputCaptureExtension` do Spring Boot).
+- Erro do cliente é outra história: `GET /pedidos/abc` recebe 400 com uma explicação útil. A regra é "explique o que o cliente pode corrigir, esconda o que só a operação pode corrigir".
+- O tratador seguro é o **último recurso** que o ASVS pede (16.5.4); em projetos maiores, convive com tratadores específicos para cada exceção de negócio. O `standaloneSetup` com `setControllerAdvice` testa esse contrato sem subir contexto Spring.
+
+<Callout tipo="atencao" titulo="O Spring Boot já ajuda, se você deixar">
+Os padrões do Boot para a página de erro são seguros: `server.error.include-stacktrace` e `server.error.include-message` valem `never`. O vazamento quase sempre vem de um `@ExceptionHandler` escrito à mão que devolve `e.getMessage()`, ou de alguém que trocou esses padrões para depurar e esqueceu. Um teste como o deste passo, rodando contra a configuração de produção, pega os dois.
+</Callout>
+
+Por fim, a decisão de autorização quando a dependência falha:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/owasp/erros/AutorizadorDeEstorno.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/owasp/erros/FalharFechadoTest.java" semImports />
+
+```bash
+mvn test -Dtest=FalharFechadoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.owasp.erros.FalharFechadoTest
+WARN dev.trilhajava.m11.aulas.owasp.erros.AutorizadorDeEstorno -- servico-de-limites-indisponivel atendente=atendente-7 politica=ABERTA
+java.lang.IllegalStateException: timeout de 2s no servico-de-limites
+...
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.071 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Com o serviço de limites no ar, as duas políticas recusam um estorno de R$ 50.000,00 para quem tem limite de R$ 1.000,00. Com o serviço fora do ar, a política aberta **libera**. Para quem quer abusar, derrubar ou sobrecarregar o serviço de limites vira o caminho para estornos sem teto. A política fechada nega, registra o evento com o nome da política e deixa a decisão de negócio (fila de aprovação manual, mensagem ao atendente) para um fluxo explícito. Repare que o `catch` nunca é vazio: ele registra e devolve uma decisão consciente.
+
+### Passo 9: a suíte inteira
+
+```bash
+cd java
+mvn -q -pl m11-seguranca/aulas -am verify
+```
+
+```text
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.arquivos.PathTraversalTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.desserializacao.JacksonPolimorfismoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.desserializacao.SerializacaoNativaTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.erros.FalharFechadoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.erros.VazamentoDeErroTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.injecao.OrdenacaoDinamicaTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.injecao.SqlInjectionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.logs.InjecaoEmLogTest
+[INFO] Tests run: 27, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.ssrf.SsrfTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...owasp.xml.XxeTest
+[INFO] Tests run: 59, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cinquenta e nove testes, oito categorias de falha, nenhuma rede e nenhum Docker. Essa suíte é o tipo de coisa que vale levar para o seu projeto: não como cópia, mas como padrão. Cada correção de segurança entra com o teste que prova o ataque.
+
+## Quando dá errado
+
+As mensagens abaixo foram copiadas da execução durante a construção desta aula. Cada uma ensina algo sobre a ferramenta.
+
+### O Jackson 3 recusa o polimorfismo por classe
+
+```text
+tools.jackson.databind.exc.InvalidDefinitionException: Configured `PolymorphicTypeValidator` (of type `tools.jackson.databind.jsontype.DefaultBaseTypeLimitingValidator`) denies resolution of all subtypes of base type `java.lang.Object` as using too generic base type can open a security hole without checks on subtype: please configure a custom `PolymorphicTypeValidator` for this use case
+```
+
+**Como ler:** o Jackson 3 está protegendo você. A base `Object` é genérica demais para aceitar subtipos sem uma lista. **Como corrigir:** não configure um validador permissivo, como a mensagem parece sugerir. Troque `Id.CLASS` por `Id.NAME` com `@JsonSubTypes`, ou estreite a base para uma interface sua. Se precisar mesmo de `Id.CLASS` (dado interno, nunca de fora), use `BasicPolymorphicTypeValidator.builder().allowIfSubType(TipoEspecifico.class)` com a lista exata.
+
+### O LaissezFaireSubTypeValidator sumiu
+
+```text
+tools.jackson.databind.jsontype.impl.LaissezFaireSubTypeValidator is not public in tools.jackson.databind.jsontype.impl; cannot be accessed from outside package
+```
+
+**Como ler:** código e respostas antigas do Jackson 2 usam esse validador "aceita tudo". No Jackson 3 ele não é mais acessível de fora do pacote. **Como corrigir:** é um sinal para rever o desenho, não para procurar outro jeito de aceitar tudo.
+
+### O filtro de desserialização recusou o próprio carrinho
+
+```text
+java.io.InvalidClassException: filter status: REJECTED
+	at ...SerializacaoNativaTest.carrinhoLegitimoPassaPeloFiltro(SerializacaoNativaTest.java:30)
+```
+
+**Como ler:** a primeira versão da lista não tinha as classes internas de `List.of` nem o `java.lang.Object` (para arrays, o filtro confere o tipo do **elemento**). A mensagem não diz qual classe foi recusada. **Como corrigir:** ligue o log do filtro (o logger `java.io.serialization`, em nível de depuração) ou escreva uma sonda: um filtro que imprime `info.serialClass()` e devolve `UNDECIDED`. Foi assim que a lista final saiu.
+
+### O parser endurecido recusou o DOCTYPE
+
+```text
+[Fatal Error] :2:10: DOCTYPE fica desativado quando o recurso "http://apache.org/xml/features/disallow-doctype-decl" é definido como verdadeiro.
+```
+
+**Como ler:** é o comportamento esperado, e a mensagem segue o idioma da JVM (em inglês, ela diz que o DOCTYPE não é permitido quando a feature está ligada). **Como corrigir:** nada, se o XML vem de fora. Se um parceiro legítimo envia `DOCTYPE`, peça para remover; se não der, reabra só o `DOCTYPE` e mantenha entidades externas e DTDs remotos desligados. Num teste, confira o nome da feature, não o texto traduzido.
+
+### SQL quebrado com o SQL inteiro na mensagem
+
+```text
+org.springframework.jdbc.BadSqlGrammarException: PreparedStatementCallback; bad SQL grammar [SELECT id, titular, agencia, saldo FROM conta WHERE agencia = ? ORDER BY saldo']
+```
+
+**Como ler:** além de mostrar a concatenação, a mensagem do Spring carrega o SQL completo. **Como corrigir:** a allowlist do passo 2 resolve a causa; o tratador do passo 8 garante que mensagens assim nunca saiam da aplicação.
+
+### Coluna como parâmetro de bind
+
+A tentativa intuitiva de "parametrizar a coluna", no H2:
+
+```java
+jdbc.sql("SELECT id, titular, agencia, saldo FROM conta ORDER BY :coluna DESC").param("coluna", "saldo")
+```
+
+```text
+org.springframework.dao.DataIntegrityViolationException: PreparedStatementCallback; SQL [SELECT id, titular, agencia, saldo FROM conta ORDER BY ? DESC]; Data conversion error converting "saldo"
+Caused by: java.lang.NumberFormatException: For input string: "saldo"
+```
+
+**Como ler:** o H2 tenta interpretar o parâmetro do `ORDER BY` como **número da coluna**. Em outros bancos, o parâmetro vira uma constante e a ordenação simplesmente não acontece, sem erro nenhum, o que é pior. **Como corrigir:** allowlist.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Denylist: procurar o que é perigoso" depois="Allowlist: aceitar só o que é esperado">
+```java
+// sempre incompleta
+if (arquivo.contains("..")) throw ...;
+if (url.contains("169.254")) throw ...;
+if (ordenarPor.contains(";")) throw ...;
+// e o caminho absoluto? e o IP em decimal?
+// e o DNS que aponta para 10.0.0.5?
+// e a subconsulta sem ponto e vírgula?
+```
+
+```java
+// fecha o que ninguém previu
+if (!nomeValido(arquivo)) throw ...;        // formato
+if (!alvo.startsWith(pasta)) throw ...;     // confinamento
+if (!dominioPermitido(host)) throw ...;     // lista
+if (!publico(ip)) throw ...;                // destino real
+String sql = COLUNAS.get(ordenarPor);       // tradução
+```
+</Comparar>
+
+As regras de bolso, cada uma com a falha que ela evita:
+
+- **Valide no destino, não só na entrada.** Bean Validation no DTO (`@Pattern`, `@Size`) ajuda, mas o mesmo dado pode chegar ao `sql(...)` por outro caminho (uma fila, um job, um import de planilha). A proteção definitiva mora onde o dado é usado: parâmetro de bind no SQL, confinamento no `Files`, validador na chamada HTTP.
+- **Não confie em "sanitizar".** Remover `../` da string é denylist disfarçada: `....//` vira `../` depois da remoção. Rejeite o que está fora do formato.
+- **Não confie no front.** Quem ataca chama a API com `curl`.
+- **Não use o Top 10 como checklist de conformidade.** "Passamos no Top 10" não é verificável; "atendemos ao ASVS nível 2 nos capítulos V1, V5, V8 e V16" é.
+- **Não confunda WAF com correção.** Um *Web Application Firewall* compra tempo contra payloads conhecidos; não sabe o que é `ordenarPor` na sua API.
+- **Falso positivo de SAST** se marca na ocorrência, com justificativa; não se desliga a regra no projeto.
+- **Quando NÃO escrever o validador de SSRF.** Se o produto aceita receber o arquivo em vez da URL (upload de avatar em vez de "cole o link"), aceite o arquivo. Se as chamadas de saída vão para poucos parceiros fixos, a allowlist de URLs completas, sem DNS dinâmico, é mais simples. O validador desta aula é para quando o destino realmente varia por cliente.
+- **Quando NÃO usar serialização nativa:** praticamente sempre que o dado cruza processo, rede ou disco compartilhado. Ela só se justifica em código legado que ainda não migrou, e aí com filtro.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber corrigir um SQL injection é o mínimo. O que se espera de quem é Pleno ou Sênior é **organizar o trabalho de segurança do time**: decidir onde investir, como detectar em escala, como responder quando algo escapa e como justificar o custo.
+
+**Onde colocar cada controle.** Uma defesa vale mais quanto mais perto do destino perigoso ela está e quanto menos depende da memória de quem escreve o código. Um sênior transforma correções pontuais em **componentes do projeto**: um `ClienteHttpDeSaida` que só aceita `DestinoAprovado`, sem redirecionamento e com timeout; um `ArmazemDeArquivos` que só lê por id; um `JsonMapper` configurado num único `@Bean`. E protege essas decisões com testes de arquitetura (o ArchUnit da aula 10.06): "nenhuma classe fora do pacote `saida` usa `RestClient`", "ninguém chama `ObjectInputStream`".
+
+**SAST, DAST, SCA e testes: o que cada um encontra e quanto custa.** SAST roda em cada pull request, é barato e encontra padrões (`sql(` com concatenação, `Id.CLASS`, `MD5`), mas gera falsos positivos e não entende regra de negócio. DAST encontra configuração errada e vazamentos de verdade, mas é lento e só cobre o que alcança. SCA é quase gratuito e cobre a categoria A03, com o custo de triar alertas. Testes como os desta aula encontram só o que você pensou em testar, mas sem falsos positivos e com efeito de regressão. A combinação madura: SAST e SCA bloqueando o merge acima de uma severidade combinada; testes de segurança junto dos funcionais; DAST agendado contra homologação; revisão humana focada nos destinos perigosos. Comece com poucas regras de alta confiança e aumente aos poucos, para o time não aprender a ignorar alertas.
+
+**Triagem.** A pergunta não é "qual a nota CVSS?", e sim "quem alcança isto, com que pré-requisito, e o que expõe?". Uma CVE crítica numa biblioteca usada só num job interno sem entrada externa pode esperar o ciclo normal; um path traversal num endpoint público é incidente.
+
+**Falhar fechado tem custo, e alguém precisa decidir.** Negar todos os estornos quando o serviço de limites cai é seguro, mas para o atendimento. A decisão é uma conversa com o negócio, e as alternativas precisam ser explícitas: limite conservador em cache, fila de aprovação manual, disjuntor (*circuit breaker*) que falha rápido. O inaceitável é a decisão ficar escondida num `catch` que devolve `true`.
+
+**Mensagens de erro: suporte versus segurança.** O código de rastreio resolve o dilema se a operação acha o log pelo código em segundos: log estruturado com o código como campo, retenção adequada e acesso para quem atende o cliente. Sem isso, o time volta a pedir "manda a mensagem completa", e o vazamento volta.
+
+**Resposta a incidente.** Quando o e-mail do pesquisador chega: desde quando a falha existe (o Git responde), foi explorada (os logs de acesso respondem, se tiverem o necessário), quais dados estavam ao alcance, quem precisa ser avisado (a LGPD exige comunicação à ANPD e aos titulares em incidentes com risco relevante) e como eliminar a **classe** de falha, não só a ocorrência. Um `security.txt` com contato faz o próximo pesquisador escrever para você em vez de publicar direto.
+
+**Como justificar para o time.** Funcionam: o custo de um incidente contra uma correção que cabe numa tarde; o fato de que várias correções também são funcionais (o `D'Ávila` do passo 1); e clientes e auditorias que pedem evidência de ASVS. O melhor argumento é um teste vermelho mostrando o ataque funcionando no código de vocês.
+
+**Quando trocar de abordagem.** SQL dinâmico demais pede um construtor de consultas tipado (jOOQ, Criteria API). Validação de SSRF reimplementada em cada serviço pede um proxy de saída centralizado. Serialização nativa em vários caches pede uma migração para JSON, que custa uma vez e encerra a categoria.
+
+## OWASP API Security Top 10 (2023)
+
+Para APIs existe uma lista específica, que complementa o Top 10 geral. Ela é útil porque fala a língua de quem desenha endpoints:
+
+| API Top 10 (2023) | Relação com o Top 10:2025 | Onde a trilha trata |
+|---|---|---|
+| API1 Broken Object Level Authorization | A01 | [aula 11.04](../../11-seguranca/04-autorizacao-e-bola/), exercício 11.03 |
+| API2 Broken Authentication | A07 | aulas 11.01 a 11.03 |
+| API3 Broken Object Property Level Authorization | A01 e A08 (atribuição em massa) | DTOs de entrada e de saída (aula 11.04) |
+| API4 Unrestricted Resource Consumption | A10 e A06 | limites, paginação máxima, timeouts ([aula 11.06](../../11-seguranca/06-defesas-da-api/)) |
+| API5 Broken Function Level Authorization | A01 | regras por rota e por papel (aulas 11.02 e 11.04) |
+| API6 Unrestricted Access to Sensitive Business Flows | A06 | limites de negócio, casos de abuso |
+| API7 Server Side Request Forgery | A01 | passo 5 desta aula |
+| API8 Security Misconfiguration | A02 | Actuator, erros, CORS, XXE (passo 6) |
+| API9 Improper Inventory Management | A02 | versões antigas da API esquecidas no ar, documentação exposta |
+| API10 Unsafe Consumption of APIs | A08 e A05 | tratar a resposta de um parceiro como dado não confiável |
+
+Dois itens merecem atenção porque não aparecem com o mesmo destaque no Top 10 geral. **API9** é organizacional: `v1` que ninguém desligou, ambiente de homologação público com dados reais, o Swagger UI aberto em produção. Mantenha um inventário (o próprio OpenAPI gerado é um começo) e um processo de desativação de versões. **API10** é o espelho do que você fez nesta aula: a resposta do parceiro também é dado de fora. Um campo dela concatenado num SQL é injeção; uma URL dela seguida sem validação é SSRF; um JSON dela desserializado com tipo livre é A08.
+
+## ASVS 5.0 como checklist
+
+O **ASVS** (*Application Security Verification Standard*) é o que transforma "seja seguro" em requisitos verificáveis. A versão atual é a **5.0.0**, com cerca de 350 requisitos em 17 capítulos (de V1, *Encoding and Sanitization*, a V17, *WebRTC*) e três níveis: o **L1** é o mínimo (cerca de 20% dos requisitos), o **L2** é o que a maioria das aplicações deve buscar (L1 e L2 somam cerca de 70%) e o **L3** é para aplicações que precisam demonstrar o nível mais alto de segurança. Cada requisito tem um identificador no formato `v5.0.0-capítulo.seção.requisito`, que você pode citar num pull request ou num critério de aceite.
+
+Os requisitos ligados ao que você praticou:
+
+| Requisito | Nível | Resumo | Nesta aula |
+|---|---|---|---|
+| 1.2.4 | L1 | consultas parametrizadas ou protegidas contra SQL injection | passos 1 e 2 |
+| 1.3.6 | L2 | proteção contra SSRF com allowlist de protocolos, domínios, caminhos e portas | passo 5 |
+| 1.5.1 | L1 | parsers XML com configuração restritiva, entidades externas desligadas | passo 6 |
+| 1.5.2 | L2 | desserialização com allowlist de tipos | passo 7 |
+| 5.3.2 | L1 | caminhos de arquivo a partir de dados internos, ou nomes do usuário validados estritamente | passo 4 |
+| 5.4.1 | L2 | nome de arquivo do usuário ignorado ou validado; `Content-Disposition` definido pela aplicação | passo 4 |
+| 13.4.2 e 13.4.5 | L2 | modo de depuração desligado; monitoramento e documentação não expostos sem intenção | A02 (Actuator) |
+| 16.4.1 | L2 | componentes de log codificam os dados contra injeção em log | passo 3 |
+| 16.5.1 | L2 | mensagem genérica ao consumidor em erro inesperado ou sensível | passo 8 |
+| 16.5.3 e 16.5.4 | L2 e L3 | falhar de forma segura; tratador de último recurso para exceções não tratadas | passo 8 |
+
+**Como usar no dia a dia.** Escolha o nível com o negócio (uma fintech mira L2, no mínimo) e os capítulos que se aplicam (sem front, V3 sai; sem WebRTC, V17 sai). Transforme os requisitos em critérios de aceite ("dado um nome de arquivo com `../`, então 404, conforme 5.3.2"), num checklist de pull request para os capítulos mais tocados (V1, V5, V8, V16) e em testes com o identificador no comentário, como evidência para auditoria. A cada trimestre, revise o que tem teste, o que depende só de revisão e o que ainda não é atendido. Essa planilha é a resposta quando um cliente grande pergunta "como vocês garantem segurança?".
+
+<Callout tipo="entrevista">
+Perguntas que aparecem para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Quais riscos do OWASP Top 10 você já corrigiu?"** Não recite a lista. Escolha dois ou três e mostre em código: parâmetro de bind e o caso do `ORDER BY` com allowlist; path traversal com `normalize` + `Path.startsWith` + `toRealPath`, e a observação de que o melhor é receber id; o tratador de erros com Problem Details e código de rastreio. Mencione que a edição 2025 trouxe *Supply Chain* e *Mishandling of Exceptional Conditions* e consolidou SSRF em Broken Access Control.
+- **"Como você protege um endpoint que recebe uma URL?"** As quatro camadas (parser, forma, allowlist, DNS com faixas internas), conectar no IP conferido por causa do DNS rebinding, não seguir redirecionamentos, timeout e limite de resposta, e a pergunta de produto: dá para receber o arquivo em vez da URL?
+- **"O que é desserialização insegura e como acontece em Java hoje?"** Bytes escolhendo a classe; gadgets; `ObjectInputStream` sem filtro e Jackson com `Id.CLASS` ou default typing permissivo. Correções: JSON com DTO, `Id.NAME` com subtipos fechados, `ObjectInputFilter` com allowlist. Bônus: o Jackson 3 recusa base `Object` por padrão.
+- **"Como você organizaria a segurança no ciclo de desenvolvimento de um time?"** SCA e SAST no CI com política de bloqueio, testes de segurança junto dos funcionais, DAST agendado, ASVS como fonte de requisitos e checklist, modelagem de ameaças nas funcionalidades sensíveis, triagem por alcance e impacto, e componentes seguros por padrão protegidos por testes de arquitetura.
+- **"Falhar aberto ou fechado?"** Fechado para decisões de segurança, com a alternativa de negócio explícita (fila manual, limite conservador em cache), nunca escondida num `catch`.
+</Callout>
+
+## Checkpoint
+
+O time quer exportar extratos em CSV com `GET /extratos/exportar?ordenarPor=...&colunas=data,valor,descricao`. O cliente escolhe a ordenação e **quais colunas** saem no arquivo. As colunas possíveis são `data`, `valor`, `descricao` e `contraparte`; no banco elas se chamam `criado_em`, `valor`, `descricao` e `nome_contraparte`. O SQL precisa listar as colunas no `SELECT` e ordenar no `ORDER BY`.
+
+**O desafio:** escreva uma classe `ColunasDoExtrato` com um método `String select(String colunasPedidas)` que devolve o trecho `SELECT` seguro (por exemplo, `criado_em AS data, valor AS valor`) e lança uma exceção com mensagem útil para colunas desconhecidas, repetidas ou para uma lista vazia. Depois escreva os testes: um que prova que `valor, (SELECT senha_hash FROM usuario LIMIT 1)` é recusado e outro que prova que a ordem pedida pelo cliente é respeitada. Pense também: o que mais pode dar errado num CSV gerado a partir de dados de clientes?
+
+<details>
+<summary>Solução comentada</summary>
+
+```java
+public final class ColunasDoExtrato {
+
+    private static final Map<String, String> COLUNAS = Map.of(
+            "data", "criado_em",
+            "valor", "valor",
+            "descricao", "descricao",
+            "contraparte", "nome_contraparte");
+
+    private ColunasDoExtrato() {
+    }
+
+    public static String select(String colunasPedidas) {
+        if (colunasPedidas == null || colunasPedidas.isBlank()) {
+            throw new IllegalArgumentException("Informe ao menos uma coluna: " + new TreeSet<>(COLUNAS.keySet()));
+        }
+        var vistas = new LinkedHashSet<String>();
+        var trechos = new ArrayList<String>();
+        for (String bruta : colunasPedidas.split(",")) {
+            String nome = bruta.strip();
+            String coluna = COLUNAS.get(nome);
+            if (coluna == null) {
+                throw new IllegalArgumentException("Coluna desconhecida. Use: " + new TreeSet<>(COLUNAS.keySet()));
+            }
+            if (!vistas.add(nome)) {
+                throw new IllegalArgumentException("Coluna repetida: " + nome);
+            }
+            trechos.add(coluna + " AS " + nome);   // os dois lados vêm do mapa, nunca do cliente
+        }
+        return "SELECT " + String.join(", ", trechos);
+    }
+}
+```
+
+```java
+@Test
+void recusaSubconsulta() {
+    assertThatThrownBy(() -> ColunasDoExtrato.select("valor, (SELECT senha_hash FROM usuario LIMIT 1)"))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageStartingWith("Coluna desconhecida");
+}
+
+@Test
+void respeitaAOrdemPedida() {
+    assertThat(ColunasDoExtrato.select("valor, data"))
+            .isEqualTo("SELECT valor AS valor, criado_em AS data");
+}
+```
+
+**Por que assim.** O apelido depois do `AS` também é um identificador; ele vem do mapa (a chave já validada), nunca do texto bruto. A mensagem de erro não repete o que o cliente mandou, para não refletir conteúdo arbitrário. A ordenação usa a mesma ideia do passo 2, com o mesmo mapa.
+
+**O que mais pode dar errado no CSV.** *CSV injection* (ou *formula injection*): uma descrição que começa com `=`, `+`, `-` ou `@` é interpretada como fórmula quando o arquivo é aberto numa planilha. Prefixe esses valores com um apóstrofo ou espaço, e sempre escape aspas e separadores. Além disso: limite o período e o número de linhas (A10 e API4), confira que o extrato é da conta de quem pediu (BOLA) e registre a exportação como evento de segurança (A09), porque exportação em massa é um sinal clássico de conta comprometida.
+
+</details>
+
+<Quiz
+  id="11-owasp"
+  questoes={[
+    {
+      pergunta: 'No OWASP Top 10:2025, onde fica o SSRF?',
+      opcoes: ['Continua como A10, categoria própria', 'Foi consolidado em A01 Broken Access Control', 'Foi para A05 Injection', 'Saiu da lista'],
+      correta: 1,
+      explicacao: 'Na edição 2025, a CWE-918 (SSRF) está mapeada em A01 Broken Access Control. A posição A10 agora é Mishandling of Exceptional Conditions.',
+    },
+    {
+      pergunta: 'Um validador de webhook confere que o host está em `*.parceiro.com.br`. Por que ainda é preciso resolver o DNS e checar o IP?',
+      opcoes: ['Para medir a latência do parceiro', 'Porque um domínio permitido pode resolver para um IP interno (10.0.0.5, 169.254.169.254), e quem controla o DNS controla o destino', 'Porque o URI do Java não entende domínios com curinga', 'Não é preciso: a allowlist de domínio basta'],
+      correta: 1,
+      explicacao: 'A allowlist confere o nome; o ataque acontece no IP. Resolva, recuse se qualquer IP for interno e conecte no IP conferido, para evitar DNS rebinding.',
+    },
+    {
+      pergunta: 'Um download faz `Files.readAllBytes(pasta.resolve(arquivo))`, e alguém propõe recusar nomes que contêm "..". O que continua passando?',
+      opcoes: ['Nada, ".." é o único jeito de sair da pasta', 'Um caminho absoluto: Path.resolve descarta a pasta base quando o argumento é absoluto', 'Somente nomes com espaços', 'Somente arquivos .pdf'],
+      correta: 1,
+      explicacao: 'O teste do passo 4 mostra `pasta.resolve("/caminho/absoluto")` devolvendo o caminho absoluto. Formato fechado, `normalize` + `Path.startsWith` e `toRealPath` fecham as variações.',
+    },
+    {
+      pergunta: 'Com o Jackson 3 padrão, um campo `Object` anotado com `@JsonTypeInfo(use = Id.CLASS)` recebe um JSON com nome de classe. O que acontece e qual a correção certa?',
+      opcoes: ['O Jackson instancia a classe; a correção é validar o objeto depois', 'O Jackson recusa com InvalidDefinitionException; a correção é usar Id.NAME com @JsonSubTypes, não afrouxar o validador', 'O Jackson ignora o campo silenciosamente', 'O Jackson lança NullPointerException'],
+      correta: 1,
+      explicacao: 'O validador padrão do Jackson 3 nega subtipos de bases genéricas como Object. Configurar um validador que aceita tudo reabre a falha; nome lógico com subtipos fechados resolve.',
+    },
+    {
+      pergunta: 'O serviço de limites de estorno está fora do ar. Qual comportamento está alinhado com o A10?',
+      opcoes: ['Liberar o estorno para não travar o atendimento', 'Negar o estorno, registrar o evento e oferecer um fluxo explícito (por exemplo, aprovação manual)', 'Repetir a chamada indefinidamente até o serviço voltar', 'Devolver ao cliente a mensagem da exceção para ele entender o problema'],
+      correta: 1,
+      explicacao: 'Falhar fechado é a regra para decisões de segurança (CWE-636 é falhar aberto). A alternativa de negócio deve ser explícita, e a mensagem da exceção fica no log, não na resposta.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O **OWASP Top 10:2025**: A01 Broken Access Control (agora com SSRF), A02 Security Misconfiguration, **A03 Software Supply Chain Failures** (nova), A04 Cryptographic Failures, A05 Injection, A06 Insecure Design, A07 Authentication Failures, A08 Software or Data Integrity Failures, A09 Security Logging and Alerting Failures e **A10 Mishandling of Exceptional Conditions** (nova).
+- A maioria dos bugs de backend está onde **dado de fora encontra um destino perigoso**: SQL, caminho de arquivo, URL de saída, log, desserializador, parser XML. Revise a partir dos destinos.
+- **Injeção:** parâmetro de bind para valores, allowlist para identificadores (`ORDER BY`, colunas), neutralização ou log estruturado contra CRLF.
+- **Path traversal:** prefira id a nome; se precisar de nome, formato fechado, `normalize` + `Path.startsWith` e `toRealPath`. `Path.resolve` com caminho absoluto descarta a base.
+- **SSRF:** parser, forma, allowlist de domínio, DNS com recusa de faixas internas, conexão no IP conferido, sem redirecionamento.
+- **XXE:** `disallow-doctype-decl`; o JDK 25 padrão ainda resolve entidade externa local.
+- **Desserialização:** JSON com DTO, `Id.NAME` com subtipos fechados, `ObjectInputFilter` com allowlist; o Jackson 3 recusa `Id.CLASS` em `Object` por padrão, e afrouxar isso reabre a falha.
+- **A10:** Problem Details genérico com código de rastreio, detalhe no log, falhar fechado, transação em operações de várias escritas.
+- Cada correção entra com o teste que **prova o ataque e o bloqueio**. Para requisitos verificáveis, use o **ASVS 5.0**; para APIs, cruze com o **API Security Top 10 (2023)**.
+
+## Próximo passo
+
+Na [aula 11.06, Defesas da API](../../11-seguranca/06-defesas-da-api/), você aprofunda os controles que esta aula só citou: limite de requisições por chave, cabeçalhos de segurança, CORS sem mitos, segredos fora do código e a cadeia de suprimentos no pipeline, com Dependabot, varredura de dependências e SBOM.
+
+## Referências
+
+- [OWASP Top 10:2025](https://top10.owasp.org/2025/) — a lista, a introdução com as mudanças e uma página por categoria.
+- [OWASP API Security Top 10 (2023)](https://owasp.org/API-Security/editions/2023/en/0x11-t10/)
+- [OWASP Application Security Verification Standard 5.0](https://owasp.org/www-project-application-security-verification-standard/) e o [repositório com os capítulos](https://github.com/OWASP/ASVS/tree/master/5.0/en).
+- OWASP Cheat Sheet Series: [SQL Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html), [Server-Side Request Forgery Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html), [XML External Entity Prevention](https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html), [Deserialization](https://cheatsheetseries.owasp.org/cheatsheets/Deserialization_Cheat_Sheet.html), [Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html) e [Error Handling](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html).
+- [Spring Framework — JdbcClient](https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html#jdbc-JdbcClient)
+- [Spring Boot — HTTP clients (redirects)](https://docs.spring.io/spring-boot/reference/io/rest-client.html) e [Actuator endpoints](https://docs.spring.io/spring-boot/reference/actuator/endpoints.html)
+- [Oracle — Serialization Filtering (Java SE 25)](https://docs.oracle.com/en/java/javase/25/core/serialization-filtering1.html)
+- [RFC 9457 — Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)

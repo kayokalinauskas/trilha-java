@@ -1,0 +1,164 @@
+---
+titulo: Threads e memória compartilhada
+descricao: O que é uma thread, por que todo servidor backend é concorrente, visibilidade, atomicidade e ordem — os três problemas da memória compartilhada — e o que volatile resolve (e o que não resolve).
+modulo: 06-concorrencia
+ordem: 1
+duracao: 50
+objetivos:
+  - Explicar por que um servidor web é naturalmente concorrente
+  - Criar e coordenar threads com Thread, Runnable e join
+  - Identificar problemas de atomicidade e de visibilidade
+  - Saber o que volatile garante e o que ele não garante
+tags: [threads, concorrência, volatile, Java Memory Model]
+flashcards:
+  - frente: Por que uma aplicação Spring Boot é concorrente mesmo sem você criar threads?
+    verso: O servidor web atende cada requisição em uma thread; várias requisições simultâneas executam o mesmo código (os mesmos beans singleton) ao mesmo tempo.
+  - frente: Quais os três problemas da memória compartilhada?
+    verso: Atomicidade (operações que parecem uma só e são várias), visibilidade (uma thread não enxerga a escrita de outra) e ordenação (o compilador/CPU reordena instruções).
+  - frente: O que volatile garante?
+    verso: Visibilidade e ordenação — toda leitura vê a última escrita. NÃO garante atomicidade (volatile int x; x++ continua com race condition).
+  - frente: Por que beans singleton do Spring devem ser stateless?
+    verso: Porque a mesma instância é usada por todas as threads de requisição; estado mutável em atributos vira condição de corrida.
+  - frente: O que Thread.join() faz?
+    verso: Faz a thread atual esperar a outra terminar — e garante que tudo o que ela escreveu fique visível depois do join.
+---
+
+Você talvez nunca tenha escrito `new Thread(...)`, mas todo código backend que você escrever será executado **por várias threads ao mesmo tempo**. Um servidor como o Tomcat atende cada requisição HTTP em uma thread; se 200 clientes chamam `/pedidos` ao mesmo tempo, o mesmo método do mesmo objeto roda 200 vezes em paralelo. Entender o que pode dar errado é o que separa um Júnior de um Pleno.
+
+## Threads em 2 minutos
+
+Uma **thread** é uma linha de execução dentro de um processo. As threads de um processo **compartilham a memória** (a heap), e cada uma tem sua própria pilha de chamadas.
+
+```java
+Runnable tarefa = () -> System.out.println("rodando em " + Thread.currentThread().getName());
+
+Thread t = new Thread(tarefa, "worker-1");
+t.start();       // começa a executar EM PARALELO (não use run(), que executa na thread atual)
+t.join();        // espera terminar
+```
+
+Na prática, quase nunca se cria `Thread` diretamente: usam-se **executores** (aula 3) ou **virtual threads** (aula 5). Mas os problemas de memória compartilhada são os mesmos em qualquer caso.
+
+## Problema 1: atomicidade
+
+```java
+class Contador {
+    private long total = 0;
+    void incrementar() { total++; }
+}
+```
+
+`total++` parece uma operação, mas são **três**: ler `total`, somar 1, escrever. Duas threads podem ler o mesmo valor e escrever o mesmo resultado — um incremento se perde.
+
+<Figura legenda="Duas threads intercaladas: dois incrementos, mas o total só sobe 1">
+<svg viewBox="0 0 640 190" width="640" role="img" aria-label="Thread A lê 5, thread B lê 5, A escreve 6, B escreve 6: um incremento perdido">
+  <text x="160" y="24" text-anchor="middle" class="d-title">Thread A</text>
+  <text x="480" y="24" text-anchor="middle" class="d-title">Thread B</text>
+  <rect x="80" y="40" width="160" height="30" rx="6" class="d-info"/><text x="160" y="60" text-anchor="middle" class="d-mono">lê total = 5</text>
+  <rect x="400" y="75" width="160" height="30" rx="6" class="d-violet"/><text x="480" y="95" text-anchor="middle" class="d-mono">lê total = 5</text>
+  <rect x="80" y="110" width="160" height="30" rx="6" class="d-info"/><text x="160" y="130" text-anchor="middle" class="d-mono">escreve 6</text>
+  <rect x="400" y="145" width="160" height="30" rx="6" class="d-violet"/><text x="480" y="165" text-anchor="middle" class="d-mono">escreve 6</text>
+  <text x="320" y="185" text-anchor="middle" class="d-label">esperado 7 — ficou 6</text>
+</svg>
+</Figura>
+
+Esse é o **race condition** (condição de corrida). O exercício 06.01 roda 16 threads × 20 mil incrementos e verifica que nenhum se perde.
+
+Outro formato do mesmo problema é o **check-then-act** (verificar e depois agir):
+
+```java
+if (!reservas.containsKey(assento)) {      // duas threads veem "livre"...
+    reservas.put(assento, cliente);        // ...e as duas reservam: overbooking
+}
+```
+
+## Problema 2: visibilidade
+
+Por desempenho, cada núcleo da CPU tem caches, e o compilador JIT pode manter valores em registradores. Sem sincronização, **não há garantia de que uma thread veja o que outra escreveu**:
+
+```java
+class Tarefa implements Runnable {
+    private boolean parar = false;          // sem volatile
+
+    public void run() {
+        while (!parar) { processar(); }     // pode NUNCA ver o parar = true
+    }
+    void solicitarParada() { parar = true; }
+}
+```
+
+Esse laço pode rodar para sempre: o JIT pode "otimizar" a leitura de `parar` para fora do laço.
+
+## Problema 3: ordenação
+
+O compilador e a CPU podem **reordenar** instruções que não dependem entre si. Numa thread só, isso é invisível; entre threads, outra thread pode ver os efeitos "fora de ordem" — por exemplo, ver um objeto publicado antes de os campos terem sido inicializados.
+
+## O Java Memory Model e o "happens-before"
+
+O **Java Memory Model** (JMM) define quando uma escrita é garantidamente visível a outra thread, pela relação **happens-before**. As principais:
+
+- liberar um lock (`synchronized`, `Lock.unlock`) *happens-before* adquirir o mesmo lock depois;
+- escrever num campo `volatile` *happens-before* ler esse campo;
+- `Thread.start()` *happens-before* qualquer ação da thread iniciada; tudo na thread *happens-before* o `join()` retornar;
+- campos `final` inicializados no construtor são visíveis depois que o objeto é publicado corretamente.
+
+## `volatile`: visibilidade, não atomicidade
+
+```java
+private volatile boolean parar = false;    // resolve o laço infinito acima
+```
+
+`volatile` garante que **toda leitura veja a última escrita** e impede reordenações ao redor. É ideal para **flags** escritas por uma thread e lidas por outras. Mas:
+
+```java
+private volatile long total;
+void incrementar() { total++; }            // CONTINUA com race condition!
+```
+
+Ler-somar-escrever continua sendo três passos. Para isso, você precisa de **atomicidade**: `synchronized`, `Lock` ou tipos atômicos — a próxima aula.
+
+<Callout tipo="atencao" titulo="O risco escondido nos beans do Spring">
+Beans do Spring são **singletons** por padrão: uma instância para todas as requisições. Um atributo mutável num `@Service` (um contador, uma lista "de trabalho", um `SimpleDateFormat`) é compartilhado por todas as threads. Regra de ouro: **services stateless**; estado vai para variáveis locais, para o banco ou para estruturas thread-safe.
+</Callout>
+
+## A melhor sincronização é não precisar dela
+
+- **Imutabilidade**: objetos imutáveis (records, `String`, `BigDecimal`) podem ser compartilhados sem nenhum cuidado.
+- **Confinamento**: dados que só uma thread acessa (variáveis locais) não precisam de sincronização.
+- **Estruturas prontas**: `ConcurrentHashMap`, `AtomicLong`, filas concorrentes.
+
+<Callout tipo="entrevista">
+"O que é uma race condition?" e "o que `volatile` faz?" são perguntas clássicas. A resposta que impressiona separa **visibilidade** de **atomicidade**: "`volatile` resolve visibilidade, mas `x++` num volatile continua com race condition, porque são três operações". E cite o risco prático: estado mutável em beans singleton.
+</Callout>
+
+<Quiz
+  id="06-threads"
+  questoes={[
+    {
+      pergunta: 'Qual a diferença entre `t.start()` e `t.run()`?',
+      opcoes: ['Nenhuma', 'start() executa em uma nova thread; run() executa na thread atual', 'run() é mais rápido', 'start() espera terminar'],
+      correta: 1,
+      explicacao: 'Chamar run() diretamente é só uma chamada de método comum, sem paralelismo.',
+    },
+    {
+      pergunta: '`private volatile int acessos; void registrar() { acessos++; }` é thread-safe?',
+      opcoes: ['Sim, volatile garante tudo', 'Não: volatile garante visibilidade, mas ++ não é atômico', 'Sim, porque int é primitivo', 'Só em máquinas com um núcleo'],
+      correta: 1,
+      explicacao: 'O incremento lê, soma e escreve em passos separados; duas threads podem intercalar.',
+    },
+    {
+      pergunta: 'Um @Service guarda a "lista de itens do pedido atual" em um atributo. Qual o problema?',
+      opcoes: ['Nenhum', 'O bean é singleton: requisições simultâneas compartilham e misturam a mesma lista', 'Listas não podem ser atributos', 'Só é problema em testes'],
+      correta: 1,
+      explicacao: 'Estado por requisição deve ficar em variáveis locais ou parâmetros, nunca em atributos de singletons.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Todo backend é concorrente: cada requisição roda em uma thread, sobre os mesmos objetos.
+- Três problemas: **atomicidade** (race condition, check-then-act), **visibilidade** e **ordenação**.
+- O JMM define as garantias via *happens-before* (locks, volatile, start/join, final).
+- `volatile` = visibilidade, **não** atomicidade.
+- Prefira imutabilidade, confinamento e estruturas thread-safe; services stateless.

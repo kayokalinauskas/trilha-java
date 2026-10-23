@@ -1,0 +1,105 @@
+---
+titulo: Ranking de produtos mais vendidos
+codigo: "03.02"
+resumo: Agregue vendas por produto com Map.merge e monte um top-K com critérios de desempate encadeados em um Comparator — sem Streams.
+modulo: 03-colecoes-generics-excecoes
+ordem: 2
+dificuldade: medio
+tempo: 1,5h
+conceitos: [HashMap, TreeMap, Map.merge, Comparator, record]
+aulas: [03-colecoes-generics-excecoes/03-equals-hashcode-comparable, 03-colecoes-generics-excecoes/01-list-set-map]
+java:
+  modulo: m03-colecoes-generics-excecoes
+  teste: RankingVendasTest
+---
+
+## Contexto
+
+Uma cafeteria online quer um painel com os **produtos mais vendidos** do dia e o **faturamento por produto**. Os dados chegam como uma lista de vendas (produto, quantidade, valor unitário) — o mesmo produto aparece várias vezes, às vezes com preços diferentes por causa de promoções.
+
+## Requisitos
+
+| Método | Retorna |
+|---|---|
+| `faturamentoPorProduto(vendas)` | `Map<String, BigDecimal>` com o total faturado por produto, **chaves em ordem alfabética** |
+| `topPorQuantidade(vendas, k)` | Os `k` produtos com mais unidades vendidas, como `List<ItemRanking>` |
+
+**Critérios do ranking**, nesta ordem:
+
+1. Mais **unidades** vendidas primeiro.
+2. Empate: maior **faturamento** primeiro.
+3. Empate: **nome** em ordem alfabética.
+
+## Exemplo
+
+| Venda | Produto | Qtd | Unitário |
+|---|---|---|---|
+| 1 | Café 500g | 3 | 25,90 |
+| 2 | Filtro | 10 | 4,50 |
+| 3 | Café 500g | 4 | 24,90 |
+| 4 | Caneca | 2 | 39,90 |
+| 5 | Filtro | 1 | 4,50 |
+| 6 | Moedor | 1 | 189,00 |
+| 7 | Caneca | 5 | 39,90 |
+
+```text
+Top 3:
+1. Filtro     11 un.  R$  49,50
+2. Caneca      7 un.  R$ 279,30   ← empata com Café em unidades, mas faturou mais
+3. Café 500g   7 un.  R$ 177,30
+```
+
+## Regras
+
+- `Venda` valida a si mesma: produto obrigatório, quantidade ≥ 1, valor unitário ≥ 0.
+- `k < 1` é inválido. `k` maior que o número de produtos devolve todos.
+- Sem vendas: ranking e mapa vazios.
+- A lista devolvida é imutável.
+- **Restrição didática:** não use Streams (eles chegam no módulo 04).
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `RankingVendasTest` passam.
+- [ ] A ordem do ranking é definida por **um único `Comparator`**, montado com `comparing`/`reversed`/`thenComparing`.
+- [ ] A agregação percorre a lista de vendas **uma vez**.
+
+## Desafios opcionais
+
+- Refaça com Streams e `Collectors.groupingBy` depois do módulo 04 e compare a legibilidade.
+- Para um fluxo com milhões de produtos, onde só o top 10 importa, use uma `PriorityQueue` de tamanho 10 em vez de ordenar tudo. Qual a complexidade de cada abordagem?
+
+<Dicas>
+<Dica nivel={1}>
+Primeiro agregue, depois ordene. A agregação é um problema de `Map` (produto → total); a ordenação é um problema de `Comparator` sobre a lista agregada.
+</Dica>
+<Dica nivel={2}>
+`mapa.merge(produto, venda.quantidade(), Integer::sum)` acumula as quantidades e `mapa.merge(produto, venda.total(), BigDecimal::add)` acumula o faturamento. Para as chaves ordenadas no primeiro método, qual implementação de `Map` você usaria?
+</Dica>
+<Dica nivel={3}>
+`Comparator.comparingInt(ItemRanking::quantidade).reversed().thenComparing(ItemRanking::faturamento, Comparator.reverseOrder()).thenComparing(ItemRanking::produto)`. Repare que `reversed()` inverte só o critério definido até ali, e o faturamento precisa do seu próprio `reverseOrder()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/ranking/RankingVendas.java" />
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/ranking/Venda.java" />
+
+### Pontos-chave
+
+- **O `Comparator` é uma constante com nome.** `ORDEM_DO_RANKING` documenta a regra de negócio em um só lugar e pode ser reutilizado (em um endpoint, em um relatório…).
+- **O `reversed()` é a pegadinha.** `comparingInt(...).reversed().thenComparing(...)` inverte só a quantidade. Se você chamar `reversed()` no final da cadeia, inverte **todos** os critérios, inclusive o nome.
+- **`TreeMap` no faturamento, `HashMap` no ranking.** Onde a ordem das chaves é requisito, a estrutura já a garante; onde a ordem vem de um `sort`, o `HashMap` é mais rápido.
+- **`subList` + `List.copyOf`.** `subList` devolve uma **visão** da lista original; copiar garante que o resultado seja imutável e independente.
+- **`Venda.total()` no record.** O cálculo mora junto dos dados que ele usa (Tell, Don't Ask).
+
+### Avalie sua solução
+
+- Seu desempate por faturamento está em ordem **decrescente**? O teste `desempate` pega isso.
+- Você percorreu as vendas uma vez ou uma vez por produto?
+- O que acontece com `k = 50` e 4 produtos?
+
+</Solucao>

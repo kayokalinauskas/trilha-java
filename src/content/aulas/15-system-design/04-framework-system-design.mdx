@@ -1,0 +1,202 @@
+---
+titulo: "Entrevista de system design: um roteiro para 45 minutos"
+descricao: Como conduzir uma entrevista de system design do começo ao fim — requisitos funcionais e não funcionais, estimativas de ordem de grandeza feitas passo a passo, API, modelo de dados, desenho de alto nível, aprofundamento e trade-offs —, os números de latência que todo backend deveria conhecer e os erros mais comuns.
+modulo: 15-system-design
+ordem: 4
+duracao: 55
+objetivos:
+  - Conduzir uma entrevista de system design seguindo etapas com tempo definido
+  - Levantar requisitos funcionais e não funcionais com perguntas objetivas
+  - Fazer estimativas de QPS, armazenamento e banda por ordem de grandeza
+  - Usar números de latência para justificar decisões de arquitetura
+tags: [system design, entrevista, estimativas, QPS, latência, requisitos não funcionais, trade-offs]
+flashcards:
+  - frente: Quais são as etapas de uma entrevista de system design?
+    verso: Requisitos (funcionais e não funcionais), estimativas, API, modelo de dados, desenho de alto nível, aprofundamento em 1 ou 2 componentes, gargalos e trade-offs.
+  - frente: Quantos segundos tem um dia, para estimativas?
+    verso: 86.400, que se arredonda para 10 elevado a 5 (100 mil). Um milhão de eventos por dia dá cerca de 12 por segundo em média.
+  - frente: Ordem de grandeza - memória, SSD, rede no datacenter, entre continentes
+    verso: Referência à memória - cerca de 100 ns. Leitura aleatória em SSD - cerca de 100 µs. Ida e volta no mesmo datacenter - cerca de 0,5 ms. Ida e volta entre continentes - cerca de 150 ms.
+  - frente: Por que estimar o pico e não só a média?
+    verso: O sistema cai no pico. A média diária esconde o horário de almoço, a sexta-feira e a Black Friday. Assuma um fator (2 a 10 vezes a média, conforme o domínio) e diga que é premissa.
+  - frente: Qual o erro mais comum numa entrevista de system design?
+    verso: Começar a desenhar caixas antes de entender o problema. Sem requisitos e números, qualquer arquitetura parece certa, e nenhuma decisão pode ser justificada.
+---
+
+"Desenhe um encurtador de URL." "Desenhe o feed de uma rede social." "Desenhe um sistema de pagamentos." A entrevista de system design não tem resposta certa: o que se avalia é **como você pensa** diante de um problema aberto. Você pergunta antes de supor? Faz contas antes de escolher tecnologia? Enxerga os gargalos? Explica o que perde com cada escolha?
+
+Um roteiro fixo ajuda a não se perder nos 45 minutos e mostra ao entrevistador que existe método. Esta aula apresenta esse roteiro, com um exemplo de estimativa feito passo a passo e os números que sustentam as decisões.
+
+## O roteiro
+
+<Figura legenda="Uma divisão possível dos 45 minutos. O tempo exato varia; a ordem, não">
+<svg viewBox="0 0 680 210" width="680" role="img" aria-label="Linha do tempo com seis etapas: requisitos, estimativas, API e dados, alto nível, aprofundamento, gargalos e trade-offs">
+  <defs><marker id="m1504" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <path d="M10 140 H665" class="d-line" marker-end="url(#m1504)"/>
+  <rect x="10" y="40" width="80" height="80" rx="8" class="d-info"/><text x="50" y="72" text-anchor="middle" class="d-title">1</text><text x="50" y="96" text-anchor="middle" class="d-label">requisitos</text>
+  <rect x="96" y="40" width="88" height="80" rx="8" class="d-info"/><text x="140" y="72" text-anchor="middle" class="d-title">2</text><text x="140" y="96" text-anchor="middle" class="d-label">estimativas</text>
+  <rect x="190" y="40" width="90" height="80" rx="8" class="d-ok"/><text x="235" y="72" text-anchor="middle" class="d-title">3</text><text x="235" y="96" text-anchor="middle" class="d-label">API e dados</text>
+  <rect x="286" y="40" width="120" height="80" rx="8" class="d-ok"/><text x="346" y="72" text-anchor="middle" class="d-title">4</text><text x="346" y="96" text-anchor="middle" class="d-label">alto nível</text>
+  <rect x="412" y="40" width="150" height="80" rx="8" class="d-accent"/><text x="487" y="72" text-anchor="middle" class="d-title">5</text><text x="487" y="96" text-anchor="middle" class="d-label">aprofundamento</text>
+  <rect x="570" y="40" width="100" height="80" rx="8" class="d-violet"/><text x="620" y="72" text-anchor="middle" class="d-title">6</text><text x="620" y="96" text-anchor="middle" class="d-label">trade-offs</text>
+  <text x="50" y="162" text-anchor="middle" class="d-label">~5 min</text>
+  <text x="140" y="162" text-anchor="middle" class="d-label">~5 min</text>
+  <text x="235" y="162" text-anchor="middle" class="d-label">~5 min</text>
+  <text x="346" y="162" text-anchor="middle" class="d-label">~10 min</text>
+  <text x="487" y="162" text-anchor="middle" class="d-label">~15 min</text>
+  <text x="620" y="162" text-anchor="middle" class="d-label">~5 min</text>
+  <text x="10" y="186" class="d-label">Quem conduz é você: anuncie cada etapa e confirme com o</text>
+  <text x="10" y="204" class="d-label">entrevistador antes de avançar.</text>
+</svg>
+</Figura>
+
+## 1. Requisitos
+
+**Funcionais**: o que o sistema faz. Liste 3 a 5 e confirme o escopo. "Registrar transação, consultar extrato paginado, exportar PDF. Notificações e contestação ficam fora, certo?"
+
+**Não funcionais**: como ele se comporta. São eles que decidem a arquitetura:
+
+| Pergunta | Por que importa |
+|---|---|
+| Quantos usuários? Quantas operações por dia? | define a escala (próxima etapa) |
+| Qual a latência aceitável (p99)? | define cache, síncrono × assíncrono |
+| Qual a disponibilidade esperada? | define redundância e o que acontece numa falha |
+| Consistência forte ou eventual? Onde? | saldo: forte; contador de curtidas: eventual |
+| Proporção leitura × escrita? | sistemas muito lidos pedem cache e réplicas |
+| Retenção dos dados? Requisitos legais? | define armazenamento e arquivamento |
+
+Faça as perguntas e, se o entrevistador devolver "você decide", **declare premissas** em voz alta e anote-as no quadro.
+
+## 2. Estimativas de ordem de grandeza
+
+O objetivo não é precisão: é saber se o problema cabe **num servidor**, **em dez** ou **em mil**. Arredonde sem medo, e mostre as contas.
+
+Constantes úteis:
+
+- 1 dia = 86.400 s, arredondado para **100 mil** (10 elevado a 5).
+- 1 milhão de eventos por dia dá cerca de **12 por segundo** em média.
+- KB, MB, GB, TB: cada unidade é mil vezes a anterior (para estimar, basta).
+
+**Exemplo passo a passo: o extrato de uma fintech.** Premissas (hipotéticas, declaradas ao entrevistador): 10 milhões de usuários ativos por dia; cada um faz 2 transações e consulta o extrato 10 vezes por dia; cada transação ocupa 500 bytes; o pico é 3 vezes a média; retenção de 5 anos.
+
+1. **Escritas.** 10 milhões × 2 = 20 milhões por dia. 20.000.000 ÷ 86.400 ≈ **230 por segundo** em média. No pico, 3 × 230 ≈ **700 por segundo**.
+2. **Leituras.** 10 milhões × 10 = 100 milhões por dia. 100.000.000 ÷ 86.400 ≈ **1.160 por segundo**. No pico, ≈ **3.500 por segundo**. Proporção leitura × escrita: 5 para 1.
+3. **Armazenamento.** 20 milhões × 500 B = 10.000.000.000 B = **10 GB por dia**. Por ano, 10 GB × 365 ≈ **3,65 TB**. Em 5 anos, ≈ **18 TB**. Com 3 réplicas, ≈ **55 TB** em disco.
+4. **Banda de saída.** Cada consulta devolve uma página de 20 transações: 20 × 500 B = 10 KB. No pico, 3.500 × 10 KB = **35 MB/s**, cerca de 280 Mbit/s.
+
+O que os números dizem:
+
+- 700 escritas por segundo é uma carga ao alcance de um PostgreSQL bem configurado (a confirmar com teste de carga): **não** comece falando de sharding.
+- 18 TB em 5 anos é o que pesa: **particione por data** e arquive o que é antigo.
+- As leituras se concentram nos lançamentos recentes: **réplicas de leitura** e **cache** da primeira página resolvem a maior parte.
+
+<Callout tipo="dica" titulo="Diga a conta, não só o resultado">
+"20 milhões por dia, dividido por cerca de 100 mil segundos, dá uns 200 por segundo" vale mais que "uns 230 QPS" jogado sem explicação. Se você errar um fator, o entrevistador corrige e a conversa continua. Se esconder a conta, ele não sabe se você acertou por acaso.
+</Callout>
+
+## 3. API e modelo de dados
+
+Poucos endpoints, os do caminho principal, com o que entra e o que sai:
+
+```text
+POST /contas/{id}/transacoes        Idempotency-Key: <uuid>
+     { valor, tipo, descricao }  →  201 { transacaoId, criadaEm }
+
+GET  /contas/{id}/extrato?cursor=<token>&limite=20
+     →  200 { itens: [...], proximoCursor }
+```
+
+Detalhes que mostram experiência: **idempotência** nas escritas (módulo 12), paginação por **cursor** (e não por `OFFSET`, que fica lento em páginas profundas), versionamento. No modelo de dados, as entidades principais, a **chave primária** e os índices que atendem às consultas da API.
+
+## 4. Desenho de alto nível
+
+Caixas e setas, do cliente ao armazenamento: balanceador, serviços sem estado, banco, cache, fila. Percorra **um fluxo de escrita e um de leitura** em voz alta ("o app chama o gateway, que chama o serviço de transações, que grava no banco e publica o evento pela outbox..."). Ainda sem detalhes: o objetivo é ter um sistema que funciona de ponta a ponta.
+
+## 5. Aprofundamento
+
+O entrevistador escolhe, ou você propõe, 1 ou 2 componentes para detalhar. É aqui que você mostra profundidade: como o cache é invalidado, como a tabela é particionada, o que acontece se o consumidor processar o evento duas vezes, como garantir que o saldo não fique negativo com duas transações simultâneas.
+
+## 6. Gargalos e trade-offs
+
+Termine olhando para o próprio desenho com olhar crítico: qual o **ponto único de falha**? O que acontece se o banco primário cair? Se o tráfego crescer 10 vezes, o que quebra primeiro? Cada decisão tem um custo, e dizê-lo em voz alta é o que diferencia quem decorou arquiteturas de quem sabe projetá-las: "escolhi consistência eventual no extrato, então um lançamento pode levar alguns segundos para aparecer; para o saldo, não aceitei isso."
+
+## Números que todo backend deveria conhecer
+
+Valores aproximados, arredondados da lista popularizada por Jeff Dean e Peter Norvig. O hardware muda; o que importa são as **ordens de grandeza** entre eles:
+
+| Operação | Ordem de grandeza |
+|---|---|
+| acesso ao cache L1 da CPU | ~1 ns |
+| referência à memória principal | ~100 ns |
+| leitura aleatória de 4 KB em SSD | ~100 µs |
+| ida e volta na rede do mesmo datacenter | ~500 µs |
+| busca (*seek*) em disco giratório | ~10 ms |
+| ida e volta entre continentes | ~150 ms |
+
+Consequências práticas:
+
+- Memória é cerca de **mil vezes** mais rápida que SSD, e SSD cerca de **cem vezes** mais rápido que disco giratório. Por isso cache em memória funciona.
+- Uma chamada a outro serviço no mesmo datacenter custa meio milissegundo **antes** de ele fazer qualquer coisa. Dez chamadas em sequência já são 5 ms só de rede: paralelize ou agregue.
+- Uma ida e volta entre continentes custa mais que centenas de consultas no banco local. Um usuário no Brasil acessando um servidor em outro continente paga esse custo **em cada** requisição.
+
+<Callout tipo="erro" titulo="Erros comuns">
+- **Desenhar antes de perguntar.** Sem requisitos, nenhuma decisão tem justificativa.
+- **Microsserviços, Kafka e sharding para 50 requisições por segundo.** Complexidade que os números não pedem conta contra.
+- **Citar tecnologia sem motivo.** "Usaria Cassandra" não diz nada; "preciso de escrita alta e consulta sempre pela mesma chave, então um banco orientado a partição serve" diz.
+- **Ignorar falhas.** Todo componente cai. O que acontece quando cai?
+- **Falar sozinho por 20 minutos.** A entrevista é uma conversa: confirme o rumo a cada etapa.
+- **Não fechar.** Guarde os últimos minutos para gargalos e trade-offs.
+</Callout>
+
+## Pratique
+
+O exercício 15.05 aplica o roteiro inteiro ao clássico **encurtador de URL**: requisitos, estimativas, geração de identificadores curtos, armazenamento, cache dos links mais acessados e os trade-offs. Faça as estimativas com as suas próprias premissas antes de olhar a solução comentada.
+
+<Callout tipo="entrevista">
+Nos primeiros minutos, diga como vai conduzir: "Vou começar pelos requisitos e algumas estimativas, depois proponho a API e um desenho de alto nível, e aprofundamos no que você achar mais interessante." Isso mostra método, dá ao entrevistador a chance de ajustar o rumo e ajuda você a controlar o tempo.
+</Callout>
+
+<Quiz
+  id="15-framework"
+  questoes={[
+    {
+      pergunta: 'Qual deve ser o primeiro passo numa entrevista de system design?',
+      opcoes: ['Escolher o banco de dados', 'Levantar requisitos funcionais e não funcionais', 'Desenhar o balanceador de carga', 'Escrever o código da API'],
+      correta: 1,
+      explicacao: 'Sem saber o que o sistema faz e em que escala, nenhuma decisão pode ser justificada.',
+    },
+    {
+      pergunta: 'Um sistema recebe 50 milhões de escritas por dia. Qual a média aproximada por segundo?',
+      opcoes: ['cerca de 50', 'cerca de 580', 'cerca de 5.800', 'cerca de 50.000'],
+      correta: 1,
+      explicacao: '50.000.000 ÷ 86.400 ≈ 579. Com o arredondamento de 100 mil segundos, dá 500: a mesma ordem de grandeza.',
+    },
+    {
+      pergunta: 'Qual a ordem de grandeza de uma ida e volta na rede dentro do mesmo datacenter?',
+      opcoes: ['cerca de 100 ns', 'cerca de 0,5 ms', 'cerca de 150 ms', 'cerca de 1 s'],
+      correta: 1,
+      explicacao: '100 ns é memória; 150 ms é entre continentes. Dentro do datacenter, fração de milissegundo.',
+    },
+    {
+      pergunta: 'As estimativas mostram 700 escritas por segundo no pico. Qual a proposta mais sensata?',
+      opcoes: ['Sharding em 20 nós desde o início', 'Começar com um banco relacional bem configurado, réplicas para leitura, e mostrar quando particionar', 'Trocar para um banco em memória', 'Microsserviços por tabela'],
+      correta: 1,
+      explicacao: 'Os números não pedem sharding. Complexidade sem necessidade é um ponto negativo.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- A entrevista avalia **como você pensa**: pergunte, estime, desenhe, aprofunde, critique.
+- Roteiro: requisitos → estimativas → API e dados → alto nível → aprofundamento → gargalos e trade-offs.
+- Requisitos **não funcionais** (escala, latência, disponibilidade, consistência) decidem a arquitetura.
+- Estimativas: 1 dia ≈ 100 mil segundos; declare premissas, considere o **pico**, mostre as contas.
+- Latências: memória ~100 ns, SSD ~100 µs, datacenter ~0,5 ms, entre continentes ~150 ms.
+- Evite complexidade que os números não pedem; termine com os trade-offs.
+
+## Referências
+
+- Alex Xu — *System Design Interview: An Insider's Guide*, volumes 1 e 2
+- Martin Kleppmann — *Designing Data-Intensive Applications* (O'Reilly)
+- Jeff Dean — *Designs, Lessons and Advice from Building Large Distributed Systems* (palestra, 2009), origem da tabela de latências

@@ -1,0 +1,28 @@
+# Exercício 14.04 — pipeline de CI. No repositório, fica em .github/workflows/ci.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          # Guarda ~/.m2 entre execuções, com chave pelo hash dos pom.xml.
+          cache: maven
+
+      # -B: modo batch (sem cores nem barra de progresso no log).
+      # verify: compila, roda os testes (inclusive Testcontainers) e empacota o jar.
+      - name: Testes e empacotamento
+        run: mvn -B verify
+
+      - name: Imagem Docker
+        run: docker build -f entrega/Dockerfile -t trilha-m14:${{ github.sha }} .

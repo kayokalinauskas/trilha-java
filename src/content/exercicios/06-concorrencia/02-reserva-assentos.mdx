@@ -1,0 +1,83 @@
+---
+titulo: Reserva de assentos sem overbooking
+codigo: "06.02"
+resumo: Implemente reservas simples e múltiplas (tudo ou nada) que continuam corretas com centenas de clientes disputando os mesmos assentos ao mesmo tempo.
+modulo: 06-concorrencia
+ordem: 2
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [check-then-act, ReentrantLock, atomicidade, visibilidade]
+aulas: [06-concorrencia/02-sincronizacao]
+java:
+  modulo: m06-concorrencia
+  teste: SalaDeCinemaTest
+---
+
+## Contexto
+
+Na estreia de um filme muito aguardado, uma rede de cinemas vendeu o **mesmo assento para duas pessoas** em 37 sessões. O código verificava se o assento estava livre e depois o reservava — dois passos que duas requisições simultâneas conseguiam intercalar. Pior: na compra de assentos para grupos, às vezes metade do grupo ficava com assento e metade não.
+
+## Requisitos
+
+| Método | Comportamento |
+|---|---|
+| `new SalaDeCinema(total)` | Assentos numerados de `0` a `total - 1` |
+| `reservar(assento, cliente)` | `true` se reservou; `false` se já estava ocupado; assento inexistente → `IllegalArgumentException` |
+| `reservarVarios(assentos, cliente)` | **Tudo ou nada**: reserva todos ou nenhum, de forma atômica |
+| `ocupante(assento)` | `Optional` com o cliente |
+| `livres()` | Quantidade de assentos livres |
+
+## Os testes de concorrência
+
+- **200 threads** disputam o **mesmo assento** com largada simultânea: exatamente **uma** pode vencer.
+- **19 grupos** querem pares sobrepostos (`{0,1}`, `{1,2}`, `{2,3}`…): nenhum assento pode ter dois donos, todo grupo vencedor tem **os dois** assentos e `livres()` precisa bater.
+
+Cada teste roda 5 vezes, porque race conditions nem sempre aparecem na primeira.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `SalaDeCinemaTest` passam, em todas as rodadas.
+- [ ] A verificação e a reserva acontecem **dentro da mesma seção crítica**.
+- [ ] O lock é liberado em `finally`.
+- [ ] As leituras (`ocupante`, `livres`) também têm garantia de visibilidade.
+
+## Desafios opcionais
+
+- Troque o lock único por **um lock por assento**, adquiridos sempre em ordem crescente (para evitar deadlock), e meça se o throughput melhora.
+- Adicione **expiração**: uma reserva não paga em 10 minutos volta a ficar livre.
+
+<Dicas>
+<Dica nivel={1}>
+O bug original é *check-then-act*: "está livre?" e "reserve" precisam acontecer como **uma operação indivisível**. Para vários assentos, isso vale para o conjunto inteiro.
+</Dica>
+<Dica nivel={2}>
+Um `ReentrantLock` (ou `synchronized`) protegendo um array `String[] ocupantes` resolve os dois métodos. Faça `reservar` delegar para `reservarVarios(Set.of(assento), cliente)` — uma regra, um lugar.
+</Dica>
+<Dica nivel={3}>
+Dentro do lock: primeiro percorra **todos** os assentos pedidos verificando se estão livres (se algum não estiver, `return false` sem alterar nada); só depois grave todos e atualize o contador de livres. Valide os números dos assentos **antes** de pegar o lock.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m06-concorrencia/solucao/src/main/java/dev/trilhajava/m06/SalaDeCinema.java" />
+
+### Por que assim
+
+- **Check-then-act dentro do lock**: nenhuma outra thread consegue ver o assento livre entre a verificação e a gravação.
+- **Duas passadas** em `reservarVarios` (verificar tudo, depois gravar tudo) garantem o "tudo ou nada" sem precisar desfazer nada.
+- **Lock também nas leituras**: sem ele, uma thread poderia não enxergar uma reserva recém-feita (visibilidade). O lock cria a relação *happens-before* entre quem escreve e quem lê.
+- **Lock único × locks finos**: um lock por assento aumentaria o paralelismo, mas a reserva em grupo precisaria de vários locks, sempre na mesma ordem, para não ter deadlock. Para uma sala de cinema, a disputa real é baixa, e a simplicidade ganha.
+
+### E no mundo real?
+
+Com várias instâncias da aplicação, um lock em memória não protege nada: cada instância tem o seu. A reserva vira uma operação no **banco** — uma constraint de unicidade em `(sessao, assento)`, um `UPDATE ... WHERE ocupante IS NULL` ou lock pessimista (módulo 09) — ou um lock distribuído (Redis, módulo 15).
+
+### Avalie sua solução
+
+- Existe algum caminho em que o `unlock` não é chamado?
+- Com um grupo que falha, algum assento dele ficou reservado?
+
+</Solucao>

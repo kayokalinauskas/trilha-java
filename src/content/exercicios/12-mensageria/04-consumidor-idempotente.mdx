@@ -1,0 +1,282 @@
+---
+titulo: Consumidor idempotente de pagamentos
+codigo: "12.04"
+resumo: O gateway de pagamentos reenvia confirmações e às vezes as entrega fora de ordem. Implemente o consumidor que aplica cada evento uma única vez — mesmo com 8 cópias simultâneas —, descarta eventos obsoletos, desfaz tudo numa falha e só avisa o cliente depois do commit. Você confere tudo contra um PostgreSQL 18 de verdade, com um programa que dispara os cenários e mostra o estado final das tabelas.
+modulo: 12-mensageria
+ordem: 4
+dificuldade: dificil
+tempo: 3h
+conceitos: [idempotência, deduplicação, INSERT ON CONFLICT, SELECT FOR UPDATE, sequência, afterCommit, PostgreSQL]
+aulas: [12-mensageria/05-consumidores-idempotentes]
+java:
+  modulo: m12-mensageria
+  arquivos:
+    - src/main/java/dev/trilhajava/m12/pagamentos/ConsumidorDePagamentos.java
+---
+
+## Contexto
+
+Uma loja recebe do gateway de pagamentos eventos `APROVADO` e `ESTORNADO`. O contrato do gateway é claro: **"entregamos pelo menos uma vez; eventos podem chegar duplicados e fora de ordem; use `mensagemId` para deduplicar e `sequencia` para ordenar"**.
+
+A versão atual do consumidor confiou que isso "quase nunca acontece". No último mês: 14 pedidos com dois lançamentos contábeis, 3 clientes que receberam dois e-mails de "pagamento aprovado" e um pedido estornado que voltou a aparecer como pago, porque a aprovação antiga chegou depois do estorno.
+
+Você vai reescrever o consumidor para que ele seja **idempotente**: processar a mesma mensagem duas, oito ou cem vezes, em sequência ou ao mesmo tempo, tem o mesmo efeito que processá-la uma vez.
+
+## O que você vai praticar
+
+- **Deduplicação no banco.** Uma tabela de "mensagens processadas" com chave primária (`consumidor`, `mensagem_id`). Quem consegue inserir a linha é quem processa; quem não consegue, sabe que é duplicata. Veja [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/).
+- **`INSERT ... ON CONFLICT DO NOTHING`.** O PostgreSQL insere ou não faz nada, e devolve quantas linhas inseriu (1 ou 0). Se outra transação inseriu a mesma chave e ainda não terminou, a segunda **espera** a primeira: não há janela entre "verificar" e "gravar". Mesma aula.
+- **Trava pessimista com `SELECT ... FOR UPDATE`.** Trava a linha do pedido até o fim da transação, para que dois eventos **diferentes** do mesmo pedido sejam aplicados um de cada vez.
+- **Ordem por sequência.** Guardar no pedido a maior sequência já aplicada e ignorar (como *obsoleto*) o evento mais antigo que ela.
+- **Efeitos depois do commit.** O que está no banco se desfaz num rollback; um e-mail enviado, não. Com `TransactionSynchronization.afterCommit()`, o aviso só sai se a transação for confirmada.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m12.pagamentos` (não precisa mudar):
+
+- o esquema em `schema-pagamentos.sql`, recriado a cada subida da aplicação (`pagamentos.properties` liga o `spring.sql.init`):
+
+  | Tabela | Colunas |
+  |---|---|
+  | `pedido` | `id`, `valor` (`NUMERIC(12,2)`), `status` (`AGUARDANDO`, `PAGO`, `ESTORNADO`; padrão `AGUARDANDO`), `versao_evento` (a maior sequência já aplicada; padrão 0), `atualizado_em` |
+  | `pagamento` | `id`, `pedido_id`, `tipo`, `valor`, `transacao` |
+  | `lancamento_contabil` | `id`, `pedido_id`, `valor`, `historico` |
+  | `mensagem_processada` | `consumidor`, `mensagem_id`, `processada_em`; chave primária (`consumidor`, `mensagem_id`) |
+
+- `EventoDePagamento(String mensagemId, String pedidoId, Tipo tipo, BigDecimal valor, String transacao, long sequencia)`, com `Tipo` = `APROVADO` ou `ESTORNADO`;
+- `Contabilidade.lancar(pedidoId, valor, historico)`, que grava em `lancamento_contabil`, no **mesmo** banco (participa da transação de quem chama);
+- `NotificadorDePagamento`, com `pagamentoAprovado(pedidoId)` e `pagamentoEstornado(pedidoId)`: avisa o cliente por e-mail, um efeito **fora** do banco. A implementação `NotificadorNoLog` só escreve no log;
+- `PedidoDesconhecidoException(pedidoId)`, `ValorDivergenteException(pedidoId, esperado, recebido)` e o enum `ResultadoDoProcessamento` (`PROCESSADO`, `DUPLICADO`, `OBSOLETO`);
+- `PagamentosApplication`, que também declara um bean `Clock` (UTC).
+
+### O que você implementa
+
+A classe `ConsumidorDePagamentos`, já criada e vazia, com esta API pública (fixa):
+
+```java
+@Service
+public class ConsumidorDePagamentos {
+    public ConsumidorDePagamentos(JdbcClient jdbc, Contabilidade contabilidade,
+            NotificadorDePagamento notificador, Clock relogio)
+    public ResultadoDoProcessamento processar(EventoDePagamento evento)   // regras 1 a 9
+}
+```
+
+Use o `JdbcClient` do Spring para o SQL e o `Clock` para os horários (`processada_em`, `atualizado_em`).
+
+## Regras
+
+1. **Tudo numa transação.** A marca de processada, a mudança do pedido, o pagamento e o lançamento contábil são gravados juntos, ou nenhum é. O consumidor se identifica como `pagamentos` na coluna `consumidor`.
+2. **Mensagem nova e em ordem → `PROCESSADO`.** Quando o `mensagemId` nunca foi visto e a `sequencia` é maior que o `versao_evento` do pedido: o pedido passa a `PAGO` (aprovação) ou `ESTORNADO` (estorno), com `versao_evento = sequencia` e `atualizado_em = agora`; uma linha em `pagamento`; um lançamento contábil de **+valor** na aprovação e **−valor** no estorno. Exemplo: pedido `PED-1` de 199,90, `APROVADO` com sequência 1 → `PED-1` `PAGO`, `versao_evento=1`, um pagamento, lançamento `+199.90`.
+3. **Mesma mensagem de novo → `DUPLICADO`, sem efeito nenhum.** Nem pagamento, nem lançamento, nem aviso ao cliente. Exemplo: o mesmo evento do exemplo anterior, processado uma segunda vez → `DUPLICADO`, e o pedido continua com um pagamento só.
+4. **Cópias simultâneas também são duplicatas.** Oito threads processando a mesma mensagem ao mesmo tempo → exatamente um `PROCESSADO` e sete `DUPLICADO`, **sem exceções** e com um pagamento só.
+5. **Evento antigo → `OBSOLETO`.** Mensagem nova, mas com `sequencia <= versao_evento`: não muda o pedido nem grava pagamento, mas fica registrada como processada (se chegar de novo, é `DUPLICADO`). Exemplo: o estorno (sequência 2) chega antes da aprovação (sequência 1). O estorno é `PROCESSADO`; a aprovação, quando chega, é `OBSOLETO`, e o pedido continua `ESTORNADO`.
+6. **Pedido inexistente → `PedidoDesconhecidoException`, e nada gravado.** Nem a marca de processada: se o pedido for criado depois, a reentrega da mensagem precisa funcionar.
+7. **Valor diferente do pedido → `ValorDivergenteException`, e nada gravado.** A comparação de `BigDecimal` é por valor (`compareTo`), não por `equals`: `199.9` e `199.90` são o mesmo valor. Exemplo: estorno de 10,00 num pedido de 199,90 → exceção, e ninguém é avisado.
+8. **Qualquer falha no meio desfaz tudo.** Se a `Contabilidade` lançar uma exceção depois que o pedido já foi atualizado, a exceção sobe, o pedido volta ao que era, e a marca de processada também é desfeita, para que a reentrega processe normalmente.
+9. **O cliente só é avisado depois do commit.** `notificador.pagamentoAprovado(pedidoId)` (ou `pagamentoEstornado`) é chamado só quando a transação for confirmada, e nunca para `DUPLICADO`, `OBSOLETO` ou numa falha. No momento do aviso, outra conexão ao banco já enxerga o pagamento.
+
+## Passo a passo sugerido
+
+1. **Suba o PostgreSQL** (comando no **Experimente**).
+2. **O caminho feliz (regras 1 e 2).** `@Transactional`, um `SELECT` do pedido, o `UPDATE`, o `INSERT` do pagamento e o lançamento. Rode o programa: o passo 1 dá `PROCESSADO`.
+3. **A deduplicação (regras 3 e 4).** O `INSERT ... ON CONFLICT DO NOTHING` **antes** de tudo, olhando o número de linhas inseridas. O passo 2 dá `DUPLICADO`, e o passo 3, sete `DUPLICADO`.
+4. **Ordem e validação (regras 5 a 7).** O `FOR UPDATE` no `SELECT`, a comparação de sequência e a de valor.
+5. **O aviso (regra 9).** Registre uma `TransactionSynchronization` com `afterCommit()`.
+6. **A falha no meio (regra 8).** Para ver com os próprios olhos: acrescente, temporariamente, um `throw new IllegalStateException("teste")` logo depois da chamada à `Contabilidade`, rode o passo 1 e confira com `psql` que `pedido`, `pagamento` e `mensagem_processada` ficaram como antes. Depois, remova a linha.
+
+## Experimente
+
+Suba um PostgreSQL 18 (é preciso ter o Docker):
+
+```bash
+docker run -d --name postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
+```
+
+O programa abaixo sobe a sua aplicação apontando para esse banco, cria três pedidos de 199,90 e dispara os cenários: aprovação, a mesma mensagem de novo, oito cópias ao mesmo tempo, estorno e aprovação fora de ordem, pedido que não existe e valor divergente. No fim, imprime o estado de cada pedido (status, `versao_evento`, quantos pagamentos e a soma dos lançamentos contábeis) e quantas mensagens ficaram marcadas como processadas. Salve-o em `src/main/java/dev/trilhajava/m12/pagamentos/DemonstracaoDePagamentos.java`, no starter:
+
+```java
+package dev.trilhajava.m12.pagamentos;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+public class DemonstracaoDePagamentos {
+
+    public static void main(String[] args) throws Exception {
+        try (ConfigurableApplicationContext app = new SpringApplicationBuilder(PagamentosApplication.class)
+                .properties(
+                        "spring.datasource.url=jdbc:postgresql://localhost:5432/postgres",
+                        "spring.datasource.username=postgres",
+                        "spring.datasource.password=postgres")
+                .run(args)) {
+            var consumidor = app.getBean(ConsumidorDePagamentos.class);
+            var jdbc = app.getBean(JdbcClient.class);
+            for (String pedido : List.of("PED-1", "PED-2", "PED-3")) {
+                jdbc.sql("INSERT INTO pedido (id, valor) VALUES (?, ?)").params(pedido, new BigDecimal("199.90")).update();
+            }
+            BigDecimal valor = new BigDecimal("199.90");
+
+            var aprovado = new EventoDePagamento("m-1", "PED-1", EventoDePagamento.Tipo.APROVADO, valor, "TX-1", 1);
+            processar(consumidor, "1. aprovado PED-1", aprovado);
+            processar(consumidor, "2. a mesma mensagem", aprovado);
+
+            var copia = new EventoDePagamento("m-2", "PED-2", EventoDePagamento.Tipo.APROVADO, valor, "TX-2", 1);
+            List<String> resultados = Collections.synchronizedList(new ArrayList<>());
+            var largada = new CountDownLatch(1);
+            try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
+                for (int i = 0; i < 8; i++) {
+                    pool.submit(() -> {
+                        largada.await();
+                        try {
+                            resultados.add(consumidor.processar(copia).name());
+                        } catch (RuntimeException erro) {
+                            resultados.add(erro.getClass().getSimpleName());
+                        }
+                        return null;
+                    });
+                }
+                largada.countDown();
+            }
+            Map<String, Integer> contagem = new TreeMap<>();
+            resultados.forEach(r -> contagem.merge(r, 1, Integer::sum));
+            System.out.printf("%-34s %s%n", "3. 8 cópias ao mesmo tempo", contagem);
+
+            processar(consumidor, "4. estorno PED-3 (seq 2)",
+                    new EventoDePagamento("m-4", "PED-3", EventoDePagamento.Tipo.ESTORNADO, valor, "TX-3", 2));
+            processar(consumidor, "5. aprovação PED-3 (seq 1)",
+                    new EventoDePagamento("m-3", "PED-3", EventoDePagamento.Tipo.APROVADO, valor, "TX-3", 1));
+            processar(consumidor, "6. pedido que não existe",
+                    new EventoDePagamento("m-5", "PED-9", EventoDePagamento.Tipo.APROVADO, valor, "TX-9", 1));
+            processar(consumidor, "7. valor divergente",
+                    new EventoDePagamento("m-6", "PED-1", EventoDePagamento.Tipo.ESTORNADO, new BigDecimal("10.00"), "TX-1", 2));
+
+            System.out.println();
+            jdbc.sql("""
+                    SELECT p.id, p.status, p.versao_evento,
+                           (SELECT count(*) FROM pagamento g WHERE g.pedido_id = p.id) AS pagamentos,
+                           (SELECT coalesce(sum(l.valor), 0) FROM lancamento_contabil l WHERE l.pedido_id = p.id) AS saldo
+                    FROM pedido p ORDER BY p.id""")
+                    .query((rs, linha) -> "%s %-10s versao=%d pagamentos=%d contabil=%s".formatted(rs.getString("id"),
+                            rs.getString("status"), rs.getLong("versao_evento"), rs.getLong("pagamentos"),
+                            rs.getBigDecimal("saldo")))
+                    .list()
+                    .forEach(System.out::println);
+            System.out.println("mensagens processadas: "
+                    + jdbc.sql("SELECT count(*) FROM mensagem_processada").query(Long.class).single());
+        }
+    }
+
+    static void processar(ConsumidorDePagamentos consumidor, String passo, EventoDePagamento evento) {
+        String resultado;
+        try {
+            resultado = consumidor.processar(evento).name();
+        } catch (RuntimeException erro) {
+            resultado = erro.getClass().getSimpleName() + ": " + erro.getMessage();
+        }
+        System.out.printf("%-34s %s%n", passo, resultado);
+    }
+}
+```
+
+Rode pelo ▶ do IntelliJ ou, na pasta do starter:
+
+```bash
+mvn -q compile exec:java "-Dexec.mainClass=dev.trilhajava.m12.pagamentos.DemonstracaoDePagamentos"
+```
+
+Com a sua solução pronta, a saída (sem as linhas de log do Spring) é esta:
+
+```text
+1. aprovado PED-1                  PROCESSADO
+2. a mesma mensagem                DUPLICADO
+3. 8 cópias ao mesmo tempo         {DUPLICADO=7, PROCESSADO=1}
+4. estorno PED-3 (seq 2)           PROCESSADO
+5. aprovação PED-3 (seq 1)         OBSOLETO
+6. pedido que não existe           PedidoDesconhecidoException: pedido desconhecido: PED-9
+7. valor divergente                ValorDivergenteException: pedido PED-1: esperado 199.90, recebido 10.00
+
+PED-1 PAGO       versao=1 pagamentos=1 contabil=199.90
+PED-2 PAGO       versao=1 pagamentos=1 contabil=199.90
+PED-3 ESTORNADO  versao=2 pagamentos=1 contabil=-199.90
+mensagens processadas: 4
+```
+
+No log, o `NotificadorNoLog` escreve exatamente três avisos: `pagamento aprovado: pedido PED-1`, `pagamento aprovado: pedido PED-2` e `pagamento estornado: pedido PED-3`. As quatro mensagens processadas são `m-1`, `m-2`, `m-4` e `m-3` (a obsoleta também conta); as dos passos 6 e 7 foram desfeitas junto com o resto.
+
+Como ler a saída quando algo está errado:
+
+- **Passo 3 com `PROCESSADO=2` ou mais, ou `PED-2` com `pagamentos=2`:** a deduplicação tem uma janela entre verificar e gravar (um `SELECT` antes do `INSERT`, por exemplo).
+- **Passo 3 com `DuplicateKeyException` ou `DataIntegrityViolationException`:** o `INSERT` não tem `ON CONFLICT DO NOTHING`. E não adianta capturar a exceção: no PostgreSQL, um erro aborta a transação inteira, e qualquer comando seguinte falha com `current transaction is aborted, commands ignored until end of transaction block`.
+- **`PED-3 PAGO`:** a aprovação antiga desfez o estorno; falta a comparação com `versao_evento`.
+- **`mensagens processadas: 6`:** a marca de processada sobreviveu às exceções dos passos 6 e 7. A transação não está envolvendo o método (o `@Transactional` só funciona em método público chamado de fora da classe, através do proxy do Spring).
+- **Quatro ou mais avisos no log, ou um aviso para o `PED-1` depois do passo 7:** o notificador está sendo chamado dentro da transação, e não no `afterCommit()`.
+
+## Critérios de aceite
+
+- [ ] Os cenários do **Experimente** dão a saída indicada, com a sua aplicação rodando contra um PostgreSQL 18, e o log mostra os três avisos.
+- [ ] Oito threads processando a mesma mensagem ao mesmo tempo produzem exatamente um pagamento, sem exceções.
+- [ ] Nenhum `catch` de exceção de chave duplicada.
+- [ ] Com a falha temporária do passo 6 do **Passo a passo**, nada fica gravado e a reentrega funciona.
+
+## Desafios opcionais
+
+- Uma rotina que apaga as marcas de `mensagem_processada` com mais de 7 dias. Por que não apagar depois de 1 hora?
+- Troque o `afterCommit` por um evento de aplicação e `@TransactionalEventListener`.
+- Transforme o aviso ao cliente num evento na outbox, e responda: o que isso resolve que o `afterCommit` não resolve?
+- Escreva a sua própria suíte de testes com `@SpringBootTest` e Testcontainers (`PostgreSQLContainer` com `@ServiceConnection`), com um `@MockitoBean` no lugar do `NotificadorDePagamento` para contar os avisos.
+
+<Dicas>
+<Dica nivel={1}>
+A ordem das operações importa. Primeiro, **marque** a mensagem como processada (e descubra se ela já era). Depois, trave e leia o pedido. Por último, aplique o efeito. Tudo com `@Transactional`.
+</Dica>
+<Dica nivel={2}>
+- `INSERT INTO mensagem_processada (...) VALUES (...) ON CONFLICT DO NOTHING`, com `jdbc.sql(...).params(...).update()`, devolve o número de linhas inseridas: 0 significa duplicata.
+- `SELECT valor, versao_evento FROM pedido WHERE id = ? FOR UPDATE`, com `.query(...).optional()`, serializa eventos diferentes do mesmo pedido e diz se ele existe.
+</Dica>
+<Dica nivel={3}>
+Para o aviso sair depois do commit: `TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() { public void afterCommit() { ... } })`. E não use `catch (DuplicateKeyException)`: no PostgreSQL, o erro aborta a transação inteira.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/pagamentos/ConsumidorDePagamentos.java" />
+
+A solução de referência tem uma suíte com Testcontainers, em `java/m12-mensageria/solucao/src/test`, que cobre os mesmos cenários do **Experimente** e a falha no meio.
+
+### Por que assim
+
+- **Marcar primeiro.** O `INSERT ... ON CONFLICT DO NOTHING` é, ao mesmo tempo, a verificação e a reserva. Não há janela entre "já processei?" e "agora processei": duas transações simultâneas com a mesma chave se enfileiram na chave primária.
+- **`FOR UPDATE` no pedido.** Duas mensagens **diferentes** do mesmo pedido (a aprovação e o estorno, chegando juntos) passam pela deduplicação; a trava garante que uma veja o resultado da outra.
+- **A marca de obsoleto também é gravada.** Sem ela, uma reentrega da mensagem obsoleta faria todo o trabalho de novo para chegar à mesma conclusão.
+- **Exceções desfazem a marca.** Como a marca está na mesma transação, uma falha no meio a desfaz, e a reentrega processa normalmente. Uma marca gravada fora da transação transformaria uma falha passageira em perda de evento.
+- **O aviso no `afterCommit`.** Um e-mail não se desfaz. Se a transação fosse desfeita depois do envio, o cliente receberia "pagamento aprovado" de um pagamento que não existe.
+
+### Alternativas e trade-offs
+
+- **Chave natural no efeito** (uma restrição única em `pagamento.transacao`) em vez de uma tabela de mensagens: funciona quando o efeito tem um identificador natural, mas não cobre efeitos sem um (o lançamento contábil, o aviso).
+- **Redis com `SET NX` para deduplicar:** rápido, mas fica fora da transação do banco. Entre o `SET` e o commit, uma queda perde o evento ou o processa duas vezes.
+- **Bloqueio otimista** (comparar `versao_evento` no `UPDATE ... WHERE versao_evento = ?`) em vez de `FOR UPDATE`: menos espera em carga baixa, mas exige tratar a falha e tentar de novo.
+
+### Avalie sua solução
+
+- O que acontece se o envio do e-mail falhar dentro do `afterCommit`? O pagamento está confirmado; quem garante que o cliente vai ser avisado?
+- Com 50 consumidores e um pedido "quente" recebendo muitos eventos, onde está o gargalo? O que você mediria primeiro?
+- Quanto cresce a tabela `mensagem_processada` por mês, com 2 milhões de eventos por dia? Como isso afeta a sua rotina de limpeza?
+
+</Solucao>

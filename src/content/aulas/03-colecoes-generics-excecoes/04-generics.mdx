@@ -1,0 +1,198 @@
+---
+titulo: Generics sem medo (e o tal do PECS)
+descricao: Por que generics existem, classes e métodos genéricos, tipos limitados, a invariância que confunde todo mundo, wildcards extends e super (PECS) e type erasure.
+modulo: 03-colecoes-generics-excecoes
+ordem: 4
+duracao: 55
+objetivos:
+  - Escrever classes e métodos genéricos com segurança de tipos
+  - Explicar por que List<Integer> não é subtipo de List<Number>
+  - Aplicar PECS para escolher entre ? extends e ? super
+  - Entender o que o type erasure impede e como contornar
+tags: [generics, wildcards, PECS, type erasure]
+flashcards:
+  - frente: Por que List<Integer> não é subtipo de List<Number>?
+    verso: Se fosse, você poderia adicionar um Double em uma List<Integer> através da referência List<Number>. Generics são invariantes para impedir isso.
+  - frente: O que significa PECS?
+    verso: Producer Extends, Consumer Super — use ? extends T quando a coleção só FORNECE valores, e ? super T quando só RECEBE valores.
+  - frente: "O que <T extends Comparable<? super T>> permite?"
+    verso: Aceitar tipos que se comparam com um supertipo deles — como LocalDate, que implementa Comparable<ChronoLocalDate>.
+  - frente: O que é type erasure?
+    verso: Os tipos genéricos existem só na compilação; no bytecode, T vira Object (ou o limite). Por isso não dá para fazer new T() ou new T[n].
+  - frente: Qual a diferença entre List<?> e List<Object>?
+    verso: List<Object> aceita adicionar qualquer objeto; List<?> é uma lista de algum tipo desconhecido — dá para ler (como Object), mas não adicionar (exceto null).
+---
+
+Antes do Java 5, uma `List` guardava `Object`. Você colocava uma `String`, tirava um `Object` e fazia cast torcendo para dar certo. Um `Integer` perdido no meio só explodia em produção, com `ClassCastException`. **Generics** movem esse erro para o compilador.
+
+## Classes e métodos genéricos
+
+```java
+public final class Resultado<T> {
+    private final T valor;
+    private final String erro;
+
+    private Resultado(T valor, String erro) { this.valor = valor; this.erro = erro; }
+
+    public static <T> Resultado<T> sucesso(T valor) { return new Resultado<>(valor, null); }
+    public static <T> Resultado<T> falha(String erro) { return new Resultado<>(null, erro); }
+
+    public boolean ok() { return erro == null; }
+    public T valor() { return valor; }
+}
+
+Resultado<Pedido> r = Resultado.sucesso(pedido);
+Pedido p = r.valor();        // sem cast
+```
+
+- **`<T>` na classe** declara um parâmetro de tipo, preenchido por quem usa (`Resultado<Pedido>`).
+- **`<T>` antes do retorno** declara um método genérico. O tipo é **inferido** pelos argumentos.
+- O **diamante** `new Resultado<>(...)` deixa o compilador inferir o tipo.
+
+Convenções de nome: `T` (tipo), `E` (elemento), `K`/`V` (chave/valor), `R` (retorno).
+
+## Tipos limitados: `<T extends ...>`
+
+Às vezes você precisa que `T` **saiba fazer** algo:
+
+```java
+static <T extends Comparable<T>> T maior(List<T> itens) {
+    T maior = itens.get(0);
+    for (T item : itens) {
+        if (item.compareTo(maior) > 0) maior = item;   // só compila porque T é Comparable
+    }
+    return maior;
+}
+```
+
+Aqui `extends` vale tanto para classes quanto para interfaces: "T é algum tipo que é um `Comparable<T>`".
+
+## A invariância que confunde todo mundo
+
+`Integer` é subtipo de `Number`. Então `List<Integer>` é subtipo de `List<Number>`, certo? **Não.**
+
+```java
+List<Integer> inteiros = new ArrayList<>(List.of(1, 2));
+List<Number> numeros = inteiros;    // NÃO COMPILA — e ainda bem:
+numeros.add(3.14);                   // senão isto colocaria um Double
+int x = inteiros.get(2);             // ...e isto explodiria
+```
+
+Generics são **invariantes**: `List<Integer>` e `List<Number>` não têm relação de subtipo. Isso é seguro, mas incômodo — e é para isso que existem os **wildcards**.
+
+## Wildcards e PECS
+
+### `? extends T`: quem **produz** valores
+
+```java
+static double media(Collection<? extends Number> valores) {
+    double soma = 0;
+    for (Number n : valores) soma += n.doubleValue();   // LER é seguro
+    return soma / valores.size();
+}
+
+media(List.of(1, 2, 3));          // Collection<Integer> ✓
+media(List.of(1.5, 2.5));         // Collection<Double>  ✓
+```
+
+"Uma coleção de **algum** tipo que é `Number`." Você pode **ler** (tudo é pelo menos um `Number`), mas não pode **adicionar**: o compilador não sabe se é uma lista de `Integer` ou de `Double`.
+
+### `? super T`: quem **consome** valores
+
+```java
+static void adicionarPadroes(Collection<? super Integer> destino) {
+    destino.add(0);                   // ESCREVER é seguro
+    destino.add(100);
+}
+
+adicionarPadroes(new ArrayList<Integer>());   ✓
+adicionarPadroes(new ArrayList<Number>());    ✓
+adicionarPadroes(new ArrayList<Object>());    ✓
+```
+
+"Uma coleção de algum tipo que é **supertipo** de `Integer`." Um `Integer` cabe em qualquer uma delas.
+
+### A regra mnemônica: PECS
+
+> **P**roducer **E**xtends, **C**onsumer **S**uper.
+
+Se o parâmetro **fornece** valores para o seu método, use `extends`. Se **recebe** valores do seu método, use `super`. Se faz as duas coisas, não use wildcard. O exemplo clássico é o `Collections.copy` da JDK:
+
+```java
+public static <T> void copy(List<? super T> destino, List<? extends T> origem)
+```
+
+<Figura legenda="PECS: a origem produz (extends), o destino consome (super)">
+<svg viewBox="0 0 640 140" width="640" role="img" aria-label="Uma List de Integer, produtora, com extends Number, alimenta o método, que escreve em uma List de Object, consumidora, com super Number">
+  <defs><marker id="s9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="180" height="60" rx="12" class="d-info"/>
+  <text x="100" y="66" text-anchor="middle" class="d-mono">List&lt;Integer&gt;</text>
+  <text x="100" y="88" text-anchor="middle" class="d-label">? extends Number (lê)</text>
+  <path d="M190 70 H240" class="d-line" marker-end="url(#s9)"/>
+  <rect x="245" y="40" width="150" height="60" rx="12" class="d-accent"/>
+  <text x="320" y="75" text-anchor="middle" class="d-mono">copiar(...)</text>
+  <path d="M395 70 H445" class="d-line" marker-end="url(#s9)"/>
+  <rect x="450" y="40" width="180" height="60" rx="12" class="d-ok"/>
+  <text x="540" y="66" text-anchor="middle" class="d-mono">List&lt;Object&gt;</text>
+  <text x="540" y="88" text-anchor="middle" class="d-label">? super Number (escreve)</text>
+</svg>
+</Figura>
+
+### O caso do `LocalDate`
+
+Por que o `Collections.max` da JDK tem uma assinatura tão assustadora?
+
+```java
+public static <T extends Object & Comparable<? super T>> T max(Collection<? extends T> coll)
+```
+
+Porque `LocalDate` implementa `Comparable<ChronoLocalDate>`, e **não** `Comparable<LocalDate>`. Com `<T extends Comparable<T>>`, `max` não aceitaria uma lista de datas. Com `Comparable<? super T>`, aceita tipos que se comparam com **algum supertipo** deles. O exercício 03.04 testa exatamente isso.
+
+## Type erasure: generics só existem na compilação
+
+Para manter compatibilidade com código antigo, o compilador **apaga** os tipos genéricos depois de verificá-los. No bytecode, `List<String>` e `List<Integer>` são a mesma `List`. Consequências:
+
+```java
+new T();                        // não compila: em runtime, T não existe
+new T[10];                      // não compila
+if (x instanceof List<String>)  // não compila (só List<?>)
+List<int>                       // não existe: só objetos (use List<Integer>)
+```
+
+O contorno clássico para arrays genéricos é o que o próprio `ArrayList` faz: guardar em `Object[]` e fazer o cast na leitura, com `@SuppressWarnings("unchecked")` onde você **garante** que só entra `T`. Você vai fazer isso na `Janela<T>` do exercício 03.04.
+
+<Callout tipo="entrevista">
+"O que é PECS?" e "por que `List<Integer>` não é uma `List<Number>`?" são perguntas de filtro para Pleno. Responda com o exemplo do `add(3.14)` que quebraria a lista de inteiros — isso mostra que você entende o **porquê**, não só a regra.
+</Callout>
+
+<Quiz
+  id="03-generics"
+  questoes={[
+    {
+      pergunta: 'Qual assinatura aceita `List<Integer>`, `List<Double>` e `List<BigDecimal>` para somar os valores?',
+      opcoes: ['`double somar(List<Number> l)`', '`double somar(List<? extends Number> l)`', '`double somar(List<? super Number> l)`', '`double somar(List<Object> l)`'],
+      correta: 1,
+      explicacao: 'A lista produz valores que você só lê: Producer Extends.',
+    },
+    {
+      pergunta: 'Um método recebe uma lista onde vai ADICIONAR objetos Pedido. Qual o tipo de parâmetro mais flexível?',
+      opcoes: ['`List<Pedido>`', '`List<? extends Pedido>`', '`List<? super Pedido>`', '`List<?>`'],
+      correta: 2,
+      explicacao: 'A lista consome Pedidos: Consumer Super. Aceita List<Pedido> e List<Object>.',
+    },
+    {
+      pergunta: 'Por que `new T[10]` não compila?',
+      opcoes: ['Arrays não suportam objetos', 'Por causa do type erasure: T não existe em tempo de execução', 'Porque falta o diamante', 'Só funciona com T extends Number'],
+      correta: 1,
+      explicacao: 'Arrays precisam saber o tipo concreto em runtime, e o erasure apaga T.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Generics tiram o cast (e o `ClassCastException`) do seu código: o compilador verifica os tipos.
+- `<T extends X>` exige que `T` saiba fazer o que `X` define.
+- Generics são **invariantes**; wildcards dão flexibilidade: **Producer Extends, Consumer Super**.
+- `Comparable<? super T>` aceita tipos que se comparam com um supertipo (como `LocalDate`).
+- **Type erasure**: nada de `new T()`, `new T[]` ou `instanceof List<String>`.

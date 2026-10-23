@@ -1,0 +1,177 @@
+---
+titulo: "Vagas internacionais e inglês técnico"
+descricao: Como funcionam os processos de empresas estrangeiras que contratam no Brasil, o que muda em relação às entrevistas brasileiras (etapas, behavioral com peso alto, coding e system design em inglês), o trabalho remoto assíncrono e o inglês que o dia a dia de backend exige, com falsos cognatos que confundem, frases úteis para entrevista e um plano de prática.
+modulo: 17-carreira
+ordem: 4
+duracao: 55
+objetivos:
+  - Descrever as etapas de um processo internacional típico e como se preparar para cada uma
+  - Responder perguntas comportamentais em inglês com STAR e com o vocabulário esperado
+  - Evitar falsos cognatos e construções que confundem em inglês técnico
+  - Demonstrar habilidades de trabalho remoto assíncrono, como escrita clara, autonomia e fuso horário
+  - Montar um plano de prática de inglês voltado a entrevistas técnicas
+tags: [carreira, vagas internacionais, inglês, remoto, behavioral, entrevista]
+flashcards:
+  - frente: Quais as etapas típicas de um processo internacional para backend?
+    verso: Recruiter screen (30 min), technical screen (coding ou conversa técnica), um loop final com 3 a 5 entrevistas (coding, system design, behavioral, às vezes domínio), verificação de referências e oferta. Em startups o loop costuma ser menor.
+  - frente: O que significa "eventually" em inglês?
+    verso: Finalmente, no fim, com o tempo. Não é "eventualmente" (ocasionalmente, que em inglês é "occasionally"). "Eventually consistent" = consistente com o tempo.
+  - frente: O que significa "actually"?
+    verso: Na verdade, de fato. Não é "atualmente", que em inglês é "currently" ou "nowadays".
+  - frente: Por que "push back" aparece tanto em entrevistas comportamentais?
+    verso: Significa discordar ou questionar uma decisão, de forma respeitosa. "Tell me about a time you pushed back on a requirement" pergunta se você defende o que acha certo com argumentos, e não se você obedece em silêncio.
+  - frente: Como mostrar habilidade de trabalho assíncrono numa entrevista?
+    verso: Com exemplos de escrita - PRs com descrição clara, design docs, ADRs, README, atualizações de status sem ser cobrado - e dizendo como você lida com bloqueios quando o time está dormindo (documenta, segue com outra tarefa, deixa a pergunta pronta).
+  - frente: Que nível de inglês as vagas internacionais costumam pedir?
+    verso: Em geral inglês profissional, algo entre B2 e C1 no CEFR - conseguir participar de reuniões, explicar decisões técnicas e escrever com clareza. Sotaque não é problema; clareza e fluidez para comunicar ideias técnicas são.
+---
+
+Trabalhar remotamente para uma empresa de fora deixou de ser raro para devs brasileiros. O mercado é maior, a remuneração costuma ser em moeda forte e o fuso de UTC−3 conversa bem com os Estados Unidos e com a Europa. A disputa, por outro lado, é global. Esta aula trata do processo e do inglês; a aula seguinte, dos contratos.
+
+## Quem contrata e como
+
+As vagas internacionais para quem está no Brasil costumam vir de três lugares:
+
+- **Empresas estrangeiras com time remoto** que contratam diretamente (como *contractor*) ou por meio de um *Employer of Record* (EOR), que cuida do vínculo no Brasil;
+- **Consultorias e empresas de *staff augmentation*** que alocam devs brasileiros em clientes de fora;
+- **Empresas brasileiras com clientes ou times no exterior**, em que o inglês é a língua do dia a dia.
+
+Vagas internacionais para **Jr** existem, mas são disputadas. Um caminho comum é começar numa empresa brasileira, ganhar um ou dois anos de experiência em produção, e buscar as vagas de fora com inglês afiado. Isso não impede que você se candidate antes: só calibre as expectativas.
+
+## O processo típico
+
+| Etapa | Duração | O que avalia |
+|---|---|---|
+| **Recruiter screen** | 20–30 min | Inglês, motivação, experiência, fuso, expectativa salarial |
+| **Technical screen** | 45–60 min | Coding (algoritmo ou tarefa prática) ou conversa técnica sobre o seu trabalho |
+| **Take-home** (às vezes) | horas a dias | Como no Brasil, com README em inglês |
+| **Final loop** | 3–5 entrevistas | Coding, system design, behavioral, às vezes *domain* ou *hiring manager* |
+| **References** | — | Conversas com ex-gestores ou colegas |
+| **Offer** | — | Valor, moeda, contrato, férias (*PTO*), equipamento |
+
+Duas diferenças costumam surpreender quem vem de processos brasileiros:
+
+1. **A entrevista comportamental pesa tanto quanto a técnica.** Algumas empresas dão uma nota formal por competência (colaboração, ownership, lidar com ambiguidade) e reprovam um candidato tecnicamente forte que não traz exemplos concretos.
+2. **Referências são checadas de verdade.** Tenha duas ou três pessoas avisadas que possam falar do seu trabalho, em inglês se possível.
+
+## Behavioral em inglês
+
+As perguntas são previsíveis. As mais comuns:
+
+- *Tell me about yourself.*
+- *Tell me about a time you disagreed with a teammate (or pushed back on a decision).*
+- *Tell me about a mistake you made. What did you learn?*
+- *Tell me about a challenging technical problem you solved.*
+- *Tell me about a time you had to learn something quickly.*
+- *How do you handle a task with unclear requirements?*
+- *Why do you want to work here? Why remote?*
+
+Use as mesmas histórias do banco STAR da aula 3, **traduzidas e ensaiadas em voz alta**. Algumas frases de ligação ajudam a manter a estrutura:
+
+```text
+Situation   "At the time, I was working on..."  /  "The context was..."
+Task        "My goal was to..."  /  "I was responsible for..."
+Action      "The first thing I did was..."  /  "I decided to... because..."
+            "Then I..."  /  "To make sure it wouldn't happen again, I..."
+Result      "As a result, ..."  /  "We reduced ... from ... to ..."
+Learning    "What I learned from that is..."  /  "Next time, I would..."
+```
+
+Fale na **primeira pessoa do singular**. Em inglês de entrevista, "we" o tempo todo soa como se você só estivesse presente. Use "we" para o contexto e "I" para as suas ações.
+
+<Callout tipo="dica" titulo="Ganhe tempo com elegância">
+Travou? Frases como *"That's a good question, let me think for a second"* ou *"Just to make sure I understood: you're asking about..."* dão tempo para pensar e mostram cuidado. Pedir para repetir (*"Sorry, could you repeat the last part?"*) é normal. Ninguém espera fluência de nativo; espera **clareza**.
+</Callout>
+
+## Coding e system design em inglês
+
+O conteúdo é o mesmo dos módulos 05 e 15. O desafio extra é **pensar em voz alta em inglês**, o que cansa mais do que parece. Algumas frases para o live coding:
+
+```text
+"Let me restate the problem to make sure I got it right."
+"Can I assume the input is sorted? What about empty input?"
+"A brute-force approach would be O(n²). I think we can do better with a hash map."
+"I'll start with the simple version and then optimize."
+"Let me walk through an example to check this."
+"I think there's an off-by-one error here. Let me fix it."
+"The time complexity is O(n) and the space complexity is O(n)."
+```
+
+Para system design, o vocabulário vem dos requisitos e dos trade-offs: *functional and non-functional requirements*, *throughput*, *latency*, *read-heavy*, *bottleneck*, *single point of failure*, *trade-off*, *eventually consistent*, *back-of-the-envelope estimate*.
+
+## Falsos cognatos que confundem
+
+| Em inglês | Significa | Não significa |
+|---|---|---|
+| *actually* | na verdade | atualmente (*currently*) |
+| *eventually* | no fim, com o tempo | eventualmente (*occasionally*) |
+| *pretend* | fingir | pretender (*intend*, *plan to*) |
+| *assume* | supor | assumir uma tarefa (*take on*, *take ownership of*) |
+| *realize* | perceber | realizar (*carry out*, *accomplish*) |
+| *resume* (substantivo) | currículo | resumo (*summary*) |
+| *exquisite* | refinado | esquisito (*weird*) |
+| *library* | biblioteca | livraria (*bookstore*) |
+
+E algumas expressões do dia a dia remoto: *heads-up* (aviso prévio), *blocker* (impedimento), *follow up* (dar sequência), *sync* / *async*, *ETA* (previsão), *out of office* / *OOO*, *LGTM* (*looks good to me*, aprovando um PR), *nit* (comentário pequeno de revisão), *ship* (entregar em produção), *on-call* (plantão).
+
+## Remoto e assíncrono
+
+Empresas distribuídas avaliam, explícita ou implicitamente, se você funciona **sem alguém do lado**. As evidências que funcionam:
+
+- **Escrita clara**: descrições de PR que explicam o porquê, READMEs, ADRs. O seu GitHub já é essa evidência (aula 1).
+- **Autonomia com comunicação**: quando algo trava, você documenta o que tentou, pergunta com contexto e segue com outra coisa até ter resposta, sem ficar parado nem sumir.
+- **Atualizações proativas**: status antes de ser cobrado, e aviso cedo quando um prazo está em risco.
+- **Fuso**: diga quantas horas de sobreposição você oferece. UTC−3 cobre boa parte da tarde europeia e o horário comercial da costa leste dos EUA.
+
+## Um plano de prática de inglês
+
+Ler documentação você provavelmente já faz. O gargalo costuma ser **falar sob pressão**. Um plano semanal simples:
+
+1. **Ouvir**: palestras técnicas em inglês (Spring I/O, Devoxx, JavaOne), em velocidade normal, com legenda em inglês se precisar.
+2. **Falar sozinho**: grave-se respondendo uma pergunta do simulador em inglês (modo Internacional). Ouça, anote o que travou e grave de novo. Dois minutos por dia rendem mais do que uma hora por mês.
+3. **Falar com gente**: aulas de conversação, grupos de prática, comunidades de devs. Conversas simuladas de entrevista com amigos (em troca você entrevista eles).
+4. **Escrever**: o README do projeto âncora e as descrições de PR em inglês.
+
+<Callout tipo="entrevista">
+*"Why do you want to work for a company abroad?"* A resposta ruim é só o salário em dólar. A boa fala de crescimento, produto e time, e mostra que você entende as realidades do trabalho remoto: comunicação escrita, autonomia e fuso. O simulador tem essa pergunta e *Tell me about yourself* com respostas-modelo.
+</Callout>
+
+<Quiz
+  id="17-vagas-internacionais"
+  questoes={[
+    {
+      pergunta: 'Em "the read model is eventually consistent", eventually significa:',
+      opcoes: ['às vezes', 'com o tempo / no fim', 'atualmente', 'possivelmente nunca'],
+      correta: 1,
+      explicacao: '"Eventually" é "no fim, com o tempo". Eventualmente, no sentido de ocasionalmente, é "occasionally".',
+    },
+    {
+      pergunta: 'Numa resposta comportamental em inglês, como usar "we" e "I"?',
+      opcoes: ['Sempre "we", para mostrar espírito de equipe', '"We" para o contexto e "I" para as suas ações', 'Sempre "I", mesmo no contexto', 'Evitar pronomes'],
+      correta: 1,
+      explicacao: 'O entrevistador precisa saber o que você fez. Só "we" esconde a sua contribuição.',
+    },
+    {
+      pergunta: 'Você trava bloqueado numa tarefa e o time está dormindo (fuso diferente). A melhor atitude?',
+      opcoes: ['Esperar até todos acordarem', 'Documentar o bloqueio e o que tentou, deixar a pergunta com contexto e seguir com outra tarefa', 'Resolver do jeito que achar melhor sem avisar', 'Encerrar o dia'],
+      correta: 1,
+      explicacao: 'Comunicação assíncrona clara e autonomia sem sumir: é o comportamento que empresas remotas procuram.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Processos internacionais têm recruiter screen, technical screen, um loop final (coding, system design, behavioral) e **referências** checadas.
+- **Behavioral pesa muito**: histórias STAR ensaiadas em inglês, "I" para as suas ações.
+- Pensar em voz alta em inglês exige treino: use frases prontas para esclarecer, planejar, testar e analisar complexidade.
+- Cuidado com falsos cognatos: *actually*, *eventually*, *pretend*, *assume*, *realize*.
+- Mostre trabalho **assíncrono**: escrita clara, autonomia com comunicação, fuso.
+- Pratique **falar** um pouco todos os dias, gravando respostas do simulador em inglês.
+
+## Referências
+
+- Tech Interview Handbook — *Behavioral interview questions* e *Coding interview cheatsheet*
+- Council of Europe — *Common European Framework of Reference for Languages (CEFR)*, descritores de B2 e C1
+- GitLab Handbook — seções sobre comunicação assíncrona (exemplo público de empresa remota)
+- Alex Xu — *System Design Interview* (vocabulário e estrutura em inglês)

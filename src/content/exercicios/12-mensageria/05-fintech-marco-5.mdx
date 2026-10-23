@@ -1,0 +1,422 @@
+---
+titulo: "Fintech Core — Marco 5: eventos com outbox, Kafka e notificações"
+codigo: "12.05"
+resumo: Cada transferência passa a gerar o evento TransferenciaRealizada — gravado na outbox na mesma transação, publicado no Kafka por um relay e consumido por um serviço de notificações idempotente. Quem envia e quem recebe são avisados, uma vez só, mesmo com reentregas.
+modulo: 12-mensageria
+ordem: 5
+marco: 5
+dificuldade: dificil
+tempo: 8–10h
+conceitos: [projeto integrador, transactional outbox, Kafka, consumidor idempotente, consistência eventual, dead letter topic, portas e adaptadores, Flyway]
+aulas: [12-mensageria/03-kafka, 12-mensageria/04-transactional-outbox, 12-mensageria/05-consumidores-idempotentes, 12-mensageria/06-retry-e-dlq]
+java:
+  modulo: projeto-integrador
+---
+
+## Contexto
+
+Os clientes da Fintech Core pediram o óbvio: **ser avisados** quando recebem uma transferência. O time de dados pediu outra coisa: um fluxo de eventos para alimentar o antifraude e os relatórios, sem consultar o banco de produção.
+
+As duas demandas têm a mesma resposta: um evento `TransferenciaRealizada` publicado no Kafka. O difícil é publicar **sem perder e sem inventar** eventos, e consumir **sem duplicar** avisos. Chamar `kafka.send` dentro do caso de uso parece resolver, mas falha dos dois lados: se o envio der certo e o `COMMIT` falhar, o antifraude recebe uma transferência que não existiu; se o `COMMIT` der certo e o envio falhar, o cliente nunca é avisado. É o problema da **escrita dupla**, e o marco 5 o resolve com a *transactional outbox*.
+
+Tudo o que os marcos anteriores garantiram continua valendo: idempotência, locks, posse das contas, Problem Details, a arquitetura verificada pelo ArchUnit. E a aplicação precisa continuar subindo **sem** Kafka, quando a configuração mandar.
+
+## O que você vai praticar
+
+- **Transactional outbox.** "Publicar" um evento passa a ser gravar uma linha numa tabela, na mesma transação da transferência. Ou as duas coisas são confirmadas, ou nenhuma. Veja [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/).
+- **Relay e ordem por chave.** Um processo agendado lê os eventos pendentes, envia ao Kafka com a conta de origem como chave e só então marca o evento como publicado. A garantia é *pelo menos uma vez*, e a ordem vale por partição. Veja [Kafka](../../../aulas/12-mensageria/03-kafka/) e o [exercício 12.03](../03-relay-do-outbox/).
+- **Consumidor idempotente.** O mesmo evento pode chegar duas vezes. A deduplicação usa uma tabela com chave primária, gravada na mesma transação das notificações. Veja [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/) e o [exercício 12.04](../04-consumidor-idempotente/).
+- **Retry e dead letter topic.** Falha passageira é repetida; mensagem ilegível vai direto para um tópico de mensagens mortas, sem travar a partição. Veja [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/).
+- **Portas e adaptadores com mensageria.** O caso de uso conhece uma porta `PublicadorDeEventos`; Kafka, JSON e a tabela de outbox ficam em `infra`. O `Marco3ArquiteturaTest` continua verde.
+
+## Requisitos
+
+### O que já existe
+
+O seu Fintech Core ao fim do marco 4 (a solução de referência do marco 4, em `java/projeto-integrador/solucao-marco-4`, serve de base, se você preferir partir dela):
+
+- **`dominio`**: `Conta` (com `@Version` e `dono`), `Transferencia`, `Movimento`, `Usuario`, as exceções de negócio e os repositórios;
+- **`aplicacao`**: `ServicoDeContas`, `ServicoDeTransferencias` (`transferir(quem, chave, origem, destino, valor)`, que verifica a posse da origem, trata a idempotência e trava as contas da menor para a maior), `ServicoDeUsuarios`, `ServicoDeAutenticacao` e o `Solicitante`;
+- **`api`**: os controllers, o `Solicitantes` (que monta o `Solicitante` a partir do token) e o `TratadorDeErros`;
+- **`infra`**: os adaptadores JPA, a `SegurancaConfig`, as migrações `V1` a `V3` e o `compose.yaml` com o PostgreSQL 18;
+- a sua suíte de testes (domínio, Mockito, fatias web e JPA, ArchUnit).
+
+Se o seu código usar outros nomes, adapte: o que importa são os comportamentos das regras abaixo.
+
+### O que você implementa
+
+**Dependência.** Acrescente ao `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-kafka</artifactId>
+</dependency>
+```
+
+E um broker ao `compose.yaml`, ao lado do PostgreSQL. Com o `spring-boot-docker-compose` do marco 2, `mvn spring-boot:run` sobe os dois:
+
+```yaml
+  kafka:
+    # Um broker em modo KRaft (sem ZooKeeper), com a configuração padrão da imagem: localhost:9092.
+    image: apache/kafka:4.2.1
+    ports:
+      - "9092:9092"
+```
+
+**O evento.** Toda transferência **concluída** gera um `TransferenciaRealizada`. O JSON dele (o mesmo na outbox e no Kafka) é o contrato público:
+
+```jsonc
+{
+  "id": "0c4b5a1e-...",                     // o id do evento (= evento_saida.id)
+  "tipo": "TransferenciaRealizada",
+  "transferencia": "7e1f9d20-...",          // o id devolvido pelo POST /transferencias
+  "origem": "a3d2c7b4-...",
+  "destino": "f09c11e8-...",
+  "valor": "150.00",                        // texto, sempre com duas casas
+  "ocorridoEm": "2026-09-29T15:02:11.123Z"  // ISO-8601 em UTC
+}
+```
+
+**A outbox.** A tabela **`evento_saida`**:
+
+| Coluna | Conteúdo |
+|---|---|
+| `id` (UUID, PK) | o id do evento; o mesmo do campo `id` do payload |
+| `agregado_id` (UUID) | a **conta de origem**; vira a chave da mensagem no Kafka |
+| `tipo` | `TransferenciaRealizada` |
+| `payload` (texto) | o JSON acima |
+| `criado_em` | o instante da transferência |
+| `publicado_em` | `NULL` até o relay publicar |
+| `tentativas`, `proxima_tentativa`, `ultimo_erro` | o controle de falhas do relay (regra 9) |
+
+**Contrato HTTP novo.**
+
+| Rota | Acesso | Resposta de sucesso |
+|---|---|---|
+| `GET /notificacoes` | `Authorization: Bearer <token>` | `200` com `{"itens": [...]}`, as notificações de quem pede, da mais recente para a mais antiga |
+
+```json
+{
+  "itens": [
+    {
+      "id": "5b0e3c2a-...",
+      "tipo": "TRANSFERENCIA_RECEBIDA",
+      "transferencia": "7e1f9d20-...",
+      "conta": "f09c11e8-...",
+      "valor": 150.00,
+      "mensagem": "Você recebeu uma transferência de R$ 150,00",
+      "criadaEm": "2026-09-29T15:02:11.612Z"
+    }
+  ]
+}
+```
+
+**Nomes fixos** (os testes de aceitação da solução dependem deles): o tópico **`fintech.transferencias`**, o tópico de mensagens mortas **`fintech.transferencias-dlt`** e a propriedade **`fintech.eventos.habilitados`**.
+
+**Configuração.**
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+    consumer:
+      auto-offset-reset: earliest
+
+fintech:
+  eventos:
+    habilitados: ${FINTECH_EVENTOS_HABILITADOS:true}
+    relay:
+      intervalo-ms: 500
+```
+
+**Banco.** Uma migração `V4` com três tabelas: `evento_saida` (a outbox), `evento_processado` (a deduplicação, com chave primária `(consumidor, evento_id)`) e `notificacao`.
+
+**Peças sugeridas** (os nomes são livres; a separação em camadas, não):
+
+```java
+// dominio: o fato, sem nada de Spring
+public sealed interface EventoDeDominio permits TransferenciaRealizada {
+    UUID agregado();          // a conta de origem
+    Instant ocorridoEm();
+}
+public record TransferenciaRealizada(UUID transferencia, UUID origem, UUID destino,
+        BigDecimal valor, Instant ocorridoEm) implements EventoDeDominio { ... }
+
+// aplicacao: a porta de saída; o adaptador (grava na outbox) fica em infra
+public interface PublicadorDeEventos {
+    void publicar(EventoDeDominio evento);
+}
+
+// aplicacao: a deduplicação dos consumidores; o adaptador JDBC fica em infra
+public interface RegistroDeEventosProcessados {
+    boolean registrar(String consumidor, UUID evento);   // false = já processado
+}
+
+// aplicacao: o caso de uso que o listener chama
+public boolean registrar(UUID evento, TransferenciaRealizada transferencia);   // ServicoDeNotificacoes
+```
+
+## Regras
+
+Os exemplos usam Ana (dona da conta `A`, com `500.00`), Bia (dona da conta `B`) e Caio (cliente sem relação com as duas).
+
+**O evento e a outbox**
+
+1. **Toda transferência concluída grava exatamente um evento na outbox.** Ana transfere `150.00` de `A` para `B` → `201`, e `evento_saida` ganha uma linha com `tipo` = `TransferenciaRealizada`, `agregado_id` = `A`, `publicado_em` = `NULL` (até o relay passar) e o `payload` do contrato: `"transferencia"` igual ao `id` da resposta do `POST /transferencias`, `"origem"` = `A`, `"destino"` = `B`, `"valor"` = `"150.00"`.
+2. **O evento é gravado na mesma transação da transferência.** A chamada `eventos.publicar(...)` fica no `ServicoDeTransferencias`, dentro do `@Transactional`, depois dos movimentos. O adaptador da outbox exige uma transação em andamento (`@Transactional(propagation = MANDATORY)`): chamado fora de uma, falha com `IllegalTransactionStateException`, em vez de gravar um evento sem negócio.
+3. **Sem transferência, sem evento.** Saldo insuficiente (`422 saldo-insuficiente`), conta inexistente ou de outra pessoa (`404`), origem igual ao destino (`422 transferencia-invalida`) e dados inválidos (`400`) não gravam nada em `evento_saida`. Exemplo: Ana com `10.00` tenta transferir `10.01` → `422` e nenhuma linha nova.
+4. **Repetição idempotente não gera um segundo evento.** O mesmo `POST /transferencias` com a mesma `Idempotency-Key`, duas vezes → `201` nas duas, e **uma** linha em `evento_saida`.
+5. **O payload é um contrato, separado do domínio.** O `id` do payload é o mesmo `evento_saida.id`. O `valor` vai como **texto com duas casas**: um pedido com `"valor": 150` gera `"valor": "150.00"`, nunca `"150"` nem `150.0` (muitos consumidores, como JavaScript, leem número JSON como ponto flutuante). O `ocorridoEm` é um instante ISO-8601. Se o record de domínio mudar, o JSON publicado não muda.
+6. **O caso de uso não conhece Kafka nem a tabela.** Nenhum `KafkaTemplate`, `kafka.send` ou SQL de outbox em `aplicacao` ou `dominio`. O `Marco3ArquiteturaTest` (ou o seu `ArquiteturaTest`) continua verde.
+
+**O relay**
+
+7. **Um relay agendado publica os pendentes no tópico `fintech.transferencias`, com a conta de origem como chave, e preenche `publicado_em`.** Roda a cada `fintech.eventos.relay.intervalo-ms` (padrão 500 ms) e processa até 100 eventos por vez, do mais antigo ao mais novo. Exemplo: segundos depois da transferência, `publicado_em` deixa de ser `NULL`, e um consumidor do tópico vê a mensagem com chave `A`.
+8. **Primeiro envia e espera a confirmação; só depois marca.** `kafka.send(...).get(10, SECONDS)` e então o `UPDATE`. Se a aplicação cair entre os dois, o evento sai de novo na próxima rodada: a garantia é *pelo menos uma vez*, e é por isso que o consumidor precisa ser idempotente (regra 13).
+9. **Falha no envio não perde o evento e não atropela a ordem.** O relay para o lote no primeiro erro (publicar o seguinte passaria à frente deste), incrementa `tentativas`, grava `ultimo_erro` (até 500 caracteres) e adia `proxima_tentativa` com espera exponencial: 1 s, 2 s, 4 s…, no máximo 5 minutos. Exemplo: com o broker parado, uma transferência continua respondendo `201`; o evento fica com `publicado_em` nulo e `tentativas` crescendo; quando o broker volta, ele é publicado.
+10. **Várias instâncias não publicam o mesmo lote.** A leitura usa `SELECT ... FOR UPDATE SKIP LOCKED`, dentro de uma transação: cada instância pega linhas diferentes, em vez de esperar ou duplicar.
+11. **Com o broker fora, o relay não fica preso.** O produtor usa `acks=all` e idempotência habilitada, e tempos curtos (`max.block.ms` 5 s, `delivery.timeout.ms` 10 s). Com o padrão do cliente Kafka, cada `send` sem broker bloquearia por 60 s.
+
+**O consumidor e as notificações**
+
+12. **Cada evento gera duas notificações: `TRANSFERENCIA_ENVIADA` para o dono da origem e `TRANSFERENCIA_RECEBIDA` para o dono do destino.** Depois da transferência de `120.50` de `A` para `B`: o `GET /notificacoes` da Ana traz uma `TRANSFERENCIA_ENVIADA` com `"conta"` = `A`; o da Bia, uma `TRANSFERENCIA_RECEBIDA` com `"conta"` = `B`, `"valor": 120.50` e `"mensagem": "Você recebeu uma transferência de R$ 120,50"`. O do Caio continua `{"itens": []}`. Conta sem dono (aberta antes do marco 4) não gera notificação. Se a mesma pessoa for dona das duas contas, ela recebe as duas.
+13. **O consumidor é idempotente.** O mesmo evento entregue de novo **não** duplica notificações. A marca de processado (`evento_processado`, chave `(consumidor, evento_id)`, gravada com `INSERT ... ON CONFLICT DO NOTHING`) e as notificações ficam **na mesma transação**: ou as duas existem, ou nenhuma. Exemplo: apagar o `publicado_em` do evento (como se o relay tivesse caído entre o envio e a marca) faz o relay publicar de novo; a Ana e a Bia continuam com **uma** notificação cada dessa transferência.
+14. **O listener é fino e tolerante.** Ele só converte o JSON e chama o `ServicoDeNotificacoes`, que decide tudo (deduplicação, quem avisar) e é testável com Mockito. Um `tipo` de evento desconhecido (`"ContaAberta"`) é ignorado, sem erro e sem notificação: no dia em que outro evento entrar no mesmo tópico, este consumidor não quebra.
+15. **Falha passageira é repetida; mensagem ilegível vai para o DLT.** Uma exceção comum no processamento é repetida 3 vezes, com 1 s entre elas, e depois a mensagem vai para `fintech.transferencias-dlt`. Uma mensagem que não é JSON válido, ou um `TransferenciaRealizada` sem `transferencia`, `origem`, `destino`, `valor` ou `ocorridoEm`, vai **direto** para o DLT, sem repetir: tentar de novo não a conserta. Exemplo: publicar `isto não é json` no tópico → a mensagem aparece em `fintech.transferencias-dlt`, e as seguintes continuam sendo consumidas. Os dois tópicos são criados pela aplicação, com 3 partições.
+
+**A API de notificações**
+
+16. **`GET /notificacoes` devolve as 50 notificações mais recentes de quem pede, da mais recente para a mais antiga.** Duas transferências da Ana, primeiro `1.00` e depois `2.00` → a lista dela traz a de `2.00` antes da de `1.00`. Cada um vê só as próprias, inclusive o ADMIN (notificação é um aviso pessoal, não um relatório). A filtragem e o limite ficam na consulta ao banco.
+17. **Sem token → `401 nao-autenticado`**, em Problem Details, como as outras rotas protegidas do marco 4.
+18. **A notificação chega depois, não junto.** O `POST /transferencias` responde sem esperar o consumidor: logo após o `201`, o `GET /notificacoes` pode ainda não ter o aviso; em poucos segundos ele aparece. Isso é consistência eventual, e não um bug.
+
+**Configuração e operação**
+
+19. **`fintech.eventos.habilitados` (padrão `true`) liga o relay, o consumidor, os tópicos e o agendamento.** Com `false`, a aplicação sobe **sem Kafka** e sem erro de conexão, e os eventos continuam sendo gravados na outbox, com `publicado_em` nulo. Quando o broker for ligado, o relay publica o acumulado. Exemplo: `FINTECH_EVENTOS_HABILITADOS=false mvn spring-boot:run` com o Kafka parado → a aplicação sobe, a transferência responde `201`, e `evento_saida` ganha a linha.
+20. **A sua suíte cobre as regras novas, com testes rápidos e sem Kafka.** Pelo menos: no `ServicoDeTransferenciasTest`, a transferência concluída chama `publicar` com o `TransferenciaRealizada` certo, e a recusada não chama; no `ServicoDeNotificacoesTest`, um evento novo grava as duas notificações e um repetido não consulta contas nem grava nada.
+
+## Passo a passo sugerido
+
+Três partes, testáveis separadamente, nesta ordem. Depois de cada passo, rode os cenários correspondentes de **Experimente** e a sua suíte: ela tem de continuar verde.
+
+1. **Monte o jeito de experimentar.** Acrescente o starter e o Kafka ao `compose.yaml`, e a propriedade `fintech.eventos.habilitados`. Suba com `mvn spring-boot:run` e confira que os dois contêineres estão de pé (`docker compose ps`).
+2. **A outbox (regras 1 a 6).** O `EventoDeDominio` e o `TransferenciaRealizada` em `dominio`, a porta `PublicadorDeEventos`, a chamada no `ServicoDeTransferencias`, o `EventoJson` (o contrato), o adaptador que grava com `JdbcClient` e a migração `V4`. Ainda sem relay: faça transferências e confira `evento_saida` com `psql`. Rode o ArchUnit.
+3. **O relay (regras 7 a 11).** Um `@Scheduled` em `infra`, com `@EnableScheduling` numa configuração condicionada à propriedade. Confira `publicado_em` preenchido e a mensagem no tópico com o `kafka-console-consumer.sh`. Pare o broker, faça uma transferência e veja `tentativas` e `ultimo_erro`; ligue de novo e veja o evento sair.
+4. **As notificações (regras 12 a 18).** A entidade `Notificacao`, o repositório, o `RegistroDeEventosProcessados` com o adaptador JDBC, o `ServicoDeNotificacoes`, o listener com `@KafkaListener`, o `DefaultErrorHandler` com o DLT e o `NotificacaoController`. Force uma reentrega e publique uma mensagem ilegível.
+5. **Sem broker (regra 19).** Suba com `FINTECH_EVENTOS_HABILITADOS=false` e o Kafka parado.
+6. **A sua suíte (regra 20).** Atualize o `ServicoDeTransferenciasTest` (o construtor ganhou a porta) e escreva o `ServicoDeNotificacoesTest`. Nos testes com contexto Spring que não devem falar com o broker, defina `fintech.eventos.habilitados=false`.
+
+## Experimente
+
+Suba o PostgreSQL, o Kafka e a aplicação. No Bash (Git Bash no Windows):
+
+```bash
+cd java/projeto-integrador/starter
+mvn spring-boot:run
+```
+
+Em outro terminal, cadastre a Ana, a Bia e o Caio, faça login e guarde os tokens, como no [Experimente do marco 4](../../11-seguranca/05-fintech-marco-4/#experimente). Depois:
+
+```bash
+API=http://localhost:8080
+JSON='Content-Type: application/json'
+
+# as contas: A da Ana, com 500.00; B da Bia
+A=$(curl -s -X POST $API/contas -H "Authorization: Bearer $ANA" -H "$JSON" \
+  -d '{"titular": "Ana Souza", "cpf": "52998224725", "tipo": "CORRENTE"}' | jq -r .id)
+curl -s -X POST $API/contas/$A/depositos -H "Authorization: Bearer $ANA" -H "$JSON" -d '{"valor": 500.00}'
+B=$(curl -s -X POST $API/contas -H "Authorization: Bearer $BIA" -H "$JSON" \
+  -d '{"titular": "Bia Ramos", "cpf": "11144477735", "tipo": "CORRENTE"}' | jq -r .id)
+
+# a transferência
+curl -s -X POST $API/transferencias -H "Authorization: Bearer $ANA" -H "$JSON" \
+  -H "Idempotency-Key: marco5-ana-1" -d "{\"origem\": \"$A\", \"destino\": \"$B\", \"valor\": 150}"
+
+# a outbox
+docker compose exec postgres psql -U fintech -c \
+  "select tipo, agregado_id, publicado_em, tentativas, payload from evento_saida order by criado_em;"
+
+# o tópico, com a chave de cada mensagem (Ctrl+C para sair)
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic fintech.transferencias --from-beginning --property print.key=true
+
+# as notificações
+curl -s $API/notificacoes -H "Authorization: Bearer $BIA"
+```
+
+Para forçar uma **reentrega** (regra 13), apague a marca e espere o relay:
+
+```bash
+docker compose exec postgres psql -U fintech -c \
+  "update evento_saida set publicado_em = null where agregado_id = '$A';"
+```
+
+Para mandar uma **mensagem ilegível** (regra 15) e lê-la no DLT:
+
+```bash
+echo 'isto não é json' | docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic fintech.transferencias
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic fintech.transferencias-dlt --from-beginning
+```
+
+O que você deve ver (o comportamento da solução de referência):
+
+| Cenário | Resultado |
+|---|---|
+| a transferência de `150` de `A` para `B` | `201`; uma linha em `evento_saida` com `tipo` `TransferenciaRealizada`, `agregado_id` = `A` e, no `payload`, `"valor": "150.00"` e `"transferencia"` = o `id` da resposta |
+| a mesma consulta, um ou dois segundos depois | `publicado_em` preenchido, `tentativas` = `0` |
+| o `kafka-console-consumer.sh` em `fintech.transferencias` | a chave `A`, um tab e o mesmo JSON do `payload` |
+| a mesma transferência repetida com a mesma `Idempotency-Key` | `201`, e continua **uma** linha em `evento_saida` |
+| transferência com saldo insuficiente | `422` `saldo-insuficiente`, nenhuma linha nova em `evento_saida` |
+| `GET /notificacoes` da Bia | um item `TRANSFERENCIA_RECEBIDA`, `"conta"` = `B`, `"valor": 150.00`, `"mensagem": "Você recebeu uma transferência de R$ 150,00"` |
+| `GET /notificacoes` da Ana | um item `TRANSFERENCIA_ENVIADA`, `"conta"` = `A`, `"mensagem": "Você enviou uma transferência de R$ 150,00"` |
+| `GET /notificacoes` do Caio | `{"itens": []}` |
+| uma segunda transferência da Ana | a lista dela traz a nova **antes** da anterior |
+| `GET /notificacoes` sem token | `401`, `type` … `/nao-autenticado` |
+| reentrega: `publicado_em = null` | o relay publica de novo (o consumidor do tópico mostra a mensagem duas vezes); a Ana e a Bia continuam com **uma** notificação dessa transferência; `evento_processado` tem uma linha por evento |
+| `isto não é json` no tópico | aparece em `fintech.transferencias-dlt`, sem repetições; no log, o erro de leitura do JSON; as transferências seguintes continuam notificando |
+| `docker compose stop kafka` e uma transferência | `201`; o evento fica com `publicado_em` nulo, `tentativas` crescendo e `ultimo_erro` preenchido; no log, `falha ao publicar o evento ...` |
+| `docker compose start kafka` | o evento é publicado na próxima tentativa (até 5 minutos depois, conforme as tentativas acumuladas) e as notificações aparecem |
+| subir com `FINTECH_EVENTOS_HABILITADOS=false` e o Kafka parado | a aplicação sobe; a transferência responde `201`; o evento fica na outbox, sem publicar |
+
+Variam a cada execução: os ids, os instantes e a partição. A `mensagem` é formatada com o `NumberFormat` em `pt-BR`, que separa `R$` do número com um espaço não separável (U+00A0): compare o texto com isso em mente.
+
+<Callout tipo="atencao" titulo="Os testes de aceitação dos marcos anteriores">
+Se o seu projeto ainda roda as classes `Marco1…` a `Marco4…`, elas sobem a aplicação com `fintech.eventos.habilitados=false` (definido na anotação `@TesteDeAceitacao`): sem essa propriedade, elas tentariam se conectar a um broker que não existe no teste. Por isso o nome dela faz parte do contrato. Para rodar só a sua suíte: `mvn verify "-Dtest=!Marco*"`.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] Os cenários de **Experimente** dão o resultado indicado.
+- [ ] Nenhuma transferência concluída fica sem evento, e nenhuma recusada ou repetida gera evento.
+- [ ] Uma reentrega não duplica notificações, e uma mensagem ilegível vai para o DLT sem travar as seguintes.
+- [ ] Com o broker parado, as transferências continuam respondendo `201`, e os eventos saem quando ele volta.
+- [ ] Com `fintech.eventos.habilitados=false`, a aplicação sobe sem Kafka.
+- [ ] O `mvn verify` termina com `BUILD SUCCESS`, com a sua suíte (incluindo os testes da regra 20) e a verificação de arquitetura verdes.
+- [ ] Nenhum `kafka.send` dentro do caso de uso de transferência.
+- [ ] Você sabe explicar por que `kafka.send` dentro do `@Transactional` não resolve, e por que a garantia "pelo menos uma vez" exige um consumidor idempotente.
+
+## Desafios opcionais
+
+- **Reprocessar do DLT**: uma rota `POST /admin/eventos/{id}/reprocessar` (só ADMIN) que devolve um evento à outbox (`publicado_em = NULL`, `tentativas = 0`). Por que isso é seguro, dado o consumidor idempotente?
+- **Extrato em tempo real**: um segundo consumidor, em outro grupo, que mantém uma tabela de saldo diário por conta. E a pergunta: o que acontece se ele for criado depois de um mês de eventos e o tópico tiver retenção de 7 dias?
+- **Limpeza da outbox e da deduplicação**: um job que apaga eventos publicados há mais de 7 dias e linhas de `evento_processado` mais antigas que a retenção do tópico.
+- **Spring Modulith**: troque a outbox própria pelo *Event Publication Registry* com `@Externalized`, e compare o código.
+
+<Dicas>
+<Dica nivel={1}>
+Três partes independentes, nesta ordem:
+
+1. **Outbox**: o evento de domínio, a porta `PublicadorDeEventos` em `aplicacao`, o adaptador que grava na tabela e a migração `V4`. Não precisa do Kafka: confira com `psql`.
+2. **Relay**: um `@Scheduled` que lê os pendentes, publica e marca. É o [exercício 12.03](../03-relay-do-outbox/) dentro do projeto.
+3. **Notificações**: o listener, a deduplicação, a entidade, o repositório e a rota. É o [exercício 12.04](../04-consumidor-idempotente/) dentro do projeto.
+</Dica>
+<Dica nivel={2}>
+- Evento de domínio: um `record TransferenciaRealizada(...)` em `dominio`, sem nada de Spring. A chamada `eventos.publicar(TransferenciaRealizada.de(transferencia))` fica no `ServicoDeTransferencias`, depois dos movimentos e dentro do `@Transactional`.
+- O adaptador da outbox pode usar `JdbcClient`: dentro de uma transação JPA, ele usa a mesma conexão. `@Transactional(propagation = MANDATORY)` garante que ninguém o chame fora de uma transação.
+- Para a aplicação subir sem Kafka: `@ConditionalOnProperty(name = "fintech.eventos.habilitados", havingValue = "true", matchIfMissing = true)` no relay, no consumidor e na configuração dos tópicos (que também leva o `@EnableScheduling`).
+- `"valor"` com duas casas: `valor.setScale(2, RoundingMode.UNNECESSARY).toPlainString()`. O `@Digits(fraction = 2)` da requisição garante que não há arredondamento a fazer.
+</Dica>
+<Dica nivel={3}>
+- Relay: `SELECT ... WHERE publicado_em IS NULL AND proxima_tentativa <= ? ORDER BY criado_em, id LIMIT 100 FOR UPDATE SKIP LOCKED` dentro de um `TransactionTemplate`, e `kafka.send(topico, agregado, payload).get(10, SECONDS)` antes do `UPDATE`. Trate `InterruptedException` restaurando a interrupção.
+- Deduplicação: `INSERT INTO evento_processado ... ON CONFLICT DO NOTHING` e `update() == 1`. No PostgreSQL, deixar a violação de chave estourar abortaria a transação inteira, e as notificações iriam junto.
+- DLT: `new DefaultErrorHandler(new DeadLetterPublishingRecoverer(kafka), new FixedBackOff(1_000, 3))` e `addNotRetryableExceptions(JacksonException.class, ...)`. No Spring Kafka 4, o recoverer publica por padrão em `<tópico>-dlt`, na mesma partição: crie o DLT com o mesmo número de partições.
+- Se o Spring reclamar de dois beans com o mesmo nome (`tratadorDeErros`, o do `@RestControllerAdvice`), dê outro nome ao `DefaultErrorHandler`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução de referência
+
+Está em `java/projeto-integrador/solucao-marco-5`: o marco 4, mais o evento de domínio, a outbox, o relay, o consumidor e as notificações, com os testes próprios atualizados. O build da solução roda também os testes de aceitação dos marcos 1 a 5 (os que usam Docker são pulados se ele não estiver disponível).
+
+<Tabs>
+<Tab rotulo="Domínio e porta">
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/dominio/EventoDeDominio.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/dominio/TransferenciaRealizada.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/aplicacao/PublicadorDeEventos.java" titulo="aplicacao/PublicadorDeEventos.java (porta)" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferencias.java" destacar="82" />
+</Tab>
+<Tab rotulo="Outbox e relay">
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/eventos/OutboxJdbc.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/eventos/EventoJson.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/eventos/RelayDoOutbox.java" />
+</Tab>
+<Tab rotulo="Consumo">
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/eventos/ConsumidorDeTransferencias.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/eventos/ConfiguracaoDeEventos.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeNotificacoes.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/infra/RegistroDeEventosProcessadosJdbc.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/java/dev/trilhajava/fintech/api/NotificacaoController.java" />
+</Tab>
+<Tab rotulo="Migração e configuração">
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/main/resources/db/migration/V4__cria_outbox_e_notificacoes.sql" />
+
+```yaml
+# application.yml (trecho)
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all                          # o líder só confirma depois que as réplicas gravaram
+      properties:
+        enable.idempotence: true         # repetir um envio não duplica a mensagem no tópico
+        max.block.ms: 5000               # com o broker fora, o relay falha em 5 s em vez de 60 s
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
+    consumer:
+      auto-offset-reset: earliest
+
+fintech:
+  eventos:
+    # false: os eventos são gravados na outbox, mas não são publicados nem consumidos (sem broker).
+    habilitados: ${FINTECH_EVENTOS_HABILITADOS:true}
+    relay:
+      intervalo-ms: 500
+```
+</Tab>
+<Tab rotulo="Testes">
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/test/java/dev/trilhajava/fintech/aplicacao/ServicoDeNotificacoesTest.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-5/src/test/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferenciasTest.java" />
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/Marco5EventosTest.java" titulo="testes/Marco5EventosTest.java (aceitação do marco 5, roda no build da solução)" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Evento de domínio `sealed`.** `EventoDeDominio permits TransferenciaRealizada`: o `switch` que converte para JSON é verificado pelo compilador. Um evento novo sem conversão não compila.
+- **Contrato separado do domínio.** `EventoJson` é o formato público. O record de domínio pode mudar sem quebrar o antifraude, que lê o JSON.
+- **Valor como texto, com escala fixa.** `"150.00"`, e não `150.0` nem `"150"`: o consumidor não depende de como o número chegou na requisição nem de como a linguagem dele lê números JSON.
+- **O relay para no primeiro erro.** Mais simples que o travamento por agregado do exercício 12.03, e suficiente aqui: quando o Kafka cai, todos os envios falham juntos, e parar preserva a ordem.
+- **Consumidor fino.** O listener converte o JSON e chama `ServicoDeNotificacoes.registrar`, que decide tudo (deduplicação, quem avisar). A regra é testada com Mockito, sem Kafka.
+- **Leitor tolerante.** Um tipo de evento desconhecido é ignorado, não é erro. O dia em que houver `ContaAberta` no mesmo tópico, este consumidor não quebra.
+- **Exceções que não adianta repetir vão direto para o DLT.** JSON inválido continua inválido na quarta tentativa; repetir só atrasa a partição inteira.
+
+### Como o teste de reentrega prova a idempotência
+
+O teste de aceitação apaga o `publicado_em` e espera o relay publicar de novo. Mas como saber que o consumidor já processou a reentrega antes de conferir as notificações? Ele faz uma **segunda transferência da mesma conta**: mesma chave, mesma partição, e o Kafka entrega em ordem. Quando a notificação da segunda aparece, a reentrega da primeira já foi processada, e ela precisa continuar com **uma** notificação por pessoa. A mesma técnica serve para o seu teste manual.
+
+### Alternativas e trade-offs
+
+- **Outbox com polling × CDC (Debezium).** O relay por polling é pouco código e roda dentro da aplicação; o CDC lê o log de replicação do PostgreSQL, tem latência menor e não faz consultas periódicas, ao custo de mais uma peça (Kafka Connect) para operar.
+- **Deduplicação em tabela × chave natural.** A tabela `evento_processado` serve para qualquer consumidor; uma `UNIQUE (transferencia_id, tipo)` em `notificacao` resolveria este caso específico sem tabela extra, mas não protege efeitos colaterais que não são linhas no banco.
+- **Transações do Kafka (`exactly-once`).** Elas valem para ler de um tópico e escrever em outro; não cobrem a gravação no PostgreSQL. Para um efeito no banco, *pelo menos uma vez* com consumidor idempotente é o padrão.
+
+### Avalie sua solução
+
+- Um cliente faz uma transferência e abre o app na mesma hora: a notificação ainda não está lá. Isso é um bug? Como você explicaria a consistência eventual para o time de produto?
+- O que acontece com as notificações se o consumidor ficar fora por 2 horas? E se o tópico tiver retenção de 1 hora?
+- A tabela `evento_saida` cresce para sempre. Quando é seguro apagar uma linha?
+- Se a mensagem de uma conta for para o DLT, as transferências seguintes da mesma conta ainda são notificadas. Isso é aceitável para notificações? E seria para um consumidor que mantém saldo?
+
+</Solucao>

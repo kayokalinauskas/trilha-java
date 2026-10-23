@@ -1,0 +1,495 @@
+---
+import Base from '../../layouts/Base.astro';
+import Icon from '../../components/Icon.astro';
+import {
+  DIFICULDADE_LABEL,
+  formatarDuracao,
+  getAulas,
+  getExercicios,
+  getModulos,
+  NIVEL_LABEL,
+  pad2,
+  type Modulo,
+} from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+export async function getStaticPaths() {
+  const modulos = await getModulos();
+  return modulos.map((m) => ({ params: { id: m.id }, props: { modulo: m } }));
+}
+
+const { modulo } = Astro.props as { modulo: Modulo };
+const m = modulo.data;
+const [todos, aulas, exercicios] = await Promise.all([getModulos(), getAulas(modulo.id), getExercicios(modulo.id)]);
+const requisitos = todos.filter((x) => m.requisitos.includes(x.id));
+const seguintes = todos.filter((x) => x.data.requisitos.includes(modulo.id));
+const minutos = aulas.reduce((s, a) => s + a.data.duracao, 0);
+const emBreve = m.status === 'em-breve';
+---
+
+<Base title={`${pad2(m.numero)} · ${m.titulo}`} description={m.resumo}>
+  <section class="mod-hero">
+    <div class="container">
+      <nav class="crumbs" aria-label="Você está em">
+        <a href={url('')}>Trilha</a>
+        <Icon name="chevron-right" size={14} />
+        <span>Módulo {pad2(m.numero)}</span>
+      </nav>
+      <div class="mod-head">
+        <span class={`mod-num nivel-${m.nivel}`}>{pad2(m.numero)}</span>
+        <div>
+          <h1>{m.titulo}</h1>
+          <p class="lead">{m.resumo}</p>
+          <div class="row meta">
+            <span class={`badge badge-dot lvl-${m.nivel}`}>{NIVEL_LABEL[m.nivel]}</span>
+            <span class="badge"><Icon name="clock" size={13} /> ~{m.horas}h de estudo</span>
+            {!emBreve && <span class="badge"><Icon name="book" size={13} /> {aulas.length} aulas · {formatarDuracao(minutos)}</span>}
+            {!emBreve && <span class="badge"><Icon name="code" size={13} /> {exercicios.length} exercícios</span>}
+            {m.marcoProjeto && <span class="badge badge-marco"><Icon name="flag" size={13} /> {m.marcoProjeto}</span>}
+          </div>
+          {
+            !emBreve && (
+              <div class="mod-progress" data-mod-progress>
+                <div class="progress">
+                  <span />
+                </div>
+                <span class="mp-label">0% concluído</span>
+              </div>
+            )
+          }
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="container mod-grid">
+    <div class="mod-main">
+      {
+        emBreve && (
+          <div class="card soon">
+            <Icon name="sparkles" size={22} />
+            <div>
+              <h2>Em produção</h2>
+              <p class="muted">
+                Este módulo faz parte das próximas fases de entrega. O programa abaixo já está definido — enquanto isso, avance pelos módulos
+                disponíveis ou treine no simulador de entrevista.
+              </p>
+            </div>
+          </div>
+        )
+      }
+
+      {
+        aulas.length > 0 && (
+          <section aria-labelledby="aulas-t">
+            <h2 id="aulas-t" class="sec-t">
+              <Icon name="book" size={20} /> Aulas
+            </h2>
+            <ol class="lista">
+              {aulas.map((a, i) => (
+                <li>
+                  <a class="item" href={url(`aulas/${a.id}`)} data-item={`a:${a.id}`}>
+                    <span class="item-status" aria-hidden="true">
+                      <span class="n">{i + 1}</span>
+                      <Icon name="check" size={14} />
+                    </span>
+                    <span class="item-body">
+                      <strong>{a.data.titulo}</strong>
+                      <small>{a.data.descricao}</small>
+                    </span>
+                    <span class="item-meta">{formatarDuracao(a.data.duracao)}</span>
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )
+      }
+
+      {
+        exercicios.length > 0 && (
+          <section aria-labelledby="ex-t">
+            <h2 id="ex-t" class="sec-t">
+              <Icon name="code" size={20} /> Exercícios
+            </h2>
+            <ol class="lista">
+              {exercicios.map((e) => (
+                <li>
+                  <a class="item" href={url(`exercicios/${e.id}`)} data-item={`e:${e.id}`}>
+                    <span class="item-status" aria-hidden="true">
+                      <span class="n mono">{e.data.codigo.split('.')[1]}</span>
+                      <Icon name="check" size={14} />
+                    </span>
+                    <span class="item-body">
+                      <strong>{e.data.marco && <Icon name="flag" size={14} class="marco-ic" />}{e.data.titulo}</strong>
+                      <small>{e.data.resumo}</small>
+                    </span>
+                    <span class="item-meta">
+                      <span class={`badge dif-${e.data.dificuldade}`}>{DIFICULDADE_LABEL[e.data.dificuldade]}</span>
+                      <span>{e.data.tempo}</span>
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )
+      }
+
+      <section aria-labelledby="prog-t">
+        <h2 id="prog-t" class="sec-t"><Icon name="layers" size={20} /> Programa</h2>
+        <ul class="topicos">
+          {m.topicos.map((t) => <li>{t}</li>)}
+        </ul>
+      </section>
+    </div>
+
+    <aside class="mod-side">
+      <div class="card side-card">
+        <h2>Ao final você vai</h2>
+        <ul class="objetivos">
+          {
+            m.objetivos.map((o) => (
+              <li>
+                <Icon name="check-circle" size={17} />
+                {o}
+              </li>
+            ))
+          }
+        </ul>
+      </div>
+      {
+        requisitos.length > 0 && (
+          <div class="card side-card">
+            <h2>Antes deste</h2>
+            <ul class="links">
+              {requisitos.map((r) => (
+                <li>
+                  <a href={url(`modulos/${r.id}`)}>
+                    <span class="mono">{pad2(r.data.numero)}</span> {r.data.titulo}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      }
+      {
+        seguintes.length > 0 && (
+          <div class="card side-card">
+            <h2>Depois deste</h2>
+            <ul class="links">
+              {seguintes.map((r) => (
+                <li>
+                  <a href={url(`modulos/${r.id}`)}>
+                    <span class="mono">{pad2(r.data.numero)}</span> {r.data.titulo}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      }
+    </aside>
+  </div>
+</Base>
+
+<script>
+  import { aoMudar, ler } from '../../lib/progresso';
+
+  function atualizar() {
+    const p = ler();
+    const itens = [...document.querySelectorAll<HTMLElement>('[data-item]')];
+    let feitos = 0;
+    for (const el of itens) {
+      const [tipo, ...resto] = el.dataset.item!.split(':');
+      const id = resto.join(':');
+      const ok = tipo === 'a' ? !!p.aulas[id] : p.exercicios[id]?.status === 'concluido';
+      el.classList.toggle('feito', ok);
+      if (ok) feitos++;
+    }
+    const barra = document.querySelector<HTMLElement>('[data-mod-progress]');
+    if (barra && itens.length) {
+      const pct = Math.round((feitos / itens.length) * 100);
+      barra.querySelector<HTMLElement>('.progress')!.style.setProperty('--value', String(pct));
+      barra.querySelector('.mp-label')!.textContent = `${pct}% concluído · ${feitos} de ${itens.length} itens`;
+    }
+  }
+  atualizar();
+  aoMudar(atualizar);
+</script>
+
+<style>
+  .mod-hero {
+    padding-block: 32px 40px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 300px at 90% 0%, var(--accent-soft), transparent 70%);
+  }
+  .crumbs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.85rem;
+    color: var(--text-3);
+    margin-bottom: 20px;
+  }
+  .crumbs a {
+    text-decoration: none;
+  }
+  .crumbs a:hover {
+    color: var(--accent);
+  }
+  .mod-head {
+    display: flex;
+    gap: clamp(16px, 3vw, 28px);
+    align-items: flex-start;
+  }
+  .mod-head > div {
+    min-width: 0;
+  }
+  /* o nome do marco é longo: no celular ele quebra linha em vez de estourar a tela */
+  .badge-marco {
+    color: var(--accent);
+    white-space: normal;
+    border-radius: 12px;
+  }
+  .mod-num {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: clamp(60px, 10vw, 88px);
+    aspect-ratio: 1;
+    border-radius: 22px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-family: var(--font-display);
+    font-size: clamp(1.6rem, 4vw, 2.4rem);
+    font-weight: 800;
+  }
+  .mod-num.nivel-base {
+    color: var(--lvl-base);
+  }
+  .mod-num.nivel-jr,
+  .mod-num.nivel-jr-pleno {
+    color: var(--lvl-jr);
+  }
+  .mod-num.nivel-pleno {
+    color: var(--lvl-pleno);
+  }
+  .mod-num.nivel-todos {
+    color: var(--accent);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-bottom: 10px;
+  }
+  .lead {
+    max-width: 68ch;
+  }
+  .meta {
+    margin-top: 18px;
+    gap: 8px;
+  }
+  .mod-progress {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-top: 20px;
+    max-width: 520px;
+  }
+  .mod-progress .progress {
+    flex: 1;
+  }
+  .mp-label {
+    font-size: 0.82rem;
+    color: var(--text-3);
+    white-space: nowrap;
+  }
+  .mod-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 40px;
+    padding-top: 40px;
+  }
+  .mod-main {
+    display: grid;
+    gap: 40px;
+    align-content: start;
+  }
+  .sec-t {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: var(--step-1);
+    margin-bottom: 14px;
+  }
+  .sec-t :global(.icon) {
+    color: var(--accent);
+  }
+  .lista {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+  }
+  .item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 16px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    text-decoration: none;
+    transition: border-color 0.15s, transform 0.15s var(--ease);
+  }
+  .item:hover {
+    border-color: var(--accent);
+    transform: translateX(2px);
+  }
+  .item-status {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 1.5px solid var(--border-strong);
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--text-3);
+  }
+  .item-status :global(.icon) {
+    display: none;
+  }
+  .item.feito .item-status {
+    background: var(--ok);
+    border-color: var(--ok);
+    color: var(--accent-ink);
+  }
+  .item.feito .item-status .n {
+    display: none;
+  }
+  .item.feito .item-status :global(.icon) {
+    display: block;
+  }
+  .item-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+  .item-body strong {
+    font-weight: 600;
+  }
+  .item-body small {
+    color: var(--text-3);
+    font-size: 0.86rem;
+    line-height: 1.45;
+  }
+  .item-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .mono {
+    font-family: var(--font-mono);
+  }
+  .topicos {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .topicos li {
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 0.87rem;
+    color: var(--text-2);
+  }
+  .soon {
+    display: flex;
+    gap: 16px;
+    padding: 22px;
+    border-style: dashed;
+    color: var(--accent);
+  }
+  .soon h2 {
+    font-size: 1.15rem;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .mod-side {
+    display: grid;
+    gap: 16px;
+    align-content: start;
+    position: sticky;
+    top: calc(var(--header-h) + 20px);
+  }
+  .side-card {
+    padding: 20px;
+  }
+  .side-card h2 {
+    font-size: 1rem;
+    margin-bottom: 12px;
+  }
+  .objetivos,
+  .links {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 10px;
+  }
+  .objetivos li {
+    display: flex;
+    gap: 10px;
+    font-size: 0.9rem;
+    color: var(--text-2);
+    line-height: 1.45;
+  }
+  .objetivos :global(.icon) {
+    color: var(--ok);
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .links a {
+    text-decoration: none;
+    font-size: 0.92rem;
+    color: var(--text-2);
+  }
+  .links a:hover {
+    color: var(--accent);
+  }
+  .links .mono {
+    color: var(--accent);
+    margin-right: 4px;
+  }
+  @media (max-width: 960px) {
+    .mod-grid {
+      grid-template-columns: 1fr;
+    }
+    .mod-side {
+      position: static;
+    }
+  }
+  @media (max-width: 600px) {
+    .mod-head {
+      flex-direction: column;
+    }
+    .item {
+      flex-wrap: wrap;
+    }
+    .item-meta {
+      width: 100%;
+      padding-left: 46px;
+    }
+  }
+</style>

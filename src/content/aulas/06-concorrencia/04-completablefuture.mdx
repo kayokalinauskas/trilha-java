@@ -1,0 +1,146 @@
+---
+titulo: CompletableFuture — compondo chamadas assíncronas
+descricao: Disparar chamadas em paralelo, encadear com thenApply e thenCompose, combinar com thenCombine e allOf, e tratar falhas e timeouts sem derrubar o fluxo.
+modulo: 06-concorrencia
+ordem: 4
+duracao: 55
+objetivos:
+  - Executar chamadas independentes em paralelo com supplyAsync
+  - Encadear e combinar resultados (thenApply, thenCompose, thenCombine, allOf)
+  - Tratar falhas com exceptionally e handle
+  - Impor limites de tempo com orTimeout e completeOnTimeout
+tags: [CompletableFuture, assíncrono, timeout, paralelismo]
+flashcards:
+  - frente: Qual a diferença entre thenApply e thenCompose?
+    verso: thenApply transforma o resultado com uma função comum (T → U); thenCompose encadeia uma função que já devolve CompletableFuture (T → CF<U>), evitando CF<CF<U>>.
+  - frente: Para que serve thenCombine?
+    verso: Para combinar os resultados de dois futures independentes quando ambos terminarem.
+  - frente: Qual a diferença entre orTimeout e completeOnTimeout?
+    verso: orTimeout faz o future falhar com TimeoutException; completeOnTimeout completa com um valor padrão.
+  - frente: Por que passar um Executor para supplyAsync?
+    verso: Sem ele, usa o ForkJoinPool comum (dimensionado para CPU); chamadas bloqueantes de I/O ali podem travar outras partes da aplicação.
+  - frente: Por que disparar todos os futures antes de dar join?
+    verso: Se você der join em cada um logo após criá-lo, eles executam em sequência — o paralelismo some.
+---
+
+Um checkout típico chama o serviço de frete, o antifraude e o de estoque. Se cada chamada leva 300 ms e elas são **independentes**, fazê-las em sequência custa 900 ms; em paralelo, 300 ms. `CompletableFuture` é a API do Java para compor esse tipo de trabalho assíncrono.
+
+## Disparando em paralelo
+
+```java
+ExecutorService io = Executors.newVirtualThreadPerTaskExecutor();
+
+CompletableFuture<BigDecimal> frete = CompletableFuture.supplyAsync(() -> fretes.cotar(cep), io);
+CompletableFuture<Boolean> aprovado = CompletableFuture.supplyAsync(() -> antifraude.avaliar(pedido), io);
+CompletableFuture<Boolean> reservado = CompletableFuture.supplyAsync(() -> estoque.reservar(itens), io);
+```
+
+As três chamadas começam **imediatamente**, em paralelo. `supplyAsync` devolve na hora; o resultado chega depois.
+
+<Callout tipo="atencao" titulo="Sempre passe um Executor para I/O">
+Sem o segundo argumento, `supplyAsync` usa o `ForkJoinPool.commonPool()`, dimensionado para **CPU** (núcleos − 1 threads) e compartilhado com `parallelStream` e outras bibliotecas. Chamadas HTTP bloqueantes ali podem esgotá-lo e travar partes da aplicação que nada têm a ver com o seu código.
+</Callout>
+
+## Encadeando
+
+```java
+CompletableFuture<Recibo> recibo = CompletableFuture
+        .supplyAsync(() -> pagamentos.autorizar(pedido), io)   // CF<Autorizacao>
+        .thenApply(Autorizacao::codigo)                        // transforma: CF<String>
+        .thenCompose(codigo -> notas.emitirAsync(codigo))      // outra chamada assíncrona: CF<Nota>
+        .thenApply(Recibo::de);                                // CF<Recibo>
+```
+
+| Método | Função recebida | Use quando |
+|---|---|---|
+| `thenApply(f)` | `T → U` | transformar o resultado |
+| `thenCompose(f)` | `T → CompletableFuture<U>` | o próximo passo **também é assíncrono** (é o `flatMap` dos futures) |
+| `thenAccept(c)` | `T → nada` | efeito final (log, notificação) |
+| `thenCombine(outro, f)` | `(T, U) → V` | juntar dois futures **independentes** |
+
+```java
+CompletableFuture<Resumo> resumo = frete.thenCombine(aprovado, (valor, ok) -> new Resumo(valor, ok));
+```
+
+## Esperando vários: `allOf` e o padrão "dispare tudo, depois espere"
+
+```java
+List<CompletableFuture<Cotacao>> futuros = transportadoras.stream()
+        .map(t -> CompletableFuture.supplyAsync(() -> cotar(t), io))
+        .toList();                                     // 1. dispara TODAS
+
+List<Cotacao> cotacoes = futuros.stream()
+        .map(CompletableFuture::join)                  // 2. só então espera cada uma
+        .toList();
+```
+
+<Callout tipo="erro" titulo="O join que mata o paralelismo">
+`transportadoras.stream().map(t -> supplyAsync(...)).map(CompletableFuture::join).toList()` parece paralelo, mas não é: como as Streams são preguiçosas, **cada** elemento é criado e esperado antes do próximo. O `.toList()` intermediário força o disparo de todas antes do primeiro `join`.
+</Callout>
+
+`CompletableFuture.allOf(f1, f2, f3)` devolve um future que completa quando todos completam; `anyOf` completa com o primeiro.
+
+## Falhas: nada de derrubar o fluxo inteiro
+
+Uma transportadora fora do ar não pode derrubar a cotação das outras:
+
+```java
+CompletableFuture<Cotacao> segura = CompletableFuture
+        .supplyAsync(() -> cotar(t), io)
+        .exceptionally(erro -> {
+            log.warn("Cotação falhou em {}: {}", t.nome(), erro.getMessage());
+            return null;                               // ou um valor padrão
+        });
+```
+
+- **`exceptionally(f)`**: se falhar, `f` recebe a exceção e devolve um valor substituto.
+- **`handle((resultado, erro) -> ...)`**: recebe os dois (um deles é `null`) e decide.
+- **`join()`** lança `CompletionException` (unchecked); **`get()`** lança `ExecutionException` (checked).
+
+## Timeouts
+
+```java
+future.orTimeout(500, TimeUnit.MILLISECONDS);                  // falha com TimeoutException
+future.completeOnTimeout(Cotacao.indisponivel(), 500, MILLISECONDS);   // completa com um padrão
+```
+
+Toda chamada remota precisa de um limite. Combinado com `exceptionally`, o padrão fica: **cada fornecedor tem até X ms; quem não responder fica de fora**. É exatamente o exercício 06.03.
+
+<Callout tipo="info" titulo="O timeout não para a chamada">
+`orTimeout` completa o **future**, mas a tarefa pode continuar rodando em segundo plano (esperando a resposta HTTP, por exemplo). Por isso, configure também o timeout **no cliente HTTP** (conexão e leitura). No módulo 13 você verá como Resilience4j combina timeout, retry e circuit breaker.
+</Callout>
+
+## E a programação reativa?
+
+Frameworks reativos (Project Reactor, usado pelo Spring WebFlux) levam essa ideia adiante, com fluxos de muitos elementos e controle de pressão (*backpressure*). Com as **virtual threads** (próxima aula), muitos times voltaram ao código síncrono simples para I/O, e reservam `CompletableFuture` para **paralelizar** chamadas independentes, como aqui.
+
+<Quiz
+  id="06-completablefuture"
+  questoes={[
+    {
+      pergunta: 'Você tem `CF<Pedido>` e um método `CF<Nota> emitir(Pedido)`. Como encadear?',
+      opcoes: ['thenApply(this::emitir)', 'thenCompose(this::emitir)', 'thenAccept(this::emitir)', 'allOf(this::emitir)'],
+      correta: 1,
+      explicacao: 'thenApply produziria CF<CF<Nota>>; thenCompose achata.',
+    },
+    {
+      pergunta: 'Qual combina os resultados de dois futures independentes?',
+      opcoes: ['thenCompose', 'thenCombine', 'exceptionally', 'orTimeout'],
+      correta: 1,
+      explicacao: 'thenCombine espera os dois e aplica a função de combinação.',
+    },
+    {
+      pergunta: 'Qual o problema de `lista.stream().map(x -> supplyAsync(...)).map(CompletableFuture::join).toList()`?',
+      opcoes: ['Não compila', 'As tarefas rodam em sequência, porque a Stream é preguiçosa', 'Consome muita memória', 'Nenhum'],
+      correta: 1,
+      explicacao: 'Cada future é criado e esperado antes do próximo. Colete os futures primeiro, depois dê join.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `supplyAsync(tarefa, executor)` dispara em paralelo — **sempre** com executor próprio para I/O.
+- `thenApply` transforma; `thenCompose` encadeia algo assíncrono; `thenCombine` junta dois.
+- **Dispare tudo, depois espere** (`toList()` antes do `join`).
+- `exceptionally`/`handle` isolam falhas; `orTimeout`/`completeOnTimeout` limitam o tempo.

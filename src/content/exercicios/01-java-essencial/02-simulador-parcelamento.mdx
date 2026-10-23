@@ -1,0 +1,118 @@
+---
+titulo: Simulador de parcelamento
+codigo: "01.02"
+resumo: Divida compras em parcelas sem perder um centavo e calcule parcelas com juros pela Tabela Price, usando BigDecimal do jeito certo.
+modulo: 01-java-essencial
+ordem: 2
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [BigDecimal, arredondamento, arrays, validação]
+aulas: [01-java-essencial/01-tipos-e-variaveis, 01-java-essencial/04-metodos]
+java:
+  modulo: m01-java-essencial
+  teste: ParcelamentoTest
+---
+
+## Contexto
+
+Um e-commerce recebeu reclamações: em compras parceladas, a soma das parcelas às vezes dá **um centavo a mais ou a menos** que o total. O código atual divide o valor usando `double` e arredonda cada parcela de forma independente. Parece pouco, mas em milhões de pedidos por mês isso vira diferença contábil, retrabalho do time financeiro e desconfiança do cliente.
+
+Você vai reescrever o simulador de parcelamento usado no checkout.
+
+## Requisitos
+
+### 1. Parcelamento sem juros
+
+`Parcelamento.semJuros(BigDecimal total, int parcelas)` devolve um `BigDecimal[]` com o valor de cada parcela.
+
+- Todas as parcelas têm **2 casas decimais**.
+- A **soma das parcelas é exatamente o total** — sempre.
+- Centavos que sobrarem da divisão vão para a **primeira** parcela.
+
+| Total | Parcelas | Resultado |
+|---|---|---|
+| 300,00 | 3 | 100,00 · 100,00 · 100,00 |
+| 100,00 | 3 | **33,34** · 33,33 · 33,33 |
+| 10 | 3 | 3,34 · 3,33 · 3,33 |
+
+### 2. Parcela com juros (Tabela Price)
+
+`Parcelamento.parcelaComJuros(BigDecimal valor, BigDecimal taxaMensal, int parcelas)` devolve o valor da parcela fixa pela fórmula da **Tabela Price**:
+
+```text
+                i
+PMT = PV × ─────────────────
+            1 − (1 + i)^(−n)
+```
+
+Onde `PV` é o valor financiado, `i` a taxa mensal (0,02 = 2%) e `n` o número de parcelas. O resultado é arredondado para 2 casas com `HALF_EVEN`.
+
+| Valor | Taxa | Parcelas | Parcela |
+|---|---|---|---|
+| 1.000,00 | 2% | 12 | 94,56 |
+| 2.500,00 | 1,99% | 10 | 278,17 |
+| 1.200,00 | 0% | 12 | 100,00 |
+
+## Regras de negócio
+
+- Parcelas: de **1 a 24** (a constante `MAXIMO_PARCELAS` já existe). Fora disso: `IllegalArgumentException` com a palavra "parcelas" na mensagem.
+- Total/valor: **maior que zero** e não nulo.
+- Taxa: **zero ou positiva**. Taxa zero significa dividir igualmente.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ParcelamentoTest` passam, inclusive o que testa **todas** as quantidades de 1 a 24 para R$ 1.999,99.
+- [ ] Nenhum `double` participa do cálculo de valores monetários.
+- [ ] A validação de entradas não está duplicada entre os dois métodos.
+
+## Restrições técnicas
+
+- `BigDecimal.pow` só aceita expoente inteiro positivo. Você vai precisar reescrever a fórmula para evitar o `-n` (ou calcular o inverso).
+- Toda divisão de `BigDecimal` precisa de escala/`MathContext` e modo de arredondamento.
+
+## Desafios opcionais
+
+- Gere a **tabela de amortização** completa: para cada mês, juros, amortização e saldo devedor. A última parcela deve absorver a diferença de arredondamento para o saldo zerar exatamente.
+- Calcule o **CET** (Custo Efetivo Total) anual a partir da taxa mensal.
+
+<Dicas>
+<Dica nivel={1}>
+Para o sem juros: pense em **centavos inteiros**. R$ 100,00 são 10.000 centavos. Divida em 3 com divisão inteira e resto (`/` e `%` em `long`). Aí fica claro quantos centavos sobram e para onde vão.
+</Dica>
+<Dica nivel={2}>
+Para converter `BigDecimal` em centavos: `total.setScale(2, RoundingMode.HALF_EVEN).movePointRight(2).longValueExact()`. De volta: `BigDecimal.valueOf(centavos, 2)` cria o valor com 2 casas.
+
+Para a Price, multiplique numerador e denominador por `(1+i)^n` e a fórmula vira `PV × i × (1+i)^n / ((1+i)^n − 1)` — agora só com expoente positivo.
+</Dica>
+<Dica nivel={3}>
+Use `MathContext.DECIMAL64` (16 dígitos de precisão) nas contas intermediárias e só arredonde para 2 casas **no final**: `numerador.divide(denominador, 2, RoundingMode.HALF_EVEN)`. Arredondar no meio do caminho introduz erro que se propaga.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m01-java-essencial/solucao/src/main/java/dev/trilhajava/m01/Parcelamento.java" />
+
+### Por que assim
+
+- **Centavos como `long` no sem juros.** Com inteiros, a conta de "quanto sobra" é exata e óbvia: `base = centavos / n` e `sobra = centavos % n`. A primeira parcela recebe `base + sobra`. Como `sobra < n`, nunca passa de alguns centavos.
+- **`longValueExact()`** lança exceção se houver parte fracionária ou estouro, em vez de truncar em silêncio. É um "cinto de segurança".
+- **Fórmula reescrita.** `PV·i/(1−(1+i)^−n)` é matematicamente igual a `PV·i·(1+i)^n/((1+i)^n − 1)`. A segunda só usa `pow` com expoente positivo, que o `BigDecimal` suporta.
+- **Precisão intermediária alta, arredondamento só no fim.** `DECIMAL64` mantém 16 dígitos significativos durante a conta; o `divide(..., 2, HALF_EVEN)` final produz o valor exibido.
+- **Validação única.** `validar(total, parcelas)` é chamada pelos dois métodos públicos.
+
+### Alternativas e trade-offs
+
+- **Sobra na última parcela** também é comum (e alguns bancos fazem assim). O importante é ser **consistente e documentado** — por isso o teste fixa a regra.
+- **Distribuir 1 centavo por parcela** (as primeiras `sobra` parcelas recebem +0,01) gera parcelas mais parecidas entre si. É o que o `Dinheiro.ratear` do módulo 02 faz. Compare as duas abordagens.
+- **`double` com arredondamento final** "funciona" em muitos casos e falha em outros — exatamente o tipo de bug que só aparece em produção. Não vale o risco.
+
+### Avalie sua solução
+
+- Rode o teste `somaSempreFecha`: ele passa para 1 a 24 parcelas?
+- Existe algum `double` no caminho do dinheiro? Mesmo como variável temporária?
+- Você arredondou a cada passo da fórmula da Price? Compare com a solução: o resultado pode divergir em 1 centavo em alguns casos.
+
+</Solucao>

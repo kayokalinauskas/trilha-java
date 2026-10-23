@@ -1,0 +1,17 @@
+{
+  "specversion": "1.0",
+  "id": "c4e8f0d2-1a3b-4f5c-8d9e-0b1a2c3d4e02",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-09-10T15:00:00Z",
+  "subject": "PED-200",
+  "datacontenttype": "application/json",
+  "dataschema": "https://esquemas.loja.com.br/pedidos/pedido-confirmado/v2.json",
+  "data": {
+    "pedidoId": "PED-200",
+    "clienteId": "CLI-42",
+    "valorTotal": { "quantia": "249.90", "moeda": "BRL" },
+    "cepDeEntrega": "30130-010",
+    "formaDePagamento": "PIX"
+  }
+}

@@ -1,0 +1,191 @@
+---
+titulo: "O processo seletivo, etapa por etapa"
+descricao: As etapas típicas de um processo para backend Java Jr e Pleno no Brasil (triagem, conversa com RH, teste online, desafio para casa, live coding, entrevista técnica, comportamental e proposta), o que cada uma avalia, como se preparar para cada uma e como organizar a busca como um funil, com volume, registro e aprendizado com as recusas.
+modulo: 17-carreira
+ordem: 3
+duracao: 55
+objetivos:
+  - Reconhecer as etapas de um processo seletivo e o que cada uma realmente avalia
+  - Preparar-se para live coding pensando em voz alta e para desafios para casa entregues como trabalho profissional
+  - Estruturar respostas comportamentais com o método STAR e um banco de histórias
+  - Organizar a busca por vaga como um funil, com registro, cadência e revisão
+tags: [carreira, entrevista, processo seletivo, live coding, take-home, STAR, comportamental]
+flashcards:
+  - frente: O que o live coding avalia além de acertar o problema?
+    verso: Como você pensa - se esclarece requisitos, fala o plano antes de codar, começa simples, testa com exemplos, reage a dicas e comunica o que está fazendo. Um código incompleto com raciocínio claro costuma valer mais do que uma solução certa em silêncio.
+  - frente: O que é o método STAR?
+    verso: Estrutura para respostas comportamentais - Situação (contexto curto), Tarefa (o seu papel ou objetivo), Ação (o que VOCÊ fez, a parte maior) e Resultado (o que mudou, com número se possível, e o que aprendeu).
+  - frente: Como entregar um desafio para casa como trabalho profissional?
+    verso: Cumprir os requisitos antes dos extras, README com como rodar e as decisões, testes das regras de negócio, commits com histórico, sem segredos, e uma seção de "o que eu faria com mais tempo". Respeitar o prazo e o escopo pedido.
+  - frente: Por que manter um banco de histórias antes das entrevistas?
+    verso: As perguntas comportamentais se repetem (conflito, erro, prazo, aprender algo rápido, orgulho). Com 5 a 8 histórias preparadas em STAR, você adapta uma delas a cada pergunta em vez de improvisar sob pressão.
+  - frente: Como tratar a busca de vagas como um funil?
+    verso: Registrar cada candidatura (empresa, vaga, data, etapa, resultado, aprendizado), manter uma cadência semanal, medir onde você cai mais (triagem, teste técnico, entrevista) e atacar essa etapa. Recusa é dado, não veredito.
+---
+
+Um processo seletivo parece uma sequência de provas independentes, mas cada etapa responde a uma pergunta diferente sobre você. Saber qual é a pergunta muda como você se prepara.
+
+<Figura legenda="Um processo típico para backend Jr/Pleno: cada etapa avalia uma coisa diferente, e nem toda empresa usa todas">
+<svg viewBox="0 0 680 250" width="680" role="img" aria-label="Etapas: triagem, conversa com RH, avaliação técnica (teste online, desafio para casa ou live coding), entrevista técnica, entrevista comportamental ou com gestor, e proposta">
+  <defs><marker id="m1731" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="30" width="100" height="70" rx="8" class="d-box"/><text x="60" y="60" text-anchor="middle" class="d-title">Triagem</text><text x="60" y="80" text-anchor="middle" class="d-label">ATS + RH</text>
+  <rect x="124" y="30" width="100" height="70" rx="8" class="d-box"/><text x="174" y="60" text-anchor="middle" class="d-title">Conversa</text><text x="174" y="80" text-anchor="middle" class="d-label">com RH</text>
+  <rect x="238" y="30" width="100" height="70" rx="8" class="d-violet"/><text x="288" y="60" text-anchor="middle" class="d-title">Técnica 1</text><text x="288" y="80" text-anchor="middle" class="d-label">teste ou desafio</text>
+  <rect x="352" y="30" width="100" height="70" rx="8" class="d-violet"/><text x="402" y="60" text-anchor="middle" class="d-title">Técnica 2</text><text x="402" y="80" text-anchor="middle" class="d-label">com o time</text>
+  <rect x="466" y="30" width="100" height="70" rx="8" class="d-info"/><text x="516" y="60" text-anchor="middle" class="d-title">Gestor</text><text x="516" y="80" text-anchor="middle" class="d-label">e cultura</text>
+  <rect x="580" y="30" width="90" height="70" rx="8" class="d-ok"/><text x="625" y="60" text-anchor="middle" class="d-title">Proposta</text><text x="625" y="80" text-anchor="middle" class="d-label">e negociação</text>
+  <path d="M110 65 H120" class="d-line" marker-end="url(#m1731)"/>
+  <path d="M224 65 H234" class="d-line" marker-end="url(#m1731)"/>
+  <path d="M338 65 H348" class="d-line" marker-end="url(#m1731)"/>
+  <path d="M452 65 H462" class="d-line" marker-end="url(#m1731)"/>
+  <path d="M566 65 H576" class="d-line" marker-end="url(#m1731)"/>
+  <text x="60" y="130" text-anchor="middle" class="d-label">bate com</text><text x="60" y="148" text-anchor="middle" class="d-label">a vaga?</text>
+  <text x="174" y="130" text-anchor="middle" class="d-label">motivação,</text><text x="174" y="148" text-anchor="middle" class="d-label">logística</text>
+  <text x="288" y="130" text-anchor="middle" class="d-label">sabe</text><text x="288" y="148" text-anchor="middle" class="d-label">programar?</text>
+  <text x="402" y="130" text-anchor="middle" class="d-label">entende o</text><text x="402" y="148" text-anchor="middle" class="d-label">que fez?</text>
+  <text x="516" y="130" text-anchor="middle" class="d-label">trabalha bem</text><text x="516" y="148" text-anchor="middle" class="d-label">com a gente?</text>
+  <text x="625" y="130" text-anchor="middle" class="d-label">fecha as</text><text x="625" y="148" text-anchor="middle" class="d-label">condições?</text>
+  <rect x="10" y="180" width="660" height="56" rx="8" class="d-accent"/><text x="340" y="204" text-anchor="middle" class="d-label">Startups costumam ter 2 a 4 etapas; bancos e grandes empresas, 4 a 6.</text><text x="340" y="224" text-anchor="middle" class="d-label">Pergunte ao RH quais serão as etapas: é uma pergunta normal e ajuda você a se preparar.</text>
+</svg>
+</Figura>
+
+## Triagem e conversa com RH
+
+A triagem cruza o currículo e as respostas do formulário com os requisitos (aula anterior). Passando, vem uma conversa de 20 a 40 minutos com alguém de recrutamento. Ela avalia **motivação, comunicação e logística**, não Java. Prepare:
+
+- um **pitch de 60–90 segundos** sobre você ("Me fale sobre você"): de onde vem, o que construiu, o que busca, e por que esta vaga. Sem ler a vida inteira;
+- por que esta empresa: leia o site, o produto, notícias recentes. "Vi que vocês lançaram o Pix parcelado" mostra interesse real;
+- **logística**: modelo de trabalho, disponibilidade para começar, regime (CLT/PJ) e **pretensão** (aula 6 trata disso);
+- perguntas suas: etapas do processo, tamanho do time, stack, o que se espera de um Jr nos primeiros meses.
+
+## Avaliação técnica: os três formatos
+
+### Teste online
+
+Plataformas como HackerRank, Codility ou testes próprios: problemas de algoritmo com tempo, às vezes questões de múltipla escolha sobre Java e SQL. É a etapa em que o **módulo 5** paga o investimento. Preparação: resolva problemas com cronômetro, na linguagem do teste, e leia o enunciado inteiro antes de codar, incluindo os limites de entrada (eles dizem qual complexidade é aceitável). Garanta os casos simples antes de otimizar: pontuação parcial conta.
+
+### Desafio para casa (take-home)
+
+Uma API pequena, com prazo de alguns dias. Ela avalia o que o dia a dia exige: organização, testes, clareza. Trate como **trabalho profissional**:
+
+1. **Leia duas vezes** e liste os requisitos; tire dúvidas por e-mail (é bem-visto) ou registre as suposições no README.
+2. **Requisitos antes de extras.** Um Kafka que ninguém pediu não compensa uma regra de negócio faltando.
+3. **Testes das regras** que importam (o que acontece com saldo insuficiente? com a mesma requisição duas vezes?).
+4. **README**: como rodar (de preferência `docker compose up`), decisões, suposições, o que faria com mais tempo.
+5. **Histórico de commits** real, sem segredos, sem arquivos de IDE, sem `target/`.
+6. **Respeite o escopo de tempo.** Se disseram "cerca de 4 horas", entregar algo que claramente levou 40 cria uma expectativa estranha. Melhor: entregar bem o essencial e listar o resto.
+
+Se o desafio pedir **muitos dias** de trabalho sem pagamento, você pode perguntar se há uma versão reduzida. Nem sempre há, mas a pergunta é legítima.
+
+### Live coding
+
+Você resolve um problema com alguém assistindo, numa IDE online ou compartilhando a tela. Pode ser um algoritmo ou uma tarefa "de backend" (um endpoint com validação, uma refatoração). O que se avalia é o **raciocínio**, e o erro mais comum é o silêncio.
+
+Um roteiro que funciona:
+
+1. **Repita o problema** com suas palavras e pergunte o que não está claro (entrada vazia? números negativos? tamanho da entrada?).
+2. **Dê um exemplo** pequeno e resolva à mão.
+3. **Fale o plano** antes de codar, inclusive a solução ingênua: "dá para fazer em O(n²) com dois laços; acho que um `HashMap` leva a O(n)".
+4. **Codifique falando**: nomes claros, funções pequenas.
+5. **Teste** com o exemplo e com um caso de borda; ache você mesmo os bugs.
+6. **Discuta** complexidade e o que melhoraria.
+
+Travou? Diga o que está pensando: "estou em dúvida entre ordenar primeiro ou usar um mapa". Entrevistadores dão dicas, e **usar bem uma dica** é um ponto positivo, não negativo.
+
+<Callout tipo="atencao" titulo="IA durante a avaliação">
+Se a etapa proíbe assistentes de código ou IA, respeite. Usar escondido é desonestidade, costuma ser percebido (pelas ferramentas ou quando pedem para você explicar o código) e encerra o processo. Se o desafio para casa permite, diga no README como você usou. O m16 discute isso em detalhe.
+</Callout>
+
+## Entrevista técnica com o time
+
+Uma conversa com devs, tech lead ou arquiteto. Os temas vêm do seu currículo, do desafio que você entregou e da stack da empresa: "por que você usou lock otimista aqui?", "como esse endpoint se comporta com mil requisições por segundo?", "o que é uma transação?". O banco de perguntas do **simulador de entrevista** da trilha cobre boa parte desses temas, com resposta-modelo.
+
+Três hábitos que fazem diferença:
+
+- **Estruture a resposta**: definição curta, exemplo, trade-off. "Lock otimista é... eu usaria quando... o custo é...".
+- **Diga "não sei"** quando não sabe, e mostre como descobriria. Inventar é pior do que não saber, e entrevistadores percebem.
+- **Leve a conversa para o que você fez**: "no meu projeto tive um N+1 exatamente assim; resolvi com `JOIN FETCH`".
+
+Para Pleno, é comum uma etapa de **system design** (m15): desenhar um sistema em 45 minutos, com requisitos, estimativas, componentes e trade-offs.
+
+## Entrevista comportamental
+
+Pode ser com a gestão, com o RH ou misturada à técnica. As perguntas começam com "me conte uma vez em que...": um conflito, um erro, um prazo impossível, algo que você aprendeu rápido, um projeto de que se orgulha. O que se avalia é como você age em situações reais, e a melhor evidência é uma **história real bem contada**.
+
+O método **STAR** dá a estrutura:
+
+| Parte | O que dizer | Peso |
+|---|---|---|
+| **S**ituação | Contexto em uma ou duas frases | pequeno |
+| **T**arefa | O seu papel e o objetivo | pequeno |
+| **A**ção | O que **você** fez, passo a passo, e por quê | grande |
+| **R**esultado | O que mudou (com número, se houver) e o que aprendeu | médio |
+
+Os erros típicos são falar no plural o tempo todo ("nós fizemos": o que **você** fez?), gastar três minutos no contexto e esquecer o resultado.
+
+Monte um **banco de 5 a 8 histórias** antes de começar a buscar vagas. Elas podem vir de projetos, do trabalho anterior (mesmo fora de TI), da faculdade ou de trabalho voluntário. Cada história serve para várias perguntas: um bug difícil do Fintech Core serve para "um problema técnico difícil", "um erro seu" e "algo que você aprendeu".
+
+<Callout tipo="dica" titulo="Não tenho experiência de trabalho em TI">
+Use o que você tem, mas com a mesma estrutura: o bug de concorrência que levou dois dias no projeto, o grupo de estudos que você organizou, o processo que você automatizou no emprego anterior com uma planilha. Entrevistadores de Jr sabem que a experiência é pequena; o que eles avaliam é **como** você pensa e age.
+</Callout>
+
+## Proposta
+
+Se deu certo, a proposta chega por telefone ou e-mail. Agradeça, peça **por escrito** e com todos os itens (salário, regime, benefícios, bônus, modelo de trabalho, data de início), e não aceite nem recuse na hora. A aula 5 compara regimes e a aula 6 trata de negociação.
+
+## A busca como funil
+
+Procurar a primeira vaga é um processo com muitas recusas, inclusive para quem é bom. Trate como um funil que você mede:
+
+- **Registre** cada candidatura numa planilha: empresa, vaga, data, origem (site, indicação, LinkedIn), etapa alcançada, resultado e o que aprendeu.
+- **Mantenha uma cadência** (por exemplo, 5 a 10 candidaturas bem ajustadas por semana, mais estudo e projeto), em vez de rajadas de 100 envios seguidas de semanas paradas.
+- **Olhe onde você cai**. Nenhuma resposta? O problema é currículo ou alvo (aula 2). Cai no teste técnico? Mais prática do m05 com cronômetro. Cai na entrevista técnica? Treine explicar em voz alta, com o simulador.
+- **Peça feedback** depois de uma recusa em etapa avançada. Muitas empresas não dão, mas as que dão entregam ouro.
+
+Recusa não é veredito sobre você. É um dado sobre a etapa, a vaga ou o momento.
+
+<Quiz
+  id="17-processo-seletivo"
+  questoes={[
+    {
+      pergunta: 'No live coding, você não sabe a solução ótima. O que fazer?',
+      opcoes: ['Ficar em silêncio até pensar na ótima', 'Explicar a solução ingênua e a complexidade dela, implementá-la e então discutir como melhorar', 'Dizer que não sabe e encerrar', 'Pedir para trocar de problema'],
+      correta: 1,
+      explicacao: 'Uma solução correta e simples, bem comunicada, é um bom ponto de partida e mostra raciocínio. A otimização vem depois, muitas vezes com uma dica do entrevistador.',
+    },
+    {
+      pergunta: 'Numa resposta STAR, qual parte deve ser a maior?',
+      opcoes: ['Situação', 'Tarefa', 'Ação', 'Resultado'],
+      correta: 2,
+      explicacao: 'A Ação é o que você fez e por quê: é onde está a evidência. Contexto longo e ação curta é o erro mais comum.',
+    },
+    {
+      pergunta: 'O desafio para casa pede uma API de pedidos com três regras. Com o tempo que sobrou, o que mais agrega?',
+      opcoes: ['Adicionar Kafka e Kubernetes', 'Testes das três regras, README com como rodar e as decisões, e uma lista do que faria com mais tempo', 'Um front-end em React', 'Mais endpoints que ninguém pediu'],
+      correta: 1,
+      explicacao: 'Requisitos bem feitos, verificados e explicados valem mais do que extras. A lista do que faria depois mostra senso de prioridade.',
+    },
+    {
+      pergunta: 'Você mandou 40 currículos e não recebeu nenhuma resposta. Onde está o problema mais provável?',
+      opcoes: ['Na entrevista técnica', 'No currículo, no perfil ou no alvo das vagas (triagem)', 'Na negociação', 'No live coding'],
+      correta: 1,
+      explicacao: 'Sem nenhuma resposta, você está caindo antes de falar com alguém: revise o currículo (formato, termos, bullets), o LinkedIn e se as vagas batem com o seu nível.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Cada etapa responde uma pergunta: triagem (bate com a vaga?), RH (motivação e logística), técnica (sabe programar? entende o que fez?), gestor (trabalha bem aqui?), proposta.
+- **Teste online**: m05 com cronômetro, enunciado inteiro, casos simples antes de otimizar.
+- **Desafio para casa**: requisitos antes de extras, testes, README, histórico limpo, escopo respeitado.
+- **Live coding**: esclarecer, exemplo, plano em voz alta, codar falando, testar, discutir.
+- **Comportamental**: STAR com Ação maior, e um banco de 5 a 8 histórias preparadas.
+- A busca é um **funil**: registre, mantenha a cadência, descubra onde você cai e trabalhe nessa etapa.
+
+## Referências
+
+- Gayle Laakmann McDowell — *Cracking the Coding Interview* (capítulos sobre o processo e comportamental)
+- Tech Interview Handbook (techinterviewhandbook.org) — guias de coding interview e behavioral
+- Amazon — *Leadership Principles* (exemplo público de critérios comportamentais)
+- Simulador de entrevista desta trilha (perguntas por tema e nível)

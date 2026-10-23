@@ -1,0 +1,850 @@
+---
+titulo: Padrões de projeto que realmente aparecem no backend
+descricao: "Strategy, Factory, Builder, Adapter, Decorator, Chain of Responsibility, State, Template Method e Observer num checkout de pagamentos com Java 25 e Spring: a forma moderna de cada um (sealed, records, switch com pattern matching, lambdas), onde o Spring já aplica o padrão por você, os anti-padrões mais caros e como escolher pelo problema, e não pelo catálogo."
+modulo: 13-arquitetura
+ordem: 2
+duracao: 110
+objetivos:
+  - Identificar, num trecho de código, o problema recorrente que pede Strategy, Factory, Builder, Adapter, Decorator, Chain of Responsibility, State, Template Method ou Observer
+  - Implementar cada um desses padrões com Java 25 (interfaces seladas, records, switch com pattern matching e lambdas) e rodar o exemplo com o Maven
+  - Empilhar decorators na ordem correta e justificar a ordem pelo que cada camada observa
+  - Reconhecer o padrão por trás de proxies, eventos, filtros e templates do Spring e prever o efeito da chamada interna num bean com proxy
+  - Diagnosticar NoUniqueBeanDefinitionException, referência circular entre decorators e switch não exaustivo a partir da mensagem de erro
+  - Recusar um padrão quando ele é abstração sem segundo caso de uso, Singleton estático ou God object disfarçado
+tags: [padrões de projeto, GoF, Strategy, Decorator, Adapter, Observer, State, Chain of Responsibility, Builder, Template Method, sealed, Spring AOP]
+flashcards:
+  - frente: Strategy com switch sobre sealed ou com interface e beans?
+    verso: "Conjunto fechado de variações que você controla (meios de pagamento): switch sobre tipo selado; o compilador acusa o caso esquecido. Conjunto aberto, que cresce por plugins ou módulos: interface com uma implementação por bean e List<Interface> injetada."
+  - frente: Qual a diferença entre Adapter e Decorator?
+    verso: "Adapter MUDA a interface: traduz o SDK de um fornecedor para a interface do seu domínio. Decorator MANTÉM a interface: envolve um objeto do mesmo tipo e acrescenta comportamento (retry, registro, cache)."
+  - frente: Por que a ordem dos decorators importa?
+    verso: "Cada camada só vê o que passa por ela. Registro por fora da retentativa registra uma cobrança; por dentro, registra cada tentativa. Retry por fora de um circuit breaker repete chamadas que o disjuntor recusaria."
+  - frente: Por que @Cacheable ou @Transactional não funciona numa chamada this.metodo()?
+    verso: "O comportamento está num proxy (um decorator gerado pelo Spring) que envolve o bean. Uma chamada interna usa this, o objeto original, e não passa pelo proxy. Solução preferida: mover o método para outro bean."
+  - frente: State com tipos selados
+    verso: "Cada estado é um record com os dados que só existem nele (o código de autorização só existe depois de autorizar). Cada transição é um switch sem default que devolve um novo estado ou lança TransicaoInvalidaException."
+  - frente: Chain of Responsibility no backend moderno
+    verso: "Uma lista ordenada de handlers avaliada até o primeiro que decide (antifraude, validações). Os filtros do Servlet e o SecurityFilterChain do Spring Security são a variante em que cada elo chama o próximo e pode agir antes e depois."
+  - frente: Observer no Spring
+    verso: "publishEvent(evento) e métodos @EventListener. Por padrão é síncrono, na mesma thread e na mesma transação: uma exceção no ouvinte volta para quem publicou. @TransactionalEventListener roda depois do commit."
+  - frente: Quando NÃO criar uma abstração?
+    verso: "Quando só existe um caso de uso real. Espere o segundo (ou o terceiro) para saber o que de fato varia. Uma interface com uma implementação só é custo: indireção, mais arquivos e uma aposta que costuma errar o eixo da variação."
+---
+
+O arquivo `CheckoutService.java` tinha 1.400 linhas quando você entrou no time. O método `pagar` começava com um `if` para Pix, outro para cartão e outro para boleto; cada ramo montava um mapa para o SDK do fornecedor, convertia reais em centavos de um jeito ligeiramente diferente, tinha o próprio `for` de retentativa copiado e colado (um com `Thread.sleep(500)`, outro sem espera nenhuma) e terminava chamando, em sequência, o emissor de nota fiscal, o programa de fidelidade e o e-mail. Na semana passada, o time precisou trocar o fornecedor do cartão. A mudança tocou 23 lugares, e um deles, esquecido, mandava o valor em reais onde o novo SDK esperava centavos: um pedido de R$ 189,90 foi cobrado como R$ 1,89.
+
+Nenhum desses problemas é novo. Converter a interface de um fornecedor, repetir uma chamada que falhou, escolher um comportamento conforme o tipo, avisar vários interessados sem que quem avisa os conheça: são **problemas recorrentes**, e soluções testadas para eles têm nome desde 1994, quando Gamma, Helm, Johnson e Vlissides (a "Gangue dos Quatro", ou **GoF**) publicaram *Design Patterns*. O livro tem 23 padrões e foi escrito para C++ e Smalltalk. Parte deles resolvia limitações dessas linguagens e virou uma linha de Java moderno; parte continua essencial, e o Spring está cheio deles.
+
+Nesta aula você vai reconstruir esse checkout com nove padrões: **Strategy, Factory, Builder, Adapter, Decorator, Chain of Responsibility, State, Template Method e Observer**, escritos com Java 25 (interfaces seladas, records, `switch` com pattern matching e lambdas). Para cada um, vai ver o problema que ele resolve, o código rodando, onde o Spring já aplica o mesmo padrão por você e, tão importante quanto, quando **não** usá-lo.
+
+## A intuição: as técnicas de uma cozinha profissional
+
+Numa cozinha profissional, ninguém diz "corte a cenoura em cubinhos bem pequenos, todos do mesmo tamanho, uns dois ou três milímetros". Diz-se **brunoise**. Ninguém explica "deixe tudo picado, medido e separado em potes antes de ligar o fogo": diz-se **mise en place**. Cada nome carrega uma técnica inteira, com o porquê e os limites dela: brunoise cozinha por igual, mas leva tempo e não serve para um ensopado de seis horas.
+
+Padrões de projeto são esse vocabulário para o código. Quando alguém na revisão escreve "isso aqui é um decorator do gateway", todo o time entende a estrutura (mesma interface, um objeto envolvendo outro), o objetivo (acrescentar comportamento sem mexer no original) e o risco (a ordem das camadas importa). Um nome substitui dez minutos de explicação.
+
+A analogia também mostra o mau uso. Um cozinheiro que acabou de aprender brunoise quer cortar tudo em brunoise, inclusive as batatas do purê. Um desenvolvedor que acabou de ler o livro quer pôr Strategy, Factory e Visitor em um CRUD de três telas. **A técnica é escolhida pelo prato, e não o contrário.** Padrão é resposta; se você não tem a pergunta, ele é só peso.
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Padrão de projeto** | Uma solução nomeada para um problema recorrente de design, com consequências conhecidas. Não é código pronto: é uma forma de organizar classes e responsabilidades |
+| **GoF** | *Gang of Four*, os quatro autores do livro de 1994. Dividem os padrões em **criacionais** (como criar objetos), **estruturais** (como compor objetos) e **comportamentais** (como distribuir responsabilidades) |
+| **Composição** | Um objeto usa outro que recebeu, em vez de herdar dele. A maioria dos padrões úteis no backend é composição; o próprio livro recomenda preferi-la à herança |
+| **Interface funcional** | Interface com um único método abstrato. Pode ser implementada por uma lambda, o que torna muitos padrões uma linha |
+| **Interface selada** (`sealed`) | Interface que declara quais tipos podem implementá-la. O compilador conhece todos os casos (Java 17) |
+| **Record** | Classe imutável de dados com construtor, `equals`, `hashCode` e `toString` gerados (Java 16) |
+| **Pattern matching no `switch`** | `case Pix p ->` testa o tipo e já declara a variável; com tipo selado, o `switch` sem `default` precisa ser **exaustivo** (Java 21). Record patterns desmontam o record: `case Cartao(_, int parcelas)` |
+| **Proxy** | Objeto que fica no lugar de outro, com a mesma interface, e controla o acesso a ele. O Spring cria proxies para aplicar `@Transactional`, `@Cacheable` e afins |
+| **AOP** | Programação orientada a aspectos: aplicar um comportamento transversal (transação, cache, segurança) a muitos métodos sem escrevê-lo em cada um. No Spring, implementada com proxies |
+| **Idempotência** | Repetir a operação produz o mesmo efeito que fazê-la uma vez. Uma cobrança idempotente pode ser repetida sem cobrar duas vezes |
+
+E os nove padrões desta aula, num quadro que vale guardar:
+
+| Padrão | Problema que resolve | Forma moderna | Onde o Spring já usa |
+|---|---|---|---|
+| **Strategy** | Um comportamento que varia por tipo ou configuração | `switch` sobre `sealed`, ou interface com beans e `List<Interface>` | `PasswordEncoder`, `HandlerMethodArgumentResolver`, `CacheManager` |
+| **Factory** | Esconder qual objeto é criado e como | método de fábrica estático com nome; `@Bean` | `BeanFactory`, `FactoryBean`, `@Bean` |
+| **Builder** | Objetos com muitos parâmetros, vários opcionais | builder com os obrigatórios no construtor; record para o resultado | `RestClient.builder()`, `UriComponentsBuilder`, `MockMvc` |
+| **Adapter** | Uma interface externa diferente da que o seu código espera | classe que implementa a sua interface e chama a externa | `HandlerAdapter` no `DispatcherServlet`, adaptadores de mensageria |
+| **Decorator** | Acrescentar comportamento sem mexer no original | classe com a mesma interface que envolve outra | proxies de `@Transactional`, `@Cacheable`, `@Retryable` |
+| **Chain of Responsibility** | Vários tratadores, cada um pode decidir ou passar adiante | lista ordenada avaliada até o primeiro que decide | filtros do Servlet, `SecurityFilterChain`, `HandlerInterceptor` |
+| **State** | Comportamento que depende do estado e transições que precisam ser válidas | um record por estado e transições com `switch` exaustivo | `StateMachine` do Spring Statemachine (projeto à parte) |
+| **Template Method** | Um esqueleto fixo com um passo que varia | classe que recebe o passo como lambda | `JdbcTemplate`, `TransactionTemplate`, `RestClient` |
+| **Observer** | Avisar interessados sem conhecê-los | eventos de domínio como records | `ApplicationEventPublisher`, `@EventListener` |
+
+## O código que vamos construir
+
+Todo o código desta aula está no projeto Maven da trilha, em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.padroes`, e roda no CI. O domínio é o checkout de uma loja online, com outros nomes e um fornecedor de pagamentos fictício, a **PagaFácil**. A tabela mostra cada arquivo e o padrão que ele representa:
+
+| Arquivo | Padrão | Papel |
+|---|---|---|
+| `MeioDePagamento`, `ResultadoDaCobranca` | tipos selados | Pix, Cartão, Boleto; Aprovada ou Recusada |
+| `Tarifas` | Strategy (com `switch`) | a taxa de cada meio de pagamento |
+| `SolicitacaoDeCobranca` | Builder e Factory | o que o gateway precisa para cobrar |
+| `GatewayDePagamento` | a interface do domínio | o que o checkout conhece |
+| `fornecedor.*` | o "SDK" de terceiros | centavos, status em texto, exceção própria |
+| `AdaptadorPagaFacil` | Adapter | traduz o domínio para o SDK e de volta |
+| `GatewayComRetentativa`, `GatewayComRegistro` | Decorator | repetir falhas temporárias, registrar chamadas |
+| `RegraAntifraude`, `AnaliseAntifraude` | Chain of Responsibility | regras avaliadas em ordem até a primeira recusa |
+| `EstadoDaCobranca` | State | Pendente, Autorizada, Capturada, Estornada, Recusada |
+| `LeitorDeRetorno` | Template Method | lê o arquivo de retorno do fornecedor |
+| `PagamentoAprovado`, `EmissorDeNotaFiscal`, `ProgramaDeFidelidade` | Observer | o evento e dois ouvintes |
+| `ServicoDeCheckout`, `ConfiguracaoDePagamentos` | a montagem | o Spring juntando tudo |
+| `TabelaDeTaxas` | o decorator do Spring | `@Cacheable` e a chamada interna |
+
+O coração do desenho é a pilha de objetos que atende uma cobrança. O checkout recebe **um** `GatewayDePagamento`; ele não sabe que, por trás dessa interface, há três camadas:
+
+<Figura legenda="A pilha do gateway: dois decorators e um adaptador, todos com a mesma interface GatewayDePagamento. O checkout conhece só a camada de fora; só a de dentro conhece o fornecedor">
+<svg viewBox="0 0 760 380" width="760" role="img" aria-labelledby="pilha-titulo pilha-desc">
+  <title id="pilha-titulo">Pilha de decorators e adaptador do gateway de pagamento</title>
+  <desc id="pilha-desc">O ServicoDeCheckout chama cobrar com a solicitação. A chamada entra no GatewayComRegistro, que registra a chamada e o desfecho. Dentro dele está o GatewayComRetentativa, que repete até três vezes quando vem uma FalhaTemporariaException. Dentro dele está o AdaptadorPagaFacil, que converte reais em centavos, Pix no texto PIX, DECLINED em Recusada e o erro 503 em FalhaTemporariaException. O adaptador chama createTransaction no SDK da PagaFácil, que fica fora da pilha.</desc>
+  <defs><marker id="mk-pilha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="200" y="10" width="300" height="44" rx="10" class="d-box"/>
+  <text x="350" y="38" text-anchor="middle" class="d-mono">ServicoDeCheckout</text>
+  <path d="M350 54 L350 88" class="d-line" marker-end="url(#mk-pilha)"/>
+  <text x="360" y="76" class="d-label">cobrar(solicitação)</text>
+  <rect x="20" y="90" width="510" height="275" rx="12" class="d-info"/>
+  <text x="40" y="116" class="d-title">GatewayComRegistro</text>
+  <text x="40" y="137" class="d-label">registra a chamada e o desfecho</text>
+  <rect x="45" y="150" width="460" height="200" rx="12" class="d-violet"/>
+  <text x="65" y="176" class="d-title">GatewayComRetentativa</text>
+  <text x="65" y="197" class="d-label">repete até 3 vezes se vier FalhaTemporaria</text>
+  <rect x="70" y="212" width="410" height="124" rx="12" class="d-accent"/>
+  <text x="90" y="238" class="d-title">AdaptadorPagaFacil</text>
+  <text x="90" y="262" class="d-label">reais → centavos, Pix → "PIX"</text>
+  <text x="90" y="284" class="d-label">"DECLINED" → Recusada</text>
+  <text x="90" y="306" class="d-label">503 → FalhaTemporariaException</text>
+  <path d="M480 274 L558 274" class="d-line" marker-end="url(#mk-pilha)"/>
+  <rect x="560" y="232" width="190" height="84" rx="10" class="d-box"/>
+  <text x="655" y="263" text-anchor="middle" class="d-title">SDK PagaFácil</text>
+  <text x="655" y="290" text-anchor="middle" class="d-mono">createTransaction</text>
+</svg>
+</Figura>
+
+Três decisões tornam esse desenho possível, e elas valem para qualquer padrão desta aula:
+
+- **O domínio define as próprias interfaces.** `GatewayDePagamento` fala em `SolicitacaoDeCobranca` e `ResultadoDaCobranca`, nunca em centavos ou em `"APPROVED"`. É a inversão de dependência da [aula anterior](../01-solid-sem-dogma/).
+- **Tudo chega pelo construtor.** Cada camada recebe a de dentro; nenhuma faz `new` da outra. Por isso dá para montar a pilha em qualquer ordem, num teste ou na configuração do Spring.
+- **Os dados são imutáveis.** Solicitação, resultado, estado e evento são records. Ninguém altera um objeto que outra camada ainda está usando.
+
+## Mão na massa
+
+Os passos 1 a 7 rodam sem Spring, com uma classe de demonstração que executa uma parte de cada vez. Compile o módulo uma vez:
+
+```bash
+cd java/m13-arquitetura/aulas
+mvn -q compile
+```
+
+Sem `-q`, o Maven termina com `BUILD SUCCESS`; com `-q`, uma compilação bem-sucedida não imprime nada. Depois, cada passo roda com:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes <parte>
+```
+
+A demonstração inteira, para você consultar quando quiser:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/DemonstracaoDosPadroes.java" semImports />
+
+### Passo 1: Strategy com um tipo selado
+
+**O que vamos fazer e por quê.** Cada meio de pagamento tem uma taxa diferente: Pix cobra 0,99% do valor; cartão à vista, 2,49%; cada parcela extra acrescenta 1,5 ponto percentual; boleto custa R$ 3,49 fixos. No código legado, isso era um `if (tipo.equals("PIX"))` repetido em cinco lugares. É o problema clássico do **Strategy**: uma família de algoritmos intercambiáveis, escolhidos conforme o caso.
+
+No livro, a solução é uma interface `CalculoDeTaxa` com uma classe por meio de pagamento. Em Java moderno, quando o conjunto de casos é **fechado e seu**, há uma forma mais direta. Primeiro, os tipos:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/MeioDePagamento.java" />
+
+A palavra `sealed` diz ao compilador que só esses três records implementam `MeioDePagamento` (records aninhados na própria interface dispensam a cláusula `permits`). Cada record carrega só os dados que fazem sentido para ele: Pix tem chave, cartão tem bandeira e parcelas, boleto tem vencimento. E o construtor compacto valida na entrada: não existe cartão com 13 parcelas em lugar nenhum do sistema.
+
+Agora a estratégia:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/Tarifas.java" semImports />
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes tarifas
+```
+
+Saída esperada:
+
+```text
+Pix[chave=loja@exemplo.com.br] -> taxa R$ 2.48
+Cartao[bandeira=VISA, parcelas=1] -> taxa R$ 6.22
+Cartao[bandeira=VISA, parcelas=6] -> taxa R$ 24.98
+Boleto[vencimento=2026-10-20] -> taxa R$ 3.49
+```
+
+**O que acabou de acontecer.**
+
+- `case Pix _ ->` testa o tipo e, como a variável não é usada, a descarta com `_` (variáveis sem nome, Java 22).
+- `case Cartao(_, int parcelas) when parcelas == 1` é um **record pattern** com **guarda**: desmonta o cartão, ignora a bandeira, extrai as parcelas e só casa se a condição for verdadeira. O `case` seguinte pega os cartões parcelados. A ordem importa: o compilador recusa um `case` que nunca poderia ser alcançado.
+- **Não há `default`.** Como `MeioDePagamento` é selado, o compilador sabe que três casos cobrem tudo. Se alguém acrescentar um quarto meio de pagamento, este método **deixa de compilar** até tratá-lo. Você verá essa mensagem em "Quando dá errado".
+- O arredondamento é `HALF_EVEN` (o "arredondamento bancário"): 2,475 vira 2,48 e 6,225 vira 6,22, porque o empate vai para o vizinho par. Ao longo de milhões de cobranças, isso evita o viés para cima de `HALF_UP`. Dinheiro é sempre `BigDecimal`, com a regra de arredondamento escrita no código.
+
+**Strategy por `switch` ou por interface?** Esta é a primeira decisão de design da aula, e vale entendê-la bem. Com o `switch` sobre tipo selado, é **fácil acrescentar uma operação** (uma nova função `prazoDeLiquidacao(meio)` é mais um `switch`, num arquivo só) e **trabalhoso acrescentar um tipo** (um meio novo obriga a mexer em todos os `switch`, mas o compilador lista cada um). Com uma interface e uma classe por meio, é o contrário: um tipo novo é uma classe nova, sem tocar no resto, mas uma operação nova obriga a mexer em todas as classes. Esse dilema tem nome, *expression problem*, e não tem solução universal. A regra prática:
+
+- Conjunto **fechado**, que você controla e que muda pouco (meios de pagamento, estados de um pedido, tipos de evento): `sealed` com `switch`. O compilador vira seu revisor.
+- Conjunto **aberto**, que cresce por fora (cada time adiciona uma regra, um plugin, uma integração): interface, uma implementação por bean e `List<Interface>` injetada. É o formato do [exercício 13.01](../../../exercicios/13-arquitetura/01-motor-de-frete/).
+
+O `switch` com pattern matching também aposenta o **Visitor**, o padrão do livro para "acrescentar operações a uma hierarquia sem mexer nela". O Visitor exige um método `aceitar(visitante)` em cada classe e um `visitarX` para cada tipo, só para simular o que hoje o `switch` exaustivo faz diretamente.
+
+### Passo 2: Builder e métodos de fábrica
+
+**O que vamos fazer e por quê.** Uma cobrança precisa de pedido, cliente, valor e meio de pagamento, e pode ter uma chave de idempotência, uma descrição, a opção de não notificar o cliente e metadados livres. Um construtor com oito parâmetros, metade `null`, é uma armadilha: `new SolicitacaoDeCobranca("PED-1", "cliente-42", valor, pix, null, "", true, Map.of())` não diz o que é cada argumento, e trocar dois `String` de lugar compila. É o problema do **Builder**.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/SolicitacaoDeCobranca.java" semImports />
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes builder
+```
+
+Saída esperada:
+
+```text
+SolicitacaoDeCobranca[pedidoId=PED-2001, clienteId=cliente-42, valor=189.90, meio=Pix[chave=loja@exemplo.com.br], chaveDeIdempotencia=cobranca-PED-2001, descricao=2 camisetas, notificarCliente=true, metadados={canal=app}]
+recusado pelo record: valor com mais de 2 casas decimais: 10.999
+```
+
+**O que acabou de acontecer.**
+
+- **Os obrigatórios vão no método de fábrica** `builder(pedidoId, clienteId, valor, meio)`, e não em setters do builder. Esquecer um deles é erro de compilação, e não uma exceção em produção. Os opcionais têm nome (`descricao(...)`, `semNotificarCliente()`), e cada linha se explica.
+- **O resultado é um record imutável.** O builder é mutável e descartável; a solicitação, não. O construtor compacto do record é o único lugar que valida, então nem o builder nem quem chamar o construtor diretamente consegue criar uma solicitação inválida. A segunda linha da saída mostra isso: `10.999` foi recusado pelo record.
+- **`Map.copyOf`** no construtor faz uma cópia imutável. Sem ela, quem montou o mapa poderia alterá-lo depois e mudar a solicitação "por fora".
+- **O valor padrão da chave de idempotência** é derivado do pedido: `cobranca-PED-2001`. Isso parece detalhe, mas é o que torna seguro o retry do passo 4. Guarde essa linha.
+
+O método `builder(...)` também é um exemplo do padrão **Factory** na forma que você mais vai usar: o **método de fábrica estático**. `List.of(...)`, `Optional.empty()`, `Duration.ofMinutes(5)` e `BigDecimal.valueOf(...)` são fábricas estáticas. Comparadas a um construtor, elas têm nome (que diz a intenção), podem devolver um subtipo ou um objeto em cache, e podem validar antes de criar. A classe `XyzFactory` do livro raramente é necessária: no Spring, a fábrica de objetos é o próprio contêiner (`BeanFactory`), e cada método `@Bean` é um método de fábrica. Quando você precisa **escolher a implementação em tempo de execução** por uma chave que vem de fora (o fornecedor configurado para o lojista, por exemplo), o Spring injeta um mapa indexado pelo nome do bean:
+
+```java
+// cada fornecedor é um bean GatewayDePagamento; a chave do mapa é o nome do bean
+GatewayDosLojistas(Map<String, GatewayDePagamento> porNome) { this.porNome = porNome; }
+
+GatewayDePagamento para(Lojista lojista) {
+    GatewayDePagamento gateway = porNome.get(lojista.fornecedor());
+    if (gateway == null) throw new IllegalStateException("fornecedor sem gateway: " + lojista.fornecedor());
+    return gateway;
+}
+```
+
+Esse mapa é uma fábrica (escolhe o objeto) que entrega estratégias (os gateways). Na prática, os padrões aparecem combinados, e é normal que um mesmo trecho seja descrito por dois nomes.
+
+### Passo 3: Adapter para o SDK do fornecedor
+
+**O que vamos fazer e por quê.** O SDK da PagaFácil tem o estilo dele: valores em centavos (`long`), método de pagamento como texto em inglês, status `"APPROVED"` ou `"DECLINED"` e uma exceção própria quando o serviço cai.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/fornecedor/PagaFacilClient.java" />
+
+Se o checkout chamasse esse SDK diretamente, centavos e `"DECLINED"` se espalhariam pelo sistema, exatamente como no legado do gancho. O **Adapter** é uma classe que implementa a interface que o seu código espera e, por dentro, chama a interface que o fornecedor oferece:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/AdaptadorPagaFacil.java" semImports />
+
+O pacote `fornecedor` também tem um `PagaFacilSandbox`, um "ambiente de testes" em memória: falha com 503 nas primeiras chamadas (quantas você pedir), recusa valores acima de R$ 10.000,00 e respeita a chave de idempotência, devolvendo a mesma resposta para a mesma chave, como fazem os provedores de pagamento reais.
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes adapter
+```
+
+Saída esperada:
+
+```text
+Aprovada[codigoDeAutorizacao=PF-0001]
+Recusada[motivo=amount_above_limit]
+Aprovada[codigoDeAutorizacao=PF-0001]
+```
+
+**O que acabou de acontecer.**
+
+- A primeira cobrança (R$ 199,90) foi aprovada; a segunda (R$ 12.000,00), recusada pelo limite do fornecedor, e o motivo chegou como `Recusada`, um tipo do **seu** domínio.
+- A terceira linha repete a cobrança do pedido `PED-3001`. A chave de idempotência é a mesma (`cobranca-PED-3001`), então o fornecedor devolveu **a mesma transação**, `PF-0001`, sem cobrar de novo.
+- `movePointRight(2).longValueExact()` converte R$ 199,90 em 19990 centavos sem passar por `double`, e `longValueExact` lança exceção se sobrar fração, em vez de truncar em silêncio. Esse é o tipo de bug do gancho (R$ 189,90 cobrado como R$ 1,89), e agora ele só pode existir em **um** arquivo.
+- O adaptador traduz também as **falhas**: `PagaFacilIndisponivelException` vira `FalhaTemporariaException`, uma exceção do domínio. O resto do sistema decide o que fazer com falhas temporárias sem saber de que fornecedor elas vieram.
+- O `default` no `switch` sobre `resposta.status()` é proposital: o status é um `String` de terceiros, não um tipo selado, e um status desconhecido deve falhar alto, com a mensagem dizendo qual veio.
+
+Trocar de fornecedor, agora, é escrever outro adaptador (`AdaptadorPagaRapido implements GatewayDePagamento`) e mudar uma linha da configuração. O checkout, os decorators e os testes de regra de negócio não mudam. Na [arquitetura hexagonal](../03-hexagonal/), este é o papel de todo adaptador de saída: a interface do domínio é a **porta**, e a tradução para o mundo externo é o **adaptador**. O próprio Spring MVC usa o padrão por dentro: o `DispatcherServlet` não sabe chamar um método anotado com `@GetMapping`; quem sabe é um `HandlerAdapter`, que adapta "um método qualquer de controller" para a interface que o `DispatcherServlet` conhece.
+
+### Passo 4: Decorators para retry e registro
+
+**O que vamos fazer e por quê.** O fornecedor às vezes responde 503 por alguns segundos. Vale tentar de novo, mas onde? Pôr um `for` dentro do adaptador mistura duas responsabilidades (traduzir e insistir) e obriga a reescrever o retry em cada adaptador novo. Pôr no checkout espalha um detalhe de infraestrutura na regra de negócio. O **Decorator** resolve: uma classe com a **mesma interface** do objeto que envolve, que acrescenta um comportamento antes, depois ou em volta da chamada.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/GatewayComRetentativa.java" semImports />
+
+E um segundo decorator, que registra cada chamada e o desfecho:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/GatewayComRegistro.java" semImports />
+
+A demonstração monta a pilha da figura, com um sandbox que falha nas duas primeiras chamadas:
+
+```java
+GatewayDePagamento gateway = new GatewayComRegistro(
+        new GatewayComRetentativa(new AdaptadorPagaFacil(sandbox), 3, Duration.ofMillis(100)),
+        mensagem -> System.out.println("[registro] " + mensagem));
+```
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes decorators
+```
+
+Saída esperada (leva cerca de 300 ms, por causa das esperas de 100 e 200 ms):
+
+```text
+[registro] cobrando pedido PED-4001 (R$ 79.90)
+[registro] pedido PED-4001 -> Aprovada[codigoDeAutorizacao=PF-0001]
+resultado: Aprovada[codigoDeAutorizacao=PF-0001]
+chamadas ao fornecedor: 3, transações criadas: 1
+```
+
+**O que acabou de acontecer.**
+
+- O fornecedor recebeu **três** chamadas: duas falharam com 503, a terceira foi aprovada. Quem chamou o gateway não viu nenhuma falha.
+- O registro apareceu **uma vez**, e não três. O `GatewayComRegistro` está **por fora** da retentativa, então ele vê a operação inteira: uma cobrança, um desfecho. Se você invertesse a ordem (`new GatewayComRetentativa(new GatewayComRegistro(adaptador, ...), ...)`), o registro estaria por dentro e veria cada tentativa: três linhas "cobrando", duas "falhou: PagaFácil indisponível (HTTP 503)" e uma aprovação. **As duas ordens são úteis**, para perguntas diferentes: por fora, "quantas cobranças falharam para o cliente?"; por dentro, "quantas vezes o fornecedor falhou?". O que não pode é a ordem ser acidental.
+- Foi criada **uma** transação, apesar das três chamadas. Isso só é verdade porque a solicitação carrega a chave de idempotência do passo 2. Um retry de uma operação que **não** é idempotente, como uma cobrança sem chave, é um bug esperando o dia em que o fornecedor processa a cobrança e cai antes de responder: o retry cobra de novo.
+- O recuo é linear (100 ms, depois 200 ms). Em produção, use recuo exponencial com variação aleatória (*jitter*), para que mil clientes que falharam juntos não tentem de novo no mesmo milissegundo. Isso é assunto da [aula de resiliência](../06-resiliencia/).
+- O `catch` de `InterruptedException` restaura a flag de interrupção da thread antes de lançar outra exceção. Engolir a interrupção impede que um desligamento ordenado da aplicação consiga parar a thread.
+
+**Onde você já usa decorators sem escrever nenhum.** No Spring, `@Transactional`, `@Cacheable`, `@Async`, `@PreAuthorize` e o `@Retryable` do Spring Framework 7 (pacote `org.springframework.resilience.annotation`, habilitado com `@EnableResilientMethods`) funcionam do mesmo jeito: o contêiner cria um **proxy** com a mesma interface (ou uma subclasse gerada, com CGLIB) que envolve o seu bean. A chamada passa pelo proxy, que abre a transação, consulta o cache ou repete, e só então chega ao seu método. O que muda em relação ao decorator escrito à mão é que o Spring gera a classe, e isso tem uma consequência importante, que o passo 8 mostra rodando.
+
+### Passo 5: Chain of Responsibility na antifraude
+
+**O que vamos fazer e por quê.** Antes de cobrar, a cobrança passa por regras de antifraude: boleto acima de R$ 5.000,00 é recusado; cliente na lista de bloqueio é recusado. Amanhã virão "mais de três cartões diferentes na mesma hora" e "CEP de entrega diferente do de cobrança para valor alto". Um método com uma sequência de `if` cresce sem fim, e cada regra nova é uma alteração no mesmo arquivo. O **Chain of Responsibility** organiza isso: cada regra é um elo independente, os elos são avaliados em ordem, e o primeiro que decide encerra a cadeia.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/RegraAntifraude.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/AnaliseAntifraude.java" semImports />
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes antifraude
+```
+
+Saída esperada:
+
+```text
+PED-5001 -> aprovado pela antifraude
+PED-5002 -> boleto acima de R$ 5.000,00
+PED-5003 -> boleto acima de R$ 5.000,00
+PED-5004 -> cliente bloqueado
+```
+
+**O que acabou de acontecer.**
+
+- `PED-5003` é de um cliente bloqueado **e** é um boleto alto. A resposta foi só a primeira regra: a cadeia parou nela, e a regra de bloqueio nem rodou. Isso é o curto-circuito, e ele tem duas consequências práticas: regras **baratas e frequentes vão primeiro** (comparar um valor custa nada; consultar um serviço de score custa uma chamada de rede) e o motivo devolvido depende da ordem. Se o suporte precisa saber "todos os motivos", a cadeia não serve; troque por uma avaliação que coleta todas as recusas.
+- Como `RegraAntifraude` é uma interface funcional, cada regra pode ser uma lambda. No Spring, cada regra vira um `@Bean` (ou um `@Component`) com `@Order`, e a `AnaliseAntifraude` recebe `List<RegraAntifraude>` já ordenada. Uma regra nova é um arquivo novo; nenhuma regra existente muda.
+- `List.copyOf` no construtor impede que alguém altere a cadeia depois de montada.
+
+**A outra forma da cadeia.** No livro, cada elo guarda uma referência ao próximo e decide se o chama. Essa variante é a dos **filtros do Servlet**: `doFilter(request, response, chain)` pode agir antes de `chain.doFilter(...)`, depois dele, ou não chamá-lo e responder direto (um 401, por exemplo). O `SecurityFilterChain` do Spring Security é uma cadeia dessas, com mais de uma dezena de filtros (CSRF, autenticação, autorização), e os `HandlerInterceptor` do Spring MVC seguem a mesma ideia com `preHandle` e `postHandle`. Use a forma "lista até a primeira decisão" quando cada elo só decide; use a forma "cada elo chama o próximo" quando um elo precisa agir **em volta** do resto (medir o tempo, abrir e fechar um contexto, tratar a exceção dos elos seguintes).
+
+### Passo 6: State com tipos selados
+
+**O que vamos fazer e por quê.** Uma cobrança de cartão passa por estados: pendente, autorizada (o valor fica reservado no limite do cliente), capturada (o dinheiro é efetivamente cobrado), estornada ou recusada. Nem toda transição é válida: não se captura o que não foi autorizado, não se estorna o que foi recusado. No legado, isso era um campo `String status` e `if`s espalhados, e um bug de concorrência deixou uma cobrança "capturada" sem código de autorização. O padrão **State** dá a cada estado o comportamento que só ele tem.
+
+<Figura legenda="As transições válidas de uma cobrança. Qualquer seta que não está no desenho lança TransicaoInvalidaException">
+<svg viewBox="0 0 760 290" width="760" role="img" aria-labelledby="estados-titulo estados-desc">
+  <title id="estados-titulo">Máquina de estados da cobrança</title>
+  <desc id="estados-desc">Pendente vai para Autorizada com autorizar, ou para Recusada com recusar. Autorizada vai para Capturada com capturar, ou para Estornada com estornar. Capturada vai para Estornada com estornar. Recusada e Estornada são estados finais: nenhuma transição sai deles.</desc>
+  <defs><marker id="mk-estados" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="20" y="30" class="d-text">Qualquer seta ausente lança TransicaoInvalidaException</text>
+  <rect x="20" y="70" width="150" height="48" rx="10" class="d-box"/>
+  <text x="95" y="99" text-anchor="middle" class="d-mono">Pendente</text>
+  <rect x="270" y="70" width="170" height="48" rx="10" class="d-accent"/>
+  <text x="355" y="99" text-anchor="middle" class="d-mono">Autorizada</text>
+  <rect x="560" y="70" width="170" height="48" rx="10" class="d-ok"/>
+  <text x="645" y="99" text-anchor="middle" class="d-mono">Capturada</text>
+  <rect x="20" y="210" width="150" height="48" rx="10" class="d-violet"/>
+  <text x="95" y="239" text-anchor="middle" class="d-mono">Recusada</text>
+  <rect x="400" y="210" width="170" height="48" rx="10" class="d-violet"/>
+  <text x="485" y="239" text-anchor="middle" class="d-mono">Estornada</text>
+  <path d="M170 94 L268 94" class="d-line" marker-end="url(#mk-estados)"/>
+  <text x="219" y="84" text-anchor="middle" class="d-label">autorizar</text>
+  <path d="M440 94 L558 94" class="d-line" marker-end="url(#mk-estados)"/>
+  <text x="499" y="84" text-anchor="middle" class="d-label">capturar</text>
+  <path d="M95 118 L95 208" class="d-line" marker-end="url(#mk-estados)"/>
+  <text x="105" y="168" class="d-label">recusar</text>
+  <path d="M370 118 L460 208" class="d-line" marker-end="url(#mk-estados)"/>
+  <text x="340" y="170" class="d-label">estornar</text>
+  <path d="M630 118 L540 208" class="d-line" marker-end="url(#mk-estados)"/>
+  <text x="600" y="170" class="d-label">estornar</text>
+  <text x="590" y="252" class="d-label">finais: nada sai deles</text>
+</svg>
+</Figura>
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/EstadoDaCobranca.java" semImports />
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes estados
+```
+
+Saída esperada:
+
+```text
+Pendente[]
+Autorizada[codigo=PF-0001]
+Capturada[codigo=PF-0001, em=2026-10-06T13:00:00Z]
+recusado: não é possível autorizar uma cobrança no estado Capturada
+Estornada[codigo=PF-0001, motivo=cliente desistiu]
+```
+
+**O que acabou de acontecer.**
+
+- **Cada estado carrega só os seus dados.** `Pendente` não tem código; `Autorizada` tem; `Capturada` tem código e instante. O bug do legado (capturada sem código) agora é impossível de representar: não existe construtor de `Capturada` sem código, e a única transição que cria uma `Capturada` copia o código da `Autorizada`. Esse é o princípio "torne estados inválidos irrepresentáveis", e é o maior ganho de modelar estados com tipos.
+- **Transições devolvem um novo estado.** Nada é alterado no lugar: `estado = estado.autorizar("PF-0001")`. O estado antigo continua válido para quem o tinha, o que simplifica concorrência, eventos ("mudou de X para Y") e testes.
+- **Os `switch` listam todos os estados**, inclusive os inválidos (`case Autorizada _, Capturada _, Estornada _, Recusada _ -> throw ...`), em vez de usar `default`. Parece repetitivo, mas é o que faz um sexto estado (digamos, `EmDisputa`, para chargeback) quebrar a compilação em cada transição até que alguém decida, conscientemente, o que acontece com ele.
+- Um detalhe de produção: `capturar` recebe o `Instant` em vez de chamar `Instant.now()`. Quem decide a hora é quem chama, com o `Clock` injetado, e o teste fica determinístico.
+
+**Comparação com o State do livro.** No GoF, cada estado é uma classe com todos os métodos de transição, e o objeto "contexto" delega para o estado atual (`this.estado = this.estado.capturar(this)`). A versão com tipos selados é a mesma ideia, com dois ganhos: imutabilidade e a verificação do compilador. A versão clássica ainda faz sentido quando os estados têm **muito comportamento próprio**, e não só transições (cada estado de um pedido calcula prazos, permissões e textos de tela diferentes): aí, um método por estado, em vez de um `switch` por operação, deixa cada estado legível num arquivo só. É de novo o *expression problem* do passo 1.
+
+### Passo 7: Template Method sem herança
+
+**O que vamos fazer e por quê.** Toda madrugada, a PagaFácil envia um **arquivo de retorno**: uma linha por transação liquidada, com cabeçalho, colunas separadas por ponto e vírgula e, às vezes, linhas em branco ou quebradas. O banco envia outro arquivo, com outras colunas, para os boletos. O esqueleto da leitura é o mesmo (conferir o cabeçalho, pular linhas vazias, separar colunas, coletar erros com o número da linha sem parar o arquivo inteiro); só muda como interpretar as colunas. Esse é o problema do **Template Method**: um algoritmo fixo com um passo variável.
+
+No livro, a solução é herança: uma classe abstrata com o método `final` que define o esqueleto e um método `abstract` para o passo variável.
+
+<Comparar antes="Template Method clássico: herança" depois="Template Method moderno: o passo como função">
+
+```java
+abstract class LeitorDeRetorno<T> {
+    final Leitura<T> ler(List<String> linhas) {
+        // ... confere cabeçalho, pula linhas,
+        //     separa colunas, junta erros
+        registros.add(interpretar(partes));
+    }
+    protected abstract T interpretar(String[] colunas);
+}
+
+class LeitorPagaFacil extends LeitorDeRetorno<Liquidacao> {
+    protected Liquidacao interpretar(String[] c) { ... }
+}
+```
+
+```java
+var leitor = new LeitorDeRetorno<Liquidacao>(
+        "codigo;valor;status", 3,
+        c -> new Liquidacao(c[0], new BigDecimal(c[1]), c[2]));
+
+var leitura = leitor.ler(linhas);
+```
+
+</Comparar>
+
+A versão moderna está no projeto:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/LeitorDeRetorno.java" semImports />
+
+Rode:
+
+```bash
+java -cp target/classes dev.trilhajava.m13.aulas.padroes.DemonstracaoDosPadroes retorno
+```
+
+Saída esperada:
+
+```text
+Liquidacao[codigo=PF-0001, valor=199.90, status=LIQUIDADO]
+Liquidacao[codigo=PF-0004, valor=79.90, status=ESTORNADO]
+erro: linha 3: Character a is neither a decimal digit number, decimal point, nor "e" notation exponential mark.
+erro: linha 5: esperava 3 colunas, veio 2
+```
+
+**O que acabou de acontecer.**
+
+- O arquivo tinha seis linhas: cabeçalho, duas válidas, uma com valor `abc`, uma em branco e uma com duas colunas. As válidas viraram registros; as inválidas viraram erros **com o número da linha** (contando a partir de 1, como o editor de texto mostra); a linha em branco foi ignorada. Um arquivo com uma linha ruim não perde as outras mil.
+- O passo variável é uma `Function<String[], T>`. A exceção que ele lançar (aqui, a `NumberFormatException` do `new BigDecimal("abc")`) é capturada **pelo esqueleto**, que a transforma em erro da linha. Quem escreve o passo não precisa saber disso.
+- O `split(";", -1)` mantém colunas vazias no fim da linha. Sem o `-1`, `"PF-0005;10.00;"` viraria duas colunas, e não três.
+- A classe é `final`. Ninguém precisa herdar dela, e isso elimina o principal problema do Template Method clássico: a **classe base frágil**, em que uma mudança no esqueleto quebra subclasses que dependiam de detalhes dele, ou uma subclasse sobrescreve um método que não devia.
+
+Você usa Template Method do Spring todos os dias, na forma moderna. No `JdbcTemplate` e no `JdbcClient`, o framework abre a conexão, prepara o comando, traduz exceções para a hierarquia `DataAccessException` e fecha tudo; você passa um `RowMapper` (uma lambda) que converte uma linha. No `TransactionTemplate`, o framework faz `begin`, `commit` e `rollback`; você passa o trabalho. No `RestClient`, o framework cuida da conexão e da conversão; você diz o que extrair. Em todos, a parte repetitiva e perigosa fica num lugar testado, e a parte que varia é uma função.
+
+### Passo 8: Observer e o Spring montando tudo
+
+**O que vamos fazer e por quê.** Depois de um pagamento aprovado, a nota fiscal precisa ser emitida e o cliente ganha pontos de fidelidade. Amanhã, o time de marketing vai querer disparar uma pesquisa de satisfação. Se o checkout chamar cada um desses serviços, ele passa a depender de todos e muda toda vez que surge um interessado novo. O **Observer** inverte isso: o checkout **publica um evento** ("o pagamento foi aprovado") e quem tiver interesse se inscreve para ouvi-lo.
+
+O evento é um record no passado, com os dados de que os ouvintes precisam:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/PagamentoAprovado.java" semImports />
+
+O checkout junta os padrões dos passos anteriores e publica o evento:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/ServicoDeCheckout.java" semImports />
+
+E dois ouvintes, que o checkout não conhece:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/EmissorDeNotaFiscal.java" semImports />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/ProgramaDeFidelidade.java" semImports />
+
+A configuração do Spring é onde a pilha de decorators é montada, as regras de antifraude ganham ordem e o cache é ligado:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/ConfiguracaoDePagamentos.java" semImports />
+
+Repare em três escolhas da configuração:
+
+- **Existe um único bean do tipo `GatewayDePagamento`.** O adaptador e os decorators são criados com `new` dentro do método `@Bean`, na ordem certa, e só a pilha pronta vira bean. Se cada camada fosse um bean do mesmo tipo, o Spring não saberia qual injetar no checkout. Você verá esse erro na próxima seção.
+- **As regras de antifraude são lambdas com `@Order`.** O Spring injeta `List<RegraAntifraude>` ordenada pelo `@Order`, que vale tanto na classe quanto no método `@Bean`.
+- **`@EnableCaching` e um `CacheManager`** ligam o `@Cacheable` da `TabelaDeTaxas`, que existe para mostrar o decorator que o Spring gera:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/TabelaDeTaxas.java" semImports />
+
+<Figura legenda="O proxy do Spring é um decorator gerado: só as chamadas que chegam de fora passam por ele. Uma chamada this.metodo() dentro do bean vai direto ao objeto original">
+<svg viewBox="0 0 760 240" width="760" role="img" aria-labelledby="proxy-titulo proxy-desc">
+  <title id="proxy-titulo">Proxy do Spring e a chamada interna</title>
+  <desc id="proxy-desc">Outro bean chama percentualVigente. A chamada entra no proxy gerado pelo Spring, que consulta o cache chamado taxas e, se não encontrar, chama o objeto TabelaDeTaxas original. Dentro do objeto original, o método simular chama this.percentualVigente diretamente, sem passar pelo proxy, então o cache é ignorado.</desc>
+  <defs><marker id="mk-proxy" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="80" width="170" height="60" rx="10" class="d-box"/>
+  <text x="95" y="106" text-anchor="middle" class="d-title">outro bean</text>
+  <text x="95" y="127" text-anchor="middle" class="d-label">recebe o proxy injetado</text>
+  <path d="M180 110 L238 110" class="d-line" marker-end="url(#mk-proxy)"/>
+  <rect x="240" y="40" width="230" height="150" rx="12" class="d-info"/>
+  <text x="355" y="70" text-anchor="middle" class="d-title">proxy (CGLIB)</text>
+  <text x="355" y="100" text-anchor="middle" class="d-label">consulta o cache "taxas"</text>
+  <text x="355" y="122" text-anchor="middle" class="d-label">e só chama o original</text>
+  <text x="355" y="144" text-anchor="middle" class="d-label">se não encontrar</text>
+  <path d="M470 110 L528 110" class="d-line" marker-end="url(#mk-proxy)"/>
+  <rect x="530" y="40" width="220" height="150" rx="12" class="d-accent"/>
+  <text x="640" y="68" text-anchor="middle" class="d-title">TabelaDeTaxas</text>
+  <text x="640" y="98" text-anchor="middle" class="d-mono">simular(...)</text>
+  <path d="M640 106 L640 150" class="d-line" marker-end="url(#mk-proxy)"/>
+  <text x="648" y="132" class="d-label">this.</text>
+  <text x="640" y="170" text-anchor="middle" class="d-mono">percentualVigente</text>
+  <text x="530" y="222" class="d-label">a chamada interna não vê o cache</text>
+</svg>
+</Figura>
+
+O teste sobe um contexto do Spring só com essa configuração (sem Spring Boot, com `@SpringJUnitConfig`) e verifica os dois comportamentos:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/padroes/PadroesNoSpringTest.java" semImports />
+
+Rode:
+
+```bash
+mvn test -Dtest=PadroesNoSpringTest
+```
+
+Saída esperada (resumida; as duas linhas `INFORMAÇÕES` são o `GatewayComRegistro` escrevendo pelo `System.Logger`, que sem configuração extra usa o logging do próprio JDK):
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.padroes.PadroesNoSpringTest
+out. 06, 2026 5:08:46 AM dev.trilhajava.m13.aulas.padroes.ConfiguracaoDePagamentos lambda$gatewayDePagamento$0
+INFORMAÇÕES: cobrando pedido PED-6001 (R$ 150.75)
+out. 06, 2026 5:08:46 AM dev.trilhajava.m13.aulas.padroes.ConfiguracaoDePagamentos lambda$gatewayDePagamento$0
+INFORMAÇÕES: pedido PED-6001 -> Aprovada[codigoDeAutorizacao=PF-0001]
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.121 s -- in dev.trilhajava.m13.aulas.padroes.PadroesNoSpringTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- **Observer.** O pagamento aprovado gerou uma nota fiscal e 150 pontos (R$ 150,75, um ponto por real inteiro). O pagamento recusado pela antifraude não publicou nada: nenhuma nota, nenhum ponto. E o registro mostra só o `PED-6001`: a recusa da antifraude aconteceu **antes** do gateway, então o gateway nem foi chamado para o `PED-6002`.
+- **O evento é síncrono.** Por padrão, `publishEvent` chama cada `@EventListener` **na mesma thread**, um depois do outro, antes de voltar ao checkout. Se o emissor de nota fiscal lançar uma exceção, ela sobe até o `pagar`. E, se houver uma transação aberta, os ouvintes rodam dentro dela. Isso surpreende quem imagina eventos como "mensagens", e é o assunto da seção de decisões.
+- **Decorator gerado.** `AopUtils.isAopProxy(taxas)` confirma que o bean injetado é um proxy. Duas chamadas externas a `percentualVigente("PIX")` consultaram o "banco" uma vez só: a segunda veio do cache. Depois, `simular` com três `"PIX"` fez **três** consultas, apesar de `"PIX"` já estar no cache, porque `simular` chama `this.percentualVigente`, e `this` é o objeto original, não o proxy. A documentação do Spring descreve exatamente isso na seção sobre proxies de AOP.
+
+**Por que um proxy CGLIB?** O Spring Framework usa, por padrão, um proxy dinâmico do JDK quando o bean implementa alguma interface, e uma subclasse gerada com CGLIB quando não implementa. `TabelaDeTaxas` não implementa interface, então o proxy é uma subclasse. Em aplicações Spring Boot, a configuração padrão do Boot prefere proxies por classe (CGLIB) mesmo quando há interface. Na prática, para você, isso significa duas coisas: o proxy não consegue interceptar métodos `final` nem `private` (uma subclasse não os sobrescreve), e uma classe `final` não pode receber proxy algum.
+
+### Passo 9: a suíte inteira
+
+O módulo tem cinco testes para esta aula: os dois do Spring que você acabou de rodar, dois para a máquina de estados e um para a pilha de decorators.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/padroes/GatewayDecoradoTest.java" semImports />
+
+O teste do gateway usa `Duration.ZERO` como intervalo: a retentativa é testada sem esperar, e o registro é uma `List` em vez do console, graças ao `Consumer<String>` no construtor. A última asserção trava a ordem da pilha: se alguém inverter os decorators, o registro passa a ter seis linhas e o teste falha.
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.104 s -- in dev.trilhajava.m13.aulas.padroes.EstadoDaCobrancaTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.037 s -- in dev.trilhajava.m13.aulas.padroes.GatewayDecoradoTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.189 s -- in dev.trilhajava.m13.aulas.padroes.PadroesNoSpringTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Os números de testes do módulo crescem quando outras aulas do módulo 13 acrescentam os delas; as três linhas acima são as desta aula.
+
+## Quando dá errado
+
+As mensagens abaixo são reais: foram geradas quebrando o código de propósito, no mesmo projeto.
+
+### the switch expression does not cover all possible input values
+
+Acrescente um quarto meio de pagamento à interface selada, sem mexer no resto:
+
+```java
+record Cripto(String rede) implements MeioDePagamento {
+}
+```
+
+```text
+dev\trilhajava\m13\aulas\padroes\Tarifas.java:26: error: the switch expression does not cover all possible input values
+        BigDecimal taxa = switch (meio) {
+                          ^
+1 error
+```
+
+**Como ler:** o compilador sabe que existem quatro subtipos e o `switch` trata três. O mesmo erro aparece no `AdaptadorPagaFacil`, e em cada `switch` exaustivo sobre `MeioDePagamento` do sistema. **Como corrigir:** trate o novo caso em cada lugar apontado; a lista de erros é a sua lista de tarefas. **Como não corrigir:** pôr `default -> BigDecimal.ZERO` para o erro sumir. Isso desliga, para sempre, a proteção que você ganhou ao selar o tipo: o próximo meio de pagamento passará a ter taxa zero, em silêncio.
+
+### NoUniqueBeanDefinitionException: expected single matching bean but found 2
+
+Registre o adaptador e o decorator como dois beans do mesmo tipo, deixando a montagem para o Spring:
+
+```java
+@Bean AdaptadorPagaFacil adaptadorPagaFacil() { ... }
+@Bean GatewayComRetentativa gatewayComRetentativa(AdaptadorPagaFacil a) { ... }
+```
+
+```text
+org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'servicoDeCheckout' defined in ...: Unsatisfied dependency expressed through method 'servicoDeCheckout' parameter 1: No qualifying bean of type 'dev.trilhajava.m13.aulas.padroes.GatewayDePagamento' available: expected single matching bean but found 2: adaptadorPagaFacil,gatewayComRetentativa
+```
+
+**Como ler:** o checkout pede um `GatewayDePagamento` (o "parameter 1" do método `servicoDeCheckout`, contando a partir de zero), e o adaptador e o decorator **são** ambos `GatewayDePagamento`, porque o decorator implementa a mesma interface por definição. **Como corrigir:** a forma mais clara é a da `ConfiguracaoDePagamentos`: um único bean do tipo, com a pilha montada dentro do método. Se as camadas precisarem ser beans (para serem reaproveitadas ou terem as próprias dependências injetadas), marque a camada de fora com `@Primary` ou injete com `@Qualifier`. O ponto é que a escolha de qual camada o resto do sistema recebe precisa estar escrita.
+
+### BeanCurrentlyInCreationException: Is there an unresolvable circular reference?
+
+Tente montar o decorator recebendo "o gateway" como parâmetro do próprio método:
+
+```java
+@Bean
+GatewayDePagamento gatewayDePagamento(GatewayDePagamento original) {
+    return new GatewayComRetentativa(original, 3, Duration.ZERO);
+}
+```
+
+```text
+org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'gatewayDePagamento' defined in ...: Unsatisfied dependency expressed through method 'gatewayDePagamento' parameter 0: Error creating bean with name 'gatewayDePagamento': Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?
+```
+
+**Como ler:** para criar `gatewayDePagamento`, o Spring precisa de um `GatewayDePagamento`, e o único candidato é o próprio bean que ainda está sendo criado. **Como corrigir:** o decorator precisa receber o tipo **concreto** de dentro (`AdaptadorPagaFacil`) ou um bean com `@Qualifier`, nunca "um qualquer do mesmo tipo". Essa confusão é frequente quando alguém tenta decorar um bean de uma biblioteca; para esse caso, o Spring oferece o `BeanPostProcessor`, que recebe o bean pronto e pode devolver outro objeto no lugar (é assim que o próprio Spring cria os proxies de AOP).
+
+### Could not generate CGLIB subclass ... using a final class
+
+Marque como `final` uma classe com `@Cacheable` (ou `@Transactional`) que não implementa interface:
+
+```text
+org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'taxasFinal' defined in ...: Could not generate CGLIB subclass of class ...TaxasFinal: Common causes of this problem include using a final class or a non-visible class
+Caused by: java.lang.IllegalArgumentException: Cannot subclass final class ...TaxasFinal
+```
+
+**Como ler:** o proxy CGLIB é uma subclasse gerada em tempo de execução, e uma classe `final` não admite subclasse. **Como corrigir:** tire o `final` da classe, ou faça o bean implementar uma interface e injete pela interface. Com um método `final` (e não a classe), não há erro nenhum: o proxy é criado, mas não consegue sobrescrever aquele método, e a anotação é **ignorada em silêncio**. O mesmo vale para métodos `private`. Por isso essa armadilha é mais perigosa no método do que na classe.
+
+### TransicaoInvalidaException e a mensagem que ajuda
+
+```text
+recusado: não é possível autorizar uma cobrança no estado Capturada
+```
+
+Essa é a exceção do passo 6, e ela é do seu domínio, não do Java. Vale reparar na mensagem: diz **a ação** e **o estado atual**. Num log de produção às 3h da manhã, "transição inválida" sozinho obriga alguém a abrir o banco para descobrir o estado; "autorizar em Capturada" já sugere a causa (provavelmente uma mensagem de autorização processada duas vezes, um problema de [consumidor idempotente](../../12-mensageria/05-consumidores-idempotentes/)). Na API, essa exceção costuma virar um `409 Conflict`.
+
+## Armadilhas e quando NÃO usar
+
+### Singleton estático
+
+O Singleton do livro (construtor privado, campo `static`, método `getInstance()`) é o padrão que mais causa dano em código Java. Ele é, na prática, uma **variável global**: qualquer classe chama `Configuracoes.getInstance()` sem declarar essa dependência no construtor, o teste não consegue trocá-lo por outro, e o estado sobrevive de um teste para o outro. Em código concorrente, a inicialização "preguiçosa" ainda costuma vir com uma condição de corrida.
+
+<Comparar antes="Singleton estático: dependência escondida" depois="Bean singleton: dependência declarada">
+
+```java
+class ServicoDeCheckout {
+    ResultadoDaCobranca pagar(SolicitacaoDeCobranca s) {
+        var gateway = GatewayPagaFacil.getInstance();
+        // o teste cobra no fornecedor de verdade
+        return gateway.cobrar(s);
+    }
+}
+```
+
+```java
+class ServicoDeCheckout {
+    private final GatewayDePagamento gateway;
+    ServicoDeCheckout(GatewayDePagamento gateway) {
+        this.gateway = gateway;   // o teste passa um fake
+    }
+}
+```
+
+</Comparar>
+
+"Uma instância só" é uma decisão de **configuração**, não da classe. No Spring, todo bean é singleton por padrão (uma instância por contexto), sem que a classe saiba disso. Se você precisar de uma instância compartilhada fora do Spring, crie-a no `main` e passe pelo construtor. O único singleton estático aceitável é o de objetos **sem estado e imutáveis** (um `Comparator`, uma constante), e para esses um `static final` basta.
+
+### God object
+
+O `CheckoutService` de 1.400 linhas do gancho é um **God object**: uma classe que sabe e faz tudo. Os padrões desta aula são justamente as ferramentas para desmontá-lo, e um sintoma ajuda a perceber quando aplicá-los: uma classe com dez dependências no construtor, ou um teste que precisa de dez mocks. Cada dependência é um motivo para mudar. A saída não é criar uma `CheckoutFacade` que chama o God object (isso só esconde o problema atrás de mais uma camada); é extrair, um padrão de cada vez, o que varia: o adaptador do fornecedor, os decorators de infraestrutura, a cadeia de regras, os ouvintes de eventos. O checkout desta aula tem três dependências e 20 linhas.
+
+Um cuidado: padrões também **criam** God objects. Um `EventListener` gigante que trata vinte eventos diferentes, uma `ConfiguracaoGeral` com 80 métodos `@Bean`, um `switch` de 300 linhas sobre o tipo de evento. Se um arquivo cresce sem parar, o padrão está mal recortado.
+
+### Abstração sem segundo caso de uso
+
+Este é o erro mais comum de quem acabou de aprender padrões. A loja aceita só Pix, e alguém cria `GatewayDePagamento`, `GatewayDePagamentoFactory`, `AbstractGatewayDePagamento` e `GatewayDePagamentoStrategyResolver` "para quando vier o cartão". Seis meses depois, o cartão chega e precisa de autorização e captura em dois passos, algo que a abstração não previu. A interface criada cedo demais **errou o eixo da variação** e agora atrapalha.
+
+A regra prática é a "regra de três": escreva o primeiro caso direto; no segundo, aceite alguma duplicação e observe o que realmente varia; no terceiro, extraia a abstração com base no que você viu. Há uma exceção importante: a interface que **isola uma fronteira** (um fornecedor externo, o banco, o relógio) vale desde o primeiro dia, mesmo com uma implementação só, porque o segundo caso de uso já existe, e é o teste. O `GatewayDePagamento` desta aula se justificaria com um único fornecedor; um `CalculadoraDeDescontoStrategy` com uma implementação e nenhum teste que a substitua, não.
+
+### Outras armadilhas que caem em revisão de código
+
+- **Decorators em ordem acidental.** Retry por fora do circuit breaker repete chamadas que o disjuntor recusaria; retry por fora do timeout multiplica a espera; registro por dentro do cache registra só as falhas de cache. Escreva a ordem num único lugar (a configuração) e trave-a com um teste, como o `GatewayDecoradoTest`.
+- **Retry de operação não idempotente.** O decorator de retentativa só é seguro com a chave de idempotência. Sem ela, é cobrança em dobro.
+- **Eventos para um fluxo obrigatório.** Se a nota fiscal **precisa** ser emitida para o pedido ser válido, esconder essa chamada atrás de um evento torna o fluxo invisível (ninguém lê o checkout e descobre que ele emite nota) e frágil (um ouvinte que falha em silêncio quebra uma regra de negócio). Eventos servem para efeitos **secundários** e para desacoplar módulos; o caminho principal fica explícito.
+- **Builder para tudo.** Um record de três campos obrigatórios não precisa de builder; o construtor já é claro. E o `@Builder` do Lombok gera um builder em que **todos** os campos são opcionais: esquecer um obrigatório só aparece em execução.
+- **Herança para reaproveitar código.** Uma `AbstractServicoBase` com métodos utilitários que dez serviços estendem é Template Method sem esqueleto: só acoplamento. Prefira composição: um objeto colaborador, ou uma função.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber implementar os padrões é o ponto de partida. O que se espera de quem é pleno ou sênior é escolher, justificar e prever o que acontece em produção.
+
+### Como escolher: comece pelo sintoma
+
+Os padrões aparecem bem quando você parte do **sintoma no código**, e não do catálogo:
+
+| Sintoma | Padrão provável | Custo que você aceita |
+|---|---|---|
+| O mesmo `if/else` sobre um tipo em vários lugares | Strategy (`switch` sobre `sealed` ou interface) | Um arquivo ou um tipo a mais |
+| Construtor com muitos parâmetros do mesmo tipo, vários opcionais | Builder | Uma classe aninhada para manter |
+| Um formato de terceiros vazando para o domínio | Adapter | Uma tradução a mais em cada chamada |
+| O mesmo código de retry, log, cache ou métrica em vários métodos | Decorator (ou a anotação do Spring) | Ordem das camadas e depuração mais longa |
+| Uma lista crescente de validações ou regras independentes | Chain of Responsibility | O resultado depende da ordem |
+| `if (status.equals(...))` espalhado, transições inválidas em produção | State | Um tipo por estado |
+| Mesmo esqueleto de processamento com um passo diferente | Template Method (com lambda) | Uma função como parâmetro |
+| Uma classe que chama cinco serviços que nada têm a ver com ela | Observer (eventos) | Fluxo menos visível; depuração por log |
+
+Se nenhum sintoma aparece, o código provavelmente não precisa de padrão. Um CRUD bem escrito, com um serviço e um repositório, é o desenho correto para a maioria das telas de um sistema.
+
+### Indireção tem custo, e quem paga é quem depura
+
+Cada camada de decorator, cada evento e cada proxy torna o código mais flexível e o **rastreamento** mais longo. Uma exceção no `PagaFacilSandbox` chega ao checkout atravessando três classes; com proxies do Spring, a pilha de chamadas ganha linhas de `CglibAopProxy` e `ReflectiveMethodInvocation`; um evento síncrono transforma uma falha na fidelidade num erro "do checkout". Em produção, isso se paga com observabilidade: um *trace* distribuído (OpenTelemetry, módulo 14) mostra cada camada como um trecho com duração; logs com o identificador do pedido ligam o evento ao ouvinte. Antes de acrescentar uma camada, pergunte "quem vai depurar isso às 3h da manhã consegue ver o que aconteceu?".
+
+Desempenho, por outro lado, raramente é argumento. A JIT do Java lida bem com chamadas por interface quando há poucas implementações no mesmo ponto de chamada, e um proxy custa microssegundos diante dos milissegundos de uma chamada de rede ou de banco. Se alguém recusar um decorator "por desempenho" numa chamada HTTP, peça a medição.
+
+### Eventos: síncronos, transacionais ou mensagens?
+
+O `@EventListener` do passo 8 é síncrono: roda na mesma thread, na mesma transação, e sua exceção volta para quem publicou. Isso é uma **vantagem** quando o efeito precisa ser atômico com a operação (gravar uma linha de auditoria na mesma transação do pagamento) e um **risco** no resto dos casos. As três opções que você vai encontrar:
+
+1. **`@EventListener`**: síncrono e na mesma transação. Bom para efeitos internos que devem ser desfeitos junto com a operação.
+2. **`@TransactionalEventListener`** (do `spring-tx`): por padrão, roda **depois do commit** de quem publicou. Evita mandar o e-mail de "pagamento aprovado" para uma transação que sofreu rollback. Mas, se a aplicação cair entre o commit e o ouvinte, o efeito se perde; e, depois do commit, uma exceção do ouvinte não desfaz nada.
+3. **Mensageria com outbox**: o evento é gravado na mesma transação, numa tabela, e publicado depois num broker. É o único dos três que **sobrevive a uma queda** e que atravessa processos. Custa infraestrutura e exige consumidores idempotentes. Veja o [Transactional Outbox](../../12-mensageria/04-transactional-outbox/).
+
+A decisão segue a pergunta "o que acontece se esse efeito não ocorrer?". Pontos de fidelidade perdidos podem ser recalculados por um processo noturno: opção 2. Nota fiscal não emitida é problema fiscal: opção 3. O [monólito modular](../04-monolito-modular/) usa exatamente essa escala, e o Spring Modulith acrescenta um registro de publicação para que eventos internos não se percam numa queda.
+
+### Retry em camadas multiplica a carga
+
+Retry é o decorator mais perigoso em escala. Se o checkout tenta três vezes, o cliente HTTP do adaptador tenta outras três e o balanceador de carga também repete, uma única falha vira 3 × 3 × 3 = 27 chamadas ao fornecedor, que, se já estava sobrecarregado, agora cai de vez. Em um sistema com várias camadas, decida **onde** fica o retry (geralmente, o mais perto possível da chamada que falha, e em um lugar só), use recuo exponencial com *jitter* e combine com um disjuntor (*circuit breaker*). O retry também só repete o que é idempotente e o que é **temporário**: um 503 ou um tempo esgotado, nunca um "cartão recusado" ou um 400. Por isso o adaptador separa `Recusada` (resultado de negócio, que não se repete) de `FalhaTemporariaException` (que se repete).
+
+### Segurança: a ordem da cadeia é uma decisão de risco
+
+Na cadeia de antifraude, a ordem define custo e comportamento sob falha. Se a regra de score chama um serviço externo e esse serviço cai, o que a cadeia faz? **Falhar fechado** (recusar a cobrança) protege contra fraude e derruba a conversão; **falhar aberto** (deixar passar) mantém as vendas e abre uma janela para fraude. Não existe resposta técnica; existe uma decisão de negócio, que precisa estar escrita e testada. O mesmo raciocínio vale para o `SecurityFilterChain` do Spring Security: um filtro de autenticação colocado depois de um filtro que já responde à requisição simplesmente nunca roda.
+
+Decorators também são o lugar natural de controles de segurança transversais: um `GatewayComAuditoria` que grava quem pediu cada estorno, fora do código de negócio, sem que um desenvolvedor possa esquecê-lo num fluxo novo.
+
+### Como justificar para o time, e quando trocar de abordagem
+
+Um padrão novo numa base de código é uma decisão que o time vai manter por anos. Três práticas tornam essa decisão defensável:
+
+- **Mostre o sintoma, não o padrão.** "O retry está copiado em seis lugares e dois têm bugs diferentes" convence; "devíamos usar Decorator" não.
+- **Registre a decisão** quando ela mudar a estrutura do sistema: um ADR (Architecture Decision Record) curto com contexto, decisão, alternativas e consequências. A [aula 13.08](../08-decisoes-e-evolucao-da-arquitetura/) trata disso.
+- **Trave o comportamento com teste**, como a ordem dos decorators no `GatewayDecoradoTest`. Um padrão sem teste é desfeito na primeira refatoração apressada.
+
+E saiba quando sair de um padrão. O `switch` sobre `sealed` deixa de servir quando os casos passam a vir de fora (cada lojista configura o próprio meio de pagamento): troque por interface e beans. A cadeia em memória deixa de servir quando as regras passam a ser configuradas por um time de risco sem deploy: troque por um motor de regras ou por regras em banco. O evento síncrono deixa de servir quando o ouvinte fica lento ou precisa sobreviver a quedas: troque por mensageria. O Decorator escrito à mão deixa de servir quando o mesmo comportamento se aplica a dezenas de classes: troque pela anotação do Spring (que é o mesmo padrão, gerado). Mudar de padrão quando o problema muda não é sinal de que a primeira escolha estava errada; é sinal de que ela foi feita para o problema que existia.
+
+<Callout tipo="entrevista">
+**"Qual padrão de projeto você mais usa?"** Uma boa resposta começa pelo **problema**: "Strategy, quando uma regra varia por tipo e cresce com o tempo. Se o conjunto é fechado, como meios de pagamento, uso um `switch` sobre uma interface selada e deixo o compilador apontar o caso esquecido; se é aberto, uma interface com uma implementação por bean e `List` injetada." Citar o *expression problem* mostra profundidade.
+
+**"Qual a diferença entre Adapter, Decorator e Proxy?"** Adapter muda a interface (SDK do fornecedor para a do domínio). Decorator mantém a interface e acrescenta comportamento. Proxy mantém a interface e controla o acesso; no Spring, os proxies de `@Transactional` e `@Cacheable` são, na prática, decorators gerados. A pergunta seguinte costuma ser a chamada interna: o `this.metodo()` não passa pelo proxy, então a anotação é ignorada; a correção é mover o método para outro bean.
+
+**"Por que o Singleton é considerado um anti-padrão?"** Porque é estado global com dependência escondida: o teste não consegue substituí-lo e o estado vaza entre testes. "Uma instância" é decisão de configuração; no Spring, o escopo singleton do bean resolve isso sem a classe saber.
+
+**"Eventos do Spring são assíncronos?"** Não, por padrão: mesma thread, mesma transação, e a exceção do ouvinte volta para quem publicou. `@TransactionalEventListener` roda depois do commit; para sobreviver a quedas, outbox e broker. Uma resposta sênior diz qual escolher pela pergunta "o que acontece se esse efeito se perder?".
+
+**"Quando você não criaria uma abstração?"** Quando só há um caso de uso e nenhuma fronteira a isolar. Uma interface de fronteira (fornecedor, banco, relógio) vale desde o primeiro dia porque o teste já é o segundo caso; uma abstração de regra de negócio espera o segundo ou o terceiro caso real.
+</Callout>
+
+## Checkpoint
+
+O time de finanças quer saber, a qualquer momento, quantas cobranças foram aprovadas, quantas foram recusadas e quantas falharam por erro do fornecedor.
+
+**O desafio:** escreva um terceiro decorator, `GatewayComContadores`, com um método `resumo()` que devolve `"aprovadas=N recusadas=N falhas=N"`. Depois responda: em que posição da pilha ele deve ficar (por fora do registro, entre o registro e a retentativa, ou por dentro da retentativa), se a pergunta de finanças é "quantas cobranças **o cliente** viu falhar"? E se fosse "quantas vezes **o fornecedor** falhou"?
+
+Monte a pilha num `main` seu, com o `PagaFacilSandbox(2)` e três cobranças, e confira os números.
+
+<details>
+<summary>Ver uma solução</summary>
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/padroes/GatewayComContadores.java" semImports />
+
+**Por que assim.** O decorator implementa a mesma interface, recebe a camada de dentro e não muda o resultado: só observa. A falha é contada e **relançada** (contar e engolir a exceção mudaria o comportamento da pilha). O `switch` sobre `ResultadoDaCobranca` não tem `default`: se um dia existir um terceiro resultado, o contador deixa de compilar em vez de ignorá-lo. `LongAdder` é a escolha para contadores com muita concorrência e poucas leituras; em produção, você usaria um `Counter` do Micrometer, com o desfecho como *tag*, e a estrutura do decorator seria a mesma.
+
+**A posição na pilha.** Para "quantas cobranças o cliente viu falhar", o contador fica **por fora da retentativa** (por exemplo, `new GatewayComContadores(new GatewayComRegistro(new GatewayComRetentativa(adaptador, ...), ...))`). Com `PagaFacilSandbox(2)` e três cobranças, o resumo fica `aprovadas=3 recusadas=0 falhas=0`: as duas falhas foram absorvidas pela retentativa. Para "quantas vezes o fornecedor falhou", ele fica **por dentro** (`new GatewayComRetentativa(new GatewayComContadores(adaptador), ...)`), e o resumo fica `aprovadas=3 recusadas=0 falhas=2`. Em produção, vale ter os dois: a diferença entre eles mostra quanto a retentativa está trabalhando, e um aumento súbito é o primeiro sinal de que o fornecedor está degradando.
+
+</details>
+
+<Quiz
+  id="13-padroes"
+  questoes={[
+    {
+      pergunta: 'Um decorator de registro está POR FORA de um decorator de retentativa com até 3 tentativas. O fornecedor falha duas vezes e aprova na terceira. Quantas cobranças o registro vê?',
+      opcoes: ['Três: uma por tentativa', 'Uma: ele vê só a chamada que entrou na pilha e o desfecho final', 'Nenhuma: decorators não veem retentativas', 'Duas: só as falhas'],
+      correta: 1,
+      explicacao: 'Cada camada vê apenas o que passa por ela. Por fora da retentativa, o registro vê uma chamada e um desfecho (aprovada). Por dentro, veria as três tentativas. É exatamente o que a última asserção do `GatewayDecoradoTest` trava.',
+    },
+    {
+      pergunta: 'Um bean tem `@Cacheable` em `percentualVigente` e um método `simular` que chama `this.percentualVigente(...)`. O que acontece quando outro bean chama `simular`?',
+      opcoes: ['O cache funciona normalmente', 'A chamada interna não passa pelo proxy; o cache é ignorado', 'O Spring lança uma exceção na inicialização', 'O cache funciona só se o método for `final`'],
+      correta: 1,
+      explicacao: 'O comportamento de cache está no proxy que envolve o bean. `this` é o objeto original, então a chamada interna não consulta o cache. A correção preferida é mover o método cacheado para outro bean.',
+    },
+    {
+      pergunta: 'Os meios de pagamento são um conjunto fechado, que só o seu time altera. Qual forma de Strategy aproveita melhor o compilador?',
+      opcoes: ['Uma interface com uma classe por meio e `List<Interface>` injetada', 'Um `switch` sem `default` sobre uma interface selada', 'Um `Map<String, Function>` montado em tempo de execução', 'Um `if/else` com `instanceof`'],
+      correta: 1,
+      explicacao: 'Com o tipo selado, o compilador sabe todos os casos: um meio novo quebra a compilação em cada `switch` até ser tratado. Interface com beans é a escolha para conjuntos abertos, que crescem por fora.',
+    },
+    {
+      pergunta: 'A configuração registra `AdaptadorPagaFacil` e `GatewayComRetentativa` como dois beans, e o checkout pede um `GatewayDePagamento`. O que acontece?',
+      opcoes: ['O Spring injeta o decorator, porque ele foi criado por último', 'NoUniqueBeanDefinitionException: os dois são GatewayDePagamento', 'O Spring injeta o adaptador, porque ele não tem dependências', 'BeanCurrentlyInCreationException'],
+      correta: 1,
+      explicacao: 'O decorator implementa a mesma interface por definição, então há dois candidatos. Resolva com um único bean montado na configuração, ou com `@Primary`/`@Qualifier` na camada que o resto do sistema deve receber.',
+    },
+    {
+      pergunta: 'Qual afirmação sobre `@EventListener` do Spring, na configuração padrão, está correta?',
+      opcoes: ['Roda em outra thread, depois que o publicador termina', 'Roda na mesma thread de quem publicou; uma exceção no ouvinte volta para o publicador', 'Roda só depois do commit da transação', 'Garante entrega mesmo se a aplicação cair'],
+      correta: 1,
+      explicacao: 'O padrão é síncrono, na mesma thread e dentro da transação corrente. Depois do commit é o comportamento padrão do `@TransactionalEventListener`; sobreviver a quedas exige outbox e mensageria.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Padrões são **vocabulário** para problemas recorrentes. Escolha pelo sintoma no código, nunca pelo catálogo; sem sintoma, sem padrão.
+- **Strategy**: `switch` sem `default` sobre tipo selado para conjuntos fechados; interface com beans e `List<Interface>` para conjuntos abertos. O `switch` exaustivo também aposenta o Visitor.
+- **Factory e Builder**: métodos de fábrica estáticos com nome; builder com os obrigatórios no método de fábrica e um record imutável que valida no construtor compacto.
+- **Adapter** muda a interface e é o único lugar que conhece o fornecedor, inclusive as falhas dele. **Decorator** mantém a interface e acrescenta comportamento; a ordem das camadas define o que cada uma vê.
+- Os proxies do Spring (`@Transactional`, `@Cacheable`, `@Retryable`) são decorators gerados: a chamada interna `this.metodo()` e os métodos `final` ou `private` ficam de fora.
+- **Chain of Responsibility**: lista ordenada até a primeira decisão (antifraude) ou elos que chamam o próximo (filtros do Servlet, `SecurityFilterChain`).
+- **State** com records selados torna estados inválidos irrepresentáveis; transições devolvem um novo estado ou lançam uma exceção que diz a ação e o estado atual.
+- **Template Method** moderno recebe o passo como função (`JdbcTemplate`, `TransactionTemplate`); evite a classe base frágil.
+- **Observer** no Spring é síncrono por padrão; use `@TransactionalEventListener` para depois do commit e outbox quando o efeito não pode se perder.
+- Anti-padrões: Singleton estático (estado global), God object, abstração sem segundo caso de uso, retry de operação não idempotente e decorators em ordem acidental.
+
+## Próximo passo
+
+No [exercício 13.01, Motor de frete](../../../exercicios/13-arquitetura/01-motor-de-frete/), você refatora um legado aplicando SOLID e os padrões desta aula a outro domínio, com um *golden master* garantindo que nada mudou de comportamento. Depois, a [aula 13.03, Arquitetura hexagonal](../03-hexagonal/), leva o Adapter ao nível da arquitetura inteira: portas definidas pelo domínio e adaptadores para HTTP, banco e fornecedores, com a regra de dependência verificada em teste.
+
+## Referências
+
+- [Spring Framework: Understanding AOP Proxies](https://docs.spring.io/spring-framework/reference/core/aop/proxying.html)
+- [Spring Framework: Standard and Custom Events](https://docs.spring.io/spring-framework/reference/core/beans/context-introduction.html)
+- [Spring Framework: Transaction-bound Events](https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html)
+- [Spring Framework: Cache Abstraction](https://docs.spring.io/spring-framework/reference/integration/cache.html)
+- [Spring Framework: Resilience Features (`@Retryable`, `@ConcurrencyLimit`)](https://docs.spring.io/spring-framework/reference/core/resilience.html)
+- [Spring Framework: Using `@Autowired` (coleções, `@Order` e mapas de beans)](https://docs.spring.io/spring-framework/reference/core/beans/annotation-config/autowired.html)
+- [JEP 409: Sealed Classes](https://openjdk.org/jeps/409)
+- [JEP 441: Pattern Matching for switch](https://openjdk.org/jeps/441)
+- [JEP 440: Record Patterns](https://openjdk.org/jeps/440)
+- [JEP 456: Unnamed Variables & Patterns](https://openjdk.org/jeps/456)

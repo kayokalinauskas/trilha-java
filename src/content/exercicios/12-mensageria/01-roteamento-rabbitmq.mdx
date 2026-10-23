@@ -1,0 +1,349 @@
+---
+titulo: Roteamento de notificações com RabbitMQ
+codigo: "12.01"
+resumo: Declare a topologia de notificações de um e-commerce (topic exchange, filas por canal, fila de urgentes, auditoria e DLQ), publique em JSON com message_id e consuma e-mails com retry limitado — falhas transitórias são repetidas, as permanentes vão direto para a DLQ. Você confere tudo contra um RabbitMQ 4 de verdade, com um programa que publica cada cenário e mostra onde a mensagem foi parar.
+modulo: 12-mensageria
+ordem: 1
+dificuldade: medio
+tempo: 2–3h
+conceitos: [RabbitMQ, topic exchange, routing key, quorum queue, DLX, retry, Spring AMQP 4]
+aulas: [12-mensageria/01-por-que-mensageria, 12-mensageria/02-rabbitmq]
+java:
+  modulo: m12-mensageria
+  arquivos:
+    - src/main/java/dev/trilhajava/m12/notificacoes/TopologiaRabbit.java
+    - src/main/java/dev/trilhajava/m12/notificacoes/PublicadorDeNotificacoes.java
+    - src/main/java/dev/trilhajava/m12/notificacoes/ConsumidorDeEmail.java
+    - src/main/resources/notificacoes.properties
+---
+
+## Contexto
+
+O serviço de pedidos de um e-commerce envia notificações por e-mail, SMS e push. Hoje ele chama cada provedor por HTTP, dentro da requisição do checkout. Quando o provedor de SMS caiu numa Black Friday, o checkout caiu junto. A decisão foi colocar um RabbitMQ no meio: o serviço de pedidos **publica** a notificação e segue a vida, e cada canal **consome** no seu ritmo.
+
+Dois outros times pegaram carona na mudança. O atendimento quer uma fila só com as notificações **urgentes**, de qualquer canal, para acompanhar em tempo real. O jurídico exige uma cópia de **todas** as notificações para auditoria. E ninguém quer que uma mensagem com problema suma em silêncio: o que não puder ser entregue vai para uma fila de mensagens mortas (DLQ), onde alguém pode olhar.
+
+Você vai declarar essa topologia em código, publicar as notificações e escrever o consumidor de e-mails, com repetição limitada para falhas passageiras.
+
+## O que você vai praticar
+
+- **Exchanges, filas e bindings.** No RabbitMQ, quem publica não escolhe a fila: publica numa *exchange* com uma *routing key*, e os *bindings* (ligações entre exchange e fila) decidem para onde a mensagem vai. Numa *topic exchange*, o binding é um padrão: `*` casa exatamente uma palavra, e `#` casa zero ou mais. Veja [RabbitMQ](../../../aulas/12-mensageria/02-rabbitmq/).
+- **Topologia como código.** Um `@Bean` do tipo `Declarables` reúne exchanges, filas e bindings; o `RabbitAdmin` do Spring os cria na primeira conexão, e não faz nada se já existirem iguais. Mesma aula.
+- **Mensagens mortas.** Uma fila com *dead letter exchange* (DLX) encaminha para ela as mensagens rejeitadas sem reenfileiramento. O RabbitMQ acrescenta o cabeçalho `x-death`, que diz de que fila a mensagem veio e por quê. Mesma aula.
+- **Retry do listener e falhas permanentes.** O Spring AMQP repete a chamada ao listener quando ele lança exceção, e desiste depois de um número de tentativas. Repetir só faz sentido para o que é passageiro; um e-mail sem `@` nunca vai dar certo. Veja [Por que mensageria](../../../aulas/12-mensageria/01-por-que-mensageria/).
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m12.notificacoes` (não precisa mudar):
+
+- `Notificacao(UUID id, Canal canal, Prioridade prioridade, String destinatario, String mensagem)`, com `Notificacao.nova(canal, prioridade, destinatario, mensagem)`, que gera o `id`;
+- os enums `Canal` (`EMAIL`, `SMS`, `PUSH`) e `Prioridade` (`ALTA`, `NORMAL`, `BAIXA`);
+- `EnviadorDeEmail`, a integração com o provedor: `void enviar(String destinatario, String mensagem)`. Ele lança `ProvedorIndisponivelException` numa falha transitória (o provedor fora do ar, um *timeout*). A implementação `EnviadorDeEmailNoLog` só escreve no log;
+- `DestinatarioInvalidoException(String destinatario)`, para a falha permanente;
+- `NotificacoesApplication`, a aplicação Spring Boot, que carrega `notificacoes.properties`.
+
+### O que você implementa
+
+Três classes, já criadas e vazias, e um arquivo de propriedades. Os nomes das classes e dos métodos públicos são fixos; o resto é sugestão.
+
+```java
+// TopologiaRabbit (@Configuration)
+@Bean Declarables topologia()                                  // regras 1 a 4
+@Bean MessageConverter conversorJson(JsonMapper json)          // regra 5 (tools.jackson.databind.json.JsonMapper)
+@Bean RabbitListenerRetrySettingsCustomizer naoRepetirFalhasPermanentes()   // regra 9
+
+// PublicadorDeNotificacoes (@Component)
+public PublicadorDeNotificacoes(RabbitTemplate rabbit)
+public void publicar(Notificacao notificacao)                  // regras 5 e 6
+
+// ConsumidorDeEmail (@Component)
+ConsumidorDeEmail(EnviadorDeEmail enviador)
+@RabbitListener(queues = "notificacoes.email") void receber(Notificacao notificacao)   // regras 7 a 9
+```
+
+```properties
+# notificacoes.properties — regra 8
+spring.rabbitmq.listener.simple.retry.…
+```
+
+A topologia completa:
+
+| Elemento | Tipo | Ligado a | Padrão do binding |
+|---|---|---|---|
+| `notificacoes` | topic exchange | — | — |
+| `notificacoes.email` | fila quorum, com DLX | `notificacoes` | `email.*` |
+| `notificacoes.sms` | fila quorum, com DLX | `notificacoes` | `sms.*` |
+| `notificacoes.push` | fila quorum, com DLX | `notificacoes` | `push.*` |
+| `notificacoes.urgentes` | fila durável | `notificacoes` | `*.alta` |
+| `notificacoes.auditoria` | fila durável | `notificacoes` | `#` |
+| `notificacoes.dlx` | fanout exchange | — | — |
+| `notificacoes.dlq` | fila durável | `notificacoes.dlx` | (fanout: sem padrão) |
+
+## Regras
+
+**Topologia**
+
+1. **Tudo é declarado em código e é durável.** As duas exchanges e as seis filas sobrevivem a um reinício do RabbitMQ. Nada é criado à mão no painel. Exemplo: com o RabbitMQ recém-criado e vazio, basta subir a aplicação para as seis filas aparecerem em `http://localhost:15672/#/queues`.
+2. **A routing key é `canal.prioridade`, em minúsculas.** Exemplos: `Canal.EMAIL` com `Prioridade.ALTA` → `email.alta`; `SMS`/`NORMAL` → `sms.normal`; `PUSH`/`BAIXA` → `push.baixa`. Use `Locale.ROOT` no `toLowerCase`, para não depender do idioma da máquina.
+3. **Cada mensagem chega em todas as filas cujo padrão casa, e só nelas.** Exemplos:
+
+   | Routing key | Filas que recebem |
+   |---|---|
+   | `sms.normal` | `sms`, `auditoria` |
+   | `push.alta` | `push`, `urgentes`, `auditoria` |
+   | `push.baixa` | `push`, `auditoria` |
+   | `email.alta` | `email`, `urgentes`, `auditoria` |
+
+4. **As filas de canal são quorum queues com DLX.** `email`, `sms` e `push` têm o argumento `x-queue-type=quorum` e `x-dead-letter-exchange=notificacoes.dlx`. Uma mensagem rejeitada sem reenfileiramento numa delas vai para a `notificacoes.dlq`, com o cabeçalho `x-death` indicando a fila de origem e o motivo `rejected`.
+
+**Publicação**
+
+5. **O corpo é JSON.** `content-type: application/json`, com os campos do record. Exemplo de corpo: `{"id":"5f0c…","canal":"SMS","prioridade":"NORMAL","destinatario":"+5511999990000","mensagem":"Seu pedido saiu"}`. O mesmo conversor serve para publicar e para o listener converter de volta para `Notificacao`.
+6. **O `id` vai no cabeçalho `message_id` e a mensagem é persistente.** `message_id` igual a `notificacao.id().toString()`, para que qualquer consumidor possa deduplicar sem abrir o corpo, e modo de entrega `PERSISTENT` (o padrão do `RabbitTemplate`; confira que você não o mudou).
+
+**Consumo de e-mails**
+
+7. **O consumidor valida antes de chamar o provedor.** Um destinatário sem formato de e-mail (algo como `nome@dominio.tld`, sem espaços) lança `DestinatarioInvalidoException` **sem** chamar o `EnviadorDeEmail`. Exemplo: `sem-arroba` → exceção, zero chamadas ao provedor. `ana@exemplo.com` → `enviador.enviar("ana@exemplo.com", "Senha alterada")`.
+8. **Falha transitória: 1 tentativa + 2 repetições.** Se o provedor lançar `ProvedorIndisponivelException`, o Spring repete a chamada depois de 200 ms e de novo depois de 400 ms (o intervalo dobra). Exemplos: um provedor que falha duas vezes e depois funciona → 3 chamadas, e a mensagem **não** vai para a DLQ. Um provedor que falha sempre → 3 chamadas, e a mensagem vai para a DLQ com `x-death` = `notificacoes.email` / `rejected`.
+9. **Falha permanente não se repete.** `DestinatarioInvalidoException` vai **direto** para a DLQ: uma tentativa só, sem os 600 ms de espera das repetições. O consumidor não tem `try/catch`: quem decide entre repetir e desistir é a política de retry. Atenção: um `catch` que só registra no log faria o Spring confirmar (*ack*) a mensagem, e ela sumiria.
+
+## Passo a passo sugerido
+
+1. **Suba o RabbitMQ** (comando no **Experimente**) e abra o painel em `http://localhost:15672` (usuário e senha `guest`). Está vazio.
+2. **A topologia (regras 1 a 4).** Escreva o `Declarables` com as duas exchanges, as seis filas e os seis bindings. Suba `NotificacoesApplication`: as filas aparecem no painel, e a aba *Bindings* da exchange `notificacoes` mostra os padrões.
+3. **O conversor e o publicador (regras 2, 5 e 6).** Declare o `MessageConverter` JSON e escreva `publicar` com o `convertAndSend(exchange, routingKey, objeto, MessagePostProcessor)`, que deixa você mexer nas `MessageProperties` antes do envio. Rode o programa do **Experimente** e confira as filas dos três primeiros cenários.
+4. **O consumidor (regra 7).** O listener valida e chama o provedor. O quarto cenário passa a mostrar a chamada ao provedor, e a fila `email` fica vazia.
+5. **O retry (regras 8 e 9).** Ligue o retry em `notificacoes.properties` e declare o `RabbitListenerRetrySettingsCustomizer`. Os cenários 5, 6 e 7 passam a dar o resultado da tabela.
+6. **Confira a ausência de `catch`** no consumidor e de `Thread.sleep` no código de produção.
+
+## Experimente
+
+Suba um RabbitMQ 4 com o painel de gestão (é preciso ter o Docker):
+
+```bash
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:4-management-alpine
+```
+
+O Spring Boot se conecta por padrão a `localhost:5672` com `guest`/`guest`, então não há nada a configurar.
+
+O programa abaixo sobe a sua aplicação com um **provedor de e-mail de mentira** no lugar do `EnviadorDeEmailNoLog`: destinatários que começam com `instavel` falham nas duas primeiras chamadas, e os que começam com `fora-do-ar` falham sempre. Ele esvazia as filas, publica sete notificações e, depois de cada uma, mostra em que filas ela foi parar (exceto a de e-mail, que o seu consumidor esvazia). Salve-o em `src/main/java/dev/trilhajava/m12/notificacoes/DemonstracaoDeNotificacoes.java`, no starter:
+
+```java
+package dev.trilhajava.m12.notificacoes;
+
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.springframework.amqp.core.AmqpAdmin;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.support.GenericApplicationContext;
+
+public class DemonstracaoDeNotificacoes {
+
+    static final List<String> FILAS = List.of("notificacoes.sms", "notificacoes.push",
+            "notificacoes.urgentes", "notificacoes.auditoria", "notificacoes.dlq");
+
+    /** Provedor de mentira: "instavel@..." falha nas duas primeiras chamadas; "fora-do-ar@..." falha sempre. */
+    static final class ProvedorDeMentira implements EnviadorDeEmail {
+        final Map<String, AtomicInteger> chamadas = new ConcurrentHashMap<>();
+
+        @Override
+        public void enviar(String destinatario, String mensagem) {
+            int n = chamadas.computeIfAbsent(destinatario, d -> new AtomicInteger()).incrementAndGet();
+            System.out.printf("    provedor: chamada %d para %s%n", n, destinatario);
+            if (destinatario.startsWith("fora-do-ar") || (destinatario.startsWith("instavel") && n <= 2)) {
+                throw new ProvedorIndisponivelException("503 do provedor");
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        var provedor = new ProvedorDeMentira();
+        // Registra o provedor de mentira como o EnviadorDeEmail principal (no lugar do que só escreve no log).
+        ApplicationContextInitializer<GenericApplicationContext> registrar = contexto -> contexto.registerBean(
+                "provedorDeMentira", EnviadorDeEmail.class, () -> provedor, definicao -> definicao.setPrimary(true));
+
+        try (ConfigurableApplicationContext app = new SpringApplicationBuilder(NotificacoesApplication.class)
+                .initializers(registrar)
+                .run(args)) {
+            var publicador = app.getBean(PublicadorDeNotificacoes.class);
+            var rabbit = app.getBean(RabbitTemplate.class);
+            var admin = app.getBean(AmqpAdmin.class);
+            for (String fila : FILAS) {
+                if (admin.getQueueInfo(fila) == null) {
+                    System.out.println("A FILA " + fila + " NÃO EXISTE");
+                } else {
+                    admin.purgeQueue(fila, false);
+                }
+            }
+
+            cenario(publicador, rabbit, Notificacao.nova(Canal.SMS, Prioridade.NORMAL, "+5511999990000", "Seu pedido saiu"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.PUSH, Prioridade.ALTA, "dispositivo-42", "Login novo"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.PUSH, Prioridade.BAIXA, "dispositivo-42", "Novidades"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.EMAIL, Prioridade.ALTA, "ana@exemplo.com", "Senha alterada"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.EMAIL, Prioridade.NORMAL, "instavel@exemplo.com", "Fatura"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.EMAIL, Prioridade.NORMAL, "fora-do-ar@exemplo.com", "Oi"));
+            cenario(publicador, rabbit, Notificacao.nova(Canal.EMAIL, Prioridade.ALTA, "sem-arroba", "Oi"));
+        }
+    }
+
+    static void cenario(PublicadorDeNotificacoes publicador, RabbitTemplate rabbit, Notificacao notificacao)
+            throws InterruptedException {
+        System.out.printf("%s.%s para %s%n", notificacao.canal(), notificacao.prioridade(), notificacao.destinatario());
+        publicador.publicar(notificacao);
+        Thread.sleep(2_000); // tempo para o consumidor de e-mail e as repetições (só neste programa de teste)
+
+        List<String> chegou = new ArrayList<>();
+        Message exemplo = null;
+        for (String fila : FILAS) {
+            Message m;
+            while ((m = rabbit.receive(fila)) != null) {
+                chegou.add(fila.substring("notificacoes.".length()));
+                exemplo = exemplo == null ? m : exemplo;
+                if (fila.endsWith(".dlq")) {
+                    System.out.println("    na DLQ, x-death: " + m.getMessageProperties().getXDeathHeader().getFirst().get("queue")
+                            + " / " + m.getMessageProperties().getXDeathHeader().getFirst().get("reason"));
+                }
+            }
+        }
+        System.out.println("    filas: " + chegou);
+        if (exemplo != null && notificacao.canal() == Canal.SMS) {
+            var p = exemplo.getMessageProperties();
+            System.out.printf("    routing key=%s content-type=%s message_id=%s modo=%s%n    corpo=%s%n",
+                    p.getReceivedRoutingKey(), p.getContentType(), p.getMessageId(), p.getReceivedDeliveryMode(),
+                    new String(exemplo.getBody(), StandardCharsets.UTF_8));
+        }
+    }
+}
+```
+
+Rode pelo ▶ do IntelliJ ou, na pasta do starter:
+
+```bash
+mvn -q compile exec:java "-Dexec.mainClass=dev.trilhajava.m12.notificacoes.DemonstracaoDeNotificacoes"
+```
+
+Com a sua solução pronta, a saída (sem as linhas de log do Spring) é esta:
+
+```text
+SMS.NORMAL para +5511999990000
+    filas: [sms, auditoria]
+    routing key=sms.normal content-type=application/json message_id=5f0c9a1e-… modo=PERSISTENT
+    corpo={"id":"5f0c9a1e-…","canal":"SMS","prioridade":"NORMAL","destinatario":"+5511999990000","mensagem":"Seu pedido saiu"}
+PUSH.ALTA para dispositivo-42
+    filas: [push, urgentes, auditoria]
+PUSH.BAIXA para dispositivo-42
+    filas: [push, auditoria]
+EMAIL.ALTA para ana@exemplo.com
+    provedor: chamada 1 para ana@exemplo.com
+    filas: [urgentes, auditoria]
+EMAIL.NORMAL para instavel@exemplo.com
+    provedor: chamada 1 para instavel@exemplo.com
+    provedor: chamada 2 para instavel@exemplo.com
+    provedor: chamada 3 para instavel@exemplo.com
+    filas: [auditoria]
+EMAIL.NORMAL para fora-do-ar@exemplo.com
+    provedor: chamada 1 para fora-do-ar@exemplo.com
+    provedor: chamada 2 para fora-do-ar@exemplo.com
+    provedor: chamada 3 para fora-do-ar@exemplo.com
+    na DLQ, x-death: notificacoes.email / rejected
+    filas: [auditoria, dlq]
+EMAIL.ALTA para sem-arroba
+    na DLQ, x-death: notificacoes.email / rejected
+    filas: [urgentes, auditoria, dlq]
+```
+
+O que pode variar: o `id` (é aleatório) e a ordem dos campos no corpo. Nos cenários com falha, o Spring também escreve avisos no log com a pilha da exceção; isso é esperado. Se uma fila não existir, o programa avisa logo no começo (`A FILA … NÃO EXISTE`).
+
+Como ler a saída quando algo está errado:
+
+- **`filas: []` em todos os cenários:** os bindings não existem ou a routing key está diferente (maiúsculas, por exemplo). Abra a exchange `notificacoes` no painel e confira a aba *Bindings*; publique uma mensagem à mão pela aba *Publish message* para testar um padrão.
+- **`urgentes` recebendo `push.baixa`:** o padrão está `*.*` ou `#`, e não `*.alta`.
+- **`instavel` com uma chamada só e a mensagem na DLQ:** o retry não está ligado. Com o retry desligado e uma DLX, a primeira exceção já rejeita a mensagem.
+- **`sem-arroba` com três chamadas, ou chegando à DLQ depois de mais de meio segundo:** a falha permanente está sendo repetida.
+- **A mensagem de `fora-do-ar` voltando para a fila sem parar:** a mensagem está sendo rejeitada *com* reenfileiramento. Sem o retry configurado, é o que o Spring faz por padrão quando o listener lança exceção.
+
+## Critérios de aceite
+
+- [ ] Os sete cenários do **Experimente** dão a saída indicada, com a sua aplicação rodando contra um RabbitMQ 4.
+- [ ] A topologia é toda declarada em código: apagar o container, subir outro vazio e rodar o programa produz a mesma saída.
+- [ ] O consumidor não tem `try/catch`, e o código de produção não tem `Thread.sleep`.
+- [ ] Você explica, com as suas palavras, por que o serviço de pedidos não precisa saber que as filas de urgentes e de auditoria existem.
+
+## Desafios opcionais
+
+- Ative *publisher confirms* (`spring.rabbitmq.publisher-confirm-type=correlated`) e trate uma confirmação negativa.
+- Troque o consumo por um listener que recebe `Message` e deduplica pelo `message_id` (antecipando a aula de consumidores idempotentes).
+- Adicione uma exchange alternativa (*alternate exchange*) para capturar mensagens sem fila de destino, por exemplo com a routing key `fax.alta`.
+- Escreva a sua própria suíte de testes com `@SpringBootTest` e Testcontainers (`RabbitMQContainer` com `@ServiceConnection`), transformando cada cenário do **Experimente** num teste.
+
+<Dicas>
+<Dica nivel={1}>
+Declare tudo num único bean `Declarables`: exchanges, filas e bindings. Para a fila de canal, use `QueueBuilder.durable(nome).quorum().deadLetterExchange("notificacoes.dlx").build()`. Os bindings saem de `BindingBuilder.bind(fila).to(exchange).with(padrao)`; para a fanout, sem o `with`.
+</Dica>
+<Dica nivel={2}>
+- JSON: um bean `MessageConverter` com `new JacksonJsonMessageConverter(json)`. O Spring Boot o liga no `RabbitTemplate` e na fábrica de listeners.
+- `message_id`: no `MessagePostProcessor`, `mensagem.getMessageProperties().setMessageId(...)` e devolva a mensagem.
+- Retry: `spring.rabbitmq.listener.simple.retry.enabled`, `max-retries`, `initial-interval` e `multiplier`, em `notificacoes.properties`.
+</Dica>
+<Dica nivel={3}>
+Para a falha permanente não ser repetida, declare um bean `RabbitListenerRetrySettingsCustomizer` que chame `setExceptionExcludes(List.of(DestinatarioInvalidoException.class))`. A política verifica as causas da exceção, então funciona apesar do `ListenerExecutionFailedException` que envolve a sua. Esgotadas as tentativas, o recuperador padrão rejeita a mensagem sem reenfileirar, e a DLX faz o resto.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="TopologiaRabbit">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/notificacoes/TopologiaRabbit.java" />
+</Tab>
+<Tab rotulo="Publicador">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/notificacoes/PublicadorDeNotificacoes.java" />
+</Tab>
+<Tab rotulo="Consumidor">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/notificacoes/ConsumidorDeEmail.java" />
+</Tab>
+</Tabs>
+
+```properties
+# notificacoes.properties
+spring.rabbitmq.listener.simple.retry.enabled=true
+spring.rabbitmq.listener.simple.retry.max-retries=2
+spring.rabbitmq.listener.simple.retry.initial-interval=200ms
+spring.rabbitmq.listener.simple.retry.multiplier=2
+spring.rabbitmq.listener.simple.prefetch=10
+```
+
+A solução de referência tem uma suíte com Testcontainers, em `java/m12-mensageria/solucao/src/test`, que cobre os mesmos cenários do **Experimente**.
+
+### Por que assim
+
+- **Roteamento na configuração, não no código.** O publicador não sabe que existem as filas de urgentes e de auditoria. Um quarto interessado (o time de dados) é mais um binding, sem mudar nem fazer deploy do serviço de pedidos.
+- **Quorum queues para os canais.** São replicadas e, no RabbitMQ 4, limitam as reentregas. A DLQ e a auditoria ficaram clássicas por simplicidade; em produção, a auditoria também seria quorum.
+- **O consumidor não trata exceções.** Quem decide entre repetir e desistir é a política de retry. Um `try/catch` que registra no log e retorna faria o Spring confirmar (ack) a mensagem, e ela sumiria.
+- **A validação vem antes do provedor.** Um destinatário inválido nem chega ao `EnviadorDeEmail`.
+- **`prefetch=10`.** O padrão (250) favorece a vazão, mas prende muitas mensagens num consumidor lento enquanto os outros ficam ociosos.
+
+### Alternativas e trade-offs
+
+- **Uma exchange por canal** (direct) em vez de uma topic: mais simples, mas a fila de urgentes precisaria de bindings em três exchanges.
+- **Retry com fila de espera** (TTL + DLX de volta para a fila original): não bloqueia o consumidor durante a espera, ao custo de mais filas. É o equivalente, no RabbitMQ, aos tópicos de retry do Kafka. O retry em memória deste exercício segura a thread do consumidor durante os 600 ms.
+
+### Avalie sua solução
+
+- O que acontece se o serviço de pedidos publicar enquanto o RabbitMQ está fora? Como a aula de transactional outbox resolve isso?
+- Se o provedor de e-mail ficar fora por 1 hora, quantas mensagens vão para a DLQ? Que alternativa seria melhor do que matar todas?
+- Quem olha a DLQ, e com que frequência? Sem um alerta sobre o tamanho dela, ela é só um lugar organizado para perder mensagens.
+
+</Solucao>

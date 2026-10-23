@@ -1,0 +1,717 @@
+---
+titulo: Por que testar — e como escrever um bom teste
+descricao: "O custo de um bug que nenhum teste pegou, a pirâmide e o troféu de testes, o que faz um bom teste, Arrange-Act-Assert e como escolher os casos (partições, valores-limite, erros). Na prática: escrever, rodar e quebrar de propósito uma suíte com JUnit 6 e AssertJ, e medir a força dela com testes de mutação (PIT)."
+modulo: 10-testes
+ordem: 1
+duracao: 100
+objetivos:
+  - Explicar, a partir de um bug concreto, o que se perde quando o comportamento não tem teste automatizado
+  - Distribuir testes entre unidade, integração e ponta a ponta usando a pirâmide e o troféu de testes
+  - Escrever um teste de unidade com JUnit 6 e AssertJ na estrutura Arrange-Act-Assert e rodá-lo pelo Maven e pelo IntelliJ
+  - Derivar casos de teste com partições de equivalência, valores-limite e casos de erro, e registrá-los numa tabela
+  - Reconhecer testes que falham (ou passam) pelo motivo errado e corrigi-los com base nas propriedades de um bom teste
+  - Diferenciar cobertura de linhas de força da suíte e interpretar o relatório de um teste de mutação do PIT
+tags: [testes, pirâmide de testes, AAA, valores-limite, cobertura, mutation testing, PIT, Surefire]
+flashcards:
+  - frente: O que diz a pirâmide de testes? E o troféu?
+    verso: A pirâmide pede muitos testes de unidade (rápidos, baratos, precisos), menos de integração e poucos ponta a ponta (lentos, caros, frágeis). O troféu, de Kent C. Dodds, põe o maior peso na integração, que dá mais confiança por teste em aplicações que são "cola" entre HTTP e banco.
+  - frente: O que significa Arrange-Act-Assert?
+    verso: A estrutura de um teste. Arrange monta o cenário, Act executa UMA ação sob teste e Assert confere o resultado. Em BDD, os mesmos três blocos se chamam Given-When-Then.
+  - frente: O que são partições de equivalência e valores-limite?
+    verso: Partição é um grupo de entradas que o código deve tratar do mesmo jeito (todo subtotal entre 100,00 e 299,99 ganha 5%); basta um representante de cada. Valores-limite são as entradas nas fronteiras entre partições (99,99 e 100,00), onde moram os erros de "maior" trocado por "maior ou igual".
+  - frente: O que significa "o teste falha pelo motivo certo"?
+    verso: Ele só fica vermelho quando o comportamento que descreve quebra. Falhar por escala de BigDecimal (7.5 contra 7.50), fuso horário ou ordem de execução é falhar pelo motivo errado, e ensina o time a ignorar o vermelho.
+  - frente: Por que 100% de cobertura de linhas não garante uma boa suíte?
+    verso: Cobertura só mede se a linha EXECUTOU durante os testes, não se algum teste conferiu o resultado dela. Na aula, uma suíte com 100% de cobertura deixou passar o bug de ">=" trocado por ">".
+  - frente: O que é teste de mutação e o que significa "o mutante sobreviveu"?
+    verso: Uma ferramenta (no Java, o PIT) cria cópias do código com um defeito pequeno cada (">=" vira ">", um retorno vira null) e roda a suíte contra cada cópia. Se nenhum teste falha, o mutante sobreviveu, e existe um comportamento que nenhum teste protege.
+  - frente: Por que uma classe de teste chamada VerificacoesDoDesconto não roda no mvn test?
+    verso: O Surefire só executa, por padrão, classes cujo nome termina em Test, Tests ou TestCase, ou começa com Test. As outras são ignoradas em silêncio, e o build fica verde mesmo que o teste falhe.
+---
+
+Numa segunda-feira de novembro, a loja de cafés da nossa trilha lançou uma campanha: **"5% de desconto em compras a partir de R$ 100"**. O item mais vendido da campanha era o Kit Degustação, que custa exatamente R$ 100,00. Na quarta-feira, o atendimento já tinha dezenas de reclamações: quem comprava só o kit não ganhava desconto nenhum. A causa era um único caractere. A regra dizia "a partir de", e o código dizia `subtotal.compareTo(CEM) > 0`, ou seja, "acima de". R$ 100,00 não é maior que R$ 100,00.
+
+O conserto levou um minuto. Todo o resto levou dias: descobrir quais pedidos foram afetados, estornar a diferença para cada cliente (a oferta anunciada obriga a loja a cumpri-la, como manda o Código de Defesa do Consumidor), responder às reclamações e, o pior, colocar a correção no ar numa sexta à noite **sem saber se ela quebrava outra coisa**, porque nada no sistema dizia o que ele deveria fazer. O teste que teria evitado tudo isso tem quatro linhas e roda em um milissegundo.
+
+É disso que esta aula trata: do que os testes compram para quem mantém o sistema, que é **poder mudar o código sem medo**. Você vai ver onde cada tipo de teste se encaixa, o que separa um bom teste de um que só ocupa espaço e como decidir **quais** casos testar. Na prática, vai escrever a suíte da calculadora de descontos da loja, rodá-la pelo terminal e pelo IntelliJ, reintroduzir o bug da campanha para vê-la pegá-lo e medir a força dela com testes de mutação.
+
+## O que os testes compram (e o que custa não ter)
+
+| Onde o bug aparece | Quem descobre | O que custa |
+|---|---|---|
+| No seu computador, ao rodar os testes | Você, segundos depois de escrever | Corrigir uma linha ainda fresca na memória |
+| No CI, no pull request | O pipeline, antes da revisão | Um commit a mais |
+| Em homologação | Alguém de QA, dias depois | Reproduzir, abrir chamado, relembrar o código |
+| Em produção | O cliente | Dinheiro, reputação, investigação, correção sob pressão |
+
+Quanto mais tarde, mais caro. Testes automatizados empurram a descoberta para a primeira linha da tabela, e compram mais do que isso:
+
+- **Refatoração segura.** Você melhora a estrutura e a suíte diz, em segundos, se o comportamento mudou. Sem testes, ninguém ousa refatorar, e código que não pode ser melhorado só piora.
+- **Deploy frequente.** O CI (módulo 14) roda a suíte a cada commit; ninguém precisa "testar tudo na mão" antes de cada entrega.
+- **Documentação que não mente.** Um teste chamado "exatamente R$ 100,00 já ganha 5%" explica a regra melhor que um wiki, e nunca fica desatualizado, porque roda a cada build.
+- **Correções que não voltam.** O primeiro passo diante de um bug é escrever o teste que o reproduz. Corrigido o código, o teste impede que o bug volte (bugs que voltam se chamam **regressões**).
+
+## A intuição: uma montadora de carros
+
+Uma montadora testa carros em três níveis, cada um com um custo diferente:
+
+- **Na bancada**, cada peça é testada sozinha: a bomba de combustível recebe pressão e a medição é comparada com a especificação. Testes rápidos e baratos, feitos aos milhares, que apontam exatamente a peça defeituosa. No software, é o **teste de unidade**: uma classe ou regra, isolada.
+- **No dinamômetro**, o motor montado roda preso a uma bancada de medição. Mais caro e mais lento, mas pega o que a bancada não vê: duas peças boas que não encaixam. No software, é o **teste de integração**: o repositório contra um PostgreSQL de verdade, o controller recebendo HTTP.
+- **Na pista** e no **crash test**, o carro inteiro é dirigido (e destruído). O mais realista e o mais caro. No software, é o **teste ponta a ponta** (*end-to-end*, E2E): o sistema inteiro no ar, testado de fora, como um usuário.
+
+Nenhuma montadora faz só crash tests (caríssimo e, quando falha, ninguém sabe qual peça foi), nem só testes de bancada (as peças podem não encaixar). A pergunta é **quanto de cada**.
+
+<Figura legenda="Duas formas de distribuir os testes: a pirâmide pede uma base larga de testes de unidade; o troféu engorda a faixa de integração e põe a análise estática na base">
+<svg viewBox="0 0 700 330" width="700" role="img" aria-labelledby="piramide-titulo piramide-desc">
+  <title id="piramide-titulo">A pirâmide e o troféu de testes</title>
+  <desc id="piramide-desc">À esquerda, a pirâmide: unidade na base larga, integração no meio, ponta a ponta no topo. No centro, uma seta: para cima, testes mais lentos, caros e realistas; para baixo, mais rápidos, baratos e precisos. À direita, o troféu: análise estática na base, unidade, a faixa mais larga de integração e ponta a ponta no topo.</desc>
+  <defs><marker id="mk-piramide" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <polygon points="170,20 225,95 115,95" class="d-accent"/>
+  <text x="170" y="80" text-anchor="middle" class="d-title">E2E</text>
+  <polygon points="111,101 229,101 279,170 61,170" class="d-info"/>
+  <text x="170" y="141" text-anchor="middle" class="d-title">integração</text>
+  <polygon points="57,176 283,176 333,245 7,245" class="d-ok"/>
+  <text x="170" y="216" text-anchor="middle" class="d-title">unidade</text>
+  <text x="170" y="275" text-anchor="middle" class="d-text">Pirâmide</text>
+  <text x="170" y="295" text-anchor="middle" class="d-label">(Mike Cohn)</text>
+  <path d="M350 245 L350 24" class="d-line" marker-start="url(#mk-piramide)" marker-end="url(#mk-piramide)"/>
+  <text x="350" y="14" text-anchor="middle" class="d-label">lento, caro, realista</text>
+  <text x="350" y="265" text-anchor="middle" class="d-label">rápido, barato, preciso</text>
+  <rect x="487" y="20" width="96" height="40" rx="8" class="d-accent"/>
+  <text x="535" y="45" text-anchor="middle" class="d-title">E2E</text>
+  <rect x="425" y="66" width="220" height="92" rx="12" class="d-info"/>
+  <text x="535" y="117" text-anchor="middle" class="d-title">integração</text>
+  <rect x="465" y="164" width="140" height="40" rx="8" class="d-ok"/>
+  <text x="535" y="189" text-anchor="middle" class="d-title">unidade</text>
+  <rect x="495" y="210" width="80" height="35" rx="8" class="d-violet"/>
+  <text x="535" y="232" text-anchor="middle" class="d-label">estática</text>
+  <text x="535" y="275" text-anchor="middle" class="d-text">Troféu</text>
+  <text x="535" y="295" text-anchor="middle" class="d-label">(Kent C. Dodds)</text>
+  <text x="350" y="322" text-anchor="middle" class="d-label">a largura de cada faixa = a quantidade de testes daquele tipo</text>
+</svg>
+</Figura>
+
+A **pirâmide** (popularizada por Mike Cohn) segue a lógica da montadora: quanto mais alto, mais lento, mais caro de manter e mais difícil de diagnosticar. Um teste E2E vermelho diz "o checkout quebrou"; um teste de unidade vermelho diz "a faixa de 5% não começa em R$ 100,00".
+
+O **troféu** (de Kent C. Dodds) questiona a base larga. Em aplicações que são majoritariamente "cola" (recebem HTTP, validam, gravam no banco), um teste de unidade com tudo trocado por dublês prova pouco, e o de integração dá mais confiança por teste. Na base fica a **análise estática** (o compilador, o `-Xlint`), que pega erros sem rodar nada. Na prática, um backend Java saudável combina as duas ideias:
+
+| Tipo | O que testa | Velocidade | Na trilha |
+|---|---|---|---|
+| **Unidade** | uma classe ou regra, isolada | milissegundos | esta aula; os serviços com dublês da [aula 3](../03-mockito/) |
+| **Integração / fatia** | uma camada com a tecnologia real | segundos | `@WebMvcTest`, `@DataJpaTest` (aula 4); PostgreSQL de verdade com Testcontainers (aula 5) |
+| **Ponta a ponta** | o sistema inteiro, de fora | segundos a minutos | os testes de aceitação dos marcos do projeto integrador |
+
+**Regras de negócio densas** (cálculos, validações) pedem muitos testes de unidade: têm muitos casos, e cada caso custa um milissegundo. **Cada camada técnica** (HTTP, SQL, mensageria) pede integração, porque é ali que aparecem os mal-entendidos com o framework. **Os fluxos críticos** (comprar, pagar, estornar) merecem um punhado de testes ponta a ponta.
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Classe sob teste** (SUT) | A classe cujo comportamento o teste verifica. Aqui, a `CalculadoraDeDesconto` |
+| **Caso de teste** | Entradas, ação e resultado esperado. Vira um `@Test` ou uma linha de tabela |
+| **Asserção** | A verificação que decide se o teste passa: `assertThat(desconto).isEqualByComparingTo("7.50")` |
+| **Partição de equivalência** | Um grupo de entradas que o código deve tratar do mesmo jeito |
+| **Valor-limite** | Uma entrada na fronteira entre duas partições (99,99 e 100,00) |
+| **Teste *flaky*** | Um teste que às vezes passa e às vezes falha, sem mudança no código |
+| **Cobertura** | A fração do código que **executou** durante os testes |
+| **Mutante** | Uma cópia do código com um defeito proposital, que a suíte deveria "matar" (falhar) |
+
+## O que é um bom teste
+
+Um teste ruim custa em dobro: não protege nada e ainda atrapalha. Cinco propriedades separam os testes que o time respeita dos que ele aprende a ignorar.
+
+| Propriedade | Significa | O que quebra isso |
+|---|---|---|
+| **Rápido** | Unidade em milissegundos; a suíte inteira em segundos ou poucos minutos | Subir o Spring para testar um cálculo; `Thread.sleep`; rede |
+| **Determinístico** | O mesmo resultado sempre, em qualquer máquina, em qualquer dia | `LocalDate.now()`, `Random` sem semente, fuso horário, depender da internet |
+| **Isolado** | Não depende de outros testes nem da ordem em que rodam | Estado estático compartilhado; um teste que usa o dado que outro gravou |
+| **Legível** | Quem lê entende a regra sem abrir a implementação | Nome `teste1`; dez asserções sobre coisas diferentes; números mágicos sem explicação |
+| **Falha pelo motivo certo** | Fica vermelho quando, e só quando, o comportamento quebra | Esperado copiado da implementação; comparar `BigDecimal` pela escala; asserção ausente |
+
+A mesma ideia aparece em entrevistas como **FIRST**: *Fast*, *Independent*, *Repeatable*, *Self-validating* (o próprio teste decide se passou, sem ninguém "conferir no console") e *Timely* (escrito junto com o código, não "depois").
+
+A propriedade mais subestimada é a última da tabela. Um teste *flaky* é pior que nenhum: depois da terceira vez que alguém clica em "rodar de novo" e ele passa, o time aprende que vermelho não significa nada, e o dia do bug de verdade passa despercebido. As causas mais comuns são tempo (`now()`), concorrência e dependência de ordem; por isso esta trilha injeta um `Clock` (na prática, na [aula 3](../03-mockito/)) e nunca usa `sleep` em teste.
+
+## O código que vamos testar
+
+Tudo o que aparece nesta aula existe no projeto Maven da trilha, em `java/m10-testes/aulas`, pacote `dev.trilhajava.m10.aulas.fundamentos`, e roda no CI. O cliente pode ser avulso ou assinante do clube do café:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fundamentos/Cliente.java" />
+
+E a calculadora. As cinco regras do Javadoc são a especificação que a suíte precisa proteger.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fundamentos/CalculadoraDeDesconto.java" destacar="42, 45" />
+
+- **É uma função pura.** Mesma entrada, mesma saída, nenhuma dependência (nem banco, nem relógio, nem rede): o código mais fácil de testar, e por isso as regras de negócio devem morar em classes assim. Quando há banco e gateway, entram os dublês da aula 3.
+- **As linhas destacadas são as fronteiras.** O `>= 0` das linhas 42 e 45 é onde o bug da campanha morava. Trocar `>=` por `>` compila, parece certo numa revisão rápida e só erra num único valor por faixa.
+- **Dinheiro é `BigDecimal`**, nunca `double`, e o arredondamento explícito (`HALF_UP`) também é regra que merece teste.
+
+## Mão na massa
+
+Todos os comandos abaixo rodam dentro da pasta do módulo:
+
+```bash
+cd java/m10-testes/aulas
+```
+
+<Callout tipo="info" titulo="Ainda no JDK 21?">
+O projeto mira o Java 25. Se o seu JDK ainda é o 21, acrescente `"-Djava.release=21"` a cada comando `mvn` desta aula. No PowerShell, mantenha entre aspas todo argumento `-D` que tenha ponto no nome (como `"-Dexec.mainClass=..."`): sem aspas, o PowerShell o quebra em dois.
+</Callout>
+
+### Passo 1: onde os testes moram
+
+**O que vamos fazer e por quê.** Entender a convenção que o Maven (e o IntelliJ) espera. Seguindo-a, nada precisa ser configurado.
+
+```text
+java/m10-testes/aulas/
+├── pom.xml
+└── src/
+    ├── main/java/dev/trilhajava/m10/aulas/fundamentos/
+    │   ├── CalculadoraDeDesconto.java        ← código de produção
+    │   ├── Cliente.java
+    │   └── ConferenciaManual.java
+    └── test/java/dev/trilhajava/m10/aulas/fundamentos/
+        ├── DescontoPrimeiroTesteTest.java    ← testes: mesmo pacote, outra pasta
+        ├── DescontoBordaDosCemReaisTest.java
+        ├── DescontoCasosTest.java
+        └── ...
+```
+
+**O que isso significa.**
+
+- **`src/main/java`** vai para o `.jar` de produção. **`src/test/java`** só existe no build: o Maven compila e roda, mas não empacota. As dependências de teste (JUnit, AssertJ, Mockito) têm `<scope>test</scope>` e também ficam fora do `.jar`.
+- **Mesmo pacote, pastas diferentes.** Para o Java, é o mesmo pacote, então o teste enxerga membros *package-private* (como a constante `INICIO_FAIXA_5`) sem que eles precisem ser públicos.
+- **Quem roda os testes é o plugin Surefire**, na fase `test` do Maven. Ele encontra o JUnit 6 no classpath, descobre as classes de teste e grava relatórios em `target/surefire-reports`.
+- **O nome da classe importa.** Por padrão, o Surefire só executa classes cujo nome **termina** em `Test`, `Tests` ou `TestCase`, ou **começa** com `Test`. Uma classe chamada `VerificacoesDoDesconto` é ignorada em silêncio (você verá isso em "Quando o teste falha"). A convenção da trilha: `<Assunto>Test`.
+
+### Passo 2: o "teste" que todo mundo escreve primeiro
+
+**O que vamos fazer e por quê.** Quase todo mundo começa conferindo o código com um `main` que imprime resultados. Vamos rodar um para ver o que falta nele.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/fundamentos/ConferenciaManual.java" />
+
+```bash
+mvn -q compile exec:java "-Dexec.mainClass=dev.trilhajava.m10.aulas.fundamentos.ConferenciaManual"
+```
+
+```text
+R$  50,00 avulso    -> 0.00
+R$ 150,00 avulso    -> 7.50
+R$ 150,00 assinante -> 15.00
+R$ 400,00 assinante -> 50.00
+```
+
+**O que acabou de acontecer.** Os números estão certos (150 × 5% = 7,50; 150 × 10% = 15,00; 400 × 15% = 60,00, limitado ao teto de 50,00). Mas quem conferiu foi **você**, com os olhos, agora. Quatro problemas:
+
+1. **Não é automático** (viola o *self-validating*). Depois de cada mudança, alguém precisa rodar de novo e lembrar quais eram os números certos. Ninguém faz isso na sexta à noite.
+2. **A expectativa fica na sua cabeça.** "150 avulso dá 7,50" não está escrito em lugar nenhum.
+3. **Não quebra o build.** Se a saída virar `0.00`, o `main` termina com sucesso do mesmo jeito.
+4. **Só confere o que você lembrou.** Nenhuma linha passa por R$ 100,00, o valor da campanha.
+
+Um teste automatizado resolve os três primeiros por construção. O quarto depende de você, e é o assunto do passo 6.
+
+### Passo 3: o primeiro teste, em três blocos
+
+**O que vamos fazer e por quê.** Vamos transformar a segunda linha do `main` num teste de verdade: a expectativa fica escrita no código, e o JUnit decide sozinho se passou.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoPrimeiroTesteTest.java" destacar="14-16, 18-19, 21-22" />
+
+Rode:
+
+```bash
+mvn test -Dtest=DescontoPrimeiroTesteTest
+```
+
+Saída (resumida):
+
+```text
+[INFO] --- surefire:3.5.4:test (default-test) @ m10-testes-aulas ---
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoPrimeiroTesteTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.093 s -- in …DescontoPrimeiroTesteTest
+[INFO] Results:
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- `@Test` marca o método como teste. O JUnit cria **uma instância nova da classe para cada teste**, chama o método e considera que ele passou se terminar sem exceção. Nenhum campo de um teste vaza para outro: é aí que o isolamento começa.
+- `@DisplayName` dá um nome em português, que aparece no IntelliJ e nos relatórios. Ele descreve **a regra**: se o teste quebrar daqui a seis meses, o nome já diz o que parou de funcionar.
+- **Arrange** (linhas 14 a 16) monta o cenário. Em testes maiores, é onde ficam os dados e os dublês.
+- **Act** (linhas 18 e 19) executa **uma** ação, a que está sendo testada. Duas ações costumam significar dois testes.
+- **Assert** (linhas 21 e 22) confere o resultado. `isEqualByComparingTo("7.50")` compara `BigDecimal` pelo **valor** (`compareTo`), ignorando a escala. O comentário mostra a conta feita **à mão**: o esperado nunca vem de rodar o código e copiar a saída, senão o teste congela o bug em vez de detectá-lo.
+- Classe e métodos não são `public`: no JUnit 6 (como no 5), podem ser *package-private*, e a convenção é omitir o modificador.
+
+Em **BDD** (*Behavior-Driven Development*), os três blocos se chamam **Given-When-Then** ("dado um avulso com R$ 150,00, quando o desconto é calculado, então ele é R$ 7,50"). É a mesma estrutura, e é de onde vêm o `given` e o `then` do BDDMockito da aula 3. Os comentários ajudam no começo; depois, uma linha em branco entre os blocos basta.
+
+<Callout tipo="dica" titulo="Dá para ter mais de uma asserção?">
+Sim, desde que todas descrevam **o mesmo comportamento**. Conferir o desconto do avulso e depois o do assinante são dois comportamentos: dois testes. A regra não é "uma asserção por teste", é **"um motivo para falhar por teste"**.
+</Callout>
+
+### Passo 4: rodando pelo terminal e pelo IntelliJ
+
+**Pelo terminal.** O filtro `-Dtest` do Surefire aceita vários formatos:
+
+| Comando | Roda |
+|---|---|
+| `mvn test` | todos os testes do módulo |
+| `mvn test -Dtest=DescontoCasosTest` | uma classe |
+| `mvn test -Dtest='DescontoCasosTest,DescontoTetoTest'` | algumas classes |
+| `mvn test -Dtest='Desconto*Test'` | as classes que casam com o padrão |
+| `mvn test -Dtest='DescontoBordaDosCemReaisTest#exatamenteNoInicioDaFaixa'` | um único método |
+| `mvn -q test` | tudo, mostrando só erros (silencioso quando passa) |
+
+As aspas evitam que o shell interprete o `*`, o `#` e a vírgula. Cada execução deixa em `target/surefire-reports` um `.txt` e um `.xml` por classe; o `.xml` é o que o CI (GitHub Actions, Jenkins) lê para mostrar os resultados.
+
+**Pelo IntelliJ.** **File → Open**, selecione `java/m10-testes/aulas/pom.xml` e escolha **Open as Project**. Depois:
+
+1. Em `DescontoPrimeiroTesteTest`, a margem esquerda mostra um **▶ verde** ao lado da classe e de cada método: clique para rodar a classe inteira ou um só teste. Atalho, com o cursor no método: **Ctrl+Shift+F10** no Windows e no Linux (**⌃⇧R** no macOS).
+2. A janela **Run** mostra a árvore de testes com os `@DisplayName` e um ✔ ou ✘ em cada um. Num teste que falhou, o link **Click to see difference** abre o esperado e o obtido lado a lado.
+3. Botão direito em `src/test/java` → **Run 'All Tests'** roda tudo; depois de uma falha, **Rerun Failed Tests** roda só os que falharam.
+4. O menu do ▶ tem **Run with Coverage**, que pinta de verde as linhas executadas. No passo 8 você verá por que isso, sozinho, engana.
+
+O IntelliJ usa o próprio executor do JUnit, não o Surefire, e roda **qualquer** classe com `@Test` que você mandar. Um teste que passa no IntelliJ e nem aparece no `mvn test` quase sempre tem um nome fora da convenção. **O que vale é o `mvn test`**, porque é ele que o CI roda.
+
+### Passo 5: reintroduzindo o bug da campanha
+
+**O que vamos fazer e por quê.** Um teste que você nunca viu falhar é um teste em que você não pode confiar: talvez ele passe por qualquer motivo. Então vamos fazer o que o desenvolvedor da campanha fez sem querer: trocar `>=` por `>` na linha 45 da calculadora. Antes, o par de testes que teria evitado o problema:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoBordaDosCemReaisTest.java" destacar="17, 25" />
+
+Os dois testes ficam **um de cada lado da fronteira**: o último centavo sem desconto e o primeiro centavo com desconto. Agora, a alteração no código de produção (faça, mas lembre de desfazer):
+
+```java
+        if (subtotal.compareTo(INICIO_FAIXA_5) > 0) {      // era >= 0
+```
+
+```bash
+mvn test -Dtest=DescontoBordaDosCemReaisTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoBordaDosCemReaisTest
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.109 s <<< FAILURE! -- in …DescontoBordaDosCemReaisTest
+[ERROR] dev.trilhajava.m10.aulas.fundamentos.DescontoBordaDosCemReaisTest.exatamenteNoInicioDaFaixa -- Time elapsed: 0.082 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+expected: 5.00
+ but was: 0.00
+	at dev.trilhajava.m10.aulas.fundamentos.DescontoBordaDosCemReaisTest.exatamenteNoInicioDaFaixa(DescontoBordaDosCemReaisTest.java:27)
+…
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0
+[INFO] BUILD FAILURE
+```
+
+**Como ler essa saída.**
+
+- `Tests run: 2, Failures: 1` resume a classe. **Failure** é uma asserção que não bateu (comportamento errado); **Error** seria uma exceção inesperada antes da asserção (um `NullPointerException`, por exemplo).
+- A linha com `<<< FAILURE!` diz **qual** teste falhou. O `umCentavoAntesDaFaixa` continuou passando, o que já localiza o problema: o valor exato da fronteira.
+- `expected: 5.00 but was: 0.00` é a mensagem do AssertJ, e `DescontoBordaDosCemReaisTest.java:27` é a linha da asserção (no IntelliJ, um link).
+- `BUILD FAILURE`: no CI, o pull request fica vermelho. O bug da campanha **não chegaria à produção**.
+
+Desfaça a alteração e rode de novo: os dois passam. **Ver o teste falhar pelo motivo certo e depois passar** é a única prova de que ele verifica o que diz verificar. Na [aula 6](../06-tdd-e-arquitetura/), esse ciclo vira método de trabalho, o TDD.
+
+<Callout tipo="atencao" titulo="Bug encontrado? Primeiro o teste">
+Quando um bug chega de produção, escreva antes o teste que o **reproduz** e veja-o falhar. Você prova que entendeu a causa, prova que a correção funciona, e o teste fica na suíte impedindo que o bug volte. O `DescontoBordaDosCemReaisTest` é exatamente esse teste.
+</Callout>
+
+### Passo 6: como escolher os casos
+
+**O que vamos fazer e por quê.** Não dá para testar todo `BigDecimal`, e nem precisa: a maioria das entradas se comporta igual a outras. O trabalho é escolher **poucos casos que pegam muitos bugs**. Três técnicas fazem quase tudo.
+
+**1. Partições de equivalência.** Divida as entradas em grupos que o código deve tratar do mesmo jeito. Pela regra 2, os subtotais válidos formam três partições (sem desconto, 5%, 10%), e os negativos, uma quarta. Se 150,00 funciona, 180,00 quase certamente também: basta **um representante** por partição.
+
+**2. Valores-limite.** Os bugs se concentram nas **fronteiras**, onde `>` e `>=` se diferenciam e onde alguém escreve 100 querendo dizer 99,99. Para cada fronteira, teste os dois lados: o último valor de uma partição e o primeiro da seguinte. Com dinheiro, um centavo de diferença.
+
+<Figura legenda="As partições do subtotal na reta: um valor típico no meio de cada uma e um par de valores-limite em cada fronteira">
+<svg viewBox="0 0 700 250" width="700" role="img" aria-labelledby="particoes-titulo particoes-desc">
+  <title id="particoes-titulo">Partições de equivalência e valores-limite do subtotal</title>
+  <desc id="particoes-desc">Reta do subtotal em quatro partições: negativo (exceção), 0,00 a 99,99 (sem desconto), 100,00 a 299,99 (5 por cento) e a partir de 300,00 (10 por cento). Valores típicos: menos 10, 50, 200 e 350. Pares de valores-limite: menos 0,01 e 0,00; 99,99 e 100,00; 299,99 e 300,00.</desc>
+  <defs><marker id="mk-particoes" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="120" height="56" rx="8" class="d-violet"/>
+  <text x="70" y="44" text-anchor="middle" class="d-title">inválido</text>
+  <text x="70" y="64" text-anchor="middle" class="d-label">exceção</text>
+  <rect x="136" y="20" width="180" height="56" rx="8" class="d-box"/>
+  <text x="226" y="44" text-anchor="middle" class="d-title">sem desconto</text>
+  <text x="226" y="64" text-anchor="middle" class="d-label">0%</text>
+  <rect x="322" y="20" width="180" height="56" rx="8" class="d-info"/>
+  <text x="412" y="44" text-anchor="middle" class="d-title">faixa de 5%</text>
+  <text x="412" y="64" text-anchor="middle" class="d-label">100,00 a 299,99</text>
+  <rect x="508" y="20" width="182" height="56" rx="8" class="d-ok"/>
+  <text x="599" y="44" text-anchor="middle" class="d-title">faixa de 10%</text>
+  <text x="599" y="64" text-anchor="middle" class="d-label">300,00 em diante</text>
+  <path d="M10 120 L690 120" class="d-line" marker-end="url(#mk-particoes)"/>
+  <path d="M133 108 L133 132" class="d-line"/>
+  <path d="M319 108 L319 132" class="d-line"/>
+  <path d="M505 108 L505 132" class="d-line"/>
+  <circle cx="70" cy="120" r="6" class="d-box"/>
+  <circle cx="226" cy="120" r="6" class="d-box"/>
+  <circle cx="412" cy="120" r="6" class="d-box"/>
+  <circle cx="599" cy="120" r="6" class="d-box"/>
+  <text x="70" y="152" text-anchor="middle" class="d-mono">-10</text>
+  <text x="226" y="152" text-anchor="middle" class="d-mono">50</text>
+  <text x="412" y="152" text-anchor="middle" class="d-mono">200</text>
+  <text x="599" y="152" text-anchor="middle" class="d-mono">350</text>
+  <circle cx="125" cy="120" r="5" class="d-accent"/>
+  <circle cx="141" cy="120" r="5" class="d-accent"/>
+  <circle cx="311" cy="120" r="5" class="d-accent"/>
+  <circle cx="327" cy="120" r="5" class="d-accent"/>
+  <circle cx="497" cy="120" r="5" class="d-accent"/>
+  <circle cx="513" cy="120" r="5" class="d-accent"/>
+  <text x="133" y="182" text-anchor="middle" class="d-mono">-0,01 | 0,00</text>
+  <text x="319" y="182" text-anchor="middle" class="d-mono">99,99 | 100,00</text>
+  <text x="505" y="182" text-anchor="middle" class="d-mono">299,99 | 300,00</text>
+  <circle cx="190" cy="222" r="6" class="d-box"/>
+  <text x="204" y="227" class="d-label">valor típico (um por partição)</text>
+  <circle cx="420" cy="222" r="5" class="d-accent"/>
+  <text x="434" y="227" class="d-label">valores-limite (dois por fronteira)</text>
+</svg>
+</Figura>
+
+**3. Casos de erro.** Entradas inválidas também são comportamento: subtotal negativo, `null`. São os caminhos que menos rodam em produção, até o dia em que rodam. Inclua também os suspeitos de sempre: **zero**, **vazio**, **nulo**, o **maior valor aceito**.
+
+Por fim, olhe as **combinações de regras**. O assinante soma 5 pontos em **qualquer** faixa, então cada faixa precisa de um caso com assinante. E o arredondamento só aparece quando a conta gera uma terceira casa: 100,10 × 5% = 5,005, que com HALF_UP vira 5,01. Um caso "redondo" como 200,00 nunca revelaria um arredondamento errado.
+
+Com partições, limites e combinações na mão, a suíte vira uma **tabela**. O teste parametrizado do JUnit roda o mesmo método uma vez por linha:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoCasosTest.java" semImports destacar="8-9, 14, 22" />
+
+**O que acabou de acontecer.**
+
+- `@ParameterizedTest` com `@CsvSource` transforma cada string numa execução do método. O JUnit converte o texto em `BigDecimal` e em `Cliente` (pelo nome da constante).
+- `name = "{1} com R$ {0} ganha R$ {2}"` monta o nome de cada linha no relatório, como "AVULSO com R$ 100.00 ganha R$ 5.00".
+- Cada linha tem um comentário dizendo **qual partição ou fronteira ela cobre**. Quem lê entende a regra e enxerga o que falta.
+- Na linha de 299,99, 5% dá 14,9995, que arredonda para 15,00: o valor "redondo" é resultado da regra, calculado à mão.
+
+A [aula 2](../02-junit-e-assertj/) explora os parametrizados a fundo. Aqui, o ponto é o **raciocínio** que produz a tabela. Os casos de erro ficam numa classe própria, porque a forma de verificar é outra:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoEntradasInvalidasTest.java" semImports />
+
+- `assertThatIllegalArgumentException().isThrownBy(...)` executa a lambda e confere o tipo da exceção; `withMessageContaining("-0.01")` confere que a mensagem diz qual valor foi recusado.
+- `-0.01` e `0.00` são o par de limites entre "inválido" e "sem desconto". Sem o teste do zero, um código que recusasse `signum() <= 0` passaria (o PIT reclama exatamente disso no passo 8).
+- O teste dos obrigatórios tem duas asserções, mas um só comportamento: "os dois parâmetros são obrigatórios".
+
+```bash
+mvn test -Dtest='DescontoCasosTest,DescontoEntradasInvalidasTest'
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoCasosTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.156 s -- in …DescontoCasosTest
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoEntradasInvalidasTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in …DescontoEntradasInvalidasTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Doze linhas, doze testes. Com o bug da campanha de volta, a tabela o pega em **dois** lugares:
+
+```text
+[ERROR] Tests run: 12, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.265 s <<< FAILURE! -- in …DescontoCasosTest
+[ERROR] …DescontoCasosTest.calculaODesconto(BigDecimal, Cliente, BigDecimal)[4] -- Time elapsed: 0.012 s <<< FAILURE!
+expected: 5.00
+ but was: 0.00
+…
+[ERROR] …DescontoCasosTest.calculaODesconto(BigDecimal, Cliente, BigDecimal)[10] -- Time elapsed: 0.003 s <<< FAILURE!
+expected: 10.00
+ but was: 5.00
+```
+
+`[4]` e `[10]` são os números das linhas da tabela (a partir de 1): `100.00, AVULSO` e `100.00, ASSINANTE`. No IntelliJ aparece o nome montado pelo `name`, mais fácil de ler.
+
+### Passo 7: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in …DescontoBordaDosCemReaisTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.157 s -- in …DescontoCasosTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in …DescontoEntradasInvalidasTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in …DescontoPrimeiroTesteTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in …DescontoSuiteFracaTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in …DescontoTetoTest
+…
+[INFO] Tests run: 40, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+O total é 40 porque o módulo também tem os testes da aula 3 (pacote `reembolso`). Repare nos tempos: **milésimos de segundo** por classe, sem banco, rede nem Spring. É essa velocidade que permite ter centenas de testes de unidade e rodá-los a cada alteração. (`DescontoTetoTest` é a solução do checkpoint; `DescontoSuiteFracaTest` é o assunto do próximo passo.)
+
+### Passo 8: cobertura não é qualidade
+
+**O que vamos fazer e por quê.** Muitas empresas medem a qualidade dos testes pela **cobertura**: a porcentagem de linhas executadas durante a suíte (no Java, com o **JaCoCo**, que a [aula 6](../06-tdd-e-arquitetura/) coloca no pipeline, ou com o **Run with Coverage** do IntelliJ). Ela é útil para achar código que **nenhum** teste toca, mas é fácil de enganar. Esta é uma suíte que alguém poderia ter escrito para a calculadora:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoSuiteFracaTest.java" semImports destacar="28" />
+
+Ela parece razoável: um caso por faixa, o assinante, o negativo. Executa **todas** as linhas da calculadora. Agora reintroduza o bug da campanha (`> 0` na linha 45) e rode só ela:
+
+```bash
+mvn test -Dtest=DescontoSuiteFracaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoSuiteFracaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.157 s -- in …DescontoSuiteFracaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**Verde, com o bug.** Os valores escolhidos (50, 200, 400) estão no meio das partições, longe das fronteiras, e o teste do assinante nem tem asserção. Cobertura mede se a linha **executou**; não mede se alguém **conferiu** o que ela fez. Desfaça o bug antes de seguir.
+
+**Testes de mutação** medem o que importa. Se a suíte é boa, qualquer defeito pequeno no código deve fazer algum teste falhar. Então uma ferramenta cria esses defeitos de propósito:
+
+1. Gera **mutantes** a partir do código compilado: cópias com uma alteração pequena cada (`>=` vira `>`, uma condição é negada, um retorno vira `null`).
+2. Roda os testes contra cada mutante.
+3. Se algum teste falha, o mutante foi **morto**. Se todos passam, ele **sobreviveu**: existe um defeito possível que ninguém percebe.
+
+No Java, a ferramenta é o **PIT** (pitest). O `pom.xml` do módulo já o declara, sem ligá-lo ao build normal (ele é lento demais para cada `mvn test`). Rode a análise só com a suíte fraca:
+
+```bash
+mvn test-compile org.pitest:pitest-maven:mutationCoverage "-DtargetTests=dev.trilhajava.m10.aulas.fundamentos.DescontoSuiteFracaTest"
+```
+
+```text
+================================================================================
+- Mutators
+================================================================================
+> org.pitest.mutationtest.engine.gregor.mutators.ConditionalsBoundaryMutator
+>> Generated 3 Killed 0 (0%)
+> KILLED 0 SURVIVED 3 TIMED_OUT 0 NON_VIABLE 0 
+…
+> org.pitest.mutationtest.engine.gregor.mutators.returns.NullReturnValsMutator
+>> Generated 4 Killed 4 (100%)
+…
+> org.pitest.mutationtest.engine.gregor.mutators.NegateConditionalsMutator
+>> Generated 4 Killed 4 (100%)
+…
+================================================================================
+- Statistics
+================================================================================
+>> Line Coverage (for mutated classes only): 19/19 (100%)
+>> 1 tests examined
+>> Generated 11 mutations Killed 8 (73%)
+>> Mutations with no coverage 0. Test strength 73%
+```
+
+**Como ler.** Compare duas linhas: **cobertura de linhas 100%** e **8 de 11 mutantes mortos**. Os três sobreviventes são do `ConditionalsBoundaryMutator`, que troca `<` por `<=` e `>=` por `>`. O relatório HTML em `target/pit-reports/index.html` mostra onde eles estão:
+
+- linha 28: `signum() < 0` virou `<= 0` e **sobreviveu** (ninguém testou o zero);
+- linha 42: `>= 0` da faixa de 10% virou `> 0` e **sobreviveu** (ninguém testou 300,00);
+- linha 45: `>= 0` da faixa de 5% virou `> 0` e **sobreviveu**. Esse é o bug da campanha, detectado automaticamente.
+
+Um detalhe curioso: o relatório atribui a morte do mutante que **nega** a condição da linha 28 ao teste `assinante()`, o que não tem asserção. Negada a condição, o subtotal de 1000,00 passa a lançar exceção, e uma exceção inesperada derruba qualquer teste. Um teste sem asserção ainda pega explosões; só não pega resultados errados.
+
+Agora rode o PIT com as duas classes do passo 6:
+
+```bash
+mvn test-compile org.pitest:pitest-maven:mutationCoverage "-DtargetTests=dev.trilhajava.m10.aulas.fundamentos.DescontoCasosTest,dev.trilhajava.m10.aulas.fundamentos.DescontoEntradasInvalidasTest"
+```
+
+```text
+> org.pitest.mutationtest.engine.gregor.mutators.ConditionalsBoundaryMutator
+>> Generated 3 Killed 3 (100%)
+…
+>> Line Coverage (for mutated classes only): 19/19 (100%)
+>> 2 tests examined
+>> Generated 11 mutations Killed 11 (100%)
+>> Mutations with no coverage 0. Test strength 100%
+```
+
+**A mesma cobertura, 100%, e uma suíte muito mais forte.** A diferença está em **quais valores** foram usados e **o que foi conferido**. Partições e valores-limite são a forma sistemática de matar mutantes antes que eles existam.
+
+<Callout tipo="atencao" titulo="100% de mutantes mortos também não é garantia">
+O PIT só testa os defeitos que sabe gerar, e os operadores padrão não mexem em `desconto.min(TETO)` nem em `RoundingMode.HALF_UP`. `DescontoCasosTest` não tem **nenhum** caso acima do teto de R$ 50,00 e mesmo assim deu 100%: se alguém apagar a regra do teto, a suíte continua verde. Quem decide o que testar ainda é você, lendo a especificação. O checkpoint é exatamente esse buraco.
+</Callout>
+
+**Cobertura** responde "o que ninguém testou?"; **mutação** responde "os testes conferem alguma coisa?". Nenhuma das duas deve virar meta: "80% de cobertura obrigatória" produz exatamente testes como o `assinante()`, escritos para bater o número. E o PIT é caro (roda a suíte uma vez por mutante): use-o nas classes de domínio, fora do build de cada commit.
+
+## Quando o teste falha: armadilhas e mensagens reais
+
+As saídas abaixo foram geradas de verdade, com testes temporários que já foram removidos do projeto.
+
+### O teste que falha pelo motivo errado
+
+Um teste temporário comparou o desconto com `isEqualTo`, em vez de `isEqualByComparingTo`:
+
+```java
+BigDecimal desconto = calculadora.calcular(new BigDecimal("150.00"), Cliente.AVULSO);
+assertThat(desconto).isEqualTo(new BigDecimal("7.5"));
+```
+
+```text
+[ERROR] dev.trilhajava.m10.aulas.fundamentos.TemporarioMotivoErradoTest.escala -- Time elapsed: 0.094 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+expected: 7.5
+ but was: 7.50
+```
+
+**Como ler:** o código está **certo**. Mas `isEqualTo` usa `BigDecimal.equals`, que compara também a **escala** (`7.5` tem uma casa, `7.50` tem duas). O teste falhou por um detalhe de representação, não pela regra. **Como corrigir:** compare dinheiro com `isEqualByComparingTo`. Quando a mensagem mostra dois valores que "parecem iguais", desconfie da comparação, não do código.
+
+O mesmo teste, calculando o esperado com `double` (`assertThat(desconto.doubleValue()).isEqualTo(100.10 * 0.05)`), falhou assim:
+
+```text
+expected: 5.005
+ but was: 5.01
+```
+
+Aqui o teste reimplementou a regra (e errou, porque esqueceu o arredondamento). **Esperados são constantes calculadas à mão**, não fórmulas: se o teste repete a conta do código, ele repete também os erros do código.
+
+### O teste que nunca rodou
+
+Uma classe de teste temporária chamada `VerificacoesDoDesconto`, com um teste que falha de propósito (espera um desconto de R$ 999,99), foi colocada em `src/test/java`. Resultado do `mvn test`:
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.fundamentos.DescontoTetoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in …DescontoTetoTest
+…
+[INFO] Tests run: 40, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**Como ler:** 40 testes, o mesmo total de antes, e a classe nem aparece. O nome não termina em `Test`, então o Surefire a ignorou, e o teste que deveria falhar **nunca executou** (no IntelliJ, pelo ▶ verde, ele roda e falha, o que confunde ainda mais). **Como corrigir:** renomeie para `VerificacoesDoDescontoTest`, e confira sempre se o total de testes subiu quando você acrescenta um.
+
+### Armadilhas de desenho
+
+<Comparar antes="Um teste que verifica pouco e explica nada" depois="Um comportamento, dados de fronteira, esperado calculado à mão">
+```java
+@Test
+void teste1() {
+    var c = new CalculadoraDeDesconto();
+    var r1 = c.calcular(new BigDecimal("200"), Cliente.AVULSO);
+    var r2 = c.calcular(new BigDecimal("400"), Cliente.ASSINANTE);
+    // esperado copiado da saída do programa
+    assertThat(r1).isNotNull();
+    assertThat(r2.compareTo(BigDecimal.ZERO) > 0).isTrue();
+}
+```
+
+```java
+@Test
+@DisplayName("exatamente R$ 100,00 já ganha 5%: R$ 5,00")
+void exatamenteNoInicioDaFaixa() {
+    BigDecimal desconto = calculadora.calcular(
+            new BigDecimal("100.00"), Cliente.AVULSO);
+
+    assertThat(desconto).isEqualByComparingTo("5.00");
+}
+```
+</Comparar>
+
+O teste da esquerda tem um **nome** que não diz nada, testa **dois comportamentos** (se falhar, qual quebrou?), usa **valores do meio** das partições e tem **asserções fracas**: "não é nulo" e "é maior que zero" passam com quase qualquer bug. E `isTrue()` sobre uma expressão, quando falha, só diz `expected: true but was: false`. O da direita falha por um único motivo, e a mensagem diz qual.
+
+Outras armadilhas comuns em code review:
+
+- **Lógica no teste.** `if`, `for` e cálculos no teste também podem ter bug, e ninguém testa o teste. Prefira casos explícitos ou uma tabela.
+- **Testar a implementação.** Testar métodos privados via reflexão acopla o teste à forma do código. Teste pelo método público; um privado complexo demais provavelmente quer ser outra classe.
+- **Testes dependentes.** Um teste que só passa se outro rodar antes quebra quando roda sozinho. Cada teste monta o próprio cenário.
+- **Subir o mundo para testar uma regra.** `@SpringBootTest` para a `CalculadoraDeDesconto` transforma milissegundos em segundos. Cada coisa no seu andar da pirâmide.
+
+### Quando NÃO escrever (mais) testes
+
+- **Getters, setters e `record`s sem lógica.** Testar que `pedido.numero()` devolve o número do construtor é testar o compilador; eles já são exercitados pelos testes de comportamento.
+- **O próprio framework.** Não teste se o Spring injeta beans; teste o **seu** uso dele (o contrato da API, a sua consulta), assunto das aulas 4 e 5.
+- **Protótipos descartáveis.** Mas, se o protótipo sobreviveu, os testes chegam antes da primeira mudança.
+- **Mais casos na mesma partição.** Depois do representante e dos limites, o décimo valor "do meio" não pega bug novo.
+
+## Checkpoint: a borda do teto
+
+Agora é a sua vez. O passo 8 mostrou um buraco: nenhum teste do passo 6 passa do teto de R$ 50,00, e o PIT não percebeu. Se alguém apagar o `.min(TETO)` da calculadora, a loja passa a dar R$ 60,00 de desconto numa compra de R$ 400,00 de um assinante, e a suíte continua verde.
+
+**O desafio:** crie a classe `MeuTesteDoTetoTest` no pacote `dev.trilhajava.m10.aulas.fundamentos` de `src/test/java` com testes para a regra 5:
+
+1. Descubra, **à mão**, o menor subtotal em que um **assinante** chega a exatamente R$ 50,00 de desconto, e teste esse valor e o centavo anterior. (Cuidado: o arredondamento HALF_UP acontece **antes** do teto.)
+2. Teste um assinante e um avulso cujos descontos, sem o teto, passariam de R$ 50,00.
+
+Rode com `mvn test -Dtest=MeuTesteDoTetoTest`. Depois, para provar que os testes pegam o bug, troque temporariamente `return desconto.min(TETO);` por `return desconto;` e veja-os falhar. Desfaça a troca em seguida.
+
+<Dicas>
+<Dica nivel={1}>
+O assinante com subtotal a partir de R$ 300,00 tem 15% de desconto. Sem arredondamento, os 15% chegam a 50,00 em 50 ÷ 0,15 = 333,333… Agora aplique o HALF_UP a alguns subtotais em volta desse número, centavo a centavo.
+</Dica>
+<Dica nivel={2}>
+333,29 × 0,15 = 49,9935 e 333,30 × 0,15 = 49,995. Qual dos dois o HALF_UP leva para 50,00? Esse é o limite: com HALF_UP, a terceira casa 5 arredonda para cima.
+</Dica>
+<Dica nivel={3}>
+Quatro testes bastam: assinante com 333,29 (espera 49,99), assinante com 333,30 (espera 50,00), assinante com 400,00 (15% daria 60,00; espera 50,00) e avulso com 600,00 (10% daria 60,00; espera 50,00). Use `isEqualByComparingTo` em todos.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/fundamentos/DescontoTetoTest.java" semImports />
+
+Com o teto removido da calculadora (`return desconto;`), o resultado foi este:
+
+```text
+[ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0, Time elapsed: 0.020 s <<< FAILURE! -- in …DescontoTetoTest
+[ERROR] dev.trilhajava.m10.aulas.fundamentos.DescontoTetoTest.assinanteAcimaDoTeto -- Time elapsed: 0.011 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: 
+
+expected: 50.00
+ but was: 60.00
+…
+[ERROR] dev.trilhajava.m10.aulas.fundamentos.DescontoTetoTest.avulsoAcimaDoTeto -- Time elapsed: 0.002 s <<< FAILURE!
+```
+
+No mesmo experimento, `DescontoCasosTest` continuou com `Failures: 0`: o buraco era real.
+
+**Por que assim.** Os dois primeiros testes ficam um de cada lado da borda **real** do teto, que é 333,30 (e não 333,34, a conta ingênua), por causa do HALF_UP. Eles protegem também o arredondamento: com `HALF_DOWN` no lugar de `HALF_UP`, o teste de 333,30 falhou com `expected: 50.00 but was: 49.99`. Os dois últimos cobrem o teto para os dois tipos de cliente. Valores como 500,00 no avulso (exatamente 50,00, sem precisar do `min`) não matariam o mutante que remove o teto.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+"Como você garante a qualidade dos seus testes?" e "o que acha de meta de cobertura?" são clássicos. Resposta com substância: testes rápidos, determinísticos e isolados, um comportamento por teste, nomes que descrevem a regra; casos derivados de partições e valores-limite, com os casos de erro; cada teste visto falhando antes de ser confiável; unidade para regras, integração para cada camada, poucos E2E para fluxos críticos. Cobertura aponta o que ninguém testou, mas não mede se os testes conferem algo, e como meta gera testes sem asserção; para medir força, mutação (PIT) no domínio. Bônus: explicar como evitar testes *flaky* (relógio injetado, nada de `sleep`).
+</Callout>
+
+<Quiz
+  id="10-fundamentos"
+  questoes={[
+    {
+      pergunta: 'A regra diz "10% a partir de R$ 300,00". Quais subtotais formam o melhor par de valores-limite para essa fronteira?',
+      opcoes: ['R$ 250,00 e R$ 350,00', 'R$ 299,99 e R$ 300,00', 'R$ 300,00 e R$ 300,01', 'R$ 0,00 e R$ 300,00'],
+      correta: 1,
+      explicacao: 'O par fica um de cada lado da fronteira: o último centavo da partição de 5% e o primeiro da de 10%. É ali que `>=` e `>` se diferenciam; 300,00 e 300,01 estão do mesmo lado.',
+    },
+    {
+      pergunta: 'Uma suíte tem 100% de cobertura de linhas e o PIT relata 73% de mutantes mortos, com três ConditionalsBoundaryMutator sobreviventes. O que isso indica?',
+      opcoes: ['A suíte está ótima: cobertura total', 'Todas as linhas executaram, mas faltam testes nas fronteiras das condições', 'O PIT está com defeito, porque cobertura total implica mutantes mortos', 'Faltam testes de integração'],
+      correta: 1,
+      explicacao: 'Cobertura mede execução. Os mutantes de fronteira (`>=` virando `>`) sobrevivem quando nenhum teste usa o valor exato do limite.',
+    },
+    {
+      pergunta: 'Um teste compara um BigDecimal com `isEqualTo(new BigDecimal("7.5"))` e falha com "expected: 7.5 but was: 7.50". O código calcula o desconto certo. Qual o problema?',
+      opcoes: ['O código tem um bug de arredondamento', 'O teste falha pelo motivo errado: equals compara a escala; use isEqualByComparingTo', 'O AssertJ não suporta BigDecimal', 'Falta um @DisplayName'],
+      correta: 1,
+      explicacao: '`BigDecimal.equals` considera 7.5 e 7.50 diferentes. Para dinheiro, compare por valor com `isEqualByComparingTo`.',
+    },
+    {
+      pergunta: 'Você criou src/test/java/.../RegrasDeFrete.java com três @Test. No IntelliJ eles rodam, mas o mvn test mostra o mesmo total de antes. Por quê?',
+      opcoes: ['O Maven só roda testes públicos', 'O Surefire só executa classes cujo nome termina em Test, Tests ou TestCase (ou começa com Test)', 'Falta anotar a classe com @ExtendWith', 'O IntelliJ usa outra versão do JUnit'],
+      correta: 1,
+      explicacao: 'A classe fora da convenção de nomes é ignorada em silêncio pelo Surefire. Renomeie para `RegrasDeFreteTest` e confira se o total subiu.',
+    },
+    {
+      pergunta: 'Onde concentrar a maior quantidade de testes para uma regra de cálculo com muitas faixas e combinações?',
+      opcoes: ['Em testes ponta a ponta pela API', 'Em testes de unidade da classe que contém a regra', 'Em testes manuais antes de cada release', 'Em testes de integração com o banco'],
+      correta: 1,
+      explicacao: 'Regras densas têm muitos casos, e testes de unidade custam milissegundos cada e apontam exatamente o que quebrou. Integração e E2E cobrem as camadas e os fluxos, não cada combinação da regra.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Testes existem para **mudar o código com confiança**: um bug pego pela suíte custa segundos; em produção, custa dinheiro, reputação e uma correção às cegas.
+- **Pirâmide**: muita unidade, menos integração, pouco E2E. **Troféu**: mais peso na integração. Na prática: unidade para regras densas, integração para cada camada técnica, E2E para os fluxos críticos.
+- Um bom teste é **rápido, determinístico, isolado, legível e falha pelo motivo certo** (FIRST). Teste *flaky* ensina o time a ignorar o vermelho.
+- Estrutura **Arrange-Act-Assert** (Given-When-Then): um comportamento por teste, nome que descreve a regra, esperado **calculado à mão**.
+- Casos de teste: um representante por **partição de equivalência**, os dois lados de cada **valor-limite**, os **casos de erro** (negativo, zero, nulo) e as **combinações** de regras.
+- Maven: testes em `src/test/java`, no mesmo pacote; o **Surefire** roda classes terminadas em `Test`. `mvn test -Dtest=Classe#metodo` no terminal; ▶ verde no IntelliJ. Veja cada teste falhar antes de confiar nele.
+- **Cobertura** aponta o que ninguém testou; **mutação** (PIT) mostra se os testes conferem algo. Nenhuma das duas substitui ler a especificação.
+
+## Próximo passo
+
+A [aula 2, JUnit 6 e AssertJ a fundo](../02-junit-e-assertj/), aprofunda as ferramentas usadas aqui: ciclo de vida, `@Nested`, as fontes dos testes parametrizados e as asserções do AssertJ. Depois, o [exercício 10.01, Caça-mutantes: a calculadora de frete](../../../exercicios/10-testes/01-caca-mutantes-frete/), põe à prova o raciocínio desta aula: o código está pronto, e a sua suíte precisa flagrar onze versões dele com bugs escondidos em bordas, arredondamentos e combinações de regras. Partições, valores-limite e esperados calculados à mão são as armas de que você vai precisar.

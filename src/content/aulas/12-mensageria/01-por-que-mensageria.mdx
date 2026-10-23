@@ -1,0 +1,708 @@
+---
+titulo: "Por que mensageria: acoplamento, eventos e garantias de entrega"
+descricao: "Quando uma chamada HTTP síncrona vira um problema, o que muda com um broker no meio, a diferença entre comando e evento, entre fila e log, e as três garantias de entrega (no máximo uma, pelo menos uma, exatamente uma) que definem todo o resto do módulo, com um broker em memória que você roda, derruba e reinicia."
+modulo: 12-mensageria
+ordem: 1
+duracao: 100
+objetivos:
+  - Explicar acoplamento temporal e calcular a disponibilidade de uma cadeia de chamadas síncronas
+  - Classificar mensagens em comando, evento ou documento e escolher entre notificação de evento e evento com estado
+  - Comparar fila e log de eventos pelo que acontece com a mensagem depois do ack, pela releitura e pela ordem
+  - Mostrar, rodando código, como a ordem entre confirmar e processar produz at-most-once ou at-least-once
+  - Explicar o que exactly-once garante de verdade no Kafka e por que, fora dele, o caminho é at-least-once com consumidor idempotente
+  - Projetar a experiência do usuário e os contratos para conviver com consistência eventual
+  - Reconhecer quando NÃO usar mensageria e justificar a escolha para o time
+tags: [mensageria, EDA, eventos, acoplamento, at-least-once, consistência eventual, Kafka, RabbitMQ]
+flashcards:
+  - frente: O que é acoplamento temporal?
+    verso: Quando um serviço só funciona se o outro estiver no ar no mesmo instante. Numa chamada HTTP síncrona, se o serviço de e-mail cai, o checkout cai junto. Com um broker no meio, a mensagem espera o consumidor voltar.
+  - frente: Qual a disponibilidade de uma cadeia de 5 serviços com 99,9% cada?
+    verso: "O produto: 0,999^5 ≈ 99,5%. Em vez de uns 43 minutos fora do ar por mês, a cadeia fica cerca de 216 minutos (mais de 3,5 horas)."
+  - frente: Qual a diferença entre comando e evento?
+    verso: Comando é uma ordem para UM destinatário, no imperativo (EmitirNotaFiscal), e pode ser recusado; quem recebe define o contrato. Evento é um fato no passado (PedidoPago), publicado para quem quiser ouvir; quem publica define o contrato e não sabe quem consome.
+  - frente: Fila × log de eventos
+    verso: Numa fila (RabbitMQ), cada mensagem vai para um consumidor e é apagada no ack. Num log (Kafka), a mensagem fica gravada pelo tempo de retenção; cada grupo de consumidores guarda o próprio offset, lê no seu ritmo e pode reler.
+  - frente: O que decide se o consumidor é at-most-once ou at-least-once?
+    verso: A ordem entre confirmar (ack ou commit do offset) e processar. Confirmar antes e cair no meio perde a mensagem (no máximo uma vez). Processar antes e cair no meio gera reentrega (pelo menos uma vez).
+  - frente: O que o exactly-once do Kafka garante?
+    verso: Que um fluxo ler do Kafka, processar e escrever no Kafka tenha efeito uma vez, com produtor idempotente, transações e consumidores em read_committed. Não cobre efeitos externos (e-mail, banco, API de pagamento); para esses, o caminho é at-least-once com consumidor idempotente.
+  - frente: Consistência eventual
+    verso: Depois de uma mudança, as outras partes do sistema ficam consistentes "em algum momento" (milissegundos a minutos), e não na mesma transação. A interface, os contratos e o suporte precisam aceitar essa janela.
+  - frente: Quando NÃO usar mensageria?
+    verso: Quando quem chama precisa da resposta para continuar (o cartão foi aprovado?), quando a consistência tem de ser imediata (saldo antes do saque), quando um único processo resolve com uma transação local, ou quando o time não tem como operar e observar um broker.
+---
+
+Um pedido é pago. Agora é preciso emitir a nota fiscal, baixar o estoque, avisar o cliente por e-mail, pontuar o programa de fidelidade e alimentar o antifraude. A primeira versão de quase todo sistema faz isso do jeito mais óbvio: o serviço de pedidos chama os cinco, um depois do outro, via HTTP, e só então responde "pedido confirmado". Funciona na demonstração, passa nos testes e entra em produção.
+
+O primeiro problema aparece numa sexta-feira de promoção. O provedor de e-mail fica lento: cada envio passa a levar oito segundos. O checkout herda os oito segundos, as threads do servidor ficam presas esperando, a fila de requisições cresce e, em alguns minutos, ninguém consegue pagar, embora o pagamento, o estoque e a nota fiscal estejam perfeitamente saudáveis. O e-mail, que ninguém considerava crítico, derrubou a receita do dia. Na retrospectiva, alguém sugere: "e se o checkout só avisasse que o pedido foi pago, e cada serviço fizesse a sua parte quando pudesse?". Essa frase é a ideia central da mensageria, e esta aula existe para que você saiba **o que ela resolve, o que ela custa e quando ela é a resposta errada**.
+
+Este é o primeiro passo do módulo 12. Aqui você aprende o vocabulário e os modelos mentais (acoplamento temporal, comando e evento, fila e log, garantias de entrega, consistência eventual) e os vê funcionar num broker em memória, escrito em Java puro, que você pode derrubar e reiniciar à vontade. As próximas aulas trazem as ferramentas reais, RabbitMQ e Kafka, e as técnicas que tornam isso confiável em produção: outbox, consumidores idempotentes, retry e DLQ.
+
+## A intuição: a comanda da cozinha
+
+Pense num restaurante movimentado. Na versão síncrona, o garçom anota o pedido, vai até a cozinha e **fica parado ao lado do cozinheiro** até o prato sair. Depois leva a bebida ao bar e espera o barman. Só então volta ao salão para atender a próxima mesa. Se o forno quebra, o garçom fica preso na cozinha, e o salão inteiro para, inclusive as mesas que só queriam um café.
+
+Na versão com mensageria, o garçom prende a comanda num **trilho de pedidos** e volta para o salão. A cozinha pega as comandas no próprio ritmo; o bar recebe uma cópia das que têm bebida. Se o forno quebra, as comandas de pratos quentes se acumulam no trilho, mas o salão continua funcionando, os cafés continuam saindo e, quando o forno volta, a cozinha trabalha a fila acumulada.
+
+A analogia já mostra os custos. O cliente não recebe o prato no momento em que pede: ele recebe uma **promessa** ("seu pedido foi anotado"). Se a comanda cair do trilho, alguém precisa perceber. Se a cozinha ler a mesma comanda duas vezes, sai prato em dobro. E se o garçom precisa saber **agora** se ainda tem salmão, prender uma comanda no trilho não ajuda: ele precisa perguntar diretamente. Toda a aula é sobre esses pontos: o trilho (o **broker**), a promessa (a **consistência eventual**), a comanda perdida ou duplicada (as **garantias de entrega**) e a pergunta que exige resposta imediata (quando **não** usar mensageria).
+
+## Vocabulário
+
+| Termo | O que significa | No exemplo da loja |
+|---|---|---|
+| **Broker** | O servidor que recebe, guarda e entrega mensagens entre aplicações | RabbitMQ ou Kafka |
+| **Produtor** (*producer*, *publisher*) | Quem envia a mensagem ao broker | O serviço de pedidos |
+| **Consumidor** (*consumer*) | Quem recebe e processa a mensagem | E-mail, nota fiscal, fidelidade |
+| **Fila** (*queue*) | Estrutura em que cada mensagem vai para um consumidor e some quando confirmada | Uma fila de "separar pedido" no RabbitMQ |
+| **Tópico** e **partição** | No Kafka, o tópico é o nome lógico; a partição é um log ordenado, só de acréscimo, onde as mensagens ficam gravadas | `pedidos.pagos`, partições 0 a 5 |
+| **Offset** | A posição de um registro dentro da partição: 0, 1, 2... | "o grupo fidelidade já confirmou até o offset 42" |
+| **Grupo de consumidores** | Um conjunto de instâncias que dividem o trabalho de ler um tópico; cada grupo guarda os próprios offsets | Grupos `email` e `fidelidade` leem o mesmo tópico, cada um no seu ritmo |
+| **Ack** (*acknowledgement*) e **commit de offset** | A confirmação de que o consumidor terminou. No RabbitMQ é o ack da mensagem; no Kafka, o commit do offset | "processei PED-1002, pode seguir" |
+| **Lag** (atraso) | Quantas mensagens o consumidor ainda não confirmou | "o e-mail está 12 mil mensagens atrás" |
+| **Garantia de entrega** | Quantas vezes, no máximo ou no mínimo, uma mensagem é processada diante de falhas | at-most-once, at-least-once, exactly-once |
+| **Idempotência** | Fazer a mesma operação duas vezes tem o mesmo efeito que fazer uma | Creditar os pontos do evento X só uma vez, mesmo recebendo-o duas |
+| **Consistência eventual** | Os dados de partes diferentes do sistema convergem depois de um tempo, e não na mesma transação | O pedido está pago, mas os pontos aparecem alguns segundos depois |
+
+Três palavras desta tabela merecem mais do que uma linha, porque as decisões do módulo inteiro dependem delas.
+
+### Síncrono, assíncrono e os três acoplamentos
+
+Uma chamada é **síncrona** quando quem chama espera a resposta para continuar: o `RestClient` faz a requisição HTTP e a thread fica parada até o outro lado responder ou o tempo esgotar. É **assíncrona** quando quem chama entrega o trabalho e segue: publica uma mensagem, recebe a confirmação de que o broker a guardou, e responde ao cliente.
+
+Repare que "assíncrono" aqui não é sobre threads. Um `CompletableFuture` que chama o serviço de e-mail em paralelo continua **temporalmente acoplado**: se o e-mail estiver fora do ar, a chamada falha do mesmo jeito, só que em outra thread. O que muda o jogo é ter **um intermediário durável** que guarda o pedido de trabalho até alguém processá-lo.
+
+A cadeia síncrona cria três tipos de acoplamento, e vale saber nomeá-los separadamente porque a mensageria resolve cada um de um jeito:
+
+- **Acoplamento temporal.** Todos precisam estar no ar **ao mesmo tempo**. As disponibilidades se multiplicam: cinco serviços com 99,9% cada dão 0,999 elevado a 5, cerca de 99,5%. Parece pouca diferença, mas em minutos por mês é a passagem de uns 43 minutos para uns 216.
+- **Acoplamento de latência.** O tempo de resposta do checkout é a **soma** dos tempos de todos os vizinhos (ou o maior deles, se as chamadas forem paralelas), e a cauda (o p99) piora com cada elo. O cliente espera o e-mail ser enviado para ver "pedido confirmado".
+- **Acoplamento de conhecimento.** O serviço de pedidos precisa saber quem existe, o endereço de cada um e o contrato de cada API. Quando o time de dados quer receber os pedidos pagos, alguém precisa mudar e implantar o serviço de pedidos.
+
+<Figura legenda="Em cima, quatro chamadas síncronas: a disponibilidade do checkout é o produto de todas e a espera é a soma. Embaixo, o checkout grava um evento no log do broker e responde; cada consumidor lê no seu ritmo">
+<svg viewBox="0 0 700 330" width="700" role="img" aria-labelledby="m1201-cadeia-titulo m1201-cadeia-desc">
+  <title id="m1201-cadeia-titulo">Cadeia síncrona comparada a um evento publicado num broker</title>
+  <desc id="m1201-cadeia-desc">Na parte de cima, o checkout chama em sequência nota-fiscal, estoque, e-mail e fidelidade; a disponibilidade é cerca de 99,5% e a espera do cliente é 630 milissegundos, a soma das latências. Na parte de baixo, o checkout grava PedidoPago no log do broker; quatro consumidores (nota-fiscal, estoque, e-mail e fidelidade) leem do log de forma independente, e um e-mail fora do ar só atrasa os e-mails.</desc>
+  <defs><marker id="mk-m1201-cadeia" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="24" class="d-title">Síncrono: o cliente espera a cadeia inteira</text>
+  <rect x="10" y="44" width="110" height="40" rx="8" class="d-accent"/><text x="65" y="69" text-anchor="middle" class="d-mono">checkout</text>
+  <rect x="150" y="44" width="120" height="40" rx="8" class="d-box"/><text x="210" y="69" text-anchor="middle" class="d-mono">nota-fiscal</text>
+  <rect x="300" y="44" width="100" height="40" rx="8" class="d-box"/><text x="350" y="69" text-anchor="middle" class="d-mono">estoque</text>
+  <rect x="430" y="44" width="100" height="40" rx="8" class="d-box"/><text x="480" y="69" text-anchor="middle" class="d-mono">e-mail</text>
+  <rect x="560" y="44" width="120" height="40" rx="8" class="d-box"/><text x="620" y="69" text-anchor="middle" class="d-mono">fidelidade</text>
+  <path d="M120 64 H146" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <path d="M270 64 H296" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <path d="M400 64 H426" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <path d="M530 64 H556" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <text x="10" y="112" class="d-label">disponibilidade: 0,999 elevado a 5 ≈ 99,5%   ·   espera: 180 + 40 + 350 + 60 = 630 ms</text>
+  <text x="10" y="166" class="d-title">Com eventos: o checkout só depende do broker</text>
+  <rect x="10" y="206" width="110" height="40" rx="8" class="d-accent"/><text x="65" y="231" text-anchor="middle" class="d-mono">checkout</text>
+  <rect x="160" y="206" width="210" height="40" rx="8" class="d-violet"/><text x="265" y="231" text-anchor="middle" class="d-mono">log: PedidoPago</text>
+  <path d="M120 226 H156" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <path d="M370 226 H426" class="d-line" marker-end="url(#mk-m1201-cadeia)"/>
+  <rect x="430" y="184" width="125" height="34" rx="8" class="d-box"/><text x="492" y="206" text-anchor="middle" class="d-mono">nota-fiscal</text>
+  <rect x="565" y="184" width="125" height="34" rx="8" class="d-box"/><text x="627" y="206" text-anchor="middle" class="d-mono">estoque</text>
+  <rect x="430" y="232" width="125" height="34" rx="8" class="d-box"/><text x="492" y="254" text-anchor="middle" class="d-mono">e-mail</text>
+  <rect x="565" y="232" width="125" height="34" rx="8" class="d-box"/><text x="627" y="254" text-anchor="middle" class="d-mono">fidelidade</text>
+  <text x="10" y="296" class="d-label">o checkout responde assim que o broker grava o evento; cada grupo lê no seu ritmo</text>
+  <text x="10" y="318" class="d-label">e-mail fora do ar = e-mails atrasados, não checkout fora do ar</text>
+</svg>
+</Figura>
+
+Com o broker, os três acoplamentos mudam. O temporal sai do caminho do cliente: o checkout depende **só do broker** (que é um sistema replicado, operado para ter disponibilidade alta). A latência do checkout passa a ser a de gravar uma mensagem, alguns milissegundos. E o de conhecimento se inverte: o serviço de pedidos publica "o pedido foi pago" e não sabe quem escuta; um sexto interessado só precisa assinar.
+
+Nada disso é de graça, e é por isso que a palavra "eventualmente" aparece tanto neste módulo. O trabalho continua tendo de ser feito; ele só deixou de acontecer **dentro** da requisição do cliente.
+
+### Comando, evento e documento
+
+Nem toda mensagem é igual. A distinção muda o nome da mensagem, quem é dono do contrato e quem pode recusar.
+
+| Tipo | Exemplo | Tempo verbal | Destinatários | Dono do contrato | Pode ser recusado? |
+|---|---|---|---|---|---|
+| **Comando** | `EmitirNotaFiscal` | imperativo | **um**, conhecido | quem recebe | sim ("CNPJ inválido") |
+| **Evento** | `PedidoPago` | passado | **zero ou mais**, desconhecidos | quem publica | não: já aconteceu |
+| **Documento** | o `Pedido` inteiro | (substantivo) | quem precisar de uma cópia | quem publica | não |
+
+Um **comando** é uma ordem: "emita a nota fiscal deste pedido". Ele tem um destinatário, que define o formato que aceita e pode responder "não vou fazer". Enviar um comando por mensagem é parecido com chamar uma API, só que sem esperar: em geral a resposta volta como outro evento (`NotaFiscalEmitida` ou `NotaFiscalRecusada`).
+
+Um **evento** é um fato. O pedido **já foi** pago, e nenhum consumidor pode desfazer isso recusando a mensagem; se o antifraude achar o pagamento suspeito, ele publica um **novo** fato (`PagamentoContestado`), e alguém decide o que fazer. Nomes no passado (`ContaAberta`, `TransferenciaRealizada`, `ConsultaAgendada`) deixam isso claro no código e nas conversas.
+
+Um **documento** carrega o estado completo de uma entidade ("este é o pedido 42 agora"). É útil para alimentar caches e réplicas de leitura, e aparece muito em tópicos compactados do Kafka, onde só a última versão de cada chave é mantida.
+
+No código desta aula, a diferença aparece já nos tipos:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/Evento.java" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/PedidoPago.java" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/EmitirNotaFiscal.java" />
+
+Repare em dois detalhes do `PedidoPago`. Ele tem um `idDoEvento`, um `UUID` próprio, diferente do `pedidoId`: é esse identificador que permitirá descartar duplicatas mais adiante. E tem `ocorridoEm`, o instante em que o fato aconteceu no negócio, que não é o instante em que a mensagem chegou ao consumidor (pode chegar segundos ou horas depois, e fora de ordem).
+
+Dentro de "evento" há ainda uma escolha de desenho que cai em entrevista:
+
+- **Notificação de evento** (*event notification*): só o essencial, por exemplo `{"pedidoId": "PED-42"}`. Quem precisar dos detalhes consulta a API de pedidos. O contrato é pequeno e fácil de evoluir, mas cada consumidor gera uma chamada de volta, e você reintroduz um pouco do acoplamento temporal (se a API de pedidos estiver fora do ar, o consumidor não consegue trabalhar) e um problema sutil: quando o consumidor consulta, o pedido pode já estar em outro estado.
+- **Evento com o estado** (*event-carried state transfer*): o evento leva o que os consumidores precisam, como `{"pedidoId": "PED-42", "clienteId": "cli-7", "valor": "259.90"}`. O consumidor não depende de ninguém, mas o payload vira um **contrato público**: cada campo que você publica, alguém vai usar, e removê-lo depois exige negociação. A aula 7 do módulo trata de como evoluir esses esquemas sem quebrar ninguém.
+
+O `PedidoPago` desta aula é um evento com estado, enxuto: leva só o que fidelidade, e-mail e nota fiscal precisam. Uma regra útil é publicar **fatos do domínio**, e não o espelho da sua tabela: `PedidoPago` com os campos do pagamento, não `PedidoAtualizado` com as 40 colunas da tabela `pedidos`.
+
+### Fila e log: dois modelos de broker
+
+Os brokers do mercado seguem dois modelos, e o que os diferencia é **o que acontece com a mensagem depois que alguém a confirma**.
+
+<Comparar antes="Fila (RabbitMQ)" depois="Log de eventos (Kafka)">
+
+```text
+produtor ──► [ m3 m2 m1 ] ──► consumidor A
+                   fila    └─► consumidor B
+
+- cada mensagem vai para UM consumidor da fila
+- confirmou (ack)? a mensagem é apagada
+- caiu sem ack? a mensagem volta para a fila
+- roteamento rico: exchanges e routing keys
+- ótimo para distribuir TRABALHO
+```
+
+```text
+produtor ──► [ 0 1 2 3 4 5 6 ... ]  (partição)
+                     ▲       ▲
+                grupo A   grupo B   (offsets)
+
+- a mensagem FICA gravada (retenção)
+- cada grupo lê no seu ritmo e pode RELER
+- ordem garantida dentro da partição
+- consumidor novo pode começar do início
+- ótimo para FLUXOS de eventos e replay
+```
+
+</Comparar>
+
+Na **fila**, a mensagem é um pedido de trabalho. O broker entrega a um consumidor, marca como "em processamento" e espera o ack. Com ack, a mensagem deixa de existir. Sem ack (o consumidor caiu, a conexão fechou), o broker devolve a mensagem para a fila e a entrega de novo, marcada como reentregue. Vários consumidores na mesma fila **competem** pelas mensagens: é assim que se escala o processamento. Para que dois serviços recebam a mesma mensagem, cada um precisa da **sua** fila, e o broker copia a mensagem para as duas (no RabbitMQ, isso é papel das *exchanges*, assunto da próxima aula).
+
+No **log**, a mensagem é um registro histórico. O produtor acrescenta no fim; nada é apagado quando alguém lê. Cada grupo de consumidores guarda apenas **até onde já leu** (o offset). Dois serviços diferentes leem o mesmo tópico com grupos diferentes, sem cópia. Um serviço novo pode começar do início e reconstruir o próprio estado com todo o histórico ainda retido. E se um bug corrompeu os dados de um consumidor, dá para corrigir o código, voltar o offset e reprocessar. A contrapartida: a unidade de paralelismo é a partição (no modelo clássico, dentro de um grupo, cada partição é lida por uma instância só), e a ordem só é garantida **dentro** de uma partição.
+
+As fronteiras entre os dois ficaram mais finas nos últimos anos. O RabbitMQ tem *streams*, um tipo de fila com semântica de log (retenção e releitura). E o Kafka 4.2 tornou pronto para produção o recurso **Queues for Kafka** (KIP-932): os *share groups*, em que vários consumidores leem a mesma partição de forma cooperativa, com confirmação por registro e contagem de tentativas de entrega, como numa fila. Mesmo assim, o modelo mental continua valendo: pergunte "depois de processada, essa mensagem ainda tem valor para alguém?". Se sim, você quer um log.
+
+### Garantias de entrega
+
+Redes falham, processos morrem, discos enchem. Diante disso, um sistema de mensagens pode prometer uma de três coisas sobre cada mensagem:
+
+- **No máximo uma vez** (*at-most-once*): a mensagem pode se perder, mas nunca é processada duas vezes.
+- **Pelo menos uma vez** (*at-least-once*): a mensagem nunca se perde, mas pode ser processada mais de uma vez.
+- **Exatamente uma vez** (*exactly-once*): cada mensagem tem efeito uma única vez.
+
+A documentação de design do Kafka define as três exatamente assim e diz que o Kafka entrega **pelo menos uma vez por padrão**. O ponto que quase todo mundo erra é **onde** a garantia é decidida. Ela não é uma propriedade do broker sozinho: é o resultado do produtor, do broker **e do código do consumidor**, juntos.
+
+Do lado do consumidor, tudo se resume a uma pergunta: **em que ordem você faz as duas coisas, confirmar e processar?** Se o processo morrer exatamente entre uma e outra:
+
+- Confirmou antes de processar? Para o broker, a mensagem foi tratada. Ao reiniciar, o consumidor segue em frente e a mensagem **se perde**: no máximo uma vez.
+- Processou antes de confirmar? O efeito aconteceu, mas o broker não sabe. Ao reiniciar, recebe a mesma mensagem e **processa de novo**: pelo menos uma vez.
+
+Não existe uma terceira ordem. Por isso, fora de casos especiais, o "exatamente uma vez" que você entrega a um cliente é na verdade **pelo menos uma vez, com um consumidor que torna a duplicata inofensiva**: o consumidor idempotente. É o que você vai ver acontecer, com números, no passo 4.
+
+E o produtor? Ele também tem o seu dilema: mandou a mensagem, a resposta do broker não chegou (timeout). O broker gravou ou não? Se o produtor não reenvia, pode perder (no máximo uma vez); se reenvia, pode duplicar (pelo menos uma vez). O Kafka resolve a duplicata **desse trecho** com o **produtor idempotente**: cada produtor recebe um identificador e numera as mensagens, e o broker descarta o reenvio de um número que já gravou. Desde o Kafka 3.0, o produtor vem com `enable.idempotence=true` e `acks=all` por padrão.
+
+### Consistência eventual
+
+Com a cadeia síncrona, quando o checkout respondia "confirmado", os pontos de fidelidade já estavam creditados (ou o checkout tinha falhado). Com eventos, existe uma **janela**: o pedido está pago, o evento está no log, e o consumidor de fidelidade ainda não processou. Nessa janela, o banco de pedidos diz "pago" e o saldo de pontos ainda não mudou. Os dois vão concordar **em algum momento**: isso é consistência eventual.
+
+Na maior parte do tempo, a janela é de milissegundos. Mas ela não tem limite garantido: se o consumidor de fidelidade estiver fora do ar por uma hora, a janela é de uma hora. O sistema precisa ser desenhado para isso, e não só o backend:
+
+- **A interface** mostra o estado real: "pedido confirmado; os pontos aparecem em alguns minutos", em vez de prometer o que ainda não aconteceu.
+- **O próprio usuário vê o que fez**: depois de pagar, a tela do pedido lê do serviço de pedidos (que já sabe), e não de uma réplica que talvez ainda não saiba. Esse cuidado tem nome: *read-your-writes*.
+- **O suporte** sabe que "paguei e meus pontos não apareceram" pode ser lag, e tem um painel com o atraso de cada consumidor.
+- **As regras de negócio** aceitam a janela. Se a regra diz "o cliente só pode trocar pontos que já existem", ela continua certa; se dissesse "o cliente pode trocar os pontos do pedido no mesmo segundo em que paga", a arquitetura assíncrona não serviria.
+
+## O código que vamos construir
+
+Para ver acoplamento, filas, logs e garantias funcionando sem instalar nada, o pacote `dev.trilhajava.m12.aulas.fundamentos` (em `java/m12-mensageria/aulas`) traz um **broker em memória**, escrito em Java puro. Ele não substitui o RabbitMQ nem o Kafka (não tem rede, nem disco, nem replicação); serve para isolar as ideias e permitir o que num broker real é trabalhoso: derrubar o consumidor exatamente no pior momento.
+
+| Classe | Papel |
+|---|---|
+| `PedidoPago`, `EmitirNotaFiscal` | Um evento e um comando (vistos acima) |
+| `ServicoSimulado` | Um vizinho com latência declarada, que pode ser derrubado e religado, e registra o que atendeu |
+| `CheckoutSincrono` | O checkout que chama os vizinhos em sequência |
+| `LogDeEventos` | Uma partição de log: acrescenta, nunca apaga, guarda offsets por grupo |
+| `FilaDeTrabalho` | Uma fila: entrega a um consumidor, apaga no ack, devolve o que ficou sem ack |
+| `ConsumidorDoLog` | Lê o log como um grupo, com a garantia escolhida e deduplicação opcional |
+| `ProgramaDeFidelidade` | Um consumidor em que a duplicata custa caro: credita 1 ponto por real |
+| `ProdutorSemBroker` | Um produtor Kafka **de verdade**, apontado para um endereço sem broker |
+
+O coração da aula está no `LogDeEventos`. Leia com atenção os três métodos centrais: `publicar` só acrescenta; `ler` não muda nada (ler **não é** confirmar); `confirmar` grava o offset do **próximo** registro a ler, exatamente como o commit de offset do Kafka.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/LogDeEventos.java" semImports />
+
+E o consumidor, onde a garantia de entrega é decidida. As linhas destacadas são as únicas que mudam entre "no máximo uma vez" e "pelo menos uma vez": a **ordem** entre `confirmar` e `executar`.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/ConsumidorDoLog.java" semImports destacar="45-53" />
+
+Três decisões merecem atenção antes de rodar qualquer coisa:
+
+- **A queda é simulada entre os dois passos.** `cairNoMeioDoProximo()` arma uma `QuedaSimuladaException` que é lançada depois do primeiro passo e antes do segundo. É o equivalente a um `kill -9` no pior instante possível, algo que em produção acontece em todo deploy, todo reinício por falta de memória e toda troca de máquina.
+- **A deduplicação usa o `idDoEvento`, não o `pedidoId`.** Dois eventos diferentes podem falar do mesmo pedido (`PedidoPago` e, depois, `PedidoEstornado`); o que identifica "esta mesma mensagem de novo" é o id do evento.
+- **O conjunto `jaProcessados` está em memória só por didática.** Se o processo morre, ele morre junto, e a proteção some. Em produção, o registro de eventos processados fica numa tabela, gravada **na mesma transação** que o efeito (creditar os pontos). A aula 5 constrói exatamente isso.
+
+## Mão na massa
+
+Os programas ficam em `src/main` do módulo e rodam com o plugin `exec` do Maven. Entre na pasta do módulo uma vez:
+
+```bash
+cd java/m12-mensageria/aulas
+```
+
+Se preferir, abra o `pom.xml` do módulo no IntelliJ e rode cada classe pelo botão verde ao lado do `main`. As saídas abaixo foram copiadas da execução.
+
+### Passo 1: o custo da cadeia síncrona
+
+**O que vamos fazer e por quê.** Antes de colocar um broker no meio, vamos medir o problema. O `CadeiaSincrona` monta um checkout com quatro vizinhos (nota fiscal com 180 ms, estoque com 40 ms, e-mail com 350 ms, fidelidade com 60 ms), paga um pedido com tudo no ar, derruba o e-mail e paga outro.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/CadeiaSincrona.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m12.aulas.fundamentos.CadeiaSincrona
+```
+
+Saída esperada:
+
+```text
+PED-1001 confirmado; o cliente esperou 630 ms
+PED-1002 falhou no checkout: e-mail fora do ar ao processar PED-1002
+nota-fiscal já atendeu: [PED-1001, PED-1002]
+estoque já atendeu:     [PED-1001, PED-1002]
+disponibilidade de 5 elos a 99,9%: 99.5010% (216 min fora do ar por mês)
+```
+
+**O que acabou de acontecer.**
+
+- O cliente do PED-1001 esperou **630 ms**, a soma das quatro latências. O e-mail sozinho responde por mais da metade, e ele nem é necessário para confirmar a compra.
+- O PED-1002 **falhou**, embora nota fiscal, estoque e fidelidade estivessem no ar. Esse é o acoplamento temporal em uma linha.
+- Pior: as linhas 3 e 4 mostram que a nota fiscal **foi emitida** e o estoque **foi baixado** para um pedido que o cliente viu falhar. A cadeia síncrona sem transação distribuída deixa **efeitos parciais**: agora alguém precisa cancelar a nota e devolver o estoque (e se o cliente tentar de novo, a nota sai em dobro). Muita gente adota mensageria pensando em desempenho e descobre que o maior ganho é não ter de escrever essa compensação na mão em cada caminho de erro.
+- A última linha faz a conta da disponibilidade: cinco elos de 99,9% (o checkout e os quatro vizinhos) dão 99,501%, cerca de 216 minutos fora do ar num mês de 30 dias. Cada vizinho novo piora o número.
+
+### Passo 2: o mesmo checkout, com eventos
+
+**O que vamos fazer e por quê.** Agora o checkout só grava `PedidoPago` no log e responde. Dois consumidores, `email` e `nota-fiscal`, leem com grupos diferentes. Vamos repetir a situação do passo 1: o e-mail fora do ar.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/CheckoutComEventos.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m12.aulas.fundamentos.CheckoutComEventos
+```
+
+Saída esperada:
+
+```text
+PED-1002 confirmado ao cliente; evento gravado no offset 0
+nota-fiscal processou 1 evento(s)
+e-mail falhou: e-mail fora do ar ao processar PED-1002 (o evento continua no log)
+atraso do grupo email: 1 | atraso do grupo nota-fiscal: 0
+e-mail voltou e processou 1 evento(s): [PED-1002]
+atraso do grupo email: 0
+```
+
+**O que acabou de acontecer.**
+
+- O cliente recebeu "confirmado" **com o e-mail fora do ar**. A única dependência do checkout passou a ser o log.
+- A nota fiscal processou o evento normalmente: os grupos são **independentes**. O offset do grupo `nota-fiscal` andou; o do grupo `email` ficou parado.
+- O consumidor de e-mail falhou e **não confirmou**, porque usa "pelo menos uma vez" (processa antes de confirmar). O evento continua lá, e o **atraso** (lag) do grupo `email` é 1. Em produção, esse número vai para um painel e para um alerta: é o primeiro sinal de que um consumidor está doente.
+- Quando o e-mail voltou, o consumidor leu a partir do último offset confirmado e processou o que estava pendente. Ninguém precisou reenviar nada.
+
+Compare com o passo 1: lá, um vizinho fora do ar derrubava o pedido e deixava efeitos parciais; aqui, um vizinho fora do ar **atrasa a parte dele** e só.
+
+### Passo 3: fila e log lado a lado
+
+**O que vamos fazer e por quê.** Ver, com as mesmas três mensagens, as duas diferenças centrais: na fila, a mensagem vai para **um** consumidor e some no ack; no log, ela fica e um grupo novo lê tudo desde o início.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/FilaVersusLog.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m12.aulas.fundamentos.FilaVersusLog
+```
+
+Saída esperada:
+
+```text
+worker-ana recebeu  : separar PED-1
+worker-bruno recebeu: separar PED-2
+ana confirmou; prontas=1, sem ack=1
+depois da queda: separar PED-2 (reentregue=true)
+faturamento leu offset 0: PedidoPago PED-1
+faturamento leu offset 1: PedidoPago PED-2
+faturamento leu offset 2: PedidoPago PED-3
+faturamento confirmou até 3; o log ainda tem 3 registros
+grupo novo 'dados' começa do início e lê 3 registros
+```
+
+**O que acabou de acontecer.**
+
+- Na fila, Ana e Bruno **dividiram** o trabalho: cada mensagem foi para um só. Esse é o padrão *competing consumers* (consumidores concorrentes), e é como uma fila escala: mais instâncias, mais mensagens processadas em paralelo.
+- Depois do ack da Ana, a mensagem dela **deixou de existir**: sobraram uma pronta (PED-3) e uma sem ack (PED-2, com o Bruno).
+- A conexão do Bruno caiu antes do ack. A fila devolveu PED-2 para o início, com `reentregue=true`. No RabbitMQ, essa marca existe de verdade (o campo *redelivered* da entrega) e é um aviso para o consumidor: "talvez você já tenha visto esta mensagem".
+- No log, o grupo `faturamento` leu e confirmou os três registros, e o log **continua com os três**. O grupo `dados`, que nunca tinha lido nada, começou do offset 0.
+
+<Callout tipo="atencao" titulo="No Kafka, um grupo novo NÃO começa do início por padrão">
+O `LogDeEventos` desta aula faz um grupo novo começar do offset 0, para mostrar a releitura. No Kafka, o que acontece com um grupo sem offset confirmado é decidido pela configuração `auto.offset.reset` do consumidor, cujo padrão é `latest`: o grupo novo começa **do fim** e só vê o que for publicado depois. Para ler o histórico, configure `earliest` (ou reposicione os offsets com a ferramenta `kafka-consumer-groups`). Esquecer disso é um clássico: o serviço novo sobe, "não recebe nada" e ninguém entende por quê.
+</Callout>
+
+### Passo 4: a ordem que decide a garantia
+
+**O que vamos fazer e por quê.** Este é o passo mais importante da aula. O mesmo consumidor de fidelidade, com os mesmos dois eventos (R$ 259,90 e R$ 100,00 do cliente cli-7, ou seja, 359 pontos no total), e a **mesma queda no mesmo ponto**: entre os dois passos do primeiro evento. Depois da queda, o consumidor "volta" e processa o que estiver pendente. Rodamos três vezes, mudando só a configuração.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/GarantiasDeEntrega.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m12.aulas.fundamentos.GarantiasDeEntrega
+```
+
+Saída esperada:
+
+```text
+[no máximo uma vez] consumidor fidelidade caiu no offset 0; reiniciando...
+no máximo uma vez      -> saldo de cli-7: 100 pontos (o correto é 359)
+[pelo menos uma vez] consumidor fidelidade caiu no offset 0; reiniciando...
+pelo menos uma vez     -> saldo de cli-7: 618 pontos (o correto é 359)
+[pelo menos uma vez + idempotente] consumidor fidelidade caiu no offset 0; reiniciando...
+pelo menos uma vez + idempotente -> saldo de cli-7: 359 pontos (o correto é 359)
+```
+
+<Figura legenda="A mesma queda, no mesmo ponto, em duas ordens. Confirmar antes de processar perde o evento; processar antes de confirmar o repete. A idempotência torna a repetição inofensiva">
+<svg viewBox="0 0 700 270" width="700" role="img" aria-labelledby="m1201-garantias-titulo m1201-garantias-desc">
+  <title id="m1201-garantias-titulo">Ordem entre confirmar e processar e o efeito de uma queda</title>
+  <desc id="m1201-garantias-desc">Primeira linha, no máximo uma vez: ler o offset 0, confirmar o offset 1, queda, e o processamento nunca acontece; ao reiniciar, o consumidor começa no offset 1 e o evento 0 se perde, resultando em 100 pontos. Segunda linha, pelo menos uma vez: ler o offset 0, processar, queda, e a confirmação nunca acontece; ao reiniciar, o consumidor lê o offset 0 de novo e processa duas vezes, resultando em 618 pontos, ou 359 com consumidor idempotente.</desc>
+  <defs><marker id="mk-m1201-garantias" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="24" class="d-title">No máximo uma vez: confirmar, depois processar</text>
+  <rect x="10" y="40" width="140" height="40" rx="8" class="d-box"/><text x="80" y="65" text-anchor="middle" class="d-mono">ler offset 0</text>
+  <rect x="180" y="40" width="140" height="40" rx="8" class="d-accent"/><text x="250" y="65" text-anchor="middle" class="d-mono">confirmar 1</text>
+  <rect x="350" y="40" width="110" height="40" rx="8" class="d-violet"/><text x="405" y="65" text-anchor="middle" class="d-mono">queda</text>
+  <rect x="490" y="40" width="140" height="40" rx="8" class="d-box" stroke-dasharray="5 4"/><text x="560" y="65" text-anchor="middle" class="d-mono">processar</text>
+  <path d="M150 60 H176" class="d-line" marker-end="url(#mk-m1201-garantias)"/>
+  <path d="M320 60 H346" class="d-line" marker-end="url(#mk-m1201-garantias)"/>
+  <path d="M460 60 H486" class="d-line" stroke-dasharray="4 4"/>
+  <text x="10" y="106" class="d-label">reinicia no offset 1: o evento 0 nunca é processado (100 pontos em vez de 359)</text>
+  <text x="10" y="158" class="d-title">Pelo menos uma vez: processar, depois confirmar</text>
+  <rect x="10" y="174" width="140" height="40" rx="8" class="d-box"/><text x="80" y="199" text-anchor="middle" class="d-mono">ler offset 0</text>
+  <rect x="180" y="174" width="140" height="40" rx="8" class="d-ok"/><text x="250" y="199" text-anchor="middle" class="d-mono">processar</text>
+  <rect x="350" y="174" width="110" height="40" rx="8" class="d-violet"/><text x="405" y="199" text-anchor="middle" class="d-mono">queda</text>
+  <rect x="490" y="174" width="140" height="40" rx="8" class="d-box" stroke-dasharray="5 4"/><text x="560" y="199" text-anchor="middle" class="d-mono">confirmar 1</text>
+  <path d="M150 194 H176" class="d-line" marker-end="url(#mk-m1201-garantias)"/>
+  <path d="M320 194 H346" class="d-line" marker-end="url(#mk-m1201-garantias)"/>
+  <path d="M460 194 H486" class="d-line" stroke-dasharray="4 4"/>
+  <text x="10" y="240" class="d-label">reinicia no offset 0: processa de novo (618 pontos)</text>
+  <text x="10" y="260" class="d-label">com consumidor idempotente, a segunda vez é descartada (359 pontos)</text>
+</svg>
+</Figura>
+
+**O que acabou de acontecer.**
+
+- **No máximo uma vez: 100 pontos.** O consumidor confirmou o offset 1 e caiu antes de creditar os 259 pontos. Ao voltar, o log disse "seu grupo já está no offset 1", e o primeiro evento **nunca mais** será lido. Nenhuma exceção, nenhum log de erro depois da queda: a perda é **silenciosa**. O cliente simplesmente não recebe os pontos, e só vai descobrir se reclamar.
+- **Pelo menos uma vez: 618 pontos.** O consumidor creditou 259, caiu antes de confirmar e, ao voltar, leu o offset 0 de novo: creditou mais 259. São 259 + 259 + 100. Também é silencioso, só que agora o erro é a favor do cliente (e contra o caixa). Troque "pontos" por "estorno no cartão" e o problema vira manchete.
+- **Pelo menos uma vez com idempotência: 359.** A reentrega aconteceu do mesmo jeito, mas o consumidor reconheceu o `idDoEvento` e pulou o efeito, apenas confirmando. O resultado é o mesmo que teria sido sem queda nenhuma.
+
+Esse terceiro resultado é o que as pessoas querem dizer, na prática, quando falam em "exatamente uma vez": **entrega pelo menos uma vez, processamento efetivamente uma vez**. A entrega duplicada continua acontecendo; ela só deixou de ter efeito. Guarde essa frase, porque é a base de quase todas as decisões das próximas aulas.
+
+<Callout tipo="info" titulo="E se a queda for entre o efeito e o registro de 'já processado'?">
+No `ConsumidorDoLog`, o efeito (`destino.processar`) e o registro do id (`jaProcessados.add`) são duas operações separadas. Uma queda entre elas reabre a duplicata. É exatamente por isso que, em produção, o efeito e o registro do id precisam estar **na mesma transação de banco**: ou os dois acontecem, ou nenhum. Quando o efeito é externo (um e-mail, uma chamada a um gateway de pagamento), não há transação comum, e a saída é passar uma **chave de idempotência** para o sistema externo, que faz a deduplicação do lado dele. A aula 5 trata das duas situações.
+</Callout>
+
+### Passo 5: o broker também é uma dependência
+
+**O que vamos fazer e por quê.** Até aqui o log estava sempre disponível, porque mora na mesma JVM. Num sistema real, o broker é outro processo, em outras máquinas, e pode ficar inacessível. O `ProdutorSemBroker` usa o cliente oficial do Kafka (`KafkaProducer`, que vem com o `spring-boot-starter-kafka`) para publicar num endereço onde não há broker nenhum. Configuramos `max.block.ms` com 3 segundos (o padrão é 60) para não esperar um minuto.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/fundamentos/ProdutorSemBroker.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m12.aulas.fundamentos.ProdutorSemBroker
+```
+
+Saída real (resumida; antes dela, o cliente imprime dezenas de linhas de log de configuração):
+
+```text
+23:52:36.720 [kafka-producer-network-thread | producer-1] WARN org.apache.kafka.clients.NetworkClient -- [Producer clientId=producer-1] Connection to node -1 (localhost/127.0.0.1:59092) could not be established. Node may not be available.
+23:52:36.722 [kafka-producer-network-thread | producer-1] WARN org.apache.kafka.clients.NetworkClient -- [Producer clientId=producer-1] Bootstrap broker localhost:59092 (id: -1 rack: null isFenced: false) disconnected
+... (as duas linhas se repetem, com intervalos crescentes)
+falhou depois de 3568 ms: org.apache.kafka.common.errors.TimeoutException: Topic pedidos.pagos not present in metadata after 3000 ms.
+```
+
+**O que acabou de acontecer.**
+
+- Antes de enviar qualquer registro, o produtor precisa dos **metadados** do cluster: quais partições o tópico tem e qual broker é líder de cada uma. Sem broker, ele tenta se conectar várias vezes, com espera crescente entre as tentativas (os `WARN`).
+- O `send` não falhou na hora: ele **bloqueou** até `max.block.ms` esperando os metadados. Com o padrão de 60 segundos, a thread da requisição HTTP do checkout ficaria presa um minuto inteiro. Moral: você trocou cinco dependências por uma, mas essa uma **precisa** de timeouts pensados, como qualquer outra.
+- A exceção chegou embrulhada numa `ExecutionException`, porque `send` devolve um `Future`. Chamar `.get()` dentro da requisição transforma o envio em síncrono (você espera a confirmação do broker); não chamar significa responder ao cliente sem saber se a mensagem foi gravada. As duas escolhas têm consequências, e a solução robusta (o outbox) aparece na seção seguinte e na aula 4.
+
+### Passo 6: os testes do módulo
+
+Quatro testes protegem as afirmações desta aula: a cadeia síncrona falha e deixa efeito parcial, o consumidor fora do ar só acumula atraso, a ordem entre confirmar e processar produz 100, 618 e 359 pontos, e a fila reentrega enquanto o log guarda para outros grupos.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/fundamentos/FundamentosDeMensageriaTest.java" semImports />
+
+```bash
+mvn test -Dtest=FundamentosDeMensageriaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.fundamentos.FundamentosDeMensageriaTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Nenhum teste precisa de broker, Docker ou rede. Separar a **lógica** do consumidor (o que fazer com uma duplicata ou com o destino fora do ar) da **infraestrutura** vale em sistemas reais também: só uma camada fina conversa com o broker, e ela é testada com Testcontainers nas próximas aulas.
+
+## Quando dá errado
+
+Os erros abaixo são os que você vai encontrar primeiro ao adotar mensageria. Os três primeiros foram gerados rodando o código desta aula; os outros são os equivalentes nos brokers reais.
+
+### O produtor não encontra o broker
+
+```text
+org.apache.kafka.common.errors.TimeoutException: Topic pedidos.pagos not present in metadata after 3000 ms.
+```
+
+**Como ler:** o produtor não conseguiu descobrir as partições do tópico dentro de `max.block.ms`. A mensagem diz "tópico ausente", mas a causa mais comum **não** é o tópico: é o broker inacessível. As linhas `WARN ... Connection to node -1 ... could not be established` logo antes confirmam. **Causas, em ordem de frequência:** endereço errado em `bootstrap.servers` (ou em `spring.kafka.bootstrap-servers`); broker fora do ar; o broker anuncia um endereço (`advertised.listeners`) que o cliente não alcança, clássico com Docker, em que o cliente conecta em `localhost:9092`, recebe de volta o nome interno do contêiner e não consegue segui-lo; e, só então, o tópico realmente não existe e a criação automática está desligada. **Como corrigir:** confira o endereço, teste a porta e, com Docker, confira os *listeners* (a aula 3 mostra uma configuração que funciona dentro e fora do contêiner).
+
+### A cadeia síncrona deixa efeitos parciais
+
+```text
+PED-1002 falhou no checkout: e-mail fora do ar ao processar PED-1002
+nota-fiscal já atendeu: [PED-1001, PED-1002]
+```
+
+**Como ler:** a exceção do e-mail chegou ao cliente, mas a nota fiscal já tinha sido emitida. Em produção, isso aparece como "nota emitida para pedido cancelado" no relatório da contabilidade, semanas depois. **Como corrigir:** se as etapas são de fato independentes do resultado para o cliente, elas não deveriam estar na requisição: publique um evento. Se precisam ser coordenadas (pagar e reservar estoque, ou nada), isso é uma *saga*, com passos de compensação explícitos, tema do módulo 13.
+
+### A perda silenciosa
+
+```text
+[no máximo uma vez] consumidor fidelidade caiu no offset 0; reiniciando...
+no máximo uma vez      -> saldo de cli-7: 100 pontos (o correto é 359)
+```
+
+**Como ler:** repare que **não há erro** depois do reinício. É o pior tipo de falha: tudo parece normal. No Kafka, a causa típica é o commit automático de offsets (`enable.auto.commit=true`, o padrão do cliente puro) combinado com processamento assíncrono: o consumidor entrega os registros a outra thread, e o commit periódico confirma offsets de registros que ainda nem foram processados. Se o processo cair, esses registros se perdem. **Como corrigir:** confirme **depois** de processar. O Spring Kafka já desliga o commit automático do cliente e confirma ele mesmo, depois que o listener termina (o modo de confirmação padrão do container é por lote, ao fim do processamento do que foi lido); não processe os registros em outra thread por fora do listener sem entender o que isso faz com os commits.
+
+### A mensagem que volta para sempre
+
+Num consumidor at-least-once, se o processamento **sempre** falha para uma mensagem específica (um JSON malformado, um CPF inválido, um bug), a mensagem volta, falha, volta, falha. No RabbitMQ, isso aparece como a mesma mensagem sendo reentregue sem parar e a CPU do consumidor em 100%; no Kafka, como um consumidor travado no mesmo offset com o lag crescendo. Essa mensagem tem nome: *poison message* (mensagem envenenada). Ela bloqueia (no Kafka, toda a partição atrás dela) e não vai melhorar sozinha. **Como corrigir:** um número limitado de tentativas e, depois, desviar a mensagem para uma **DLQ** (*dead letter queue*, a fila de mensagens que não puderam ser processadas), onde alguém investiga. As quorum queues do RabbitMQ 4 já vêm com um limite de entregas por padrão, e o Spring Kafka tem o `DefaultErrorHandler` com publicação em tópico `-dlt`. A aula 6 é inteira sobre isso.
+
+### Confirmar duas vezes
+
+No RabbitMQ, confirmar uma entrega que já foi confirmada (ou usar uma etiqueta de outro canal) é um erro de protocolo, e o broker **fecha o canal** com uma mensagem como `PRECONDITION_FAILED - unknown delivery tag 1`. Todas as mensagens sem ack daquele canal voltam para a fila e serão reentregues, ou seja, um bug de ack vira uma avalanche de duplicatas. O `FilaDeTrabalho` imita esse cuidado: `confirmar` com uma etiqueta desconhecida lança `IllegalStateException`. A causa comum é misturar ack manual com o ack automático do framework (o listener confirma, e o seu código confirma de novo); a próxima aula mostra como escolher um modo só.
+
+## A escrita dupla: o problema que vem logo em seguida
+
+Assim que você decide publicar eventos, aparece o primeiro bug sério, e ele está em praticamente todo sistema que adota mensageria sem cuidado:
+
+```java
+@Transactional
+public void pagar(String pedidoId) {
+    pedidos.marcarComoPago(pedidoId);                       // 1. banco
+    kafka.send("pedidos.pagos", pedidoId, eventoDe(pedidoId)); // 2. broker
+}
+```
+
+São **dois sistemas**, e não há transação que abranja os dois:
+
+- Se o `send` funciona e o commit do banco falha (violação de restrição, banco caiu), o evento anuncia um pagamento que **não existe**. A nota fiscal sai para um pedido que continua "aguardando pagamento".
+- Se o commit funciona e o `send` falha, ou a aplicação cai entre os dois, o pagamento existe e **ninguém fica sabendo**. O cliente pagou e nunca recebe o produto.
+
+Inverter a ordem não resolve, só troca qual dos dois problemas acontece. Transação distribuída (XA, *two-phase commit*) entre o banco e o broker é complexa, lenta e o Kafka nem a suporta. A solução padrão do mercado é o **Transactional Outbox**: gravar o evento numa tabela do **mesmo banco**, na **mesma transação** do pagamento, e um processo separado publica o que está nessa tabela. Como esse processo publica e pode cair antes de marcar como publicado, a entrega resultante é... pelo menos uma vez. E o consumidor idempotente fecha o círculo. É a aula 4.
+
+## Armadilhas e quando NÃO usar
+
+Mensageria resolve problemas reais e cria outros, igualmente reais. Os erros abaixo aparecem em revisão de arquitetura toda semana.
+
+<Comparar antes="Mensageria onde o cliente precisa da resposta" depois="Síncrono para a decisão, evento para as consequências">
+
+```java
+// O checkout publica e "espera" a resposta numa fila de retorno
+mensageria.enviar(new AutorizarPagamento(pedidoId, valor));
+var resposta = filaDeRespostas.aguardar(pedidoId, Duration.ofSeconds(10));
+if (resposta.aprovado()) {
+    return "Pagamento aprovado";
+}
+// Um request/response síncrono disfarçado: mais lento,
+// mais difícil de depurar e com o mesmo acoplamento temporal.
+```
+
+```java
+// A decisão de que o cliente precisa: chamada direta, com timeout
+var autorizacao = gateway.autorizar(pedidoId, valor); // síncrono
+pedidos.marcarComoPago(pedidoId, autorizacao);        // banco
+outbox.registrar(new PedidoPago(...));                // mesma transação
+return "Pagamento aprovado";
+// Nota fiscal, e-mail e pontos acontecem depois, por evento.
+```
+
+</Comparar>
+
+A regra de bolso: **se o cliente precisa da resposta para continuar, a chamada é síncrona**. "O cartão foi aprovado?", "esse horário ainda está livre na agenda da clínica?", "o saldo cobre o saque?": tudo isso é síncrono. Mensageria é para o que pode acontecer **depois** da resposta: as consequências.
+
+Outros casos em que mensageria é a escolha errada, ou cedo demais:
+
+- **Consistência imediata é requisito de negócio.** Um saque não pode depender de o evento de depósito "chegar eventualmente". Se duas informações precisam estar sempre de acordo, elas provavelmente pertencem ao mesmo serviço e à mesma transação.
+- **Um único processo resolve.** Se o serviço de pedidos e o de fidelidade são módulos do mesmo monolito, com o mesmo banco, uma transação local é mais simples, mais rápida e consistente. Dentro de um processo, eventos de aplicação (o `ApplicationEventPublisher` do Spring, ou o Spring Modulith, que o módulo 13 apresenta) dão o desacoplamento de código sem o custo de um broker.
+- **O volume é baixo e o fluxo é simples.** Dez pedidos por dia com um vizinho confiável não justificam operar um cluster. Um job agendado lendo uma tabela resolve, e você pode trocar por um broker quando o problema aparecer.
+- **O time não tem como operar e observar.** Broker sem monitoramento de lag, sem alertas e sem ninguém que saiba reprocessar uma DLQ é um lugar onde mensagens morrem em silêncio. Antes do primeiro tópico, tenha um painel.
+- **Precisa de ordem global.** Se cada mensagem depende de **todas** as anteriores, o processamento vira uma fila única e você perde o paralelismo, que era um dos motivos para usar o broker. A ordem que dá para ter barato é **por chave** (todos os eventos do pedido 42, em ordem), não global.
+
+E as armadilhas de quem já adotou:
+
+- **Tratar o broker como banco de dados.** O log do Kafka é durável, mas "reconstruir o estado relendo o tópico" exige retenção adequada, esquemas versionados e consumidores determinísticos. Use isso conscientemente (é o *event sourcing*), não como efeito colateral.
+- **Eventos que são comandos disfarçados.** `EnviarEmailDeBoasVindas` publicado num tópico "de eventos" acopla o produtor ao consumidor do mesmo jeito que uma chamada direta, só que com menos visibilidade. Publique o fato (`ContaAberta`) e deixe o serviço de e-mail decidir que manda boas-vindas.
+- **Cadeias de eventos que ninguém enxerga.** A publica, B reage e publica, C reage e publica... e, para entender por que um pedido ficou parado, alguém precisa ler o código de seis serviços. Sem rastreamento distribuído (o módulo 14 mostra OpenTelemetry) e sem um catálogo de eventos, a coreografia vira mistério.
+- **Esquecer que a ordem pode chegar trocada.** Reentregas, retries e partições diferentes fazem `PedidoEstornado` chegar antes de `PedidoPago` em algum momento. Consumidores precisam decidir o que fazer (ignorar, guardar e aguardar, ou consultar o estado atual).
+- **Dados pessoais em eventos retidos.** Um tópico com 30 dias de retenção e o CPF do cliente no payload é um problema de LGPD: "apagar os dados do titular" passa a incluir o log. Publique identificadores, não dados sensíveis, sempre que puder.
+
+<Callout tipo="erro" titulo="Mensageria não é cura para serviço lento">
+Se o consumidor processa 50 mensagens por segundo e chegam 80, o lag cresce sem parar, e a janela de consistência eventual vira horas. O broker absorve **picos**, não falta de capacidade. Meça a vazão do consumidor e acompanhe o lag; se ele só cresce, escale os consumidores (mais instâncias e, no Kafka, partições suficientes para elas) ou torne o processamento mais barato.
+</Callout>
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber o que é uma fila é pré-requisito. O que se espera de quem é Pleno ou Sênior é **decidir**: se vale a pena, qual modelo, quais garantias, e como isso vai ser operado às três da manhã. Esta seção é sobre essas decisões.
+
+### Como justificar (ou recusar) um broker
+
+Uma proposta de mensageria convincente começa pelo **problema medido**, não pela tecnologia. Na prática, os argumentos que convencem um time são três:
+
+1. **Disponibilidade:** "o checkout depende hoje de cinco serviços; com 99,9% cada, a cadeia fica em 99,5%, cerca de 3,5 horas fora do ar por mês. Tirando quatro deles do caminho, o checkout passa a depender só do banco e do broker."
+2. **Latência:** "o p99 do checkout é 2,4 s, e 1,6 s disso é envio de e-mail e emissão de nota, que o cliente não precisa esperar."
+3. **Evolução:** "três times querem os pedidos pagos (dados, antifraude, marketing). Cada pedido de integração hoje é uma mudança no serviço de pedidos."
+
+E a mesma proposta precisa trazer o custo, porque quem aprova vai perguntar: um cluster para operar (ou um serviço gerenciado para pagar), consistência eventual que o produto precisa aceitar, consumidores idempotentes em todos os serviços, outbox no produtor, monitoramento de lag, DLQ com processo de tratamento, e um catálogo de eventos com dono. Se a lista de custos assusta mais do que o problema incomoda, a resposta certa é "ainda não", e isso é uma boa decisão de arquitetura, não uma derrota. Registre-a num ADR (o módulo 13 mostra como), com o gatilho que faria você reconsiderar ("quando o terceiro consumidor aparecer", "quando o p99 passar de 1 s").
+
+### Fila ou log: a decisão em quatro perguntas
+
+| Pergunta | Aponta para fila (RabbitMQ) | Aponta para log (Kafka) |
+|---|---|---|
+| A mensagem tem valor depois de processada? | Não: é trabalho a fazer | Sim: é histórico, outros vão ler, pode ser preciso reprocessar |
+| Quantos consumidores diferentes? | Um tipo de trabalhador, várias instâncias | Vários serviços independentes, cada um no seu ritmo |
+| Precisa de roteamento por conteúdo, prioridade, TTL por mensagem? | Sim: exchanges, filas com prioridade, TTL | Não: o roteamento é por tópico e chave |
+| Qual o volume e o padrão de leitura? | Moderado, entrega por mensagem com baixa latência | Muito alto, leitura em lotes, retenção longa, replay |
+
+Na dúvida entre os dois, olhe para o que o time já opera. Um broker bem operado do modelo "errado" costuma ser melhor do que um broker novo que ninguém sabe operar. E lembre que as fronteiras se aproximaram (streams no RabbitMQ, share groups no Kafka 4.2): escolha pelo modelo dominante do problema, não por um recurso específico.
+
+### Garantias: o que pedir e o que custa
+
+Na prática, a decisão quase sempre é **at-least-once com consumidores idempotentes**, e o trabalho está nos detalhes:
+
+- **No produtor:** `acks=all` (o broker só confirma quando as réplicas sincronizadas gravaram) e produtor idempotente, ambos padrão no Kafka moderno. No RabbitMQ, *publisher confirms* (o broker confirma cada publicação) e filas duráveis replicadas (quorum queues). Sem isso, "pelo menos uma vez" vira "às vezes nenhuma" quando um broker cai.
+- **No broker:** fator de replicação 3 e, no Kafka, `min.insync.replicas=2` para tópicos importantes. Isso é configuração de cluster, e quem decide são o time de plataforma e o dono do tópico juntos.
+- **No consumidor:** confirmar depois de processar e deduplicar pelo id do evento, com o registro do id na mesma transação do efeito.
+
+At-most-once tem lugar legítimo: métricas de alta frequência, posição de GPS a cada segundo, eventos de clique para analytics. Perder um ponto entre milhões é aceitável e mais barato do que deduplicar. Mas escolha isso **explicitamente**, nunca por acidente de configuração.
+
+E o exactly-once do Kafka? Ele existe e é útil, mas tem escopo preciso: com produtor transacional e consumidores em `isolation.level=read_committed`, um fluxo que **lê do Kafka, processa e escreve no Kafka** grava os resultados e o offset de leitura atomicamente. É o que o Kafka Streams usa com `processing.guarantee=exactly_once_v2`. Ele **não** cobre efeitos fora do Kafka: enviar um e-mail, chamar um gateway, gravar no PostgreSQL. Para esses, a própria documentação do Kafka sugere guardar o offset **junto** com o resultado, no mesmo sistema (por exemplo, na mesma transação do banco), o que é outra forma de idempotência. Em entrevista, diferenciar "exactly-once do Kafka para Kafka" de "processamento efetivamente uma vez com efeitos externos" é o que separa quem leu um post de quem operou o sistema.
+
+### Custos de operação que entram na conta
+
+- **Pessoas:** um cluster Kafka ou RabbitMQ tem atualizações de versão, rebalanceamento, discos, certificados, cotas e alertas. Serviços gerenciados (dos provedores de nuvem ou dos próprios fornecedores) trocam parte desse trabalho por custo mensal e menos controle.
+- **Armazenamento:** retenção longa custa disco multiplicado pelo fator de replicação. Um tópico de 50 GB por dia com 30 dias de retenção e réplica 3 ocupa 4,5 TB.
+- **Observabilidade:** lag por grupo e partição, taxa de erros, tamanho da DLQ, tempo entre `ocorridoEm` e o processamento (a janela real de consistência). Sem essas métricas, você só descobre que o consumidor parou quando o cliente liga.
+- **Segurança:** o broker vira um ponto central com dados de vários domínios. Autenticação (SASL ou mTLS), autorização por tópico ou fila (quem pode publicar em `pedidos.pagos`? quem pode ler?), criptografia em trânsito e cuidado com dados pessoais nos payloads. Uma credencial de consumidor vazada que pode ler todos os tópicos é um incidente de dados.
+
+### Contratos e times
+
+Um evento publicado é uma **API pública**, com a diferença de que você não vê quem chama. Isso pede as mesmas disciplinas de uma API REST, e algumas a mais:
+
+- **Dono claro:** o time produtor é dono do esquema do evento e do tópico. Mudanças incompatíveis passam por versão nova e período de convivência (aula 7).
+- **Catálogo:** nome, produtor, consumidores conhecidos, chave, esquema, garantia e retenção de cada evento, num lugar que todos encontram. O padrão AsyncAPI descreve isso em formato legível por máquina.
+- **Nomes de tópico com significado de domínio** (`pedidos.pagos`), não técnicos (`topic-svc-orders-v2-prod`), com a convenção registrada.
+
+### Quando trocar de abordagem
+
+Arquitetura evolui. Sinais de que é hora de **adotar** mensageria: o mesmo dado sendo pedido por três ou mais serviços; incidentes em que um serviço periférico derrubou o fluxo principal; latência dominada por etapas que o cliente não precisa esperar; picos que o sistema não absorve. Sinais de que é hora de **recuar**: a maioria dos fluxos virou request/response sobre filas; o time passa mais tempo investigando mensagens perdidas e duplicadas do que entregando funcionalidade; dois serviços trocam eventos o tempo todo para manter dados que sempre precisam estar juntos (talvez eles sejam um serviço só). Recuar também é uma decisão legítima, e explicar o porquê, com dados, é sinal de senioridade.
+
+<Callout tipo="entrevista">
+Perguntas que aparecem em entrevistas de Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Por que você usaria mensageria aqui?"** Responda com o problema: acoplamento temporal (o checkout não pode cair porque o e-mail caiu, com a conta da disponibilidade), latência (o cliente não precisa esperar a nota fiscal) e acoplamento de conhecimento (outros times vão querer esses eventos). Depois, mostre os custos: consistência eventual, duplicatas, escrita dupla, operação.
+- **"Qual a diferença entre RabbitMQ e Kafka?"** Fila contra log: o que acontece depois do ack, releitura, grupos independentes, ordem por partição, roteamento por exchange. Bônus: citar streams no RabbitMQ e share groups no Kafka 4.2 e dizer que você escolhe pelo modelo do problema.
+- **"Como você garante que uma mensagem é processada exatamente uma vez?"** Não prometa o impossível: entrega pelo menos uma vez (ack depois de processar, produtor com acks=all e idempotente) e consumidor idempotente (id do evento registrado na mesma transação do efeito). Explique o escopo do exactly-once do Kafka (Kafka para Kafka, com transações e read_committed).
+- **"Como você publica um evento quando salva no banco?"** Reconheça a escrita dupla e cite o Transactional Outbox.
+- **"Quando você não usaria?"** Quando o cliente precisa da resposta, quando a consistência precisa ser imediata, quando um processo resolve com transação local, quando o time não consegue operar o broker.
+
+Quem cita só as vantagens parece ter lido um artigo; quem cita os custos e as condições parece ter operado um sistema.
+</Callout>
+
+## Checkpoint
+
+Uma rede de clínicas vai reescrever o agendamento de consultas. Ao confirmar um agendamento, hoje o serviço `agenda`, de forma síncrona: (1) verifica se o horário do médico ainda está livre; (2) cobra a taxa de reserva no cartão; (3) envia SMS de confirmação ao paciente; (4) avisa o sistema de faturamento do convênio; (5) atualiza o painel de ocupação usado pela gerência; (6) agenda o lembrete de véspera.
+
+**O desafio:** para cada etapa, decida se ela fica **síncrona** na requisição ou sai para **mensageria**, e diga o tipo da mensagem (comando ou evento) e a garantia de entrega que você pediria. Depois, responda: que evento o serviço `agenda` deveria publicar, e que campos ele precisa ter para que o consumidor de SMS seja idempotente?
+
+<details>
+<summary>Ver uma solução comentada</summary>
+
+| Etapa | Decisão | Por quê |
+|---|---|---|
+| 1. Horário livre | **Síncrona** | É a decisão que o paciente espera; precisa de consistência imediata (dois pacientes no mesmo horário é o bug mais caro do sistema) |
+| 2. Taxa de reserva | **Síncrona** | O paciente precisa saber se o cartão foi aprovado antes de considerar a consulta marcada |
+| 3. SMS | **Evento**, at-least-once, consumidor idempotente | O paciente não precisa esperar o SMS; o provedor de SMS cai com frequência |
+| 4. Faturamento do convênio | **Evento**, at-least-once, idempotente | Pode acontecer segundos ou minutos depois; uma duplicata geraria cobrança em dobro ao convênio, por isso a idempotência é obrigatória |
+| 5. Painel de ocupação | **Evento**; at-least-once com consumidor que sobrescreve o estado (naturalmente idempotente) | Analítico, tolera atraso; um log permite reconstruir o painel se ele for refeito |
+| 6. Lembrete de véspera | **Evento** consumido por um serviço de lembretes, que agenda o envio | O lembrete é uma consequência do agendamento; quem decide quando lembrar é o serviço de lembretes |
+
+O serviço `agenda` publica **um** evento, `ConsultaAgendada`, e não comandos como `EnviarSms` ou `FaturarConvenio`: ele não precisa saber quem reage. Campos mínimos: `idDoEvento` (UUID, para deduplicar), `consultaId`, `pacienteId`, `medicoId`, `inicio` (data e hora com fuso), `convenioId` e `ocorridoEm`. Para o SMS, o consumidor guarda o `idDoEvento` numa tabela de processados na mesma transação em que registra o envio, e passa um identificador derivado dele ao provedor de SMS como chave de idempotência, se o provedor aceitar. Note que o telefone do paciente **não** precisa estar no evento: o serviço de SMS pode buscá-lo pelo `pacienteId`, o que evita espalhar dados pessoais por um log retido.
+
+E a publicação de `ConsultaAgendada` deve sair por um outbox (aula 4), para não cair na escrita dupla.
+
+</details>
+
+<Quiz
+  id="12-por-que-mensageria"
+  questoes={[
+    {
+      pergunta: 'O checkout chama 4 serviços por HTTP em sequência; ele e cada vizinho têm 99,9% de disponibilidade. Qual a disponibilidade do checkout?',
+      opcoes: ['Continua 99,9%', 'Cerca de 99,5%: o produto das cinco', 'Sobe, porque há redundância', 'Depende só do banco de dados'],
+      correta: 1,
+      explicacao: 'Numa cadeia síncrona, todos precisam estar no ar ao mesmo tempo, e as disponibilidades se multiplicam: 0,999 elevado a 5 é cerca de 0,995, uns 216 minutos fora do ar por mês.',
+    },
+    {
+      pergunta: 'O consumidor confirmou o offset e caiu antes de creditar os pontos. Ao reiniciar, o que acontece?',
+      opcoes: ['O broker reentrega, porque percebe a queda', 'O evento se perde em silêncio: é o comportamento at-most-once', 'Os pontos são creditados em dobro', 'O consumidor lança uma exceção ao reiniciar'],
+      correta: 1,
+      explicacao: 'Para o broker, o offset confirmado diz que o evento foi tratado. Confirmar antes de processar é no máximo uma vez, e a perda não gera erro nenhum.',
+    },
+    {
+      pergunta: 'Qual destes nomes é de um EVENTO, no sentido usado em mensageria?',
+      opcoes: ['EmitirNotaFiscal', 'EnviarEmailDeBoasVindas', 'ConsultaAgendada', 'CalcularFrete'],
+      correta: 2,
+      explicacao: 'Eventos são fatos no passado, publicados para quem quiser ouvir. Os outros são comandos: ordens no imperativo, para um destinatário que pode recusar.',
+    },
+    {
+      pergunta: 'O time de dados quer reprocessar os pedidos pagos dos últimos 30 dias num sistema novo. Que modelo de broker ajuda?',
+      opcoes: ['Fila, porque apaga a mensagem após o ack', 'Log de eventos com retenção suficiente: um grupo novo lê desde o início', 'Nenhum: só consultando o banco de pedidos', 'HTTP síncrono com retry'],
+      correta: 1,
+      explicacao: 'Num log, as mensagens ficam retidas e um grupo novo pode ler do início (no Kafka, com auto.offset.reset=earliest). Numa fila, a mensagem confirmada já não existe.',
+    },
+    {
+      pergunta: 'Sobre o exactly-once do Kafka, qual afirmação está correta?',
+      opcoes: ['Garante que um e-mail disparado pelo consumidor nunca sai duas vezes', 'Torna desnecessário ter consumidores idempotentes em qualquer caso', 'Vale para fluxos que leem e escrevem no próprio Kafka, com transações e read_committed; efeitos externos continuam precisando de idempotência', 'Só existe com ZooKeeper'],
+      correta: 2,
+      explicacao: 'As transações do Kafka tornam atômicos o resultado escrito no Kafka e o offset lido. E-mail, banco e APIs externas ficam fora; para eles, at-least-once com consumidor idempotente.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Cadeias síncronas criam **acoplamento temporal** (as disponibilidades se multiplicam), de **latência** (os tempos se somam) e de **conhecimento** (o produtor precisa saber quem chamar), e ainda deixam **efeitos parciais** quando um elo falha.
+- Um broker tira os vizinhos do caminho do cliente: o produtor depende só do broker, e um consumidor fora do ar vira **lag**, não indisponibilidade. Mas o broker também é uma dependência, que precisa de timeouts.
+- **Comando** é uma ordem para um destinatário, que pode recusar; **evento** é um fato no passado, para quem quiser ouvir; **documento** é o estado inteiro. Prefira publicar fatos do domínio.
+- **Fila** distribui trabalho e apaga no ack; **log** guarda o histórico, com offsets por grupo, releitura e ordem por partição.
+- A garantia do consumidor é decidida pela **ordem entre confirmar e processar**: confirmar antes perde (at-most-once), processar antes duplica (at-least-once). O padrão de produção é **at-least-once com consumidor idempotente**.
+- O exactly-once do Kafka vale para Kafka-para-Kafka; efeitos externos precisam de idempotência.
+- **Consistência eventual** é um requisito de produto, não só de backend: interface, regras e suporte precisam aceitar a janela.
+- Publicar no broker e gravar no banco são **duas escritas**; a solução é o outbox.
+- Não use mensageria quando o cliente precisa da resposta, quando a consistência precisa ser imediata ou quando o time não consegue operar e observar o broker.
+
+## Próximo passo
+
+Na [aula 12.02, RabbitMQ na prática com Spring AMQP 4](../../12-mensageria/02-rabbitmq/), a fila em memória desta aula vira um RabbitMQ de verdade: exchanges, routing keys, ack, prefetch, publisher confirms e a primeira DLQ. Em seguida, a [aula 12.03](../../12-mensageria/03-kafka/) faz o mesmo com o log do Kafka, e a [aula 12.04](../../12-mensageria/04-transactional-outbox/) resolve a escrita dupla.
+
+## Referências
+
+- Apache Kafka 4.2, *Design*: [Message Delivery Semantics](https://kafka.apache.org/42/design/design/)
+- Apache Kafka, [anúncio do Apache Kafka 4.2.0](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/) (Queues for Kafka pronto para produção)
+- Apache Kafka 4.2, [Javadoc do KafkaShareConsumer](https://kafka.apache.org/42/javadoc/org/apache/kafka/clients/consumer/KafkaShareConsumer.html)
+- RabbitMQ, [Reliability Guide](https://www.rabbitmq.com/docs/reliability)
+- RabbitMQ, [Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms)
+- RabbitMQ, [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues) e [Streams](https://www.rabbitmq.com/docs/streams)
+- Spring for Apache Kafka, [documentação de referência](https://docs.spring.io/spring-kafka/reference/)
+- Spring AMQP, [documentação de referência](https://docs.spring.io/spring-amqp/reference/)

@@ -1,0 +1,668 @@
+---
+titulo: "Transactional Outbox: o problema da escrita dupla"
+descricao: "Por que gravar no banco e publicar no broker na mesma requisição perde ou inventa eventos, e como o padrão outbox resolve com uma tabela na mesma transação e um relay: polling com FOR UPDATE SKIP LOCKED, CDC com Debezium, ordem por agregado, duplicatas e inbox no consumidor, limpeza da tabela e o registro de publicações do Spring Modulith como alternativa."
+modulo: 12-mensageria
+ordem: 4
+duracao: 110
+objetivos:
+  - Reproduzir num teste o evento fantasma da escrita dupla e explicar os quatro cenários de falha
+  - Gravar o evento na tabela de outbox na mesma transação do negócio e provar que o rollback leva os dois
+  - Implementar um relay por polling com FOR UPDATE SKIP LOCKED, backoff exponencial e ordem por agregado
+  - Comparar relay por polling e CDC com o Outbox Event Router do Debezium, e escolher entre eles
+  - Tornar o consumidor idempotente com uma inbox gravada na transação do efeito
+  - Operar a outbox em produção (limpeza, índice, métricas, eventos travados) e avaliar o Spring Modulith como alternativa
+tags: [outbox, dual write, relay, SKIP LOCKED, CDC, Debezium, inbox, Spring Modulith]
+flashcards:
+  - frente: O que é o problema da escrita dupla (dual write)?
+    verso: Gravar no banco e publicar no broker são duas operações em dois sistemas, sem transação comum. Se uma funciona e a outra falha (ou a aplicação cai entre elas), o evento se perde ou anuncia algo que não aconteceu (evento fantasma).
+  - frente: Como funciona o Transactional Outbox?
+    verso: O caso de uso grava o evento numa tabela (outbox) na MESMA transação da mudança de negócio. Um processo separado (relay) lê os pendentes, publica no broker, espera a confirmação e marca como publicados.
+  - frente: Que garantia de entrega o outbox dá?
+    verso: Pelo menos uma vez. Se o relay publicar e cair antes de marcar, o evento sai de novo. Por isso os consumidores precisam ser idempotentes, deduplicando pelo id do evento (inbox).
+  - frente: Para que serve FOR UPDATE SKIP LOCKED no relay?
+    verso: Com várias instâncias, cada uma trava as linhas que vai publicar e pula as travadas pelas outras, em vez de esperar. Evita publicação em dobro e contenção. No PostgreSQL, com LIMIT, só as linhas devolvidas são travadas.
+  - frente: Polling × CDC no outbox
+    verso: Polling - o relay consulta a tabela a cada X ms (simples, só precisa do banco). CDC - o Debezium lê o log de transações (WAL do PostgreSQL) e publica cada inserção, na ordem do commit (menos latência e carga, mais infraestrutura).
+  - frente: Por que um evento que falha precisa segurar os seguintes do mesmo agregado?
+    verso: Porque o consumidor espera a ordem por agregado. Se A1 falha e A2 é publicado, A2 chega antes de A1 (ex. PedidoCancelado antes de PedidoConfirmado). O relay trava o agregado até A1 sair.
+  - frente: O que é a inbox no consumidor?
+    verso: Uma tabela com (evento_id, consumidor) como chave. O consumidor insere nela na MESMA transação do efeito. Se o insert não grava nada (ON CONFLICT DO NOTHING), o evento é repetido e é ignorado.
+  - frente: O que o Spring Modulith oferece no lugar de um outbox escrito à mão?
+    verso: O Event Publication Registry - cada evento de aplicação é gravado numa tabela na transação de quem publica e marcado como concluído quando o ouvinte termina. Com @Externalized, o evento vai também para Kafka ou RabbitMQ.
+---
+
+Black Friday na loja virtual de cafés especiais. Às 23h40, o suporte recebe duas reclamações que parecem opostas. A primeira cliente recebeu um e-mail "Seu pedido foi confirmado!" e ganhou 358 pontos no programa de fidelidade, mas o pedido não aparece na conta dela, nunca foi cobrado e o café nunca saiu do estoque. O segundo cliente pagou, o pedido existe, o estoque baixou, e ninguém separou a caixa: a logística nunca soube daquele pedido. Os logs não mostram nenhuma exceção estranha. O banco está consistente. O Kafka está saudável.
+
+As duas reclamações têm a mesma causa, e ela está numa linha que parece inocente:
+
+```java
+@Transactional
+public UUID confirmar(NovoPedido novo) {
+    // ... grava o pedido, baixa o estoque
+    kafka.send("loja.pedidos", evento);   // avisa o resto do mundo
+}
+```
+
+O caso de uso grava no banco **e** publica no broker. São duas escritas, em dois sistemas que não compartilham transação. Na primeira reclamação, o evento saiu e o commit falhou depois (o estoque acabou no último instante): o mundo foi avisado de um pedido que não existe, um **evento fantasma**. Na segunda, o commit deu certo e a publicação falhou (o broker estava em rebalanceamento, ou o pod foi reiniciado pelo autoscaling bem naquele milissegundo): o pedido existe e ninguém ficou sabendo, um **evento perdido**. Esta aula mostra por que nenhuma ordem de chamadas resolve isso e implementa, com código testado, a solução que a indústria adotou: o **Transactional Outbox**.
+
+## A intuição: a bandeja de saída do escritório
+
+Pense num escritório de contabilidade dos anos 1990. Ao fechar o balanço de um cliente, a contadora lança o resultado no livro-razão e escreve uma carta avisando o cliente. Se ela mesma levasse a carta ao correio no meio do lançamento, poderia postá-la e depois rasgar o lançamento por um erro (a notícia de um balanço que não existe), ou terminar o lançamento e tropeçar na escada a caminho do correio (a carta nunca chega).
+
+O escritório resolveu isso com uma bandeja de **saída** na mesa. A contadora lança no livro e, no mesmo gesto, coloca a carta na bandeja. Se ela desistir do lançamento, a carta vai junto para o lixo; se o lançamento ficar, a carta fica. Ela nunca sai da mesa. De tempos em tempos, o **office boy** passa, recolhe tudo o que está na bandeja, leva ao correio e, na volta, carimba "enviado" na cópia. Se ele tropeçar na escada, as cartas continuam na bandeja e ele tenta de novo depois. Se ele postar a carta e tropeçar **antes** de carimbar, vai postá-la de novo na próxima volta: o cliente recebe a mesma carta duas vezes. Por isso o cliente, do outro lado, mantém uma bandeja de **entrada** com um caderno: "carta número 4.512, já li". A segunda cópia vai para o lixo sem ser processada.
+
+Na tradução para o backend: o livro-razão é a tabela de negócio, a bandeja de saída é a tabela `evento_saida` (a **outbox**), o gesto único é a **transação do banco**, o office boy é o **relay**, o correio é o **broker** e o caderno do cliente é a **inbox** do consumidor. A promessa do sistema muda de "toda carta é entregue exatamente uma vez" (impossível) para "toda carta é entregue **pelo menos uma vez**, e o destinatário descarta as repetidas" (possível e barato).
+
+## Vocabulário
+
+| Termo | O que significa nesta aula |
+|---|---|
+| **Escrita dupla** (*dual write*) | Uma operação lógica que escreve em dois sistemas sem transação comum, como banco e broker |
+| **Outbox** (tabela de saída) | Tabela no mesmo banco do negócio, onde o evento é gravado na mesma transação |
+| **Relay** (retransmissor) | Processo que lê a outbox, publica no broker e marca os eventos publicados |
+| **Polling** | Consultar a tabela periodicamente, a cada N milissegundos, em busca de pendentes |
+| **CDC** (*change data capture*) | Capturar as mudanças lendo o log de transações do banco, em vez de consultar a tabela |
+| **WAL** (*write-ahead log*) | O log de transações do PostgreSQL; toda mudança é escrita nele antes de ir para as tabelas |
+| **Slot de replicação** | Marcador no PostgreSQL que guarda até onde um leitor do WAL já leu; o banco não descarta o WAL que o slot ainda não consumiu |
+| **Agregado** | A entidade de negócio que muda junto e cujos eventos precisam de ordem (um pedido, uma conta) |
+| **Pelo menos uma vez** (*at-least-once*) | Nenhum evento se perde, mas algum pode chegar repetido |
+| **Idempotência** | Processar a mesma mensagem duas vezes tem o mesmo efeito de processar uma vez |
+| **Inbox** (tabela de entrada) | Registro, no consumidor, dos ids de eventos já processados, gravado na transação do efeito |
+| **Backoff exponencial** | Esperar 1 s, 2 s, 4 s, 8 s... entre tentativas, até um teto, para não martelar um sistema fora do ar |
+| **`SKIP LOCKED`** | Opção do `SELECT ... FOR UPDATE` que pula as linhas travadas por outra transação em vez de esperar |
+| **Event Publication Registry** | O outbox pronto do Spring Modulith, que registra cada evento de aplicação numa tabela |
+
+## Os quatro jeitos de dar errado
+
+O banco e o Kafka são **dois sistemas**. A transação do banco garante que o `INSERT` do pedido e o `UPDATE` do estoque acontecem juntos ou não acontecem, mas ela termina na fronteira do banco: o broker não participa dela, não sabe que ela existe e não desfaz nada num rollback. Então, seja qual for a ordem em que você escreve as chamadas, há uma janela de falha:
+
+| Onde está o `send` | O que falha | Resultado |
+|---|---|---|
+| dentro da transação | o **commit** falha depois do `send` (constraint, deadlock, falha de serialização, timeout) | evento **fantasma**: anuncia um pedido que não existe |
+| dentro da transação | o `send` demora (broker lento, rede instável) | a transação fica aberta, segurando **locks** do estoque e conexões do pool, e o sistema todo fica lento |
+| depois do commit | o `send` falha, ou a aplicação **cai** entre o commit e o `send` | evento **perdido**: o pedido existe e ninguém fica sabendo |
+| depois do commit, com retry em memória | a aplicação cai durante os retries (deploy, OOM, autoscaling) | evento **perdido** do mesmo jeito: o retry só existia na memória do processo que morreu |
+
+Nenhuma linha está errada isoladamente. O problema é de arquitetura: **uma operação lógica em dois lugares**, sem um árbitro comum. Vale descartar de cara as soluções que parecem resolver e não resolvem, porque elas aparecem em revisões de código e em entrevistas.
+
+**Transação distribuída (XA, *two-phase commit*).** O protocolo XA coordena o commit de vários recursos: um coordenador pergunta a cada participante "você consegue confirmar?" e, só se todos disserem sim, manda confirmar. Funciona com bancos e brokers JMS antigos, mas o Kafka não participa de transações XA, e o RabbitMQ também não. Mesmo onde existe, o 2PC tem custo alto: locks seguros durante as duas fases, um coordenador que vira ponto único de falha e transações "em dúvida" que alguém precisa resolver à mão quando o coordenador cai entre as fases. Quase ninguém usa com brokers modernos.
+
+**`@TransactionalEventListener(phase = AFTER_COMMIT)`.** O Spring entrega um evento de aplicação ao ouvinte só depois do commit, e o ouvinte publica no Kafka. Isso elimina o evento fantasma (o `send` só acontece se o commit deu certo), mas é exatamente a linha 3 da tabela: entre o commit e o fim do ouvinte, o evento só existe na memória. Se o processo cair, ou o `send` falhar, ele se perde.
+
+**Transações do Kafka.** O produtor transacional do Kafka (`transactional.id`) garante que várias mensagens sejam gravadas em vários tópicos de forma atômica, e que um consumidor configurado com `read_committed` só as veja depois do commit do Kafka. Mas essa transação é **do Kafka**: ela não inclui o seu banco. Sincronizar as duas (confirmar a do banco e logo depois a do Kafka) é escrita dupla de novo, só que com mais passos. O Spring Kafka descreve essa sincronização como *best effort*, e não por acaso.
+
+O que todas essas tentativas têm em comum é que mantêm **duas** escritas. A saída é transformar a escrita dupla numa escrita **simples**.
+
+## A solução: a outbox na mesma transação
+
+A ideia é gravar o evento **no mesmo banco**, **na mesma transação** da mudança de negócio, numa tabela de saída. Para o caso de uso, "publicar um evento" passa a ser um `INSERT` a mais. Se a transação confirma, o pedido e o evento existem; se ela é desfeita, nenhum dos dois existe. A atomicidade que o banco já oferecia passa a cobrir o evento também, de graça.
+
+A publicação no broker vira um problema **separado**, resolvido por outro processo, o relay, que lê a tabela, publica e marca. E esse problema separado tem uma propriedade que o original não tinha: ele pode ser **tentado quantas vezes for preciso**. O evento está guardado de forma durável no banco; se o broker estiver fora por dez minutos, o relay tenta de novo por dez minutos, e nada se perde. Se a aplicação cair, a próxima instância a subir continua de onde a outra parou.
+
+<Figura legenda="O caso de uso grava o pedido e o evento numa transação só. O relay publica depois, quantas vezes for preciso, e o consumidor descarta as repetições com a inbox">
+<svg viewBox="0 0 780 380" width="780" role="img" aria-labelledby="ob-fluxo-t ob-fluxo-d">
+  <title id="ob-fluxo-t">Fluxo do Transactional Outbox, do caso de uso ao consumidor</title>
+  <desc id="ob-fluxo-d">O caso de uso confirmar grava, dentro do PostgreSQL e na mesma transação, as tabelas pedido e produto e a tabela evento_saida. O relay lê evento_saida, publica no Kafka e marca o evento como publicado. O consumidor de fidelidade lê do Kafka e grava o id do evento na tabela evento_recebido, a inbox, na mesma transação em que credita os pontos.</desc>
+  <defs><marker id="mk-ob-fluxo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="118" width="150" height="64" rx="10" class="d-accent"/>
+  <text x="85" y="145" text-anchor="middle" class="d-mono">confirmar()</text>
+  <text x="85" y="166" text-anchor="middle" class="d-label">caso de uso</text>
+  <rect x="200" y="20" width="250" height="260" rx="12" class="d-box"/>
+  <text x="325" y="46" text-anchor="middle" class="d-title">PostgreSQL</text>
+  <rect x="220" y="64" width="210" height="48" rx="8" class="d-ok"/>
+  <text x="325" y="93" text-anchor="middle" class="d-mono">pedido, produto</text>
+  <text x="325" y="150" text-anchor="middle" class="d-label">mesma transação</text>
+  <rect x="220" y="186" width="210" height="48" rx="8" class="d-violet"/>
+  <text x="325" y="215" text-anchor="middle" class="d-mono">evento_saida</text>
+  <text x="325" y="262" text-anchor="middle" class="d-label">commit = os dois · rollback = nenhum</text>
+  <path d="M160 138 L216 96" class="d-line" marker-end="url(#mk-ob-fluxo)"/>
+  <path d="M160 162 L216 204" class="d-line" marker-end="url(#mk-ob-fluxo)"/>
+  <rect x="490" y="186" width="110" height="48" rx="10" class="d-info"/>
+  <text x="545" y="215" text-anchor="middle" class="d-mono">relay</text>
+  <path d="M486 210 L434 210" class="d-line" marker-start="url(#mk-ob-fluxo)" marker-end="url(#mk-ob-fluxo)"/>
+  <rect x="640" y="186" width="130" height="48" rx="10" class="d-accent"/>
+  <text x="705" y="215" text-anchor="middle" class="d-mono">Kafka</text>
+  <path d="M600 210 L636 210" class="d-line" marker-end="url(#mk-ob-fluxo)"/>
+  <rect x="610" y="40" width="160" height="72" rx="10" class="d-ok"/>
+  <text x="690" y="66" text-anchor="middle" class="d-title">fidelidade</text>
+  <text x="690" y="92" text-anchor="middle" class="d-mono">evento_recebido</text>
+  <path d="M705 186 L705 116" class="d-line" marker-end="url(#mk-ob-fluxo)"/>
+  <text x="490" y="300" class="d-label">relay: 1. SELECT pendentes FOR UPDATE SKIP LOCKED</text>
+  <text x="490" y="320" class="d-label">2. publicar e esperar a confirmação</text>
+  <text x="490" y="340" class="d-label">3. UPDATE publicado_em</text>
+  <text x="10" y="320" class="d-text">entrega: pelo menos uma vez</text>
+  <text x="10" y="344" class="d-text">consumidor: idempotente (inbox)</text>
+</svg>
+</Figura>
+
+Cada peça passa a ter uma garantia simples: o caso de uso cuida só da transação (o banco garante), o relay cuida da entrega (tentando de novo) e o consumidor tolera repetições (com a inbox). O preço: o evento sai alguns milissegundos depois do commit, e a entrega passa a ser **pelo menos uma vez**. Para quase todo evento de negócio, isso é aceitável.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula existe no projeto Maven da trilha, em `java/m12-mensageria/aulas`, pacote `dev.trilhajava.m12.aulas.outbox`, e roda no CI com H2 em memória no modo PostgreSQL, sem Docker. Os arquivos:
+
+| Arquivo | Papel |
+|---|---|
+| `schema.sql` (em `src/main/resources`) | As tabelas `produto`, `pedido`, `evento_saida` (outbox), `evento_recebido` (inbox) e `saldo_de_pontos` |
+| `NovoPedido`, `PedidoConfirmado`, `Mensagem` | Os dados: o que chega ao caso de uso, o evento de domínio e o que vai para o broker |
+| `Publicador` | A porta para o broker: só volta normalmente se o broker confirmou |
+| `ServicoDePedidosIngenuo` | A versão com escrita dupla, para reproduzir o defeito |
+| `Outbox` e `ServicoDePedidos` | A versão correta: o evento como `INSERT` na transação |
+| `RelayDoOutbox` | O relay por polling, com `SKIP LOCKED`, backoff, ordem por agregado e limpeza |
+| `PublicadorKafka` e `AgendadorDoRelay` | O adaptador para o Kafka e o agendamento com `@Scheduled` |
+| `Inbox` e `ProgramaDeFidelidade` | O consumidor idempotente |
+
+Nos testes, `src/test/java/.../outbox` tem uma classe de apoio (`Apoio`, com um H2 novo por teste, um broker em memória e um relógio ajustável) e três classes de teste com cinco testes no total. O domínio é a loja de cafés: o produto `CAFE-500G` começa com 10 unidades em estoque, e o evento `PedidoConfirmado` interessa a outros serviços (fidelidade, nota fiscal, logística).
+
+## Mão na massa
+
+Os comandos rodam dentro do módulo:
+
+```bash
+cd java/m12-mensageria/aulas
+mvn test -Dtest=EscritaDuplaTest      # uma classe
+mvn test                               # o módulo inteiro
+```
+
+### Passo 1: o esquema
+
+**O que vamos fazer e por quê.** Antes de qualquer Java, a tabela de outbox. Cada coluna dela existe por um motivo que vai aparecer nos passos seguintes, então vale ler os comentários com calma. O mesmo arquivo roda no H2 dos testes e no PostgreSQL 18.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/resources/dev/trilhajava/m12/aulas/outbox/schema.sql" />
+
+**O que acabou de acontecer.** As colunas da outbox respondem a perguntas do relay e do consumidor:
+
+- `id` é a identidade do evento. Ela viaja num header e é o que o consumidor usa para reconhecer uma repetição (o offset do Kafka não serve: a mesma linha publicada duas vezes ganha dois offsets).
+- `agregado_id` vira a **chave** da mensagem. No Kafka, mesma chave significa mesma partição, e a ordem só existe dentro de uma partição (aula de [Kafka](../../12-mensageria/03-kafka/)).
+- `posicao` é uma sequência do banco que ordena a leitura. `criado_em` não serve: dois eventos podem ter o mesmo instante, e desempatar por UUID aleatório embaralharia a ordem.
+- `publicado_em` nulo significa pendente. `tentativas`, `proxima_tentativa` e `ultimo_erro` sustentam o backoff e respondem "por que esse evento está parado?".
+- A `CHECK (estoque >= 0)` no produto é o que vamos usar para fazer o commit falhar de propósito.
+
+### Passo 2: reproduzindo o evento fantasma
+
+**O que vamos fazer e por quê.** Antes de corrigir, provar o defeito. O serviço ingênuo grava o pedido, publica o evento e só depois baixa o estoque. Um pedido de 12 pacotes, com 10 em estoque, faz o `UPDATE` violar a `CHECK` e a transação inteira ser desfeita. A pergunta é: e o evento?
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/ServicoDePedidosIngenuo.java" destacar="40-47" />
+
+A ordem "publica no meio, baixa o estoque depois" está exagerada para caber num teste, mas um deadlock, uma falha de serialização ou uma constraint adiada (`DEFERRABLE`) no commit produzem o mesmo resultado com qualquer `send` antes do commit, só que de forma rara e difícil de reproduzir. O broker de teste é um `Publicador` que guarda as mensagens numa lista:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/outbox/Apoio.java" semImports />
+
+E o teste. A primeira metade é a versão ingênua; a segunda, que vamos discutir no passo 3, é a mesma situação com a outbox:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/outbox/EscritaDuplaTest.java" destacar="25-29" />
+
+```bash
+mvn test -Dtest=EscritaDuplaTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.outbox.EscritaDuplaTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** O `confirmar` lançou `DataIntegrityViolationException` (a tradução do Spring para a violação da `CHECK`), o `TransactionTemplate` desfez a transação, e a tabela `pedido` ficou vazia. Mas o broker tem **uma** mensagem: o `PedidoConfirmado` de um pedido que não existe. Em produção, o serviço de fidelidade creditaria pontos, o de e-mail mandaria a confirmação e o de logística reservaria uma caixa. É a primeira reclamação da abertura, reproduzida em milissegundos.
+
+### Passo 3: a outbox na transação
+
+**O que vamos fazer e por quê.** Trocar o `broker.publicar` por um `INSERT` na outbox. A classe `Outbox` faz esse `INSERT` e se recusa a trabalhar fora de uma transação: se alguém chamar `registrar` sem transação, o evento seria gravado sozinho, confirmado na hora, e se soltaria do negócio.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/Outbox.java" destacar="25-29" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/ServicoDePedidos.java" destacar="37-43" />
+
+**O que acabou de acontecer.** A diferença entre os dois serviços é uma linha, mas a garantia é outra. Na segunda metade do `EscritaDuplaTest`, o mesmo pedido sem estoque faz a mesma exceção ser lançada, e agora **as duas** tabelas ficam vazias: o rollback levou o pedido e o evento juntos. O segundo teste, `outboxForaDeTransacaoEhErroDeUso`, confere a trava de segurança: chamar `registrar` sem transação lança `IllegalStateException`.
+
+Três detalhes de design valem a atenção:
+
+- **A verificação de transação.** Numa aplicação Spring com beans, o jeito idiomático é anotar o método com `@Transactional(propagation = Propagation.MANDATORY)`: o Spring lança `IllegalTransactionStateException` se não houver transação em andamento. Aqui as classes são montadas à mão (sem proxies do Spring), então a verificação é explícita com `TransactionSynchronizationManager.isActualTransactionActive()`. O efeito é o mesmo: um erro de uso vira exceção imediata, em vez de um evento solto descoberto semanas depois.
+- **O caso de uso não conhece o broker.** O `ServicoDePedidos` não importa nada do Kafka. Numa arquitetura hexagonal (aula 13.03), a `Outbox` é a implementação de uma porta `PublicadorDeEventos` da camada de aplicação, e trocar o relay por CDC, ou o Kafka pelo RabbitMQ, não toca no caso de uso.
+- **O payload é serializado na transação**, com os dados do momento do fato. Se o relay "buscasse o resto depois", o evento descreveria o estado de agora, não o do fato.
+
+### Passo 4: o relay
+
+**O que vamos fazer e por quê.** Com os eventos guardados, falta o processo que os leva ao broker. O relay roda em rodadas: a cada rodada, abre uma transação, trava um lote de pendentes, publica um a um na ordem, marca os que deram certo e agenda nova tentativa para os que falharam.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/RelayDoOutbox.java" destacar="49-58, 62-67, 75-83" />
+
+**O que acabou de acontecer, por blocos.**
+
+- **A consulta (linhas 49 a 58).** `WHERE publicado_em IS NULL ORDER BY posicao LIMIT ?` pega os pendentes mais antigos. `FOR UPDATE` trava as linhas devolvidas até o fim da transação do relay, e `SKIP LOCKED` faz outra instância, rodando o mesmo relay ao mesmo tempo, **pular** essas linhas em vez de esperar por elas. A documentação do PostgreSQL descreve exatamente esse uso: evitar contenção com vários consumidores acessando uma tabela que funciona como fila. Ela também avisa que, com `LIMIT`, o travamento para quando linhas suficientes foram devolvidas, ou seja, só o lote é travado, não a tabela.
+- **A trava por agregado (linhas 62 a 67).** O conjunto `travados` guarda os agregados que não podem andar nesta rodada. Um evento é **adiado** se um anterior do mesmo agregado falhou ou se ele mesmo ainda está esperando o backoff. Repare que a consulta **não** filtra por `proxima_tentativa <= agora`: se filtrasse, o A1 em espera sumiria do lote e o A2 seria publicado na frente dele.
+- **A publicação.** O `Publicador` só volta normalmente depois que o broker confirmou. Só então o `UPDATE ... SET publicado_em` é feito. Se a marca fosse gravada antes, ou sem esperar a confirmação, um envio que falhou ficaria registrado como publicado: evento perdido de novo.
+- **A falha (linhas 75 a 83).** Qualquer `RuntimeException` do publicador conta uma tentativa, guarda a mensagem de erro (cortada em 500 caracteres, o tamanho da coluna) e agenda a próxima tentativa com backoff exponencial: 1 s, 2 s, 4 s... até o teto de 5 minutos. O agregado fica travado.
+- **A limpeza.** `limpar(retencao)` apaga os publicados há mais tempo que a retenção. Pendentes nunca são apagados.
+
+O ponto mais importante não está em nenhuma linha: o relay garante **pelo menos uma vez**. Se o processo cair depois da confirmação do broker e antes do commit do relay, a linha volta a ser pendente e o evento sai de novo. O relay faz, ele próprio, uma escrita dupla, mas numa ordem em que a falha produz **duplicata**, nunca perda. Duplicata se resolve no consumidor (passo 8); perda, em lugar nenhum.
+
+### Passo 5: a ordem por agregado e o backoff, testados
+
+**O que vamos fazer e por quê.** Três eventos: A1 e A2 do pedido A, B1 do pedido B. O broker recusa tudo da chave `pedido-A`. Queremos ver: B1 sai, A1 falha e entra em backoff, A2 espera atrás de A1, e depois, com o broker de volta e o backoff vencido, A1 e A2 saem na ordem.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/outbox/RelayDoOutboxTest.java" destacar="24-45" />
+
+```bash
+mvn test -Dtest=RelayDoOutboxTest
+```
+
+Saída real (as linhas impressas pelo teste):
+
+```text
+1ª rodada: Resultado[publicados=1, falhas=1, adiados=1] -> [pedido-B]
+3ª rodada: Resultado[publicados=2, falhas=0, adiados=0] -> [pedido-B, pedido-A, pedido-A]
+...
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.** Rodada a rodada:
+
+1. **Primeira rodada.** A1 é tentado e falha: `tentativas = 1`, `proxima_tentativa = agora + 1 s`, e o agregado A fica travado. A2 é adiado sem nem ser tentado. B1, de outro agregado, sai normalmente. Uma falha num pedido **não** para os outros pedidos.
+2. **Segunda rodada, no mesmo instante.** O broker já voltou, mas o backoff de A1 ainda não venceu: A1 é adiado (e trava A), A2 é adiado. Resultado `(0, 0, 2)`. É o backoff fazendo o trabalho dele: sem ele, um broker instável receberia uma tentativa a cada 500 ms de cada instância.
+3. **Terceira rodada, 1 s depois.** A1 sai, A2 sai. O broker recebeu B1, A1, A2. A ordem **entre** agregados mudou (B1 passou na frente de A1), e isso é aceitável: ninguém promete ordem global. A ordem **dentro** do agregado A foi preservada.
+4. **A limpeza.** Oito dias depois, `limpar(Duration.ofDays(7))` apaga os três publicados.
+
+O relógio é um `Clock` ajustável (o `Relogio` do `Apoio`), e é por isso que o teste testa "1 segundo depois" e "8 dias depois" sem esperar nada. A mesma técnica do `Clock.fixed` da aula de [Mockito](../../10-testes/03-mockito/).
+
+### Passo 6: duas instâncias com SKIP LOCKED
+
+**O que vamos fazer e por quê.** Em produção, a aplicação roda com duas, cinco, vinte réplicas, e todas executam o relay. O teste simula isso: uma thread (a "instância 1") abre uma transação, trava as linhas dos pedidos A e B e **segura** a transação aberta, como se estivesse no meio da publicação. Enquanto isso, a thread principal (a "instância 2") roda o relay.
+
+O teste é o segundo método da mesma classe, `skipLockedDeixaOutraInstanciaComOResto`. Saída real:
+
+```text
+instância 2: Resultado[publicados=1, falhas=0, adiados=0] -> [pedido-C]
+```
+
+**O que acabou de acontecer.** A instância 2 pulou A1 e B1 e publicou o C1, a única linha livre. Com `FOR UPDATE` puro, ela ficaria **bloqueada** até a instância 1 terminar, e o relay viraria uma fila indiana. Sem `FOR UPDATE`, as duas leriam as mesmas linhas e publicariam em dobro.
+
+<Callout tipo="atencao" titulo="SKIP LOCKED e ordem brigam">
+Com várias instâncias, a instância 1 pode travar um lote que contém A1, e a instância 2 pegar o lote seguinte, que contém A2 do mesmo agregado. Se a instância 1 demorar, A2 sai antes de A1. O teste acima usa agregados diferentes justamente por isso. Quando a ordem por agregado é crítica, há saídas: um relay ativo por vez (eleição de líder, ou um *advisory lock* do PostgreSQL com `pg_try_advisory_lock` no começo da rodada), relays particionados por hash do agregado (a instância k só publica os agregados com `hash % N = k`), ou CDC, que lê o log na ordem do commit. Veja a seção sobre ordem, adiante.
+</Callout>
+
+### Passo 7: o adaptador do Kafka e o agendamento
+
+**O que vamos fazer e por quê.** Até aqui, o broker era uma lista. Em produção, o `Publicador` é um adaptador para o Spring Kafka. Ele faz três coisas que importam: usa o agregado como **chave**, põe o id e o tipo do evento em **headers** e **espera** a confirmação do broker.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/PublicadorKafka.java" destacar="27-37" />
+
+**O que acabou de acontecer.** O `KafkaTemplate.send(ProducerRecord)` devolve um `CompletableFuture` de `SendResult`, e o `.get(espera)` bloqueia até o broker responder, conforme o `acks` do produtor (com `acks=all`, depois que as réplicas em sincronia gravaram). Sem resposta no prazo, ou com erro, o adaptador lança `IllegalStateException`, que o relay trata como "não publicado". A `InterruptedException` restaura a flag de interrupção antes de relançar, para não impedir um desligamento limpo. Esse adaptador não tem teste aqui: a publicação no Kafka foi exercitada na aula de Kafka.
+
+O agendamento fica numa classe separada:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/AgendadorDoRelay.java" semImports />
+
+`fixedDelay` (e não `fixedRate`) é deliberado: a próxima rodada só começa depois que a anterior **terminou**. Com `fixedRate`, uma rodada lenta (broker em backoff, lote grande) se sobreporia à seguinte na mesma instância. Para ligar isso numa aplicação Spring Boot, registre `AgendadorDoRelay` como bean e ponha `@EnableScheduling` numa classe de configuração. O intervalo de 500 ms vem de uma propriedade com valor padrão, para ajustar por ambiente sem recompilar.
+
+### Passo 8: a inbox no consumidor
+
+**O que vamos fazer e por quê.** O relay garante pelo menos uma vez; o consumidor precisa transformar isso em "efeito exatamente uma vez". O programa de fidelidade credita 1 ponto por real inteiro gasto. Se o mesmo `PedidoConfirmado` chegar duas vezes, a cliente não pode ganhar o dobro. A técnica é a inbox: antes de aplicar o efeito, o consumidor tenta registrar o id do evento numa tabela com chave primária `(evento_id, consumidor)`, **na mesma transação** do efeito.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/Inbox.java" destacar="29-37" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/outbox/ProgramaDeFidelidade.java" destacar="29-31" />
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/outbox/InboxTest.java" semImports />
+
+```bash
+mvn test -Dtest=InboxTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.outbox.InboxTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.** Na primeira entrega, o `INSERT ... ON CONFLICT DO NOTHING` grava uma linha (`update()` devolve 1), e os 59 pontos são creditados. Na segunda, o conflito na chave primária faz o `INSERT` não gravar nada (devolve 0), e o consumidor sai sem efeito. O saldo fica em 59. Como o registro na inbox e o crédito estão na mesma transação, não existe o estado "registrei que processei, mas não creditei" (ou o contrário): se o crédito falhar, o rollback apaga o registro da inbox e a próxima entrega tenta de novo.
+
+Duas decisões merecem destaque. A chave inclui o **nome do consumidor**: se dois consumidores compartilharem o banco, cada um precisa da própria anotação de "já processei". E a escolha de `ON CONFLICT DO NOTHING` em vez de "tenta o `INSERT` e captura a `DuplicateKeyException`" não é estética: no PostgreSQL, um erro dentro da transação a deixa abortada, e o crédito logo abaixo não poderia mais ser gravado (a mensagem exata está em "Quando dá errado"). A aula [Consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/) aprofunda o tema: as outras técnicas de idempotência, eventos fora de ordem e efeitos fora do banco.
+
+### Passo 9: rodando tudo
+
+```bash
+mvn test
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.outbox.EscritaDuplaTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Running dev.trilhajava.m12.aulas.outbox.InboxTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Running dev.trilhajava.m12.aulas.outbox.RelayDoOutboxTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cinco testes cobrem as garantias da aula: o defeito existe, a outbox o remove, o relay respeita a ordem e o backoff, `SKIP LOCKED` divide o trabalho entre instâncias e a inbox neutraliza duplicatas.
+
+## Polling × CDC
+
+O relay por polling tem uma qualidade enorme: só precisa do banco que você já tem. Mas ele cobra um preço que cresce com o volume. Cada instância faz uma consulta a cada intervalo, haja ou não eventos; a latência mínima é o intervalo (500 ms, em média 250 ms de espera); e, no PostgreSQL, uma tabela com muitas inserções, atualizações e remoções gera linhas mortas que o `VACUUM` precisa limpar.
+
+A alternativa é não consultar a tabela, e sim **ler o log de transações** do banco. Todo `INSERT` confirmado no PostgreSQL passa pelo WAL, que já existe para recuperação de falhas e replicação. Com a **replicação lógica**, um leitor externo recebe as mudanças decodificadas, linha a linha, na ordem do commit. Essa técnica se chama CDC (*change data capture*), e a ferramenta mais usada para ela é o **Debezium**, que roda como conector do Kafka Connect.
+
+<Figura legenda="No polling, o relay pergunta à tabela de tempos em tempos. No CDC, o Debezium recebe as inserções pelo WAL, na ordem do commit">
+<svg viewBox="0 0 780 330" width="780" role="img" aria-labelledby="ob-cdc-t ob-cdc-d">
+  <title id="ob-cdc-t">Relay por polling comparado com CDC pelo Debezium</title>
+  <desc id="ob-cdc-d">Na faixa de cima, a aplicação grava em evento_saida; o relay, dentro da aplicação, faz SELECT a cada 500 milissegundos, publica no Kafka e faz UPDATE na tabela. Na faixa de baixo, a aplicação grava em evento_saida; o PostgreSQL escreve a mudança no WAL; o Debezium, rodando no Kafka Connect, lê o WAL por um slot de replicação e publica no Kafka, sem consultar a tabela.</desc>
+  <defs><marker id="mk-ob-cdc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="28" class="d-title">Polling</text>
+  <rect x="10" y="44" width="130" height="52" rx="10" class="d-accent"/>
+  <text x="75" y="75" text-anchor="middle" class="d-mono">aplicação</text>
+  <rect x="190" y="44" width="160" height="52" rx="10" class="d-violet"/>
+  <text x="270" y="75" text-anchor="middle" class="d-mono">evento_saida</text>
+  <path d="M140 70 L186 70" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+  <rect x="420" y="44" width="150" height="52" rx="10" class="d-info"/>
+  <text x="495" y="75" text-anchor="middle" class="d-mono">relay</text>
+  <path d="M416 70 L354 70" class="d-line" marker-start="url(#mk-ob-cdc)" marker-end="url(#mk-ob-cdc)"/>
+  <text x="385" y="120" text-anchor="middle" class="d-label">SELECT a cada 500 ms + UPDATE</text>
+  <rect x="630" y="44" width="140" height="52" rx="10" class="d-accent"/>
+  <text x="700" y="75" text-anchor="middle" class="d-mono">Kafka</text>
+  <path d="M570 70 L626 70" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+  <text x="10" y="178" class="d-title">CDC</text>
+  <rect x="10" y="194" width="130" height="52" rx="10" class="d-accent"/>
+  <text x="75" y="225" text-anchor="middle" class="d-mono">aplicação</text>
+  <rect x="190" y="194" width="160" height="52" rx="10" class="d-violet"/>
+  <text x="270" y="225" text-anchor="middle" class="d-mono">evento_saida</text>
+  <path d="M140 220 L186 220" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+  <rect x="200" y="270" width="140" height="44" rx="8" class="d-box"/>
+  <text x="270" y="297" text-anchor="middle" class="d-mono">WAL</text>
+  <path d="M270 246 L270 266" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+  <rect x="420" y="194" width="150" height="52" rx="10" class="d-info"/>
+  <text x="495" y="218" text-anchor="middle" class="d-mono">Debezium</text>
+  <text x="495" y="236" text-anchor="middle" class="d-label">Kafka Connect</text>
+  <path d="M340 292 L495 292 L495 250" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+  <text x="420" y="314" class="d-label">slot de replicação</text>
+  <rect x="630" y="194" width="140" height="52" rx="10" class="d-accent"/>
+  <text x="700" y="225" text-anchor="middle" class="d-mono">Kafka</text>
+  <path d="M570 220 L626 220" class="d-line" marker-end="url(#mk-ob-cdc)"/>
+</svg>
+</Figura>
+
+O Debezium tem uma transformação pronta para o padrão, o **Outbox Event Router** (classe `io.debezium.transforms.outbox.EventRouter`). Ela espera, por padrão, uma tabela com as colunas `id`, `aggregatetype`, `aggregateid`, `type` e `payload`, e faz o roteamento: o valor de `aggregatetype` decide o tópico (padrão `outbox.event.` seguido do valor, ou seja, `outbox.event.pedido`), o `aggregateid` vira a **chave** da mensagem, e o `id` vai num header chamado `id`. Os nomes das colunas são configuráveis, então a nossa `evento_saida` serviria com alguns ajustes de configuração. O esboço de um conector, só para dar a forma (as propriedades de conexão e as de mapeamento de colunas variam com a versão; confira na documentação do Debezium antes de usar):
+
+```properties
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+plugin.name=pgoutput
+table.include.list=public.evento_saida
+transforms=outbox
+transforms.outbox.type=io.debezium.transforms.outbox.EventRouter
+```
+
+Uma consequência interessante: com CDC, a aplicação pode **apagar** a linha da outbox logo depois de inseri-la, na mesma transação ou em seguida. O Debezium captura a inserção pelo log; a remoção é filtrada pela transformação. A tabela fica sempre quase vazia, e o problema de limpeza desaparece. Não existe `publicado_em`, nem `tentativas`: quem guarda "até onde já publiquei" é o próprio Kafka Connect, nos offsets do conector.
+
+| | Relay por polling | CDC (Debezium) |
+|---|---|---|
+| Como funciona | consulta a tabela periodicamente | lê o **WAL** por replicação lógica |
+| Latência | o intervalo do polling (centenas de ms) | baixa, da ordem de dezenas de ms |
+| Carga no banco | uma consulta por intervalo por instância, mais o `UPDATE` de cada evento | a decodificação do WAL; nenhuma consulta à tabela |
+| Ordem | a da consulta (`posicao`), com o cuidado das transações concorrentes | a do **commit** |
+| Garantia | pelo menos uma vez | pelo menos uma vez |
+| Infraestrutura | nenhuma além do banco | Kafka Connect, Debezium, slot de replicação, `wal_level=logical` |
+| Novo risco | consulta lenta se a tabela crescer | slot parado faz o WAL **acumular em disco** até encher o volume do banco |
+| Para começar | sim | quando volume, latência ou ordem pedirem |
+
+O último risco da tabela merece destaque, porque derruba bancos de produção: se o conector do Debezium parar (falha, deploy mal feito, alguém apagou o conector e esqueceu o slot), o PostgreSQL **não pode descartar** o WAL que o slot ainda não leu. O disco do banco enche, e o banco para de aceitar escritas. Quem adota CDC adota também um alerta sobre o atraso dos slots de replicação, e o PostgreSQL oferece um limite para isso (`max_slot_wal_keep_size`), que sacrifica o slot para salvar o banco.
+
+## Ordem e duplicatas
+
+O consumidor de um pedido precisa receber `PedidoConfirmado` antes de `PedidoCancelado`. Se receber ao contrário, pode cancelar algo que ainda não existe para ele, e depois "confirmar" um pedido já cancelado. A ordem por agregado depende de uma corrente de quatro elos, e basta um quebrar:
+
+1. **A ordem de gravação reflete a ordem real.** Duas operações sobre o mesmo pedido precisam ser serializadas no banco: o `UPDATE` do pedido (ou um `SELECT ... FOR UPDATE` na linha dele, ou o versionamento otimista da aula de [locking](../../09-persistencia/06-locking-e-flyway/)) faz a segunda transação esperar a primeira. Assim, o evento da segunda é gravado depois do commit da primeira.
+2. **O relay lê na ordem de gravação** e, se um evento falha, **não publica os seguintes do mesmo agregado** na mesma rodada. É o `travados` do passo 4.
+3. **A chave da mensagem é o agregado**, e o tópico não muda de número de partições sem planejamento (aumentar partições muda o mapeamento chave → partição).
+4. **O consumidor processa uma partição em sequência**, sem repassar as mensagens para um pool de threads que as executaria fora de ordem.
+
+Há uma sutileza no elo 2 que pega até times experientes. A `posicao` é gerada no **`INSERT`**, mas a linha só fica visível no **commit**. Imagine duas transações de pedidos diferentes: T1 grava a posição 101 e demora a confirmar; T2 grava a 102 e confirma logo. O relay roda entre os dois commits e publica a 102; a 101 aparece depois. Para agregados diferentes, isso não importa, porque ninguém promete ordem global. Para o mesmo agregado, não acontece, porque o elo 1 serializa as transações. O problema surge quando alguém usa a posição como **cursor** ("já publiquei até a 102, então a próxima consulta pede `posicao > 102`"): a 101 seria pulada para sempre. Por isso o relay desta aula consulta por `publicado_em IS NULL`, nunca por "maior que a última posição". O CDC não tem essa sutileza, porque lê na ordem dos commits.
+
+E as duplicatas são inevitáveis: o relay cai antes do commit que marca o evento, a confirmação do broker se perde na rede, o consumidor cai antes de confirmar o offset, alguém reprocessa eventos depois de um incidente. O produtor idempotente do Kafka (`enable.idempotence`, ligado por padrão desde o Kafka 3) elimina só a confirmação perdida, e só dentro da mesma sessão de produtor. A conclusão é a mesma da intuição: o consumidor idempotente não é um detalhe, é **metade** do padrão. Outbox sem consumidor idempotente troca eventos perdidos por efeitos duplicados.
+
+## Operando a outbox
+
+Uma outbox que funciona no primeiro dia pode virar problema no sexto mês. Quatro cuidados de operação:
+
+**Limpeza.** O `limpar(retencao)` do relay apaga os publicados há mais de N dias; em volumes modestos, um `DELETE` diário resolve. Em volumes altos, um `DELETE` de milhões de linhas vira uma transação enorme: apague em lotes curtos ou **particione a tabela por data** e descarte partições inteiras. Guardar alguns dias de publicados ajuda a investigar "esse evento saiu mesmo?" e a reprocessar um intervalo.
+
+**Índice.** A consulta do relay procura pendentes em ordem. No PostgreSQL, um **índice parcial** é a ferramenta certa, porque indexa só as linhas pendentes, que são poucas, e continua pequeno mesmo com milhões de publicados na tabela:
+
+```sql
+-- só no PostgreSQL (o H2 não aceita índice parcial)
+CREATE INDEX ix_evento_saida_pendentes ON evento_saida (posicao) WHERE publicado_em IS NULL;
+```
+
+**Eventos que não saem.** Um evento que falha sempre (payload que o broker recusa por tamanho, tópico que não existe, uma ACL errada) fica em backoff para sempre e **trava** os seguintes do mesmo agregado. É o comportamento correto, porque publicar os seguintes quebraria a ordem, mas alguém precisa saber. O exercício 12.03 transforma isso num status `MORTO` depois de N tentativas, com reprocessamento manual. O importante é a regra: um evento morto nunca é descartado em silêncio, e nunca é "pulado" sem uma decisão humana.
+
+**Monitoramento.** Duas métricas contam quase toda a história: **quantos pendentes** há e **a idade do pendente mais antigo**. A primeira cresce quando o relay não dá conta do volume; a segunda cresce quando algo está travado, mesmo com poucos pendentes. Um alerta do tipo "o mais antigo está pendente há mais de 5 minutos" pega broker fora do ar, relay parado (alguém desligou o `@EnableScheduling`) e eventos travados. A consulta é barata com o índice parcial:
+
+```sql
+SELECT COUNT(*) AS pendentes, MIN(criado_em) AS mais_antigo
+FROM evento_saida WHERE publicado_em IS NULL;
+```
+
+## Spring Modulith: o registro de publicações como alternativa
+
+Escrever o próprio outbox, como nesta aula, ensina o que acontece por baixo. No dia a dia, o ecossistema Spring tem uma opção pronta: o **Event Publication Registry** do Spring Modulith (versão 2.1 nesta trilha). Ele parte de outro ponto: em vez de você gravar numa tabela, você publica um **evento de aplicação** com o `ApplicationEventPublisher` do Spring, e o registro se encarrega do resto:
+
+- para cada ouvinte transacional (`@TransactionalEventListener`, ou o `@ApplicationModuleListener` do Modulith, que combina assíncrono, transação nova e execução depois do commit), uma linha é gravada na tabela de publicações, **na transação de quem publicou**;
+- quando o ouvinte termina com sucesso, a publicação é marcada como concluída; se falhar, fica incompleta, e pode ser reenviada (`IncompleteEventPublications`, ou na reinicialização com `spring.modulith.events.republish-outstanding-events-on-restart=true`);
+- com um módulo de externalização (`spring-modulith-events-kafka` ou `spring-modulith-events-amqp`), eventos anotados com `@Externalized` são publicados também no broker, com tópico e chave definidos na anotação, como `@Externalized("loja.pedidos::#{#this.pedidoId()}")`;
+- a limpeza é configurável: `spring.modulith.events.completion-mode` aceita `UPDATE` (padrão, marca como concluída), `DELETE` (apaga) e `ARCHIVE` (move para outra tabela), e `CompletedEventPublications` apaga as antigas.
+
+```java
+// O caso de uso publica um evento de aplicação; o registro grava na mesma transação.
+@Transactional
+public UUID confirmar(NovoPedido novo) {
+    // ... grava o pedido, baixa o estoque
+    eventos.publishEvent(new PedidoConfirmado(id, novo.cliente(), novo.sku(), novo.quantidade(), novo.total()));
+    return id;
+}
+```
+
+O trecho acima é ilustrativo (não está no projeto da aula). As dependências são o starter do registro (`spring-modulith-starter-jdbc`, com a tabela criada por `spring.modulith.events.jdbc.schema-initialization.enabled=true`) e, para o broker, o módulo de externalização. A aula [Monólito modular](../../13-arquitetura/04-monolito-modular/) mostra o registro em uso entre módulos.
+
+O Modulith vence quando a aplicação já é Spring e o time quer menos código para manter: registro, reenvio, limpeza e externalização vêm prontos. O outbox próprio (ou o CDC) vence quando você precisa de controle fino da **ordem por agregado** (o registro foi pensado para nada se perder; a ordem no broker precisa ser verificada para o seu caso), do formato da tabela, ou quando o produtor não é Spring. A garantia é a mesma: pelo menos uma vez.
+
+## Quando dá errado
+
+### Outbox chamada fora da transação
+
+Alguém chama `outbox.registrar(...)` de um método sem `@Transactional` (ou de um método `private` anotado, que o proxy do Spring não intercepta). Mensagem real do teste `outboxForaDeTransacaoEhErroDeUso`:
+
+```text
+java.lang.IllegalStateException: Outbox.registrar exige uma transação em andamento
+```
+
+**Causa e correção:** o evento seria gravado em *autocommit*, independente do negócio. Ponha a chamada dentro da transação do caso de uso. Com `@Transactional(propagation = MANDATORY)` num bean, a mensagem do Spring é `IllegalTransactionStateException: No existing transaction found for transaction marked with propagation 'mandatory'`.
+
+### O commit que falha leva o evento junto (e é isso que você quer)
+
+Com estoque insuficiente, o `ServicoDePedidos` lança (no H2; no PostgreSQL, a mensagem diz `violates check constraint`):
+
+```text
+org.springframework.dao.DataIntegrityViolationException: PreparedStatementCallback; SQL [UPDATE produto SET
+estoque = estoque - ? WHERE sku = ?]; Check constraint violation: "CONSTRAINT_18: "; SQL statement:
+```
+
+É a regra de negócio recusando o pedido. Se, depois dela, aparecer um evento na outbox, procure um `registrar` em outra transação (`REQUIRES_NEW`, *autocommit* ou outra conexão).
+
+### O teste de SKIP LOCKED que não pegou nada no H2
+
+A primeira versão do teste do passo 6 travava as linhas da "instância 1" com `ORDER BY posicao LIMIT 2 FOR UPDATE SKIP LOCKED`, esperando que só duas linhas fossem travadas. A falha real:
+
+```text
+instância 2: Resultado[publicados=0, falhas=0, adiados=0] -> []
+[ERROR] RelayDoOutboxTest.skipLockedDeixaOutraInstanciaComOResto -- Time elapsed: 5.013 s <<< FAILURE!
+expected: Resultado[publicados=1, falhas=0, adiados=0]
+ but was: Resultado[publicados=0, falhas=0, adiados=0]
+```
+
+**Causa:** no H2 2.5, nessa consulta, a instância 2 não encontrou nenhuma linha livre: o H2 travou mais linhas do que as duas devolvidas. O PostgreSQL documenta o contrário (com `LIMIT`, o travamento para quando linhas suficientes foram devolvidas). **Correção no teste:** a instância 1 trava por agregado (`WHERE agregado_id IN (...)`), sem depender do `LIMIT`. **Lição maior:** concorrência e locks são exatamente o ponto em que bancos diferem. O H2 serve para a aula rodar sem Docker; o relay de produção precisa de um teste de integração contra o PostgreSQL real, com Testcontainers (aula [Testcontainers](../../10-testes/05-testcontainers/)).
+
+### Capturar a chave duplicada na inbox
+
+Uma inbox escrita com "tenta o `INSERT` e captura a exceção" funciona no H2:
+
+```text
+org.springframework.dao.DuplicateKeyException: PreparedStatementCallback; SQL [INSERT INTO evento_recebido
+(evento_id, consumidor, recebido_em) VALUES (...)]; Unique index or primary key violation: "PUBLIC.CONSTRAINT_F
+INDEX PUBLIC.PRIMARY_KEY_F ON PUBLIC.EVENTO_RECEBIDO(EVENTO_ID, CONSUMIDOR) ..."
+```
+
+No PostgreSQL, porém, qualquer erro dentro de uma transação a deixa abortada, e o próximo comando da mesma transação falha com a mensagem do PostgreSQL `ERROR: current transaction is aborted, commands ignored until end of transaction block` (SQLSTATE `25P02`). **Correção:** `INSERT ... ON CONFLICT DO NOTHING` e conferir quantas linhas foram gravadas, como na `Inbox` do passo 8. (Essa mensagem do PostgreSQL não foi reproduzida nesta aula, que roda sem Docker; ela é o comportamento documentado do PostgreSQL.)
+
+### O `send` sem esperar
+
+Um relay que faz `kafka.send(...)` e marca como publicado sem `.get()` não produz mensagem de erro nenhuma: esse é o problema. Quando o broker recusa a mensagem, a falha vai para o `CompletableFuture`, que ninguém consulta, e o evento fica marcado como publicado. **Sintoma:** consumidores reclamando de eventos que a outbox diz ter publicado. **Correção:** esperar a confirmação com prazo, como o `PublicadorKafka`, ou marcar a linha dentro do *callback* de sucesso do `CompletableFuture`, numa transação própria.
+
+## Armadilhas e quando NÃO usar
+
+**Armadilhas comuns:**
+
+- **Publicar direto "só neste caso".** Basta um caso de uso que ainda chama `kafka.send` dentro da transação para reintroduzir eventos fantasmas. Uma regra de arquitetura (ArchUnit, aula 10.06) que proíba o pacote de aplicação de depender do Spring Kafka evita a recaída.
+- **Outbox num banco diferente do negócio.** A garantia vem de estar na **mesma transação**. Uma outbox num segundo banco, ou num Redis, é escrita dupla de novo.
+- **Relay que filtra por `proxima_tentativa <= agora`.** O evento em backoff some do lote e o seguinte do mesmo agregado passa na frente.
+- **Relay que usa a posição como cursor.** Transações que confirmam fora da ordem de gravação fazem eventos serem pulados para sempre (seção de ordem).
+- **Payload "magro" que obriga o consumidor a consultar o produtor.** "Pedido 123 mudou, consulte a API" transforma um evento em acoplamento síncrono e descreve o estado de agora, não o do fato.
+- **Tabela que só cresce.** Sem limpeza e sem índice parcial, a consulta do relay fica lenta mês a mês, e ninguém liga isso à outbox até o banco reclamar.
+- **Consumidor sem idempotência.** O outbox entrega pelo menos uma vez. Um consumidor que não deduplica vai, algum dia, cobrar, creditar ou enviar em dobro.
+
+**Quando NÃO usar:**
+
+- **Quando não há escrita no banco.** Um serviço que só repassa uma requisição para o broker (um coletor de telemetria, por exemplo) não tem escrita dupla: ele publica e responde ao cliente só depois da confirmação; se falhar, o cliente tenta de novo.
+- **Quando o evento é descartável.** Métricas de uso e cliques: perder alguns é aceitável, e a tabela seria custo sem retorno.
+- **Quando a fonte da verdade já é o broker.** Se o sistema escreve primeiro no Kafka e projeta no banco a partir dele, há uma escrita só.
+- **Para efeitos internos ao mesmo processo.** Se o "consumidor" é outro módulo do mesmo monólito, o registro de publicações do Spring Modulith resolve com menos peças.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Comece pelo relay por polling e meça.** Para a grande maioria dos sistemas, algumas centenas de eventos por segundo, um relay por polling com lote de 100 a 500 linhas, intervalo de 200 a 1.000 ms e índice parcial atende com folga, só com o PostgreSQL que já existe. O CDC adiciona Kafka Connect, Debezium, um slot de replicação, `wal_level=logical` e uma nova categoria de incidente (WAL acumulando em disco). Justifique a troca com números: "o relay está consumindo X% da CPU do banco", "a latência p99 do evento passou de Y segundos", "precisamos da ordem de commit entre agregados para uma projeção". Sem esses números, CDC é complexidade especulativa.
+
+**Publicar dentro ou fora da transação do relay.** O relay desta aula publica com o lote travado numa transação aberta. Isso é simples e correto, mas segura conexões e locks pelo tempo das publicações; com o broker lento, a transação fica longa. A variante de produção mais comum é a **reivindicação com prazo** (*lease*): uma transação curta marca o lote como "reservado por esta instância até agora + 30 s", a publicação acontece fora de qualquer transação, e outra transação curta marca os publicados. Se a instância morrer, a reserva expira e outra assume. Mais código, transações curtas; vale quando o volume ou a latência do broker justificam.
+
+**Ordem é uma escolha cara; faça-a conscientemente.** Ordem por agregado exige chave, leitura ordenada, trava de agregado em falha e cuidado com várias instâncias. Pergunte ao negócio: o consumidor realmente quebra se receber fora de ordem? Muitos não quebram, se o evento carrega uma versão (a aula de consumidores idempotentes mostra o "ignore se a versão for menor que a que eu já tenho"). Um consumidor tolerante a desordem libera o relay para paralelizar à vontade. Quando a ordem é crítica (extrato bancário, máquina de estados de pedido), escolha entre relay único com *advisory lock* (simples, limitado ao throughput de uma instância), particionamento por hash (escala, mais operação) ou CDC (ordem de commit, mais infraestrutura).
+
+**O custo de uma linha a mais por transação.** Cada evento é um `INSERT` na transação de negócio, mais um `UPDATE` do relay e um `DELETE` da limpeza: três escritas, com WAL, índice e `VACUUM`. Em sistemas de altíssimo volume, isso aparece no banco. As respostas são o CDC com remoção imediata (uma escrita e uma remoção, sem `UPDATE`), a tabela particionada por data e a revisão de quais eventos realmente precisam da garantia (nem todo evento é de negócio).
+
+**Contrato do evento é API pública.** O payload será lido por times que você não conhece, por anos: versione o tipo, nunca remova campos sem um período de convivência ([aula 12.07](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/)) e não coloque dado sensível (CPF, endereço) no evento sem necessidade, porque ele vai para o broker, para os logs dos consumidores e para a retenção do tópico.
+
+**Recuperação combinada antes do incidente.** Depois de uma hora de broker fora, a outbox pode ter 2 milhões de pendentes. Em quanto tempo o relay drena, com que carga no banco, e os consumidores aguentam o pico? Ensaie em homologação, com uma vazão máxima configurável no relay, e tenha um procedimento escrito para reprocessar um intervalo de eventos.
+
+**Segurança.** O usuário de banco do relay precisa de `SELECT` e `UPDATE` na outbox e de nada mais. O conector do Debezium precisa de permissão de replicação, que é poderosa: restrinja com uma *publication* só da `evento_saida` e um usuário dedicado.
+
+**Como justificar para o time.** Fale do incidente, não do padrão: "hoje, a cada deploy, perdemos em média N eventos de pedido, e o suporte resolve à mão; com a outbox, a perda vai a zero e o custo é uma tabela, um job e consumidores idempotentes, que já precisaríamos de qualquer jeito". E deixe registrado num ADR ([aula 13.08](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/)) a escolha entre outbox próprio, Modulith e CDC, com o gatilho que faria a decisão mudar.
+
+<Callout tipo="entrevista">
+**"Como você garante que o evento é publicado se, e somente se, a transação confirmar?"** Diga **escrita dupla** e **Transactional Outbox** nos primeiros 20 segundos. Depois, os detalhes que mostram profundidade: o evento vai para uma tabela **na mesma transação**; um relay publica, **espera a confirmação** e marca; a garantia é **pelo menos uma vez**, então o consumidor é **idempotente** pelo id do evento (inbox). Descarte XA e `AFTER_COMMIT` com uma frase cada.
+
+**"Você tem 5 réplicas da aplicação. Como evitar que o relay publique tudo cinco vezes?"** `SELECT ... FOR UPDATE SKIP LOCKED` com `LIMIT`: cada réplica trava o seu lote e pula os das outras. Bônus: dizer que isso pode inverter a ordem de eventos do mesmo agregado e citar as saídas (*advisory lock*, particionamento por hash, CDC).
+
+**"Polling ou CDC?"** Polling para começar: simples, só o banco. CDC (Debezium com o Outbox Event Router) quando volume, latência ou ordem de commit pedirem, sabendo do custo: Kafka Connect, slot de replicação e o risco de o WAL acumular se o conector parar.
+
+**"O outbox garante exatamente uma vez?"** Não. O relay pode publicar e cair antes de marcar. O que dá "efeito exatamente uma vez" é a combinação de entrega pelo menos uma vez com consumidor idempotente, registrando o id do evento na mesma transação do efeito.
+
+**"E se um evento nunca conseguir ser publicado?"** Backoff exponencial com teto, depois status de morto, alerta pela idade do pendente mais antigo, reprocessamento manual; e, enquanto isso, os eventos seguintes do mesmo agregado ficam retidos para não quebrar a ordem.
+</Callout>
+
+## Checkpoint
+
+A loja passou a emitir também `PedidoCancelado`. Com o relay desta aula (lote de 100, backoff de 1 s a 5 min), a outbox tem, nesta ordem de `posicao`: **P1** (`PedidoConfirmado`, pedido X), **P2** (`PedidoConfirmado`, pedido Y), **P3** (`PedidoCancelado`, pedido X). O broker está recusando mensagens da chave do pedido X; o resto funciona.
+
+Responda sem rodar nada: (a) qual o `Resultado` da primeira rodada e o que o broker recebeu? (b) numa segunda rodada, 500 ms depois, com o broker já normal, qual o `Resultado`? (c) por que seria grave o relay publicar P3 na primeira rodada? Depois, escreva um teste com o `Apoio` que confirme (a) e (b).
+
+<details>
+<summary>Solução</summary>
+
+**(a)** P1 é tentado e falha: `tentativas = 1`, próxima tentativa em 1 s, e o pedido X fica travado. P2 é de outro agregado: sai. P3 é do pedido X, travado: adiado. `Resultado[publicados=1, falhas=1, adiados=1]`, e o broker recebeu só P2.
+
+**(b)** 500 ms depois, o backoff de P1 (1 s) ainda não venceu: P1 é adiado e trava X, P3 também é adiado. P2 já foi publicado e não está mais entre os pendentes. `Resultado[publicados=0, falhas=0, adiados=2]`. Só depois de completar 1 s da falha P1 e P3 saem, nessa ordem.
+
+**(c)** O serviço de logística receberia o cancelamento de um pedido que, para ele, não existe; descartaria a mensagem (ou a mandaria para a DLQ) e, quando o `PedidoConfirmado` finalmente chegasse, separaria a caixa de um pedido cancelado.
+
+```java
+@Test
+void cancelamentoEsperaAConfirmacaoDoMesmoPedido() {
+    gravar("pedido-X", "P1");
+    gravar("pedido-Y", "P2");
+    gravar("pedido-X", "P3");
+    broker.chavesRecusadas.add("pedido-X");
+
+    assertThat(relay.executar()).isEqualTo(new Resultado(1, 1, 1));
+    assertThat(broker.recebidas).extracting(Mensagem::payload).containsExactly("P2");
+
+    broker.chavesRecusadas.clear();
+    relogio.avancar(Duration.ofMillis(500));
+    assertThat(relay.executar()).isEqualTo(new Resultado(0, 0, 2));
+}
+```
+
+**Por que assim.** O teste usa o mesmo `RelayDoOutboxTest` (com os campos `banco`, `broker`, `relogio`, `relay` e o método `gravar`) e controla o tempo com o relógio ajustável. O item (b) é o caso de borda: se alguém "otimizar" o relay para consultar só eventos com `proxima_tentativa <= agora`, P1 sumiria do lote e P3 sairia na frente. Este teste pega o erro.
+
+</details>
+
+<Quiz
+  id="12-outbox"
+  questoes={[
+    {
+      pergunta: 'O kafka.send é chamado dentro do @Transactional e o commit falha logo depois. O que acontece?',
+      opcoes: ['O Kafka desfaz o envio', 'Um evento fantasma: publicado para uma operação que não existe', 'Nada é publicado', 'O Spring reenvia depois do rollback'],
+      correta: 1,
+      explicacao: 'O broker não participa da transação do banco. O evento já saiu quando o commit falhou, e nada o desfaz.',
+    },
+    {
+      pergunta: 'O relay publica o evento, o broker confirma e a aplicação cai antes do commit que marca publicado_em. E agora?',
+      opcoes: ['O evento se perde', 'O evento sai de novo na próxima rodada: o consumidor precisa deduplicar', 'O banco desfaz o envio', 'O produtor idempotente do Kafka descarta a segunda cópia'],
+      correta: 1,
+      explicacao: 'O outbox garante pelo menos uma vez. A idempotência do produtor Kafka não ajuda: a nova rodada é outra sessão de produtor, e o relay não tem como saber que o primeiro envio deu certo.',
+    },
+    {
+      pergunta: 'Por que o relay desta aula NÃO filtra os pendentes com proxima_tentativa menor ou igual a agora?',
+      opcoes: ['Por desempenho', 'Porque o evento em backoff sumiria do lote, e o seguinte do mesmo agregado passaria na frente dele', 'Porque o H2 não aceita a comparação', 'Porque o backoff é calculado no broker'],
+      correta: 1,
+      explicacao: 'O evento em espera precisa continuar no lote para travar o agregado. Filtrar por proxima_tentativa quebraria a ordem por agregado.',
+    },
+    {
+      pergunta: 'A equipe adotou CDC com Debezium. Qual o risco operacional NOVO que precisa de alerta?',
+      opcoes: ['Eventos perdidos quando a aplicação cai', 'Com o conector parado, o slot de replicação impede o descarte do WAL, e o disco do banco pode encher', 'O Debezium publica fora da ordem do commit', 'O CDC exige XA entre o banco e o Kafka'],
+      correta: 1,
+      explicacao: 'O slot guarda a posição de leitura, e o PostgreSQL mantém todo o WAL ainda não lido. Monitore o atraso dos slots e avalie max_slot_wal_keep_size.',
+    },
+    {
+      pergunta: 'Na inbox do consumidor, por que usar INSERT ... ON CONFLICT DO NOTHING em vez de capturar a DuplicateKeyException?',
+      opcoes: ['Porque capturar exceções é sempre proibido', 'Porque no PostgreSQL o erro deixa a transação abortada, e o efeito não poderia mais ser gravado nela', 'Porque ON CONFLICT é mais rápido no H2', 'Porque a DuplicateKeyException não existe no Spring'],
+      correta: 1,
+      explicacao: 'Depois de um erro, o PostgreSQL recusa os comandos seguintes da transação (current transaction is aborted). ON CONFLICT DO NOTHING evita o erro e informa, pela contagem de linhas, se o evento é novo.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Banco e broker na mesma operação são uma **escrita dupla**: nenhuma ordem de chamadas é segura. `send` antes do commit gera **evento fantasma**; depois do commit, **evento perdido**. XA, `AFTER_COMMIT`, transações do Kafka e retries em memória não resolvem.
+- **Outbox**: o evento vira um `INSERT` numa tabela **na mesma transação** do negócio; commit grava os dois, rollback nenhum. A classe que grava exige uma transação em andamento.
+- O **relay** lê pendentes em ordem com `FOR UPDATE SKIP LOCKED`, publica **esperando a confirmação**, marca e, em falha, agenda nova tentativa com **backoff exponencial**.
+- A garantia é **pelo menos uma vez**. O consumidor é idempotente com uma **inbox** (`evento_id`, `consumidor`) gravada na transação do efeito, com `ON CONFLICT DO NOTHING`.
+- **Ordem por agregado**: transações do mesmo agregado serializadas, leitura em ordem, um evento que falha **segura os seguintes** do mesmo agregado, chave = agregado. Nunca use a posição como cursor. Várias instâncias com `SKIP LOCKED` podem inverter a ordem.
+- **Polling** para começar; **CDC** com o Outbox Event Router do Debezium quando volume, latência ou ordem de commit pedirem, com alerta sobre o atraso do slot de replicação.
+- Operação: **limpeza** (em lotes ou por partição), **índice parcial** nos pendentes, alerta pela **idade do pendente mais antigo**, eventos mortos nunca descartados em silêncio.
+- O **Event Publication Registry** do Spring Modulith é o mesmo padrão empacotado, com `@Externalized` para Kafka e RabbitMQ.
+
+## Próximo passo
+
+O outbox empurrou um problema para o outro lado: os consumidores vão receber eventos repetidos, e às vezes fora de ordem. A aula [Consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/) mostra as técnicas para lidar com isso: deduplicação na mesma transação, sequência por agregado, efeitos fora do banco e o que o "exactly-once" do Kafka realmente garante. Para praticar o relay, com eventos mortos, reprocessamento e limpeza, faça o [exercício 12.03, O relay do transactional outbox](../../../exercicios/12-mensageria/03-relay-do-outbox/).
+
+## Referências
+
+- [PostgreSQL — SELECT: The Locking Clause (FOR UPDATE, SKIP LOCKED)](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [PostgreSQL — Logical Replication](https://www.postgresql.org/docs/current/logical-replication.html)
+- [PostgreSQL — Replication configuration (max_slot_wal_keep_size)](https://www.postgresql.org/docs/current/runtime-config-replication.html)
+- [PostgreSQL — INSERT ... ON CONFLICT](https://www.postgresql.org/docs/current/sql-insert.html)
+- [Debezium — Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html)
+- [Debezium — PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)
+- [Spring Modulith — Working with Application Events (Event Publication Registry e Externalization)](https://docs.spring.io/spring-modulith/reference/events.html)
+- [Spring for Apache Kafka — Sending messages with KafkaTemplate](https://docs.spring.io/spring-kafka/reference/kafka/sending-messages.html)
+- [Spring Framework — Transaction propagation](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/tx-propagation.html)
+- [Spring Framework — Task scheduling (@Scheduled)](https://docs.spring.io/spring-framework/reference/integration/scheduling.html)

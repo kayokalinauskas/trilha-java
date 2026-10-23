@@ -1,0 +1,284 @@
+---
+titulo: Preparando o ambiente
+descricao: JDK, JRE e JVM sem confusão, instalação do JDK 25, Maven, Git e IntelliJ IDEA em Windows, macOS e Linux — e como verificar se tudo está certo.
+modulo: 00-comece-aqui
+ordem: 2
+duracao: 45
+objetivos:
+  - Explicar a diferença entre JDK, JRE e JVM e o caminho do código-fonte até a execução
+  - Instalar o JDK 25 (LTS), Maven, Git e IntelliJ IDEA
+  - Verificar a instalação pelo terminal e resolver os problemas mais comuns
+tags: [JDK, JVM, Maven, IntelliJ, setup]
+flashcards:
+  - frente: O que é a JVM?
+    verso: A Java Virtual Machine executa bytecode (.class). É ela que torna o Java portável — o mesmo bytecode roda em qualquer sistema que tenha uma JVM.
+  - frente: Qual a diferença entre JDK e JRE?
+    verso: O JDK (Java Development Kit) traz o compilador (javac) e ferramentas de desenvolvimento, além da JVM. O JRE era só o necessário para executar. Hoje você instala sempre o JDK.
+  - frente: O que o comando javac faz?
+    verso: Compila código-fonte .java em bytecode .class, que a JVM executa.
+  - frente: O que é uma versão LTS do Java?
+    verso: "Long-Term Support — versões com suporte estendido por anos (ex.: 17, 21, 25). Empresas adotam LTS; versões intermediárias (22, 23, 24) têm suporte de 6 meses."
+  - frente: Para que serve a variável JAVA_HOME?
+    verso: Aponta a pasta do JDK. Ferramentas como Maven e Gradle a usam para saber qual Java usar.
+---
+
+Antes de escrever código, você precisa de quatro ferramentas: o **JDK** (para compilar e rodar Java), o **Maven** (para gerenciar dependências e rodar testes), o **Git** (para versionar) e uma **IDE** (para escrever com produtividade). Esta aula mostra como instalar cada uma e, mais importante, **o que cada uma faz**.
+
+## Do código-fonte à execução
+
+Quando você escreve Java, o computador não executa o seu texto diretamente. Há um caminho em duas etapas:
+
+<Figura legenda="O caminho de um programa Java: compilar uma vez, executar em qualquer lugar com uma JVM">
+<svg viewBox="0 0 720 200" width="720" role="img" aria-label="Arquivo .java passa pelo javac e vira .class (bytecode), que é executado pela JVM em Windows, macOS ou Linux">
+  <defs><marker id="s2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="60" width="130" height="70" rx="12" class="d-box"/>
+  <text x="75" y="92" text-anchor="middle" class="d-mono">Ola.java</text>
+  <text x="75" y="113" text-anchor="middle" class="d-label">código-fonte</text>
+  <path d="M140 95 H200" class="d-line" marker-end="url(#s2)"/>
+  <text x="170" y="84" text-anchor="middle" class="d-mono">javac</text>
+  <rect x="205" y="60" width="140" height="70" rx="12" class="d-accent"/>
+  <text x="275" y="92" text-anchor="middle" class="d-mono">Ola.class</text>
+  <text x="275" y="113" text-anchor="middle" class="d-label">bytecode</text>
+  <path d="M345 95 H405" class="d-line" marker-end="url(#s2)"/>
+  <text x="375" y="84" text-anchor="middle" class="d-mono">java</text>
+  <rect x="410" y="45" width="130" height="100" rx="12" class="d-ok"/>
+  <text x="475" y="90" text-anchor="middle" class="d-title">JVM</text>
+  <text x="475" y="112" text-anchor="middle" class="d-label">interpreta + JIT</text>
+  <path d="M540 70 L590 40" class="d-line" marker-end="url(#s2)"/>
+  <path d="M540 95 H590" class="d-line" marker-end="url(#s2)"/>
+  <path d="M540 120 L590 150" class="d-line" marker-end="url(#s2)"/>
+  <text x="600" y="44" class="d-text">Windows</text>
+  <text x="600" y="100" class="d-text">macOS</text>
+  <text x="600" y="156" class="d-text">Linux</text>
+</svg>
+</Figura>
+
+1. O **compilador** (`javac`) lê o arquivo `.java`, verifica tipos e sintaxe e gera **bytecode** (`.class`) — um formato intermediário, independente de sistema operacional.
+2. A **JVM** (Java Virtual Machine) carrega esse bytecode e o executa. Trechos muito usados são compilados para código de máquina nativo em tempo de execução pelo **JIT** (*Just-In-Time compiler*) — é por isso que aplicações Java ficam mais rápidas depois de "aquecer".
+
+Os nomes que aparecem em toda vaga:
+
+| Sigla | O que é | Você precisa? |
+|---|---|---|
+| **JVM** | A máquina virtual que executa bytecode | Vem dentro do JDK |
+| **JRE** | "Java Runtime Environment": JVM + bibliotecas, só para executar | Não existe mais como download separado desde o Java 11 |
+| **JDK** | "Java Development Kit": JRE + compilador + ferramentas (`javac`, `jshell`, `jar`…) | **Sim** — é o que você instala |
+
+<Callout tipo="entrevista">
+"Qual a diferença entre JDK, JRE e JVM?" é uma pergunta clássica de triagem Júnior. Responda com o fluxo: **o JDK compila (`javac`) o código em bytecode, e a JVM executa esse bytecode**; o JRE era o pacote só de execução. Mencionar o JIT mostra que você entende por que Java é rápido apesar de ser "interpretado".
+</Callout>
+
+## Qual versão do Java usar?
+
+O Java lança uma versão nova a cada 6 meses (março e setembro). A cada dois anos, uma delas é **LTS** (*Long-Term Support*), com anos de correções de segurança. Empresas praticamente só usam LTS.
+
+| Versão | Lançamento | Situação em 2026 |
+|---|---|---|
+| Java 8 | 2014 | Ainda presente em sistemas legados (bancos, governo). Vale saber ler. |
+| Java 11 | 2018 | Legado em migração. |
+| Java 17 | 2021 | Muito usado; mínimo exigido pelo Spring Boot 3 e 4. |
+| Java 21 | 2023 | Muito usado; trouxe **virtual threads** e pattern matching completo. |
+| **Java 25** | **set/2025** | **LTS atual.** É o que esta trilha usa. |
+
+Nesta trilha você vai usar o **Java 25**. Tudo o que aprender funciona no 21, e as diferenças são sinalizadas com o selo "Java moderno" quando aparecerem.
+
+## Instalando o JDK 25
+
+Existem várias distribuições do mesmo OpenJDK (Eclipse Temurin, Amazon Corretto, Azul Zulu, Oracle OpenJDK…). Para estudar, qualquer uma serve. Recomendamos **Eclipse Temurin**, gratuita e amplamente usada.
+
+<Tabs grupo="so">
+<Tab rotulo="Windows">
+
+A forma mais simples é pelo **winget**, o gerenciador de pacotes que já vem no Windows 10/11. Abra o **Terminal** (ou PowerShell) e rode:
+
+```powershell
+winget install EclipseAdoptium.Temurin.25.JDK
+```
+
+O instalador configura o `PATH` e o `JAVA_HOME`. **Feche e abra o terminal de novo** para as variáveis valerem.
+
+</Tab>
+<Tab rotulo="macOS">
+
+Recomendamos o **SDKMAN!**, que permite ter várias versões do Java e trocar entre elas com um comando:
+
+```bash
+curl -s "https://get.sdkman.io" | bash
+# abra um novo terminal
+sdk list java | grep -- "-tem"      # veja o identificador exato do 25 (ex.: 25.0.2-tem)
+sdk install java 25.0.2-tem         # use o identificador que apareceu na lista
+```
+
+Alternativa com Homebrew: `brew install --cask temurin@25`.
+
+</Tab>
+<Tab rotulo="Linux">
+
+O **SDKMAN!** funciona igual ao macOS e é a opção mais prática:
+
+```bash
+curl -s "https://get.sdkman.io" | bash
+# abra um novo terminal
+sdk list java | grep -- "-tem"      # veja o identificador exato do 25 (ex.: 25.0.2-tem)
+sdk install java 25.0.2-tem         # use o identificador que apareceu na lista
+```
+
+Em distribuições Debian/Ubuntu também é possível usar o repositório da Adoptium com `apt`.
+
+</Tab>
+</Tabs>
+
+Verifique:
+
+```bash
+java -version
+javac -version
+```
+
+A saída deve mencionar a versão `25`. Se aparecer outra versão, você tem mais de um JDK instalado e o `PATH` está apontando para o antigo — veja a seção de problemas comuns no fim da aula.
+
+## Instalando o Maven
+
+O **Maven** baixa as bibliotecas que o projeto usa (como JUnit), compila e roda os testes com um único comando. Você vai estudá-lo a fundo no módulo 14; por enquanto, basta instalar.
+
+<Tabs grupo="so">
+<Tab rotulo="Windows">
+
+```powershell
+winget install Apache.Maven
+```
+
+</Tab>
+<Tab rotulo="macOS">
+
+```bash
+sdk install maven
+# ou: brew install maven
+```
+
+</Tab>
+<Tab rotulo="Linux">
+
+```bash
+sdk install maven
+```
+
+</Tab>
+</Tabs>
+
+Verifique com `mvn -v`. A saída mostra a versão do Maven **e qual Java ele está usando** — confira se é o 25.
+
+## Instalando o Git
+
+<Tabs grupo="so">
+<Tab rotulo="Windows">
+
+```powershell
+winget install Git.Git
+```
+
+O pacote inclui o **Git Bash**, um terminal no estilo Linux, útil para seguir tutoriais.
+
+</Tab>
+<Tab rotulo="macOS">
+
+```bash
+xcode-select --install   # já traz o git
+```
+
+</Tab>
+<Tab rotulo="Linux">
+
+```bash
+sudo apt install git     # Debian/Ubuntu
+sudo dnf install git     # Fedora
+```
+
+</Tab>
+</Tabs>
+
+Depois, configure sua identidade (ela aparece em cada commit):
+
+```bash
+git config --global user.name "Seu Nome"
+git config --global user.email "voce@exemplo.com"
+git config --global init.defaultBranch main
+```
+
+## A IDE: IntelliJ IDEA
+
+A IDE mais usada no mercado Java é o **IntelliJ IDEA**. A edição gratuita atende tudo o que você precisa nesta trilha. Baixe pelo site da JetBrains ou pelo **JetBrains Toolbox**, que também mantém a IDE atualizada.
+
+<Callout tipo="dica" titulo="Três atalhos para aprender já no primeiro dia">
+- <kbd>Shift</kbd> <kbd>Shift</kbd> — buscar qualquer coisa (classe, arquivo, ação).
+- <kbd>Alt</kbd> + <kbd>Enter</kbd> (<kbd>⌥</kbd> + <kbd>↩</kbd> no Mac) — "conserte isso para mim": importa classes, cria métodos, sugere correções.
+- <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>F10</kbd> (<kbd>⌃</kbd> + <kbd>⇧</kbd> + <kbd>R</kbd> no Mac) — rodar o arquivo ou teste atual.
+</Callout>
+
+VS Code com o *Extension Pack for Java* também funciona. Esta trilha usa o IntelliJ nos exemplos, mas nada depende dele.
+
+## Baixando o projeto da trilha
+
+Todos os exercícios ficam na pasta `java/` do repositório da trilha:
+
+```bash
+git clone https://github.com/kayokalinauskas/trilha-java.git
+cd trilha-java/java
+mvn -q verify
+```
+
+O `mvn verify` baixa as dependências (só na primeira vez), compila e roda os testes das **soluções de referência**. Se terminar sem erros, seu ambiente está pronto.
+
+Para fazer um exercício no IntelliJ, abra **o starter do módulo** como projeto: **File → Open**, selecione o `pom.xml` da pasta `java/<módulo>/starter` (por exemplo, `java/m01-java-essencial/starter/pom.xml`) e escolha **Open as Project**. Ele importa o projeto Maven, incluindo a pasta `testes` ao lado. Em **File → Project Structure**, confira se o SDK é o JDK 25. Não abra a pasta `java/` inteira para fazer exercícios: ali o IntelliJ carrega as **soluções** e deixa os starters de fora.
+
+<Callout tipo="info" titulo="Ainda está no Java 21?">
+Os módulos 00 a 03 funcionam no 21. Rode com `mvn -q verify -Djava.release=21` enquanto não atualiza.
+</Callout>
+
+## Problemas comuns
+
+| Sintoma | Causa provável | Solução |
+|---|---|---|
+| `'java' não é reconhecido como comando` | O terminal foi aberto antes da instalação | Feche e abra o terminal (ou reinicie o computador no Windows) |
+| `java -version` mostra 17 ou 21 | Outro JDK vem antes no `PATH` | Windows: ajuste `JAVA_HOME` e `PATH` em "Variáveis de ambiente". SDKMAN: `sdk default java <identificador-do-25>` |
+| `mvn -v` mostra um Java diferente de `java -version` | `JAVA_HOME` aponta para outro JDK | Corrija o `JAVA_HOME` para a pasta do JDK 25 |
+| `release version 25 not supported` | O Maven está usando um JDK antigo | Mesmo caso acima |
+| Acentos aparecem como `Ã§` no terminal do Windows | Codificação do console | Rode `chcp 65001` antes, ou use o terminal do IntelliJ |
+| O IntelliJ abre o projeto, mas a árvore fica vazia (só "External Libraries") | A importação Maven ficou corrompida | Feche o IntelliJ, apague a pasta `.idea` dentro do starter e abra de novo pelo `pom.xml` (**Open as Project**) |
+
+<Quiz
+  id="00-ambiente"
+  questoes={[
+    {
+      pergunta: 'O que o `javac` produz a partir de `Pedido.java`?',
+      opcoes: ['Um executável `.exe`', 'Bytecode em `Pedido.class`', 'Código de máquina nativo', 'Um arquivo `.jar`'],
+      correta: 1,
+      explicacao: 'O compilador gera bytecode (`.class`), que a JVM executa. A conversão para código nativo acontece depois, em tempo de execução, pelo JIT.',
+    },
+    {
+      pergunta: 'Uma empresa diz: "usamos só versões LTS". Quais destas são LTS?',
+      opcoes: ['17, 21 e 25', '18, 22 e 24', '9, 10 e 11', 'Todas as versões são LTS'],
+      correta: 0,
+      explicacao: 'As LTS recentes são 8, 11, 17, 21 e 25. As intermediárias têm suporte de apenas 6 meses.',
+    },
+    {
+      pergunta: '`java -version` mostra 25, mas `mvn -v` mostra "Java version: 21". Qual o problema mais provável?',
+      opcoes: ['O Maven não suporta Java 25', 'A variável `JAVA_HOME` aponta para o JDK 21', 'O Git está desatualizado', 'Falta instalar o JRE'],
+      correta: 1,
+      explicacao: 'O Maven usa o JDK apontado por `JAVA_HOME`. O `java` do terminal vem do `PATH`. Os dois precisam apontar para o mesmo JDK.',
+    },
+    {
+      pergunta: 'Por que uma aplicação Java costuma ficar mais rápida depois de alguns minutos rodando?',
+      opcoes: ['Porque o garbage collector desliga', 'Porque o JIT compila os trechos mais usados para código nativo', 'Porque o sistema operacional aprende o programa', 'Não fica; é impressão'],
+      correta: 1,
+      explicacao: 'O JIT identifica os "hot spots" (daí o nome da JVM HotSpot) e os compila para código de máquina otimizado.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Você escreve `.java`, o `javac` gera bytecode `.class` e a **JVM** executa — em qualquer sistema.
+- Instale sempre o **JDK**. Nesta trilha, o **JDK 25 (LTS)**.
+- Maven, Git e IntelliJ completam o kit. Verifique cada um com `java -version`, `mvn -v` e `git --version`.
+- `mvn -q verify` na pasta `java/` confirma que está tudo funcionando.

@@ -1,0 +1,304 @@
+---
+titulo: Tipos, variáveis e o problema do dinheiro
+descricao: Primitivos e wrappers, quando usar int, long, double ou BigDecimal, overflow silencioso, conversões, var e final.
+modulo: 01-java-essencial
+ordem: 1
+duracao: 55
+objetivos:
+  - Escolher o tipo certo para cada dado de negócio
+  - Explicar por que double não serve para dinheiro e usar BigDecimal corretamente
+  - Reconhecer overflow, divisão inteira e conversões com perda
+  - Usar var e final com critério
+tags: [tipos, BigDecimal, var, final]
+flashcards:
+  - frente: Quais são os 8 tipos primitivos do Java?
+    verso: byte, short, int, long (inteiros); float, double (ponto flutuante); char (caractere); boolean.
+  - frente: Por que 0.1 + 0.2 != 0.3 com double?
+    verso: double usa binário (IEEE 754), que não representa 0.1 exatamente. O resultado é 0.30000000000000004.
+  - frente: Como criar um BigDecimal a partir de um valor decimal sem erro?
+    verso: "Com a String: new BigDecimal(\"0.10\"), ou BigDecimal.valueOf(0.1). Nunca new BigDecimal(0.1), que carrega o erro do double."
+  - frente: Por que comparar BigDecimal com compareTo e não equals?
+    verso: equals considera a escala (2.0 ≠ 2.00); compareTo compara só o valor numérico.
+  - frente: O que acontece com Integer.MAX_VALUE + 1?
+    verso: Overflow silencioso — vira Integer.MIN_VALUE (-2147483648). Math.addExact lança exceção em vez disso.
+  - frente: Qual o problema de comparar Integer com ==?
+    verso: == compara referências. Funciona por acaso entre -128 e 127 (cache), mas falha fora dessa faixa. Use equals ou compare os primitivos.
+---
+
+Todo dado que passa por um sistema backend tem um **tipo**: o saldo de uma conta, o número de itens de um pedido, o CPF de um cliente, a data de um pagamento. Escolher o tipo errado não dá erro de compilação — dá **bug em produção**, às vezes silencioso por meses. Esta aula é sobre fazer essa escolha com consciência.
+
+## Variáveis e tipagem estática
+
+Em Java, toda variável tem um tipo definido em tempo de compilação, e ele não muda:
+
+```java
+int quantidade = 3;
+String produto = "Café 500g";
+boolean emEstoque = true;
+
+quantidade = "três";   // não compila: incompatible types
+```
+
+Isso se chama **tipagem estática**. Ela é chata no começo e uma bênção depois: o compilador pega na hora uma categoria inteira de erros que, em linguagens dinâmicas, só aparecem quando o código roda.
+
+## Os 8 tipos primitivos
+
+| Tipo | Tamanho | Faixa / uso típico | Literal |
+|---|---|---|---|
+| `byte` | 8 bits | -128 a 127 — dados binários | `(byte) 10` |
+| `short` | 16 bits | raramente usado | `(short) 10` |
+| **`int`** | 32 bits | ±2,1 bilhões — contadores, quantidades, índices | `42` |
+| **`long`** | 64 bits | ±9,2 quintilhões — IDs, timestamps, valores em centavos | `42L` |
+| `float` | 32 bits | ~7 dígitos de precisão — quase nunca no backend | `1.5f` |
+| **`double`** | 64 bits | ~15 dígitos — medidas, estatísticas, ciência | `1.5` |
+| `char` | 16 bits | um caractere UTF-16 | `'A'` |
+| **`boolean`** | — | `true` ou `false` | `true` |
+
+No dia a dia de backend você vai usar principalmente `int`, `long`, `double` e `boolean` — e, para dinheiro, **nenhum deles** (já chegamos lá).
+
+<Callout tipo="dica" titulo="Literais legíveis">
+Use `_` para separar dígitos: `long limite = 1_000_000L;`. O compilador ignora os underscores.
+</Callout>
+
+## Armadilha 1: divisão inteira
+
+```java
+int total = 7;
+int pessoas = 2;
+double porPessoa = total / pessoas;   // 3.0 — e não 3.5!
+```
+
+A divisão acontece **entre dois `int`**, então o resultado é `int` (3). Só depois ele é convertido para `double` (3.0). Para obter 3.5, pelo menos um operando precisa ser `double` **antes** da divisão:
+
+```java
+double porPessoa = (double) total / pessoas;   // 3.5
+```
+
+O mesmo vale para o resto: `7 % 2` é `1`. O operador `%` é muito usado para saber se um número é par (`n % 2 == 0`) e para "dar a volta" em índices circulares, como você vai ver no módulo 03.
+
+## Armadilha 2: overflow silencioso
+
+```java
+int saldoEmCentavos = 2_147_483_647;   // Integer.MAX_VALUE
+saldoEmCentavos = saldoEmCentavos + 1;
+System.out.println(saldoEmCentavos);   // -2147483648
+```
+
+O valor "deu a volta" e ficou negativo, **sem nenhum erro**. Em 2014, o contador de visualizações do YouTube estourou exatamente assim com um vídeo que passou de 2,1 bilhões de visualizações, e o sistema precisou migrar para 64 bits.
+
+Três defesas:
+
+- Use `long` para qualquer coisa que possa crescer muito (IDs, centavos acumulados, contadores globais).
+- Use `Math.addExact`, `Math.multiplyExact` e similares quando o estouro for um erro de negócio. Eles lançam `ArithmeticException` em vez de dar a volta.
+- Desconfie de qualquer conta com valores que vêm "de fora" (usuário, arquivo, outra API).
+
+## Armadilha 3: `double` e dinheiro
+
+Abra o JShell e digite:
+
+```text
+jshell> 0.1 + 0.2
+$1 ==> 0.30000000000000004
+
+jshell> 1.10 - 1.00
+$2 ==> 0.10000000000000009
+```
+
+Isso não é bug do Java. `double` segue o padrão **IEEE 754**, que representa números em **base 2**. Assim como 1/3 não tem representação exata em base 10 (0,333…), 0,1 não tem representação exata em base 2. O erro é minúsculo, mas **se acumula**: some mil parcelas de R$ 0,10 e o total não fecha.
+
+<Figura legenda="Por que 0,1 não cabe em binário">
+<svg viewBox="0 0 640 150" width="640" role="img" aria-label="0,1 em binário é 0,000110011001100... com repetição infinita, e o double guarda só 52 bits dela">
+  <rect x="10" y="20" width="620" height="50" rx="10" class="d-box"/>
+  <text x="24" y="51" class="d-mono">0,1 (decimal) = 0,0001100110011001100110011001100110011… (binário, infinito)</text>
+  <rect x="10" y="85" width="400" height="50" rx="10" class="d-accent"/>
+  <text x="24" y="116" class="d-mono">double guarda 52 bits → corta aqui ✂</text>
+  <text x="430" y="116" class="d-text">→ 0,1000000000000000055…</text>
+</svg>
+</Figura>
+
+A solução é **`BigDecimal`**, que representa números em base 10 com precisão arbitrária:
+
+```java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+BigDecimal preco = new BigDecimal("19.90");
+BigDecimal quantidade = BigDecimal.valueOf(3);
+BigDecimal total = preco.multiply(quantidade);            // 59.70 exato
+
+BigDecimal porPessoa = total.divide(BigDecimal.valueOf(7), 2, RoundingMode.HALF_EVEN); // 8.53
+```
+
+Quatro regras de ouro do `BigDecimal`:
+
+<Comparar antes="Errado" depois="Certo">
+```java
+new BigDecimal(0.1)     // 0.1000000000000000055511151231257827...
+a.equals(b)             // 2.0 ≠ 2.00 (escala diferente!)
+a.divide(b)             // ArithmeticException em dízimas
+a.add(b);               // resultado jogado fora
+```
+
+```java
+new BigDecimal("0.1")   // ou BigDecimal.valueOf(0.1)
+a.compareTo(b) == 0     // compara só o valor
+a.divide(b, 2, RoundingMode.HALF_EVEN)
+total = total.add(b);   // BigDecimal é imutável
+```
+</Comparar>
+
+1. **Crie a partir de `String`** (ou `BigDecimal.valueOf(double)`), nunca de `new BigDecimal(double)`.
+2. **Compare com `compareTo`**, porque `equals` também compara a escala.
+3. **Toda divisão precisa de escala e modo de arredondamento**, senão uma dízima (10 ÷ 3) lança exceção.
+4. **É imutável**: `add`, `multiply` etc. devolvem um **novo** objeto. Esquecer de atribuir o resultado é um bug clássico.
+
+<Callout tipo="info" titulo="HALF_EVEN: o arredondamento bancário">
+`RoundingMode.HALF_EVEN` arredonda o 5 para o vizinho **par**: 2,345 vira 2,34 e 2,355 vira 2,36. Em milhões de operações, os arredondamentos para cima e para baixo se equilibram. `HALF_UP` (o "da escola") tende a inflar os totais. Siga sempre a regra que o negócio definir — e, se ninguém definiu, pergunte.
+</Callout>
+
+Outra estratégia muito usada é guardar dinheiro em **centavos como `long`** (R$ 19,90 → `1990L`). É rápida e exata para soma e subtração; o cuidado fica na hora de dividir e de exibir. Você vai usar as duas abordagens nos exercícios.
+
+## Conversões (casting)
+
+Conversões **para um tipo maior** acontecem automaticamente (*widening*). **Para um tipo menor**, você precisa pedir explicitamente (*narrowing*) e assume o risco de perder informação:
+
+```java
+int i = 42;
+long l = i;              // automático: todo int cabe em long
+double d = i;            // automático: 42.0
+
+double preco = 19.99;
+int reais = (int) preco; // 19 — trunca, não arredonda!
+long grande = 3_000_000_000L;
+int estourado = (int) grande; // -1294967296 — lixo
+```
+
+Para arredondar de verdade, use `Math.round(19.99)` (devolve `long` 20).
+
+### Texto ↔ número
+
+```java
+int idade = Integer.parseInt("42");
+double taxa = Double.parseDouble("0.035");
+BigDecimal valor = new BigDecimal("1999.90");
+String texto = String.valueOf(42);       // ou "" + 42
+```
+
+`parseInt("abc")` lança `NumberFormatException`. Todo dado que vem de fora (formulário, arquivo, API) precisa ser tratado como potencialmente inválido.
+
+## Primitivos e wrappers
+
+Cada primitivo tem uma classe "embrulho" (*wrapper*): `Integer`, `Long`, `Double`, `Boolean`, `Character`… Elas existem porque coleções como `List` só guardam **objetos**, e porque às vezes você precisa representar "sem valor" (`null`).
+
+```java
+List<Integer> notas = new ArrayList<>();
+notas.add(10);            // autoboxing: int → Integer
+int primeira = notas.get(0); // unboxing: Integer → int
+```
+
+Duas armadilhas famosas:
+
+```java
+Integer a = 127, b = 127;
+System.out.println(a == b);   // true  (cache de -128 a 127)
+Integer c = 128, d = 128;
+System.out.println(c == d);   // false (objetos diferentes!)
+System.out.println(c.equals(d)); // true
+
+Integer desconto = null;
+int valor = desconto;         // NullPointerException no unboxing
+```
+
+<Callout tipo="entrevista">
+"Qual a diferença entre `int` e `Integer`?" Resposta sólida: `int` é primitivo (valor direto, não pode ser `null`, mais eficiente); `Integer` é objeto (pode ser `null`, necessário em coleções e generics). Cite as duas armadilhas: **comparar com `==`** funciona só na faixa do cache e **unboxing de `null`** lança `NullPointerException`.
+</Callout>
+
+## `var` e `final`
+
+Desde o Java 10, dentro de métodos você pode deixar o compilador **inferir** o tipo:
+
+```java
+var clientes = new ArrayList<String>();         // ArrayList<String>
+var total = BigDecimal.ZERO;                    // BigDecimal
+var mapa = new HashMap<String, List<Pedido>>(); // poupa uma linha enorme
+```
+
+A variável continua com tipo estático — `var` não é "tipo dinâmico". Use quando o tipo **fica óbvio pelo lado direito**. Evite quando esconde informação: em `var x = servico.processar();`, quem lê não sabe o que é `x`.
+
+`final` impede **reatribuir** a variável:
+
+```java
+final BigDecimal taxa = new BigDecimal("0.02");
+taxa = BigDecimal.ONE;   // não compila
+```
+
+Muitos times usam `final` em tudo que não precisa mudar: deixa claro, para quem lê, o que é constante. Atenção: `final` impede trocar **a referência**, não modificar **o objeto** — um `final List` ainda aceita `add`.
+
+### Constantes
+
+```java
+public static final int MAXIMO_PARCELAS = 24;
+public static final BigDecimal TAXA_PADRAO = new BigDecimal("0.0199");
+```
+
+Por convenção, constantes usam `MAIUSCULAS_COM_UNDERSCORE`. Um "número mágico" solto no meio do código (`if (parcelas > 24)`) deveria virar constante com nome.
+
+## Como escolher: um guia rápido
+
+| Dado | Tipo recomendado | Por quê |
+|---|---|---|
+| Preço, saldo, salário | `BigDecimal` (ou `long` em centavos) | Exatidão |
+| Quantidade de itens | `int` | Inteiro, faixa suficiente |
+| ID de banco de dados | `long` (ou `UUID`) | Cresce indefinidamente |
+| CPF, CEP, telefone | **`String`** | Não se faz conta com eles; zeros à esquerda importam |
+| Percentual de juros | `BigDecimal` | Participa de cálculo financeiro |
+| Temperatura, distância | `double` | Medida física; erro mínimo é aceitável |
+| Sim/não | `boolean` | — |
+
+<Callout tipo="erro">
+Guardar CPF ou CEP como número é um erro clássico: o CEP `01310-100` vira `1310100` e perde o zero à esquerda. **Se você não vai fazer contas com um dado, ele não é um número.**
+</Callout>
+
+<Quiz
+  id="01-tipos"
+  questoes={[
+    {
+      pergunta: 'Qual o valor de `double media = 9 / 2;`?',
+      opcoes: ['4.5', '4.0', '5.0', 'Erro de compilação'],
+      correta: 1,
+      explicacao: '`9 / 2` é divisão entre inteiros (resultado 4), depois convertida para double (4.0). Use `9 / 2.0` ou um cast.',
+    },
+    {
+      pergunta: 'Qual a forma correta de criar o valor R$ 0,10 como BigDecimal?',
+      opcoes: ['`new BigDecimal(0.10)`', '`new BigDecimal("0.10")`', '`BigDecimal.ZERO + 0.10`', '`(BigDecimal) 0.10`'],
+      correta: 1,
+      explicacao: 'O construtor com `double` herda o erro de representação binária. A String preserva o valor decimal exato.',
+    },
+    {
+      pergunta: '`new BigDecimal("2.0").equals(new BigDecimal("2.00"))` retorna…',
+      opcoes: ['true', 'false', 'Lança exceção', 'Não compila'],
+      correta: 1,
+      explicacao: '`equals` compara valor E escala. Para comparar só o valor, use `compareTo(...) == 0`.',
+    },
+    {
+      pergunta: 'Qual tipo é mais adequado para guardar um CEP?',
+      opcoes: ['int', 'long', 'String', 'double'],
+      correta: 2,
+      explicacao: 'CEP é um identificador, não uma quantidade: não se faz conta com ele e o zero à esquerda importa.',
+    },
+    {
+      pergunta: 'O que `Math.addExact(Integer.MAX_VALUE, 1)` faz?',
+      opcoes: ['Retorna Integer.MIN_VALUE', 'Retorna um long', 'Lança ArithmeticException', 'Retorna Integer.MAX_VALUE'],
+      correta: 2,
+      explicacao: 'As operações `*Exact` detectam o overflow e lançam exceção em vez de "dar a volta" silenciosamente.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Java tem tipagem estática; o tipo certo é uma decisão de **negócio**, não só técnica.
+- Cuidado com **divisão inteira**, **overflow** e **conversões com perda**.
+- **Dinheiro nunca em `double`**: use `BigDecimal` (criado de `String`, comparado com `compareTo`, dividido com escala) ou `long` em centavos.
+- `Integer` ≠ `int`: não compare com `==` e cuidado com unboxing de `null`.
+- `var` quando o tipo é óbvio; `final` para deixar claro o que não muda; constantes em `MAIUSCULAS`.

@@ -1,0 +1,19 @@
+# Aula 11.07: o serviço de faturamento chama a API de pedidos com client credentials.
+# Carregada com spring.config.name=faturamento.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          api-de-pedidos:
+            provider: loja
+            client-id: servico-de-faturamento
+            client-secret: ${FATURAMENTO_CLIENT_SECRET}
+            authorization-grant-type: client_credentials
+            scope: pedidos:ler
+        provider:
+          loja:
+            issuer-uri: ${EMISSOR:http://localhost:9000}
+faturamento:
+  api-de-pedidos:
+    url: ${API_DE_PEDIDOS_URL:http://localhost:8081}

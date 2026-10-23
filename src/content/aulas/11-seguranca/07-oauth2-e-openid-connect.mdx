@@ -1,0 +1,1073 @@
+---
+titulo: OAuth 2 e OpenID Connect na prática
+descricao: "Papéis, Authorization Code com PKCE passo a passo, ID token × access token, client credentials entre serviços, refresh, token exchange e BFF, com um servidor de autorização de verdade rodando nos testes: discovery, token endpoint, oauth2Login, oauth2ResourceServer e RestClient com OAuth2AuthorizedClientManager no Spring Security 7."
+modulo: 11-seguranca
+ordem: 7
+duracao: 130
+objetivos:
+  - Identificar os quatro papéis do OAuth 2 (resource owner, client, authorization server, resource server) numa arquitetura real e dizer quem valida o quê
+  - Executar o fluxo Authorization Code + PKCE requisição por requisição e explicar o que state, nonce, code_verifier, code_challenge e redirect_uri exata protegem
+  - Distinguir ID token, access token e refresh token, e dizer para quem cada um é emitido
+  - Ler o documento de discovery de um provedor e localizar token_endpoint, jwks_uri e end_session_endpoint
+  - Configurar oauth2Login (cliente web), oauth2ResourceServer (API) e um RestClient com OAuth2ClientHttpRequestInterceptor para client credentials no Spring Security 7
+  - Diagnosticar invalid_grant, invalid_client, invalid_scope, redirect_uri recusada, aud inválida, iss diferente e token vencido a partir das mensagens reais
+  - Escolher entre provedor gerenciado, Keycloak e Spring Authorization Server, e justificar BFF, token exchange e tempo de vida dos tokens
+tags: [OAuth 2, OpenID Connect, PKCE, Keycloak, Spring Authorization Server, client credentials, BFF]
+flashcards:
+  - frente: Qual a diferença entre ID token e access token?
+    verso: O ID token (OIDC) diz ao CLIENTE quem é a pessoa que acabou de logar; o aud dele é o client_id do app. O access token é a credencial que o cliente apresenta à API (resource server); o aud dele deveria ser a API. Nunca envie o ID token para uma API como se fosse access token.
+  - frente: O que o PKCE protege e como funciona o S256?
+    verso: Protege o código de autorização contra quem o interceptar ou injetar. O cliente gera um code_verifier aleatório, envia code_challenge = BASE64URL(SHA-256(verifier)) no pedido de autorização e revela o verifier ao trocar o código. Sem o verifier, o código não vale nada.
+  - frente: Para que servem state e nonce?
+    verso: state amarra a resposta da autorização à sessão do navegador que a pediu (proteção contra CSRF no redirect). nonce amarra o ID token à tentativa de login (proteção contra replay de ID token). O PKCE também cobre a injeção de código, mas o nonce continua sendo o mecanismo do OIDC para o ID token.
+  - frente: Por que os grants implicit e password foram abandonados?
+    verso: Implicit entregava o access token na URL (vaza em histórico, logs e Referer, e não há como amarrá-lo ao cliente). Password faz o app ver a senha do usuário, impede MFA e federação e ensina as pessoas a digitar senha em qualquer tela. A RFC 9700 (Security BCP) diz que não devem ser usados; o OAuth 2.1 os remove.
+  - frente: Quando usar client credentials?
+    verso: Quando não há pessoa envolvida, serviço chamando serviço (um job de faturamento consultando a API de pedidos). O cliente se autentica com o próprio segredo (ou chave) e recebe um access token em nome dele mesmo. Não há ID token nem, em geral, refresh token.
+  - frente: O que muda entre 401 e 403 num resource server?
+    verso: 401 é token ausente, inválido, vencido ou para outra audiência (WWW-Authenticate com error="invalid_token"). 403 é token válido, mas sem o escopo ou papel exigido (error="insufficient_scope").
+  - frente: O que é o padrão BFF para SPAs?
+    verso: Backend for Frontend. Um backend do próprio front faz o login OAuth como cliente confidencial e guarda os tokens no servidor; o navegador só recebe um cookie de sessão HttpOnly, Secure e SameSite. Nenhum token fica ao alcance de um XSS.
+  - frente: O que é token exchange (RFC 8693)?
+    verso: Um grant em que um serviço troca o token que recebeu por outro token, para chamar um serviço seguinte, com audiência e escopo próprios e, se quiser, registrando quem está agindo em nome de quem (claim act). Evita repassar o mesmo token a todos os serviços.
+---
+
+A loja cresceu e hoje tem quatro peças que precisam saber quem é quem. O **portal web**, onde a cliente acompanha os pedidos. O **aplicativo** do celular, que faz o mesmo. O **serviço de faturamento**, um processo noturno que consulta pedidos para emitir notas fiscais, sem nenhuma pessoa por trás. E a **API de pedidos**, que todos os outros chamam. Na primeira versão, cada time resolveu o problema de um jeito: o portal tinha a própria tabela de senhas, o aplicativo pedia usuário e senha numa tela nativa e mandava os dois para a API a cada chamada, e o faturamento usava uma "chave mestra" fixa num arquivo de configuração, a mesma havia três anos, copiada em quatro servidores.
+
+Os problemas apareceram em sequência. Ativar autenticação em dois fatores exigiu mudar três códigos de login diferentes. Um vazamento do arquivo de configuração do faturamento obrigou a trocar a chave mestra em todos os lugares na mesma madrugada. E a área de segurança pediu algo simples de dizer e difícil de fazer: "quero saber, em cada chamada à API de pedidos, **quem** está chamando, **em nome de quem** e **com que permissão**". A resposta da indústria para esse problema tem nome: **OAuth 2** para delegar acesso, **OpenID Connect** para identificar pessoas. Nesta aula você vai montar essa arquitetura inteira, com um servidor de autorização de verdade rodando nos testes, ver cada requisição HTTP que passa entre as peças e aprender a ler as mensagens de erro que aparecem quando algo sai do lugar.
+
+<Callout tipo="info" titulo="Onde esta aula se encaixa">
+Na [aula 11.03](../../11-seguranca/03-jwt-e-resource-server/) você aprendeu a anatomia do JWT e configurou um resource server com chave simétrica, e viu o OAuth 2 "em uma página". Aqui o foco é o protocolo de ponta a ponta: quem emite, quem pede, quem valida, e o que cada parâmetro protege. O Spring Security 7 e a cadeia de filtros da [aula 11.02](../../11-seguranca/02-spring-security-7/) são pré-requisito.
+</Callout>
+
+## A intuição: o crachá do prédio comercial
+
+Pense num prédio comercial com recepção. Você trabalha no 12º andar e chamou um técnico para consertar o ar-condicionado da sua sala. Você **não** entrega a ele a sua chave, nem o seu crachá. O que acontece é outra coisa:
+
+1. O técnico chega à recepção e diz para onde vai.
+2. A recepção **liga para você** e pergunta: "posso liberar o acesso dele ao 12º andar até as 18h?". Você confirma.
+3. A recepção entrega ao técnico um **crachá de visitante**: vale só para o 12º andar, só até as 18h, e tem o nome dele, não o seu.
+4. A catraca do 12º andar não liga para você nem para a recepção: ela **lê o crachá** e confere se ele vale para aquele andar e se ainda está no horário.
+
+Agora troque os nomes. Você é o **resource owner** (o dono do recurso). O técnico é o **client** (o aplicativo que quer agir por você). A recepção é o **authorization server** (o servidor de autorização, que autentica você e emite credenciais). O crachá de visitante é o **access token**. A catraca do andar é o **resource server** (a API). "12º andar" é a **audiência** do token; "consertar o ar" é o **escopo**; "até as 18h" é a **expiração**.
+
+Repare em três propriedades que tornam o esquema seguro, porque elas reaparecem em todo o protocolo:
+
+- **A sua senha nunca sai da recepção.** O técnico não sabe a sua senha; só a recepção a confere. No OAuth, o login acontece no servidor de autorização, e o aplicativo nunca vê a senha.
+- **O crachá é limitado.** Vale para um andar, por algumas horas. Se for perdido, o estrago é pequeno. No OAuth, o access token tem audiência, escopo e validade curtos.
+- **A catraca confere o crachá sozinha.** Ela não precisa ligar para a recepção a cada passagem; basta reconhecer a assinatura do crachá. No OAuth com JWT, a API valida o token com a chave pública do servidor de autorização, sem consultá-lo a cada requisição.
+
+E o **OpenID Connect**? É a recepção entregando, além do crachá, um **bilhete lacrado endereçado ao técnico** dizendo "quem autorizou foi Ana Souza, do 12º andar, às 14h05". O bilhete não abre catraca nenhuma: serve só para o técnico saber com quem está falando. Esse bilhete é o **ID token**.
+
+## Vocabulário
+
+Os termos abaixo aparecem em toda documentação de provedor, em toda biblioteca e em toda entrevista. Vale lê-los com calma uma vez.
+
+| Termo | O que é | Na loja |
+|---|---|---|
+| **Resource owner** | Quem pode conceder acesso ao recurso; quase sempre a pessoa usuária | Ana, cliente da loja |
+| **Client** (cliente) | O aplicativo que pede tokens e chama APIs | portal web, app do celular, faturamento |
+| **Cliente confidencial** | Roda num servidor e consegue guardar um segredo | portal web, faturamento |
+| **Cliente público** | Roda no aparelho ou no navegador; qualquer segredo embutido seria extraído | app do celular, SPA pura |
+| **Authorization server** (AS) | Autentica pessoas e clientes e emite tokens | Keycloak, Entra ID, Auth0, Spring Authorization Server |
+| **Resource server** (RS) | A API que recebe e valida o access token | API de pedidos |
+| **Grant** (concessão) | A forma de obter o token: authorization code, client credentials, refresh token... | |
+| **Access token** | Credencial apresentada à API em `Authorization: Bearer ...` | JWT de 5 minutos |
+| **Refresh token** | Credencial de longa duração usada só no token endpoint para obter novos access tokens | |
+| **ID token** | JWT do OpenID Connect que descreve a autenticação da pessoa para o cliente | |
+| **Scope** (escopo) | Permissão pedida pelo cliente e concedida pela pessoa ou pela política | `pedidos:ler`, `openid`, `email` |
+| **Claim** | Um campo dentro do token | `sub`, `aud`, `exp`, `scope` |
+| **Audiência** (`aud`) | Para quem o token foi emitido | `api-pedidos` |
+| **redirect_uri** | Para onde o AS devolve o navegador depois do login; cadastrada antes | `http://localhost:8080/login/oauth2/code/portal` |
+| **state** | Valor aleatório que o cliente manda e confere na volta | |
+| **nonce** | Valor aleatório que o cliente manda e confere dentro do ID token | |
+| **PKCE** | *Proof Key for Code Exchange* (RFC 7636): prova de que quem troca o código é quem o pediu | `code_verifier`, `code_challenge` |
+| **Discovery** | Documento JSON em `/.well-known/openid-configuration` com todos os endpoints do AS | |
+| **JWKS** | *JSON Web Key Set*: as chaves públicas que validam a assinatura dos tokens | `/oauth2/jwks` |
+| **Realm** | No Keycloak, um "inquilino" isolado: usuários, clientes, papéis e chaves próprios | `loja` |
+
+Dois endpoints concentram quase tudo. O **authorization endpoint** é aberto **no navegador** (é lá que a pessoa faz login). O **token endpoint** é chamado **de servidor para servidor**, com um POST, para trocar códigos e refresh tokens por tokens novos. Guardar essa diferença resolve metade das dúvidas sobre o protocolo: o que passa pelo navegador pode ser visto e adulterado; o que passa pelo canal direto, não.
+
+## OAuth 2.1 e o Security BCP: o que morreu e por quê
+
+O OAuth 2.0 é a RFC 6749, de 2012. Treze anos de uso em produção mostraram quais partes eram perigosas, e esse aprendizado foi consolidado em dois documentos:
+
+- **RFC 9700** (*Best Current Practice for OAuth 2.0 Security*, janeiro de 2025, BCP 240). É a referência normativa atual de segurança para quem implementa OAuth.
+- **OAuth 2.1**, um rascunho na IETF que junta a RFC 6749, a RFC 6750 (Bearer), o PKCE e as recomendações do BCP num documento único, **removendo** o que não deve mais ser usado.
+
+O que mudou, na prática:
+
+| Antes (OAuth 2.0 "clássico") | Hoje (RFC 9700 / OAuth 2.1) | Por quê |
+|---|---|---|
+| **Implicit grant**: o access token voltava direto na URL (`#access_token=...`) | Não usar. Authorization Code + PKCE para todos, inclusive SPAs e apps | Token na URL vaza em histórico, logs, extensões e cabeçalho Referer; não há como provar que quem o usa é o cliente certo |
+| **Password grant** (*resource owner password credentials*): o app coletava usuário e senha e os mandava ao AS | "MUST NOT be used", diz a RFC 9700 | O app vê a senha; não há como fazer MFA, login social ou federação; e treina as pessoas a digitar senha em qualquer tela que pareça oficial |
+| PKCE só para apps móveis | PKCE para **todo** authorization code, inclusive clientes confidenciais | Protege contra injeção de código, não só contra roubo |
+| redirect_uri com curinga ou prefixo | Comparação **exata** de string (exceção: porta variável em `localhost` para apps nativos) | Curingas e prefixos viram open redirect e roubo de código |
+| Refresh token eterno para cliente público | Refresh token de cliente público com **rotação** ou amarrado ao remetente (*sender-constrained*) | Um refresh token roubado do aparelho seria acesso perpétuo |
+| Token sem audiência | Access token **restrito à audiência** (a API para a qual foi emitido) | Um token vazado de uma API não serve em outra |
+
+Você vai ver as duas primeiras linhas na prática daqui a pouco: o servidor de autorização usado nos testes recusa o password grant com `unsupported_grant_type`, e recusa um pedido sem `code_challenge`.
+
+<Callout tipo="atencao" titulo="Implicit e password ainda aparecem em código legado">
+Tutoriais antigos e SDKs de 2016 ainda usam `response_type=token` (implicit) ou `grant_type=password`. Se você encontrar isso num projeto, trate como dívida de segurança: o caminho é Authorization Code + PKCE (para pessoas) ou client credentials (para serviços). O Keycloak ainda aceita o password grant (chamado lá de *Direct Access Grants*) se ele for ligado no cliente; deixe desligado.
+</Callout>
+
+## Authorization Code + PKCE, passo a passo
+
+Este é o fluxo para **pessoas**: no portal web, no aplicativo, numa SPA (com BFF, como você verá). A figura mostra a sequência que o teste desta aula executa, requisição por requisição.
+
+<Figura legenda="Authorization Code + PKCE: o código passa pelo navegador, mas só quem tem o code_verifier consegue trocá-lo por tokens, e isso acontece num canal direto entre o cliente e o servidor de autorização">
+<svg viewBox="0 0 760 560" width="760" role="img" aria-labelledby="pkce-titulo pkce-desc">
+  <title id="pkce-titulo">Sequência do fluxo Authorization Code com PKCE</title>
+  <desc id="pkce-desc">Quatro participantes: pessoa e navegador, app cliente, servidor de autorização e API de pedidos. O app gera verifier, state e nonce e redireciona o navegador. O navegador faz GET no authorization endpoint com code_challenge, state, nonce e redirect_uri. O servidor mostra a tela de login, a pessoa envia usuário e senha ao servidor, e o servidor redireciona de volta ao app com code e state. O app faz POST no token endpoint com o code e o code_verifier e recebe access token e ID token. O app confere state e nonce e chama a API com o access token no cabeçalho Authorization.</desc>
+  <defs><marker id="mk-pkce" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="170" height="52" rx="10" class="d-box"/>
+  <text x="95" y="32" text-anchor="middle" class="d-title">Pessoa</text>
+  <text x="95" y="52" text-anchor="middle" class="d-label">e navegador</text>
+  <rect x="200" y="10" width="170" height="52" rx="10" class="d-accent"/>
+  <text x="285" y="32" text-anchor="middle" class="d-title">App (cliente)</text>
+  <text x="285" y="52" text-anchor="middle" class="d-label">portal ou celular</text>
+  <rect x="390" y="10" width="170" height="52" rx="10" class="d-violet"/>
+  <text x="475" y="32" text-anchor="middle" class="d-title">Servidor</text>
+  <text x="475" y="52" text-anchor="middle" class="d-label">de autorização</text>
+  <rect x="580" y="10" width="170" height="52" rx="10" class="d-ok"/>
+  <text x="665" y="32" text-anchor="middle" class="d-title">API de pedidos</text>
+  <text x="665" y="52" text-anchor="middle" class="d-label">resource server</text>
+  <path d="M95 62 L95 550" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M285 62 L285 550" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M475 62 L475 550" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M665 62 L665 550" class="d-line" stroke-dasharray="4 4"/>
+  <rect x="205" y="76" width="160" height="40" rx="6" class="d-info"/>
+  <text x="285" y="92" text-anchor="middle" class="d-label">0. gera verifier,</text>
+  <text x="285" y="108" text-anchor="middle" class="d-label">state e nonce</text>
+  <path d="M285 146 L97 146" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="190" y="138" text-anchor="middle" class="d-label">1. redireciona</text>
+  <path d="M95 188 L473 188" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="285" y="180" text-anchor="middle" class="d-mono">2. GET /oauth2/authorize</text>
+  <text x="285" y="205" text-anchor="middle" class="d-label">code_challenge, state, nonce, redirect_uri</text>
+  <path d="M475 246 L97 246" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="285" y="238" text-anchor="middle" class="d-label">3. tela de login (do servidor, não do app)</text>
+  <path d="M95 286 L473 286" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="285" y="278" text-anchor="middle" class="d-label">4. usuário e senha (só o servidor vê)</text>
+  <path d="M475 332 L287 332" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="380" y="324" text-anchor="middle" class="d-label">5. redirect: code + state</text>
+  <path d="M285 380 L473 380" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="380" y="372" text-anchor="middle" class="d-mono">6. POST /oauth2/token</text>
+  <text x="380" y="397" text-anchor="middle" class="d-label">code + code_verifier</text>
+  <path d="M475 434 L287 434" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="380" y="426" text-anchor="middle" class="d-label">7. access_token + id_token</text>
+  <rect x="205" y="452" width="160" height="34" rx="6" class="d-info"/>
+  <text x="285" y="474" text-anchor="middle" class="d-label">8. confere state e nonce</text>
+  <path d="M285 524 L663 524" class="d-line" marker-end="url(#mk-pkce)"/>
+  <text x="475" y="516" text-anchor="middle" class="d-mono">9. Authorization: Bearer access_token</text>
+</svg>
+</Figura>
+
+O que cada parâmetro faz, e contra o que ele protege:
+
+- **`response_type=code`**: o cliente pede um **código de autorização**, não um token. O código é curto (alguns minutos), de **uso único** e não serve para chamar API nenhuma. Ele só vale no token endpoint.
+- **`redirect_uri`**: para onde o servidor devolve o navegador com o código. Precisa ser **idêntica**, caractere por caractere, a uma das cadastradas no cliente. Se o servidor aceitasse qualquer endereço (ou um prefixo), um atacante montaria um link de login legítimo com `redirect_uri=https://atacante.example/` e receberia o código da vítima.
+- **`state`**: um valor aleatório que o cliente guarda na sessão do navegador antes de redirecionar e confere quando o navegador volta. Sem ele, um atacante poderia fazer a vítima "completar" um login **com o código do atacante** (um CSRF no redirect), e a vítima passaria a usar a conta do atacante sem perceber, salvando nela, por exemplo, um cartão de crédito.
+- **`nonce`**: um valor aleatório que o servidor copia **para dentro do ID token**. O cliente confere que o `nonce` do ID token é o que ele mandou nesta tentativa, o que impede reaproveitar um ID token antigo ou de outra sessão.
+- **`code_verifier` e `code_challenge`** (PKCE): antes de redirecionar, o cliente sorteia um segredo de uso único, o `code_verifier`, e manda ao servidor só o **hash** dele, o `code_challenge`. Na troca do código, o cliente revela o verifier; o servidor calcula o hash e compara. Quem interceptar o código no caminho (uma extensão maliciosa, outro app registrado no mesmo esquema de URL no celular, um log de proxy) não tem o verifier e não consegue trocá-lo.
+
+O método `S256` é simples de escrever, e a RFC 7636 traz um exemplo de referência no Apêndice B, ótimo para testar:
+
+```text
+code_challenge = BASE64URL( SHA-256( ASCII(code_verifier) ) )   // sem "=" no final
+```
+
+<Callout tipo="dica" titulo="state, nonce e PKCE parecem redundantes. Não são.">
+Os três são valores aleatórios, mas cada um amarra uma coisa diferente. O `state` amarra **a resposta da autorização à sessão do navegador**. O PKCE amarra **o código a quem o pediu**. O `nonce` amarra **o ID token à tentativa de login**. A RFC 9700 admite que o PKCE substitua o `state` como proteção contra CSRF quando o servidor garante PKCE, mas o Spring Security manda os três, e é isso que você deve esperar de qualquer biblioteca madura: o custo é zero e cada um fecha uma porta.
+</Callout>
+
+## OpenID Connect: identidade em cima do OAuth
+
+O OAuth 2 sozinho não diz **quem** é a pessoa. Ele diz "este cliente pode ler pedidos em nome de alguém". Durante anos, cada provedor inventou um endpoint `/me` próprio para responder "alguém quem?", e cada integração era diferente. O **OpenID Connect** (OIDC) padronizou essa camada. Ativá-lo é pedir o escopo `openid`; a partir daí, o token endpoint devolve também um **ID token**.
+
+### ID token × access token × refresh token
+
+| | ID token | Access token | Refresh token |
+|---|---|---|---|
+| Para quem | o **cliente** (aud = client_id) | a **API** (aud = a API) | o **token endpoint** |
+| Formato | sempre JWT | JWT ou opaco (depende do provedor) | opaco, na prática |
+| Diz | quem logou, quando, como (`sub`, `auth_time`, `nonce`, `acr`...) | o que o portador pode fazer (`scope`, papéis) | nada legível: é só uma chave |
+| Vai para | ninguém: o cliente lê e guarda a identidade | `Authorization: Bearer` em cada chamada | só o token endpoint, com a autenticação do cliente |
+| Duração típica | minutos | 5 a 15 minutos | horas a dias, com rotação |
+
+O erro mais comum de quem começa com OIDC é mandar o **ID token** para a API. Ele é um JWT assinado pelo mesmo emissor, então "parece funcionar" em validações frouxas. Mas o `aud` dele é o cliente, não a API, e ele não carrega os escopos concedidos. Uma API que aceita ID tokens está aceitando um documento que foi feito para outro destinatário. A configuração de audiência que você vai ver no Passo 4 recusa isso.
+
+### Escopos e claims padronizados
+
+O OIDC define escopos que se traduzem em claims do ID token (e do userinfo):
+
+| Escopo | Claims |
+|---|---|
+| `openid` | obrigatório; liga o OIDC e garante `sub` |
+| `profile` | `name`, `family_name`, `given_name`, `preferred_username`, `picture`, `locale`... |
+| `email` | `email`, `email_verified` |
+| `address`, `phone` | endereço e telefone |
+
+Escopos **da sua API** (`pedidos:ler`, `pedidos:escrever`) são outra coisa: são permissões que vão para o access token e que a API confere. Misturá-los na mesma requisição é normal (o portal pede `openid profile email pedidos:ler`), mas cada um tem um destinatário diferente.
+
+### Userinfo e discovery
+
+O **userinfo endpoint** devolve os claims da pessoa a quem apresentar um access token com `openid`. O Spring Security chama esse endpoint depois do login, quando ele existe, para completar o `OidcUser`.
+
+O **discovery** (OpenID Connect Discovery 1.0, e o equivalente OAuth da RFC 8414) é o que permite configurar um cliente ou uma API com uma linha. Basta dizer o **emissor**; a biblioteca busca `{emissor}/.well-known/openid-configuration` e descobre ali o resto: endpoints, chaves, grants e métodos aceitos. Você vai ver o documento real no Passo 2.
+
+### Logout: encerrar a sessão também no provedor
+
+Fazer logout no portal apaga a sessão **do portal**. A sessão no servidor de autorização continua viva, e o próximo clique em "Entrar" loga a pessoa de novo sem pedir senha. Para sair "de verdade", o OIDC tem o **RP-Initiated Logout**: o cliente redireciona o navegador ao `end_session_endpoint` do provedor, com `id_token_hint` (o ID token da sessão, para o provedor saber quem está saindo) e `post_logout_redirect_uri` (para onde voltar, que também precisa estar cadastrada). Existe também o **Back-Channel Logout**, em que o provedor avisa os clientes, servidor a servidor, que uma sessão terminou; o Spring Security suporta os dois.
+
+## Client credentials, refresh token e token exchange
+
+### Serviço chamando serviço: client credentials
+
+O faturamento roda às 2h da manhã. Não há pessoa logada, não há navegador, não há tela de login. Para esse caso existe o grant **client credentials**: o serviço se autentica no token endpoint com o próprio `client_id` e segredo (ou, melhor ainda, com uma chave privada, `private_key_jwt`, ou um certificado mTLS) e recebe um access token **em nome dele mesmo**. O `sub` do token é o próprio cliente.
+
+Três características que você vai confirmar nos testes:
+
+- **Não há ID token**: não há pessoa para identificar.
+- **Não há refresh token**: o serviço tem o segredo; quando o token vence, ele simplesmente pede outro. Um refresh token seria só mais uma credencial para vazar.
+- **O escopo pedido precisa estar autorizado para aquele cliente.** O faturamento pode pedir `pedidos:ler`; o serviço de relatórios, não.
+
+Comparado à "chave mestra" fixa do começo da aula, o ganho é grande: o segredo do cliente só vai ao servidor de autorização (nunca à API), cada token dura cinco minutos e tem audiência, e o segredo pode ser rotacionado num lugar só.
+
+### Refresh token
+
+Access tokens curtos limitam o estrago de um vazamento, mas obrigariam a pessoa a logar a cada cinco minutos. O **refresh token** resolve isso: o cliente o guarda e, quando o access token vence, faz um POST no token endpoint com `grant_type=refresh_token` e recebe um access token novo. Como o refresh token só vai ao token endpoint (e, num cliente confidencial, junto com a autenticação do cliente), ele é muito menos exposto que o access token.
+
+Duas práticas que separam uma implementação madura:
+
+- **Rotação**: a cada uso, o servidor emite um refresh token **novo** e invalida o antigo. Se um refresh token antigo for reapresentado, é sinal de que alguém o copiou, e o servidor revoga a família inteira.
+- **Cliente público, cuidado redobrado**: um app de celular ou uma SPA não consegue autenticar-se no token endpoint (não tem segredo). A RFC 9700 exige, nesse caso, rotação ou refresh token amarrado ao remetente (DPoP, RFC 9449). O Spring Authorization Server vai além e, por padrão, **não emite refresh token para cliente público**, como o teste do Passo 7 mostra.
+
+### Token exchange e propagação de identidade (visão)
+
+Agora a arquitetura cresce: a API de pedidos, para responder, precisa consultar a API de estoque. Que token ela usa? As opções, da pior para a melhor:
+
+1. **Repassar o mesmo token** que recebeu. Simples, e é o que muita gente faz. Mas o token precisa ter as duas APIs na audiência (ou nenhuma), e qualquer serviço no caminho que vaze o token entrega acesso a todos os outros.
+2. **Usar client credentials da própria API de pedidos**. Funciona, mas a identidade da pessoa se perde: o estoque vê "a API de pedidos" e não sabe que foi por causa da Ana.
+3. **Token exchange** (RFC 8693): a API de pedidos vai ao token endpoint com `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, apresenta o token que recebeu (`subject_token`) e pede um token novo **para a API de estoque** (`audience`), com escopo reduzido. O token novo pode registrar a cadeia no claim `act` ("a API de pedidos agindo em nome da Ana").
+
+O token exchange é o que permite aplicar **menor privilégio em cada salto** sem perder a identidade de quem originou a chamada. O documento de discovery do servidor desta aula anuncia o grant (`urn:ietf:params:oauth:grant-type:token-exchange` aparece em `grant_types_supported` no Passo 2), o Keycloak suporta o token exchange padrão nas versões recentes da linha 26, e o lado cliente do Spring Security tem um provedor para ele. Não vamos implementá-lo aqui; o importante para um sênior é saber que ele existe e quando ele compensa: muitos saltos entre serviços, dados sensíveis, auditoria por pessoa.
+
+<Figura legenda="A arquitetura desta aula: um servidor de autorização, três clientes com fluxos diferentes e uma API que valida tudo pela chave pública">
+<svg viewBox="0 0 760 400" width="760" role="img" aria-labelledby="arq-titulo arq-desc">
+  <title id="arq-titulo">Clientes, servidor de autorização e API de pedidos</title>
+  <desc id="arq-desc">No topo, o servidor de autorização. Abaixo, quatro caixas: portal web, que usa oauth2Login como BFF; app da loja, cliente público com Code e PKCE; faturamento, com client credentials; e a API de pedidos, resource server. Linhas ligam o servidor a cada cliente, por onde passam login e tokens, e à API, por onde passam só as chaves públicas do JWKS. Uma linha inferior liga os três clientes à API, levando o access token no cabeçalho Authorization, com audiência api-pedidos.</desc>
+  <defs><marker id="mk-arq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="250" y="16" width="260" height="66" rx="10" class="d-violet"/>
+  <text x="380" y="42" text-anchor="middle" class="d-title">Servidor de autorização</text>
+  <text x="380" y="64" text-anchor="middle" class="d-label">Keycloak · Spring AS · Entra ID</text>
+  <path d="M290 82 L95 236" class="d-line" marker-start="url(#mk-arq)" marker-end="url(#mk-arq)"/>
+  <path d="M350 82 L285 236" class="d-line" marker-start="url(#mk-arq)" marker-end="url(#mk-arq)"/>
+  <path d="M410 82 L475 236" class="d-line" marker-start="url(#mk-arq)" marker-end="url(#mk-arq)"/>
+  <path d="M470 82 L665 236" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-arq)"/>
+  <text x="138" y="150" text-anchor="middle" class="d-label">login e tokens</text>
+  <text x="640" y="150" text-anchor="middle" class="d-label">só o JWKS</text>
+  <rect x="10" y="238" width="170" height="70" rx="10" class="d-accent"/>
+  <text x="95" y="264" text-anchor="middle" class="d-title">Portal web</text>
+  <text x="95" y="288" text-anchor="middle" class="d-label">oauth2Login (BFF)</text>
+  <rect x="200" y="238" width="170" height="70" rx="10" class="d-accent"/>
+  <text x="285" y="264" text-anchor="middle" class="d-title">App da loja</text>
+  <text x="285" y="288" text-anchor="middle" class="d-label">Code + PKCE · público</text>
+  <rect x="390" y="238" width="170" height="70" rx="10" class="d-info"/>
+  <text x="475" y="264" text-anchor="middle" class="d-title">Faturamento</text>
+  <text x="475" y="288" text-anchor="middle" class="d-label">client credentials</text>
+  <rect x="580" y="238" width="170" height="70" rx="10" class="d-ok"/>
+  <text x="665" y="264" text-anchor="middle" class="d-title">API de pedidos</text>
+  <text x="665" y="288" text-anchor="middle" class="d-label">oauth2ResourceServer</text>
+  <path d="M95 308 L95 344 L665 344" class="d-line"/>
+  <path d="M285 308 L285 344" class="d-line"/>
+  <path d="M475 308 L475 344" class="d-line"/>
+  <path d="M665 344 L665 312" class="d-line" marker-end="url(#mk-arq)"/>
+  <text x="380" y="372" text-anchor="middle" class="d-label">Authorization: Bearer &lt;access token&gt; · aud = api-pedidos</text>
+</svg>
+</Figura>
+
+## BFF: o padrão recomendado para SPAs
+
+Uma SPA (React, Angular, Vue) roda inteira no navegador. Se ela fizer o fluxo OAuth sozinha, como cliente público, os tokens ficam em memória JavaScript ou, pior, em `localStorage`, e qualquer XSS (um script injetado por uma dependência comprometida, por exemplo) os lê e os envia para fora. Com o token na mão, o atacante age como a pessoa até ele vencer, de qualquer lugar.
+
+O padrão **BFF** (*Backend for Frontend*), recomendado pelo rascunho da IETF *OAuth 2.0 for Browser-Based Applications*, tira os tokens do navegador:
+
+1. A SPA é servida por (ou conversa com) um backend do próprio front, o BFF.
+2. O BFF é um **cliente confidencial**: faz o Authorization Code + PKCE com segredo, recebe os tokens e os guarda **no servidor**, na sessão.
+3. O navegador recebe só um **cookie de sessão** `HttpOnly` (o JavaScript não lê), `Secure` e `SameSite`.
+4. A SPA chama o BFF; o BFF pega o access token da sessão e chama as APIs.
+
+O XSS continua sendo grave (o script ainda pode fazer chamadas pela sessão enquanto a página estiver aberta), mas o atacante **não leva o token embora**. E, como a sessão é um cookie, o **CSRF volta a importar**: o BFF precisa de proteção CSRF, que o Spring Security já liga por padrão. O portal web desta aula é exatamente esse BFF: `oauth2Login` no servidor, tokens na sessão, CSRF ligado.
+
+<Comparar antes="SPA como cliente público" depois="SPA com BFF">
+
+```text
+navegador faz o login OAuth
+access token em memória JS / localStorage
+XSS lê e exfiltra o token
+refresh token no navegador (ou sem refresh)
+CORS entre SPA e cada API
+```
+
+```text
+BFF faz o login (cliente confidencial)
+tokens na sessão do servidor
+navegador só tem cookie HttpOnly
+refresh no servidor, com o segredo
+SPA fala só com o BFF (mesma origem)
+```
+
+</Comparar>
+
+## Quem emite os tokens: Keycloak, Spring Authorization Server ou um provedor gerenciado
+
+Você quase nunca deve escrever um servidor de autorização "do zero". As opções reais:
+
+**Provedor gerenciado** (Entra ID, Auth0, Okta, Cognito, Google Identity). Alguém opera, aplica correções, escala e passa por auditorias. Você paga por usuário ativo ou por requisição e aceita os limites do produto (customização de telas, claims, fluxos).
+
+**Keycloak**, projeto open source da CNCF, que você hospeda. É o padrão de mercado para quem quer controle sem escrever código: console administrativo, login social, federação com LDAP e Active Directory, MFA, temas de tela, eventos de auditoria. Os conceitos que você vai encontrar:
+
+- **Realm**: um espaço isolado, com usuários, clientes, papéis e chaves de assinatura próprios. Uma empresa costuma ter um realm por "população" (clientes, funcionários).
+- **Client**: cada aplicação registrada. Confidencial (*Client authentication* ligado) ou público; com os fluxos que ela pode usar (*Standard flow* é o authorization code; *Service accounts* é o client credentials; *Direct access grants* é o password grant, que deve ficar desligado).
+- **Roles**: papéis de realm (`realm_access.roles` no token) ou de cliente (`resource_access.<cliente>.roles`). Um papel de cliente como `api-pedidos / pedidos-leitura`, atribuído à conta de serviço do faturamento, aparece no token como `"resource_access": { "api-pedidos": { "roles": ["pedidos-leitura"] } }`.
+- **Audiência**: por padrão, o Keycloak acrescenta ao `aud` os clientes de que o token carrega papéis (o mapper *audience resolve*), ou você configura um *audience mapper* explícito.
+
+O Spring Security não entende `resource_access` sozinho: ele transforma o claim `scope` em autoridades `SCOPE_*`. Para usar `hasRole` com papéis de cliente do Keycloak, escreve-se um conversor. Este está no projeto, com teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/api/PapeisDoKeycloak.java" semImports />
+
+Ele seria ligado ao resource server com `jwt.jwtAuthenticationConverter(...)`, passando um `JwtAuthenticationConverter` cujo `setJwtGrantedAuthoritiesConverter` recebe o `PapeisDoKeycloak`. Repare que ele lê **só os papéis do cliente desta API**: um token que carrega `api-estoque / estoque-admin` não vira administrador da API de pedidos.
+
+**Spring Authorization Server**, que desde o Spring Security 7.0 faz parte do próprio Spring Security (artefato `spring-security-oauth2-authorization-server`; o projeto separado parou na linha 1.5). É uma **biblioteca**, não um produto: você escreve uma aplicação Spring Boot que é o servidor de autorização. Compensa quando você precisa de algo que os produtos não fazem bem: regras de emissão muito específicas, integração profunda com o seu domínio, um fluxo próprio de consentimento, tudo versionado no seu repositório. O custo é que **você** opera, corrige e audita o componente mais sensível da sua arquitetura.
+
+É o Spring Authorization Server que faz o papel do provedor nos testes desta aula. A escolha tem um motivo prático: ele sobe dentro da JVM dos testes em menos de um segundo, sem Docker, e fala exatamente o mesmo protocolo que o Keycloak (discovery, JWKS, token endpoint, authorization endpoint, userinfo, logout). Os endpoints mudam de caminho (`/oauth2/token` aqui, `/realms/loja/protocol/openid-connect/token` no Keycloak), e é justamente por isso que clientes e APIs se configuram pelo **emissor** e descobrem o resto.
+
+## O código que vamos construir
+
+Tudo fica em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.oidc`, com quatro aplicações Spring Boot independentes (uma por subpacote) e testes que as sobem de verdade:
+
+| Subpacote | Aplicação | Papel no OAuth | Configuração |
+|---|---|---|---|
+| `autorizacao` | `ServidorDeAutorizacaoApplication` | authorization server | `servidor-de-autorizacao.yml` |
+| `api` | `ApiDePedidosApplication` | resource server | `api-de-pedidos.yml` |
+| `faturamento` | `FaturamentoApplication` | cliente confidencial, client credentials | `faturamento.yml` |
+| `portal` | `PortalApplication` | cliente confidencial, authorization code + PKCE (BFF) | `portal.yml` |
+
+O aplicativo do celular (cliente público) não tem aplicação Java: o teste do Passo 7 faz o papel dele, requisição por requisição. E a classe `Pkce`, no pacote raiz, implementa o cálculo do `code_challenge`.
+
+Cada aplicação lê o próprio arquivo de configuração (`spring.config.name`), para que as quatro convivam no mesmo módulo sem misturar propriedades. Em produção, seriam quatro repositórios ou quatro módulos de deploy.
+
+Os testes sobem o servidor de autorização uma vez por JVM, numa porta livre, numa classe de apoio:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/ServidorDeAutorizacaoDeTeste.java" semImports />
+
+O prefixo `{noop}` diz ao `PasswordEncoder` padrão do Spring que o valor está em texto puro. Só serve para teste: em produção, o segredo do cliente fica guardado como hash (`{bcrypt}$2a$10$...`), exatamente como a senha de uma pessoa (aula 11.01).
+
+## Mão na massa
+
+Para rodar os testes desta aula, a partir da pasta `java`:
+
+```bash
+mvn -q -pl m11-seguranca/aulas -am verify                         # o módulo inteiro
+mvn -pl m11-seguranca/aulas test -Dtest='DescobertaETokenTest'     # uma classe
+```
+
+Nenhum teste precisa de Docker nem de rede externa: o servidor de autorização, a API, o faturamento e o portal sobem dentro da JVM, em portas locais.
+
+### Passo 1: o servidor de autorização
+
+**O que vamos fazer e por quê.** Antes de qualquer cliente, precisamos de alguém que emita tokens. Com o Spring Boot 4.1, um servidor de autorização completo é uma dependência e um arquivo de configuração. O starter atual é `spring-boot-starter-security-oauth2-authorization-server` (o nome antigo, sem `security-`, ainda existe e está marcado como descontinuado):
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security-oauth2-authorization-server</artifactId>
+</dependency>
+```
+
+Os clientes registrados ficam em `servidor-de-autorizacao.yml`:
+
+```yaml
+# Aula 11.07: o servidor de autorização da loja (Spring Authorization Server).
+# Carregado com spring.config.name=servidor-de-autorizacao.
+# Os segredos chegam por variável de ambiente, já no formato do PasswordEncoder
+# ("{bcrypt}$2a$10$..." em produção; os testes usam "{noop}...").
+server:
+  port: 9000
+loja:
+  senha-da-ana: ${SENHA_DA_ANA}
+spring:
+  security:
+    oauth2:
+      authorizationserver:
+        issuer: ${EMISSOR:http://localhost:9000}
+        client:
+          faturamento:
+            registration:
+              client-id: servico-de-faturamento
+              client-secret: ${FATURAMENTO_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: pedidos:ler
+          relatorios:
+            registration:
+              client-id: servico-de-relatorios
+              client-secret: ${RELATORIOS_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: relatorios:gerar
+          auditoria:
+            registration:
+              client-id: servico-de-auditoria
+              client-secret: ${AUDITORIA_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: pedidos:auditar
+          portal:
+            registration:
+              client-id: portal-web
+              client-secret: ${PORTAL_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic
+              authorization-grant-types: authorization_code, refresh_token
+              redirect-uris: http://localhost/login/oauth2/code/portal, http://localhost:8080/login/oauth2/code/portal
+              post-logout-redirect-uris: http://localhost/, http://localhost:8080/
+              scopes: openid, profile, email, pedidos:ler
+            require-proof-key: true
+          app-da-loja:
+            registration:
+              client-id: app-da-loja
+              client-authentication-methods: none   # cliente público: um app instalado não guarda segredo
+              authorization-grant-types: authorization_code
+              redirect-uris: http://127.0.0.1:8765/callback
+              scopes: openid, profile, email
+            require-proof-key: true
+            token:
+              access-token-time-to-live: 5m
+```
+
+São cinco clientes, cada um com um propósito nos testes: o **faturamento** pode ler pedidos; o serviço de **relatórios** existe, mas tem outro escopo; o de **auditoria** tem um escopo de pedidos que não é o de leitura; o **portal** é o cliente web; o **app da loja** é o cliente público.
+
+O que o Spring Boot não adivinha está numa classe de configuração: quem são as pessoas e o que vai dentro dos tokens.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/autorizacao/ConfiguracaoDoServidorDeAutorizacao.java" semImports />
+
+**O que acabou de acontecer.**
+
+- A autoconfiguração do Boot criou o `RegisteredClientRepository` (em memória, a partir do YAML), uma chave RSA para assinar os tokens (gerada na subida: em produção, você fornece um `JWKSource` com chaves persistentes e rotação), os endpoints do protocolo e uma tela de login por formulário.
+- O `OAuth2TokenCustomizer` roda na hora de assinar cada JWT. Por padrão, o Spring Authorization Server põe no `aud` do access token o `client_id` de quem pediu, o que não ajuda a API a saber se o token é para ela. O customizador troca o `aud` para `api-pedidos` quando o token carrega algum escopo `pedidos:*`. No Keycloak, o mesmo efeito vem do mapper de audiência.
+- No ID token, o customizador acrescenta `name` e `email`, que os escopos `profile` e `email` do OIDC pedem.
+- O usuário em memória é só para o exemplo. Um servidor de autorização real autentica contra um banco de usuários ou federa com o diretório da empresa.
+
+### Passo 2: o documento de discovery
+
+**O que vamos fazer e por quê.** Todo cliente e toda API desta aula se configuram com uma única informação: o emissor. O resto vem do discovery. Vale ver o documento uma vez, de verdade.
+
+```bash
+curl -s http://localhost:9000/.well-known/openid-configuration
+```
+
+Saída real (copiada da execução dos testes, com a porta sorteada e o JSON formatado):
+
+```json
+{
+  "issuer": "http://localhost:16984",
+  "authorization_endpoint": "http://localhost:16984/oauth2/authorize",
+  "token_endpoint": "http://localhost:16984/oauth2/token",
+  "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "client_secret_jwt",
+    "private_key_jwt", "tls_client_auth", "self_signed_tls_client_auth"],
+  "jwks_uri": "http://localhost:16984/oauth2/jwks",
+  "userinfo_endpoint": "http://localhost:16984/userinfo",
+  "end_session_endpoint": "http://localhost:16984/connect/logout",
+  "response_types_supported": ["code"],
+  "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token",
+    "urn:ietf:params:oauth:grant-type:token-exchange"],
+  "revocation_endpoint": "http://localhost:16984/oauth2/revoke",
+  "introspection_endpoint": "http://localhost:16984/oauth2/introspect",
+  "code_challenge_methods_supported": ["S256"],
+  "tls_client_certificate_bound_access_tokens": true,
+  "dpop_signing_alg_values_supported": ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"],
+  "subject_types_supported": ["public"],
+  "id_token_signing_alg_values_supported": ["RS256"],
+  "scopes_supported": ["openid"]
+}
+```
+
+Leia com atenção, porque cada linha responde a uma pergunta que você faria ao time de identidade:
+
+- `issuer` é o valor exato que aparecerá no claim `iss` de todo token. A API vai comparar os dois como **strings**: `http://localhost:16984` e `http://127.0.0.1:16984` são emissores diferentes (você verá o erro em "Quando dá errado").
+- `response_types_supported` só tem `code`: não há implicit. `grant_types_supported` não tem `password`.
+- `code_challenge_methods_supported` só tem `S256`: o método `plain` do PKCE (que manda o verifier em claro) não é aceito.
+- `jwks_uri` é onde a API busca as chaves públicas. Ele devolve isto (a chave pública RSA; repare que não há o campo `d`, o expoente privado, que nunca sai do servidor):
+
+```json
+{"keys":[{"kty":"RSA","e":"AQAB","kid":"fbe8572e-ddfa-49f7-93af-f799f23d9573","n":"u72k0im3dERknqRs99O7ML7e...90gTw"}]}
+```
+
+- `dpop_signing_alg_values_supported` e `tls_client_certificate_bound_access_tokens` anunciam que o servidor sabe emitir tokens **amarrados ao remetente** (DPoP e mTLS), o assunto da seção de visão sênior.
+
+O teste que garante tudo isso:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/DescobertaETokenTest.java" semImports destacar="8-24" />
+
+### Passo 3: client credentials no token endpoint, em HTTP cru
+
+**O que vamos fazer e por quê.** Antes de deixar o Spring Security fazer o trabalho, vamos fazer a requisição do faturamento à mão, para ver exatamente o que vai e volta. É o que você faria com `curl` para depurar uma integração:
+
+```bash
+curl -s -X POST http://localhost:9000/oauth2/token \
+  -d grant_type=client_credentials \
+  -d client_id=servico-de-faturamento \
+  -d client_secret="$FATURAMENTO_CLIENT_SECRET" \
+  -d scope=pedidos:ler
+```
+
+Resposta real (`200`, `Content-Type: application/json;charset=UTF-8`, `Cache-Control: no-cache, no-store...`; o token foi encurtado):
+
+```json
+{"access_token":"eyJraWQiOiJmYmU4NTcyZS1kZGZhLTQ5ZjctOTNhZi1mNzk5ZjIzZDk1NzMiLCJhbGciOiJSUzI1NiJ9.eyJzdWIi...","scope":"pedidos:ler","token_type":"Bearer","expires_in":300}
+```
+
+Decodificando as duas primeiras partes do JWT (Base64URL, aula 11.03):
+
+```json
+{"kid":"fbe8572e-ddfa-49f7-93af-f799f23d9573","alg":"RS256"}
+```
+
+```json
+{
+  "sub": "servico-de-faturamento",
+  "aud": "api-pedidos",
+  "nbf": 1791237966,
+  "scope": ["pedidos:ler"],
+  "iss": "http://localhost:16984",
+  "exp": 1791238266,
+  "iat": 1791237966,
+  "jti": "55dbab1b-1c9d-443c-adb9-61dc6a06b559"
+}
+```
+
+**O que acabou de acontecer.**
+
+- O `kid` do cabeçalho é o mesmo da chave publicada no JWKS. É assim que a API escolhe com qual chave validar, e é o que permite **rotação**: o servidor publica a chave nova ao lado da antiga, passa a assinar com a nova, e as APIs encontram as duas pelo `kid`.
+- `sub` é o próprio cliente: não há pessoa. `aud` é `api-pedidos`, graças ao customizador do Passo 1. `exp - iat` = 300 segundos.
+- Não veio `refresh_token` nem `id_token`, como previsto.
+- O `Cache-Control: no-store` na resposta não é detalhe: a RFC 6749 exige que respostas com tokens não sejam guardadas em cache por proxies.
+
+Os testes do Passo 2 conferem também o lado negativo: o serviço de relatórios recebe um token com `aud` igual a ele mesmo (`servico-de-relatorios`), porque não pediu escopo de pedidos; se ele **pedir** `pedidos:ler`, o servidor responde `400 {"error":"invalid_scope"}`; e um segredo errado dá `401 {"error":"invalid_client"}`.
+
+### Passo 4: a API de pedidos como resource server
+
+**O que vamos fazer e por quê.** A API precisa recusar tudo o que não for um access token válido, **emitido por este emissor, para esta API**, com o escopo certo. Com o Spring Boot, são duas propriedades:
+
+```yaml
+# Aula 11.07: configuração da API de pedidos (Resource Server).
+# Carregada com spring.config.name=api-de-pedidos, para não misturar com as outras aulas do módulo.
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # O Spring busca {issuer-uri}/.well-known/openid-configuration, acha o jwks_uri
+          # e passa a exigir iss igual a este valor em todo token.
+          issuer-uri: ${EMISSOR:http://localhost:9000}
+          # O token precisa ter sido emitido PARA esta API.
+          audiences: api-pedidos
+```
+
+E a cadeia de filtros:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/api/SegurancaDaApi.java" semImports />
+
+O controller usa o `sub` do token para dizer quem chamou:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/api/PedidoController.java" semImports />
+
+O teste sobe a API numa porta aleatória e a chama com tokens reais, de clientes diferentes:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/ApiDePedidosTest.java" semImports />
+
+```bash
+mvn -pl m11-seguranca/aulas test -Dtest=ApiDePedidosTest
+```
+
+```text
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in API de pedidos como Resource Server
+[INFO] BUILD SUCCESS
+```
+
+As respostas reais de cada cenário (cabeçalhos de interesse):
+
+```text
+faturamento (aud e escopo certos)
+200  {"numero":"PED-2026-0042","status":"PAGO","total":259.90,"chamadoPor":"servico-de-faturamento"}
+
+sem token
+401  WWW-Authenticate: Bearer resource_metadata="http://localhost:62114/.well-known/oauth-protected-resource"
+
+relatórios (aud = servico-de-relatorios)
+401  WWW-Authenticate: Bearer error="invalid_token",
+       error_description="An error occurred while attempting to decode the Jwt: The aud claim is not valid",
+       error_uri="https://tools.ietf.org/html/rfc6750#section-3.1",
+       resource_metadata="http://localhost:62114/.well-known/oauth-protected-resource"
+
+auditoria (aud certa, escopo pedidos:auditar)
+403  WWW-Authenticate: Bearer error="insufficient_scope",
+       error_description="The request requires higher privileges than provided by the access token.",
+       error_uri="https://tools.ietf.org/html/rfc6750#section-3.1"
+
+token adulterado (corpo do faturamento com a assinatura de outro token)
+401  WWW-Authenticate: Bearer error="invalid_token",
+       error_description="An error occurred while attempting to decode the Jwt: Signed JWT rejected: Invalid signature", ...
+```
+
+**O que acabou de acontecer.**
+
+- Com `issuer-uri`, o Spring buscou o discovery do emissor, achou o `jwks_uri`, baixou as chaves e montou um `JwtDecoder` que confere **assinatura, `exp`/`nbf` e `iss`**. Com `audiences`, acrescentou a conferência de **`aud`**. Nenhum código de validação foi escrito.
+- **401 × 403 está certo e importa.** O token do serviço de relatórios é perfeitamente válido: assinado pelo emissor certo e dentro da validade. Mas não é **para** esta API, então ele nem chega a ser uma autenticação válida: 401. O token da auditoria é para esta API, então a pessoa (ou o serviço) está autenticada, mas não tem a permissão exigida: 403 com `insufficient_scope`, como pede a RFC 6750.
+- O claim `scope` virou autoridades `SCOPE_pedidos:ler`, o que permitiu `hasAuthority("SCOPE_pedidos:ler")`. Com o Keycloak e papéis de cliente, entraria o `PapeisDoKeycloak` mostrado antes.
+- O "token adulterado" é um ataque clássico: pegar um token válido de um cliente com pouco acesso e trocar o corpo pelo de outro. A assinatura cobre cabeçalho e corpo, então a troca é detectada.
+- O `resource_metadata` no `WWW-Authenticate` é novidade do Spring Security 7.1: aponta para o documento de **metadados do recurso protegido** (RFC 9728), em que um cliente descobre, a partir da própria API, qual servidor de autorização emite tokens para ela.
+
+<Callout tipo="atencao" titulo="Validar o aud não é opcional quando há mais de uma API">
+Sem `audiences`, o teste `audienciaErrada` passaria com `200`: qualquer token do emissor, para qualquer cliente, seria aceito pela API de pedidos. Num provedor compartilhado por dezenas de sistemas (o Entra ID da empresa, o realm único do Keycloak), isso significa que um token emitido para o sistema de RH abre a API de pedidos. É a recomendação "audience-restricted" da RFC 9700.
+</Callout>
+
+### Passo 5: o faturamento chamando a API com client credentials
+
+**O que vamos fazer e por quê.** No Passo 3 você obteve o token à mão. Num serviço real, alguém precisa pedir o token, guardá-lo, reaproveitá-lo enquanto ele vale, pedir outro quando vencer e pôr o cabeçalho `Authorization` em cada chamada. É exatamente o que o `OAuth2AuthorizedClientManager` e o `OAuth2ClientHttpRequestInterceptor` do Spring Security fazem com o `RestClient`.
+
+A dependência é `spring-boot-starter-security-oauth2-client`, e o registro do cliente fica no `faturamento.yml`:
+
+```yaml
+# Aula 11.07: o serviço de faturamento chama a API de pedidos com client credentials.
+# Carregada com spring.config.name=faturamento.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          api-de-pedidos:
+            provider: loja
+            client-id: servico-de-faturamento
+            client-secret: ${FATURAMENTO_CLIENT_SECRET}
+            authorization-grant-type: client_credentials
+            scope: pedidos:ler
+        provider:
+          loja:
+            issuer-uri: ${EMISSOR:http://localhost:9000}
+faturamento:
+  api-de-pedidos:
+    url: ${API_DE_PEDIDOS_URL:http://localhost:8081}
+```
+
+A configuração do `RestClient`:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/faturamento/ConfiguracaoDoClienteOAuth.java" semImports />
+
+E quem usa o cliente não sabe que existe OAuth:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/faturamento/ClienteDaApiDePedidos.java" semImports />
+
+O teste sobe a API e o cliente no mesmo contexto (em produção seriam dois serviços), e o `RestClient` sai pela rede, numa porta real:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/FaturamentoChamaApiTest.java" semImports destacar="31-50" />
+
+```bash
+mvn -pl m11-seguranca/aulas test -Dtest=FaturamentoChamaApiTest
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in Faturamento chama a API de pedidos com client credentials
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O registro `api-de-pedidos` virou um `ClientRegistration` com `issuer-uri`: o Boot buscou o discovery e descobriu o `token_endpoint` sozinho.
+- `AuthorizedClientServiceOAuth2AuthorizedClientManager` é o gerenciador para uso **fora de uma requisição HTTP** (jobs, consumidores de fila, tarefas agendadas). Ele guarda o token obtido num `OAuth2AuthorizedClientService` e o reaproveita. O teste prova isso: a segunda chamada usa **o mesmo** token, sem nova ida ao servidor de autorização. Quando faltar pouco para vencer (por padrão, 60 segundos), ele pede outro.
+- `OAuth2ClientHttpRequestInterceptor` é o elo com o `RestClient`: antes de cada requisição, pede o token ao gerenciador e põe `Authorization: Bearer ...`. O `setClientRegistrationIdResolver` diz qual registro usar; a alternativa da documentação é marcar cada chamada com `.attributes(clientRegistrationId("api-de-pedidos"))`.
+- Sem pessoa logada, o interceptor usa como "dono" do token o principal anônimo (`anonymousUser`), que é a chave com que o teste encontra o token guardado.
+
+<Callout tipo="dica" titulo="E dentro de uma requisição de usuário?">
+No portal, quando a Ana clica em "meus pedidos" e o portal chama a API em nome dela, o gerenciador certo é o `DefaultOAuth2AuthorizedClientManager`, que guarda o token na sessão da pessoa (pelo `OAuth2AuthorizedClientRepository`) e sabe usar o refresh token. O interceptor é o mesmo; muda o gerenciador.
+</Callout>
+
+### Passo 6: o portal web com oauth2Login e logout no provedor
+
+**O que vamos fazer e por quê.** O portal é um BFF: renderiza no servidor, faz login com o provedor e guarda tokens na sessão. A configuração do cliente:
+
+```yaml
+# Aula 11.07: o portal web faz login com OpenID Connect (Authorization Code + PKCE).
+# Carregada com spring.config.name=portal.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          portal:
+            provider: loja
+            client-id: portal-web
+            client-secret: ${PORTAL_CLIENT_SECRET}   # cliente confidencial: o segredo fica no servidor
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            scope: openid, profile, email, pedidos:ler
+        provider:
+          loja:
+            issuer-uri: ${EMISSOR:http://localhost:9000}
+```
+
+A segurança do portal:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/portal/SegurancaDoPortal.java" semImports />
+
+E a página da conta, que lê a identidade do ID token:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/portal/MinhaContaController.java" semImports />
+
+O teste:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/PortalTest.java" semImports />
+
+```bash
+mvn -pl m11-seguranca/aulas test -Dtest=PortalTest
+```
+
+```text
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in Portal web com oauth2Login (OpenID Connect)
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Sem sessão, `/minha-conta` redireciona para `/oauth2/authorization/portal`, o endpoint que o `oauth2Login` cria para **iniciar** o fluxo.
+- Esse endpoint monta o pedido de autorização com tudo o que vimos na teoria: `response_type=code`, `client_id`, `scope`, a `redirect_uri` exata (montada a partir do template `{baseUrl}/login/oauth2/code/{registrationId}`), `state`, `nonce`, `code_challenge` e `code_challenge_method=S256`. Repare que o portal é **confidencial** e mesmo assim manda PKCE: o Spring Security 7 usa PKCE também para clientes confidenciais (a configuração `requireProofKey` existe para **desligar**, se o provedor não suportar).
+- Quando o navegador voltar com o código, o filtro em `/login/oauth2/code/portal` confere o `state`, troca o código no token endpoint (com o segredo e o verifier), valida o ID token (assinatura, `iss`, `aud`, `exp` e **`nonce`**), chama o userinfo e cria a sessão com um `OidcUser`.
+- O logout (`POST /logout`, com CSRF, porque o portal usa cookie de sessão) apaga a sessão local e o `OidcClientInitiatedLogoutSuccessHandler` redireciona o navegador para o `end_session_endpoint` com `id_token_hint` e `post_logout_redirect_uri`. O placeholder `{baseUrl}` vira o endereço do portal na hora.
+- `oidcLogin()`, do `spring-security-test`, monta um usuário OIDC falso na sessão, sem passar pelo provedor, para testar o que acontece **depois** do login.
+
+<Comparar antes="oauth2Login: cliente web (BFF)" depois="oauth2ResourceServer: API">
+
+```text
+inicia o fluxo e recebe o código
+guarda tokens na sessão (cookie)
+principal: OidcUser (do ID token)
+CSRF ligado
+não autenticado: redirect ao login
+```
+
+```text
+só recebe Authorization: Bearer
+não guarda nada (stateless)
+principal: Jwt (do access token)
+CSRF desligado (não há cookie)
+não autenticado: 401 + WWW-Authenticate
+```
+
+</Comparar>
+
+### Passo 7: Authorization Code + PKCE à mão, como um aplicativo faria
+
+**O que vamos fazer e por quê.** O `oauth2Login` esconde o fluxo dentro de filtros. Para entender de verdade (e para depurar a integração de um app móvel, que não tem Spring), vamos executar o fluxo inteiro "na unha", com o `HttpClient` do JDK fazendo o papel do navegador. Primeiro, o PKCE:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/oidc/Pkce.java" semImports />
+
+O teste confere o cálculo com o exemplo publicado na RFC 7636:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/PkceTest.java" semImports destacar="6-13" />
+
+E agora o fluxo:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/AuthorizationCodeComPkceTest.java" semImports />
+
+```bash
+mvn -pl m11-seguranca/aulas test -Dtest='PkceTest,AuthorizationCodeComPkceTest'
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in PKCE (RFC 7636)
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in Authorization Code + PKCE, passo a passo
+[INFO] BUILD SUCCESS
+```
+
+As requisições reais do caminho feliz, na ordem:
+
+```text
+1) GET /oauth2/authorize?response_type=code&client_id=app-da-loja&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback
+       &scope=openid%20profile%20email&state=1d661429-...&nonce=c9ca0170-...&code_challenge=...&code_challenge_method=S256
+   Accept: text/html
+<- 302  Location: http://localhost:16984/login
+        Set-Cookie: JSESSIONID=3B31C700...; Path=/; HttpOnly
+
+2) GET /login                              <- 200, formulário com o campo escondido _csrf
+3) POST /login  username=ana&password=...&_csrf=...
+<- 302  Location: (de volta ao /oauth2/authorize salvo na sessão)
+
+4) GET /oauth2/authorize?...               (agora com a sessão autenticada)
+<- 302  Location: http://127.0.0.1:8765/callback?code=LEiqgHhOttz2V7YjI1tl...&state=1d661429-...
+
+5) POST /oauth2/token  grant_type=authorization_code&client_id=app-da-loja&code=...
+                       &redirect_uri=http://127.0.0.1:8765/callback&code_verifier=...
+<- 200  {"access_token":"eyJ...","scope":"openid profile email","id_token":"eyJ...", ...}
+```
+
+O corpo do ID token recebido:
+
+```json
+{
+  "sub": "ana",
+  "aud": "app-da-loja",
+  "azp": "app-da-loja",
+  "auth_time": 1791237966,
+  "iss": "http://localhost:16984",
+  "name": "Ana Souza",
+  "email": "ana@loja.test",
+  "nonce": "c9ca0170-d98e-4761-8a82-f1730a6eb4dc",
+  "sid": "827ToBalvPypdbQH9aCFG5qm_sKb7kxoLXT9nLtwbpQ",
+  "exp": 1791239766,
+  "iat": 1791237966,
+  "jti": "dd56d060-6c19-46bd-b60d-67cbb4fa2349"
+}
+```
+
+**O que acabou de acontecer.**
+
+- O `Accept: text/html` no "navegador" não é enfeite. Sem ele, o servidor de autorização responde `401` ao pedido de autorização, em vez de redirecionar ao login: a autoconfiguração só redireciona quem parece um navegador. Foi a primeira falha deste teste, durante a escrita da aula.
+- O app **nunca viu a senha**: ela foi do "navegador" direto para o servidor (passo 3).
+- O `state` voltou intacto no redirect e o teste o compara. O `nonce` voltou **dentro do ID token**, assinado, e o teste também o compara.
+- O `aud` do ID token é o app, não a API. E o `sid` identifica a sessão no provedor, usado no logout por back-channel.
+- **Não veio `refresh_token`.** O Spring Authorization Server não emite refresh token para cliente público (`client-authentication-methods: none`), e o teste fixa esse comportamento. Quando o access token vencer, o app repete o fluxo; como a sessão no provedor continua viva, a pessoa nem vê a tela de login de novo.
+- Os testes negativos mostram as três defesas funcionando: um código trocado com **outro** verifier recebe `400 {"error":"invalid_grant"}`; o **mesmo** código usado duas vezes também (e o servidor registra no log `Invalidated authorization token(s) previously issued to registered client 'app-da-loja'`: ele revoga os tokens emitidos na primeira troca, porque reuso de código é sinal de ataque, como pede a RFC 6749); e um pedido **sem** `code_challenge` volta ao app com `error=invalid_request`.
+
+### Passo 8: a suíte inteira
+
+```bash
+mvn -pl m11-seguranca/aulas test
+```
+
+```text
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in API de pedidos como Resource Server
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in Authorization Code + PKCE, passo a passo
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0 -- in Discovery e token endpoint, em HTTP cru
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in Faturamento chama a API de pedidos com client credentials
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in Papéis de cliente do Keycloak viram ROLE_*
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in PKCE (RFC 7636)
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in Portal web com oauth2Login (OpenID Connect)
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in Tolerância de relógio na validação de exp
+[INFO] Tests run: 29, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Vinte e nove testes, quatro aplicações, um servidor de autorização de verdade, e tudo roda em poucos segundos, sem Docker.
+
+## Quando dá errado
+
+As mensagens abaixo foram copiadas da execução. Em integrações OAuth, quase todo problema cai num destes casos, e a mensagem de erro, lida com calma, aponta a causa.
+
+### `redirect_uri` recusada
+
+Pedido de autorização (já com a pessoa logada) com `redirect_uri=http://127.0.0.1:8765/callback/../roubo`, que não é a cadastrada:
+
+```text
+400  Content-Type: text/html;charset=UTF-8
+<html><body><h1>Whitelabel Error Page</h1>... There was an unexpected error (type=Bad Request, status=400).</body></html>
+```
+
+**Como ler:** repare que **não há** `Location`. Quando a `redirect_uri` não confere, o servidor não pode redirecionar para ela (seria entregar o erro, e talvez o código, a um endereço desconhecido), então mostra um erro na própria página. No Keycloak, a mesma situação mostra "Invalid parameter: redirect_uri". **Causas comuns:** barra no final (`/callback` × `/callback/`), `http` × `https` atrás de um proxy (o app gera `http://` porque não sabe que está atrás de TLS: no Spring, configure `server.forward-headers-strategy`), porta diferente, `localhost` × `127.0.0.1`. **Correção:** cadastre a URI exata, nunca um curinga.
+
+### `invalid_grant`
+
+```text
+POST /oauth2/token (code com verifier errado, código reusado ou código inventado)
+400  {"error":"invalid_grant"}
+```
+
+**Como ler:** `invalid_grant` é o erro genérico de "a concessão que você apresentou não vale". O servidor não diz qual foi o motivo, de propósito, para não ajudar quem está tentando adivinhar. **Causas comuns:** código usado duas vezes (um retry automático do cliente HTTP, ou o usuário apertando "voltar"), código vencido (o tempo padrão é de poucos minutos), `code_verifier` de outra tentativa (o app guardou o verifier no lugar errado, por exemplo numa variável compartilhada entre abas), `redirect_uri` da troca diferente da usada no pedido, refresh token revogado ou expirado. **Correção:** procure no log **do servidor de autorização**, que costuma registrar o motivo real.
+
+### `invalid_client`, `invalid_scope` e `unsupported_grant_type`
+
+```text
+segredo errado                         401  {"error":"invalid_client"}
+escopo que o cliente não tem           400  {"error":"invalid_scope"}
+grant_type=password                    400  {"error_description":"OAuth 2.0 Parameter: grant_type",
+                                             "error":"unsupported_grant_type",
+                                             "error_uri":"https://datatracker.ietf.org/doc/html/rfc6749#section-5.2"}
+```
+
+**Como ler:** `invalid_client` é a autenticação **do cliente** que falhou (segredo errado, cliente inexistente, ou método de autenticação diferente do cadastrado: mandar o segredo no corpo, `client_secret_post`, para um cliente cadastrado só com `client_secret_basic`). No Keycloak, um segredo errado aparece como `unauthorized_client` com a descrição "Invalid client or Invalid client credentials". `invalid_scope` diz que o escopo pedido não foi concedido àquele cliente. `unsupported_grant_type` aparece para o password grant, que este servidor nem implementa.
+
+### PKCE ausente
+
+```text
+302  Location: http://127.0.0.1:8765/callback?error=invalid_request
+       &error_description=OAuth%202.0%20Parameter%3A%20code_challenge
+       &error_uri=https%3A%2F%2Fdatatracker.ietf.org%2Fdoc%2Fhtml%2Frfc7636%23section-4.4.1&state=790966ad-...
+```
+
+**Como ler:** aqui o servidor **pode** redirecionar, porque a `redirect_uri` é válida; então o erro volta ao app na URL, junto com o `state`. **Causa:** biblioteca antiga ou configuração que não manda PKCE para um cliente que o exige.
+
+### Audiência errada
+
+```text
+401  WWW-Authenticate: Bearer error="invalid_token",
+       error_description="An error occurred while attempting to decode the Jwt: The aud claim is not valid", ...
+```
+
+**Como ler:** o token é legítimo, mas foi emitido para outro destinatário. **Causas comuns:** o cliente não pediu o escopo (ou o *resource*) da API; no Keycloak, falta o mapper de audiência ou o papel de cliente que dispara o *audience resolve*; ou alguém está mandando o **ID token** em vez do access token. **Correção:** decodifique o token (nunca num site de terceiros se for um token de produção) e olhe o `aud`; corrija a emissão, não afrouxe a API.
+
+### Emissor diferente
+
+A API configurada com `issuer-uri: http://127.0.0.1:16984` para um servidor que se anuncia como `http://localhost:16984` não sobe:
+
+```text
+java.lang.IllegalStateException: The Issuer "http://localhost:16984" provided in the configuration did not match the requested issuer "http://127.0.0.1:16984"
+```
+
+**Como ler:** o Spring compara o `issuer-uri` configurado com o `issuer` do discovery, como texto. E, se a conferência passasse, todo token teria `iss` diferente do esperado e seria recusado. **Causas comuns:** `localhost` × `127.0.0.1`, nome interno × nome público (a API acessa o Keycloak por `http://keycloak:8080` dentro do cluster, mas os tokens saem com o nome público `https://login.loja.com.br`, porque foi por ele que o navegador logou). **Correção:** um único nome canônico para o emissor; no Keycloak, configure o *hostname* (opção `hostname` da linha 26) para que os tokens tenham sempre o mesmo `iss`, independentemente de por onde a requisição chegou.
+
+### Token vencido e relógios desencontrados
+
+```text
+[invalid_token] Jwt expired at 2026-10-05T11:58:00Z
+```
+
+**Como ler:** o `exp` já passou, **mais** a tolerância de relógio. O `JwtTimestampValidator` do Spring aceita 60 segundos de diferença por padrão (*clock skew*), porque os relógios do emissor e da API nunca batem perfeitamente. O teste `ToleranciaDeRelogioTest` mostra os dois lados: um token vencido há 30 segundos ainda passa; um vencido há 2 minutos, não.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/oidc/ToleranciaDeRelogioTest.java" semImports destacar="21-25, 33-41" />
+
+**Causas comuns:** servidor sem NTP (o relógio de uma VM pode derivar minutos), contêiner com relógio errado, e o oposto: token "do futuro", recusado pelo `nbf`/`iat` quando o relógio da API está **atrasado**. **Correção:** sincronize os relógios (NTP, chrony); não aumente a tolerância para minutos, porque ela estende a vida de todo token vazado.
+
+## Armadilhas e quando NÃO usar
+
+- **Guardar tokens em `localStorage`.** Qualquer XSS os leva. Para SPAs, BFF; para apps nativos, o armazenamento seguro do sistema (Keychain, Keystore).
+- **Mandar o ID token para a API.** O `aud` é o cliente, e ele não carrega os escopos. A API deve validar `aud` e recusá-lo.
+- **Validar só a assinatura.** Sem `iss` e `aud`, qualquer token do mesmo provedor (ou de um provedor que compartilhe chaves) é aceito.
+- **`redirect_uri` com curinga** (`https://*.loja.com.br/*`). Um subdomínio esquecido ou um open redirect vira roubo de código.
+- **Password grant "só para o app interno".** O app passa a ver senhas, e o MFA fica impossível. Use Authorization Code + PKCE, mesmo para apps próprios.
+- **Pedir escopos demais.** O portal não precisa de `pedidos:escrever` para mostrar pedidos. Escopo é a sua linha de defesa quando um token vaza.
+- **Access token longo para "evitar refresh".** Um token de 24 horas vazado vale 24 horas. Prefira minutos, com refresh token rotacionado.
+- **Usar o `sub` como identificador entre provedores.** O `sub` é único **dentro do emissor**. Ao migrar de provedor ou federar, o identificador estável é o par (`iss`, `sub`), e a sua base de usuários deve guardar os dois.
+- **Logar tokens.** Um `log.debug("token={}", token)` transforma o seu agregador de logs num cofre de credenciais. Logue o `jti` ou um hash, nunca o token.
+- **Usar o JWT como sessão do navegador.** Para aplicações web renderizadas no servidor, a sessão com cookie (o que o `oauth2Login` faz) é mais simples e revogável.
+
+**Quando NÃO usar OAuth/OIDC:**
+
+- Um monólito com uma única interface web, sem APIs públicas, sem SSO entre sistemas e sem terceiros: login por formulário com sessão (aula 11.02) resolve com menos peças móveis. OAuth começa a compensar quando há vários clientes, várias APIs, SSO ou terceiros.
+- Comunicação entre serviços dentro de uma malha com **mTLS** e identidade de carga de trabalho (SPIFFE, por exemplo) já autenticada pela plataforma: client credentials pode ser redundante para autenticação, embora tokens ainda sejam úteis para levar a identidade da pessoa e os escopos.
+- "Login com Google" **não é** um sistema de permissões. O OIDC diz quem é a pessoa; o que ela pode fazer na sua aplicação continua sendo regra sua (aula 11.04).
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Comprar, hospedar ou escrever.** A primeira decisão é quem opera o servidor de autorização. Um provedor gerenciado tira do seu time o componente mais crítico da arquitetura: disponibilidade (se ele cai, ninguém loga), correções de segurança, certificações, proteção contra ataques de credenciais em massa. O custo é financeiro (por usuário ativo, e cresce rápido em produtos de consumo) e de flexibilidade. O Keycloak é o meio-termo: sem custo de licença, muito configurável, mas exige operação de verdade: banco de dados, cluster com cache distribuído para sessões, atualização frequente (a linha 26 recebe versões a cada poucas semanas), backup do realm, monitoramento. O Spring Authorization Server faz sentido quando a emissão de tokens é parte do seu produto (uma plataforma que emite tokens para parceiros com regras de negócio próprias) ou quando o restante da stack já é Spring e o time quer o servidor no mesmo pipeline. Para justificar ao time: liste o que vocês precisam (SSO corporativo? login social? MFA? quantos usuários? requisitos de residência de dados?) e quanto custa uma hora de indisponibilidade do login.
+
+**O servidor de autorização é um ponto único de falha, e é de leitura intensa.** Com JWT, a API valida tokens sem chamar o provedor; só busca o JWKS de tempos em tempos. Isso é uma escolha de disponibilidade: se o provedor cair, quem já tem token continua trabalhando até o token vencer. Com **tokens opacos** e *introspection* (RFC 7662), cada requisição à API consulta o provedor: a revogação é imediata, mas a latência e a disponibilidade da API passam a depender dele. Muitas empresas usam JWT para chamadas internas e tokens opacos para clientes externos de alto risco. Seja qual for a escolha, cache do JWKS com tolerância a falhas e rotação de chaves testada (publicar a nova antes de usar, manter a velha até o último token assinado com ela vencer) são obrigatórios.
+
+**Tempo de vida é uma troca entre segurança e carga.** Access token de 5 minutos, com mil serviços pedindo tokens por client credentials, é carga constante no token endpoint; de 1 hora, um vazamento vale 1 hora. O meio de campo comum: 5 a 15 minutos para tokens de pessoas, cache no cliente (o `OAuth2AuthorizedClientManager` já faz isso), e refresh tokens rotacionados com validade de horas ou dias, revogados no logout, na troca de senha e em sinais de risco.
+
+**Bearer é "quem tem, usa".** Um access token comum é como dinheiro: quem o encontrar, gasta. Para APIs de alto valor (pagamentos, open finance, dados de saúde), o passo seguinte é o token **amarrado ao remetente**: com **DPoP** (RFC 9449), o cliente prova a posse de uma chave privada a cada requisição; com **mTLS** (RFC 8705), o token fica atrelado ao certificado do cliente. O discovery do Passo 2 mostrou que o servidor anuncia os dois. O custo é complexidade no cliente e no gateway; o ganho é que um token vazado em log não serve para nada.
+
+**Audiência e escopo são o seu desenho de autorização entre serviços.** Um único escopo `api` que abre tudo é o equivalente distribuído de um usuário administrador compartilhado. Desenhe escopos por recurso e ação (`pedidos:ler`, `pedidos:cancelar`), audiência por API, e use token exchange quando a cadeia de chamadas cruzar fronteiras de confiança. E lembre que escopo diz o que **o cliente** pode fazer; o que **a pessoa** pode fazer com aquele pedido específico (o pedido é dela?) é a regra de BOLA da aula 11.04, e continua na API.
+
+**Migração e multi-provedor.** Trocar de provedor (do Keycloak para o Entra ID, por aquisição de empresa, por exemplo) é traumático se a sua base de usuários usa o `sub` como chave. Guarde (`iss`, `sub`) e um identificador interno seu; mapeie papéis em um conversor (como o `PapeisDoKeycloak`), não em `@PreAuthorize` espalhados com nomes do provedor. Com isso, a troca vira configuração e um conversor novo.
+
+**Observabilidade e resposta a incidentes.** Num incidente, as perguntas são: quais tokens foram emitidos para este cliente, quando e para quem? Quem usou este token (o `jti`)? O provedor precisa ter eventos de auditoria (o Keycloak tem *events*; o Spring Authorization Server, eventos de aplicação que você publica), e a API precisa logar `sub`, `azp`/`client_id` e `jti`, nunca o token. Tenha um procedimento ensaiado para revogar o segredo de um cliente e todos os tokens dele.
+
+**Quando trocar de abordagem.** Se o time gasta mais tempo operando o Keycloak do que construindo o produto, é hora de avaliar um gerenciado. Se o gerenciado bloqueia uma regra de negócio essencial na emissão de tokens, é hora de avaliar Keycloak com extensões ou o Spring Authorization Server. Se as chamadas entre serviços passaram de duas ou três camadas e a auditoria pede "quem originou", é hora de token exchange. Se tokens vazados viraram incidente real, é hora de DPoP ou mTLS.
+
+<Callout tipo="entrevista">
+Perguntas frequentes para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Explique o fluxo Authorization Code com PKCE."** Os papéis; o que passa pelo navegador (pedido de autorização, código) e o que passa pelo canal direto (troca do código); o que `state`, `nonce` e PKCE protegem; `redirect_uri` exata; por que o código é de uso único e curto.
+- **"Por que o implicit e o password grant foram descontinuados?"** Token na URL e sem amarração ao cliente; app vendo senha, sem MFA nem federação. Citar a RFC 9700 e o OAuth 2.1 mostra que você acompanha a área.
+- **"Qual a diferença entre ID token e access token?"** Destinatário (cliente × API), conteúdo (identidade × permissão), e o erro de mandar o ID token para a API.
+- **"Como a sua API valida um token?"** Assinatura pelo JWKS com `kid`, algoritmo fixo, `exp`/`nbf` com tolerância pequena, `iss` e `aud`; 401 × 403; e o que muda com tokens opacos (introspection).
+- **"Como serviços se autenticam entre si?"** Client credentials com segredo ou, melhor, `private_key_jwt`/mTLS; cache do token; escopos mínimos; e, se a identidade da pessoa precisa seguir, token exchange.
+- **"Onde guardar tokens numa SPA?"** BFF com cookie `HttpOnly`/`Secure`/`SameSite` e CSRF; por que `localStorage` é ruim.
+- **"Você usaria Keycloak, um gerenciado ou o Spring Authorization Server?"** Critérios: operação, custo, customização, requisitos (SSO, MFA, federação), disponibilidade. Não existe resposta única; existe justificativa.
+</Callout>
+
+## Checkpoint
+
+O time de estoque vai lançar a **API de estoque** e quer que o faturamento possa consultá-la, mas que **nenhum** token emitido hoje para a API de pedidos funcione lá. Descreva, sem escrever código ainda:
+
+1. O que muda no `servidor-de-autorizacao.yml` e no `OAuth2TokenCustomizer`.
+2. O que a API de estoque configura para recusar os tokens atuais do faturamento.
+3. O que muda no faturamento para chamar as duas APIs.
+4. Qual resposta HTTP (status e `WWW-Authenticate`) a API de estoque devolve para o token atual do faturamento, e por quê.
+
+<details>
+<summary>Ver uma solução</summary>
+
+1. Um escopo novo, `estoque:ler`, acrescentado aos escopos do cliente `servico-de-faturamento`. No customizador, o `aud` passa a depender do escopo: `pedidos:*` dá `api-pedidos`, `estoque:*` dá `api-estoque`. Um token com os dois escopos teria as duas audiências, o que é exatamente o que se quer evitar; por isso o faturamento deve pedir **tokens separados**, um por API (escopos diferentes em cada pedido ao token endpoint).
+2. `issuer-uri` igual ao da API de pedidos e `audiences: api-estoque`; na cadeia de filtros, `hasAuthority("SCOPE_estoque:ler")`.
+3. Um segundo registro em `spring.security.oauth2.client.registration` (por exemplo `api-de-estoque`, com `scope: estoque:ler` e o mesmo `client-id`), e um segundo `RestClient` cujo interceptor resolve esse registro. O `OAuth2AuthorizedClientService` guarda os dois tokens separadamente, pela chave (registro, principal).
+4. `401` com `WWW-Authenticate: Bearer error="invalid_token", error_description="... The aud claim is not valid"`: o token é válido e do mesmo emissor, mas o `aud` é `api-pedidos`. Não é `403`, porque o token nem chega a ser uma autenticação válida para esta API.
+
+Para ir além: em vez de tokens separados, a API de pedidos poderia chamar o estoque com **token exchange** quando a consulta ao estoque acontece **dentro** de uma requisição a pedidos, mantendo o `sub` original.
+
+</details>
+
+<Quiz
+  id="11-oauth2-oidc"
+  questoes={[
+    {
+      pergunta: 'Um atacante intercepta o código de autorização no redirect de um app móvel e tenta trocá-lo no token endpoint. O que o impede, num fluxo com PKCE?',
+      opcoes: ['O state, que o atacante não conhece', 'O code_verifier: o servidor confere que o hash dele bate com o code_challenge do pedido, e o atacante não tem o verifier', 'O nonce dentro do ID token', 'O segredo do cliente, que fica no app'],
+      correta: 1,
+      explicacao: 'O código sem o `code_verifier` não vale. O `state` protege a sessão do navegador, o `nonce` protege o ID token, e um app móvel é cliente público: não tem segredo confiável.',
+    },
+    {
+      pergunta: 'A API de pedidos recebe um token válido, assinado pelo emissor certo, mas com aud = servico-de-relatorios. O que ela deve responder?',
+      opcoes: ['200, porque a assinatura é válida', '403 com insufficient_scope', '401 com error="invalid_token": o token não foi emitido para esta API', '400 Bad Request'],
+      correta: 2,
+      explicacao: 'Audiência errada torna o token inválido para esta API: 401 com `invalid_token`. O 403 é para token válido para a API, mas sem o escopo exigido.',
+    },
+    {
+      pergunta: 'Qual destes NÃO deve ser enviado à API no cabeçalho Authorization?',
+      opcoes: ['Um access token JWT', 'Um access token opaco', 'O ID token', 'Um access token obtido por client credentials'],
+      correta: 2,
+      explicacao: 'O ID token é para o cliente (aud = client_id) e descreve a autenticação; não carrega os escopos concedidos à API.',
+    },
+    {
+      pergunta: 'Por que o serviço de faturamento, usando client credentials, normalmente não recebe refresh token?',
+      opcoes: ['Porque refresh tokens só existem no OAuth 2.1', 'Porque ele pode pedir um access token novo a qualquer momento com as próprias credenciais; um refresh token seria só mais uma credencial para vazar', 'Porque o JWT não permite', 'Porque o Spring Security não suporta'],
+      correta: 1,
+      explicacao: 'O refresh token existe para não pedir a senha da pessoa de novo. No client credentials não há pessoa: o cliente reautentica com o próprio segredo.',
+    },
+    {
+      pergunta: 'Uma SPA guarda o access token em localStorage. Qual a recomendação atual?',
+      opcoes: ['Trocar por sessionStorage', 'Criptografar o token no localStorage', 'Usar um BFF: o backend do front é cliente confidencial, guarda os tokens no servidor e entrega ao navegador só um cookie HttpOnly, Secure e SameSite', 'Usar o implicit grant'],
+      correta: 2,
+      explicacao: 'Qualquer armazenamento acessível por JavaScript é alcançável por XSS. O BFF tira os tokens do navegador; o CSRF passa a ser tratado, porque há cookie de sessão.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Papéis:** resource owner (a pessoa), client (o app), authorization server (emite tokens), resource server (a API que valida). A senha só passa pelo servidor de autorização.
+- **RFC 9700 / OAuth 2.1:** implicit e password grant fora; PKCE em todo authorization code; `redirect_uri` exata; access token restrito à audiência; refresh token de cliente público rotacionado ou amarrado ao remetente.
+- **Authorization Code + PKCE:** `state` amarra a resposta ao navegador, PKCE amarra o código a quem o pediu, `nonce` amarra o ID token à tentativa; o código é curto e de uso único.
+- **OIDC:** escopo `openid`, ID token para o cliente, access token para a API, userinfo, discovery em `/.well-known/openid-configuration`, logout com `end_session_endpoint`.
+- **Client credentials** para serviço a serviço; **refresh token** com rotação para pessoas; **token exchange** (RFC 8693) para levar a identidade com menor privilégio entre serviços; **BFF** para SPAs.
+- **No Spring:** `oauth2Login` para o cliente web (sessão, `OidcUser`, CSRF ligado, PKCE automático), `oauth2ResourceServer` com `issuer-uri` + `audiences` para a API (stateless, `Jwt`, 401 × 403), `OAuth2AuthorizedClientManager` + `OAuth2ClientHttpRequestInterceptor` no `RestClient` para client credentials.
+- **Keycloak × Spring Authorization Server × gerenciado:** decisão de operação, custo e customização; papéis do Keycloak entram no Spring por um conversor de `resource_access`.
+- **Erros clássicos:** `redirect_uri` recusada sem redirect, `invalid_grant` genérico, `invalid_client`, `invalid_scope`, `aud claim is not valid`, emissor diferente (`localhost` × `127.0.0.1`), `Jwt expired at` além dos 60 s de tolerância.
+
+## Próximo passo
+
+Você agora sabe **quem** chama cada API e **com que permissão**. A próxima pergunta de um time sênior é: **o que pode dar errado** no sistema como um todo, e o que fazer com os dados que, se vazarem, viram notícia? Na [aula 11.08, Modelagem de ameaças e dados sensíveis](../../11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/), você aplica STRIDE à arquitetura desta aula, classifica dados pessoais segundo a LGPD e decide o que criptografar, mascarar e nunca registrar em log.
+
+## Referências
+
+- [RFC 6749 — The OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749) e [RFC 6750 — Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750)
+- [RFC 7636 — Proof Key for Code Exchange (PKCE)](https://www.rfc-editor.org/rfc/rfc7636)
+- [RFC 9700 — Best Current Practice for OAuth 2.0 Security](https://www.rfc-editor.org/rfc/rfc9700)
+- [The OAuth 2.1 Authorization Framework (rascunho na IETF)](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/)
+- [OAuth 2.0 for Browser-Based Applications (rascunho na IETF)](https://datatracker.ietf.org/doc/draft-ietf-oauth-browser-based-apps/)
+- [RFC 8693 — OAuth 2.0 Token Exchange](https://www.rfc-editor.org/rfc/rfc8693), [RFC 8414 — Authorization Server Metadata](https://www.rfc-editor.org/rfc/rfc8414), [RFC 9728 — Protected Resource Metadata](https://www.rfc-editor.org/rfc/rfc9728) e [RFC 9449 — DPoP](https://www.rfc-editor.org/rfc/rfc9449)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html), [Discovery 1.0](https://openid.net/specs/openid-connect-discovery-1_0.html) e [RP-Initiated Logout 1.0](https://openid.net/specs/openid-connect-rpinitiated-1_0.html)
+- [Spring Security — OAuth 2.0 Client, RestClient e OAuth2ClientHttpRequestInterceptor](https://docs.spring.io/spring-security/reference/servlet/oauth2/client/authorized-clients.html)
+- [Spring Security — OIDC Logout](https://docs.spring.io/spring-security/reference/servlet/oauth2/login/logout.html) e [OAuth 2.0 Resource Server JWT](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html)
+- [Spring Security — Authorization Server](https://docs.spring.io/spring-security/reference/servlet/oauth2/authorization-server/index.html) e [Spring Boot — OAuth2](https://docs.spring.io/spring-boot/reference/security/oauth2.html)
+- [Keycloak — Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/)

@@ -1,0 +1,131 @@
+---
+titulo: Cache LRU com operações O(1)
+codigo: "03.05"
+resumo: Implemente do zero um cache genérico que descarta o item usado há mais tempo, com HashMap e lista duplamente encadeada, listener de despejo e um teste de desempenho que não perdoa O(n).
+modulo: 03-colecoes-generics-excecoes
+ordem: 5
+dificuldade: dificil
+tempo: 2–3h
+conceitos: [HashMap, lista encadeada, generics, Big-O, design de estruturas]
+aulas: [03-colecoes-generics-excecoes/06-colecoes-modernas, 03-colecoes-generics-excecoes/02-complexidade]
+java:
+  modulo: m03-colecoes-generics-excecoes
+  teste: CacheLruTest
+---
+
+## Contexto
+
+Um serviço de cotações de frete chama a API de uma transportadora que é **lenta** (800 ms por chamada) e **cobra por requisição**. A maioria das consultas se repete: os mesmos CEPs de origem e destino ao longo do dia. O time decidiu colocar um cache em memória com tamanho máximo, descartando a cotação usada **há mais tempo** quando o cache enche.
+
+Por política da empresa, você não pode adicionar bibliotecas. E o cache fica no caminho de **toda** requisição: ele precisa ser O(1).
+
+<Callout tipo="entrevista">
+Este é, provavelmente, um dos problemas de *live coding* mais pedidos em entrevistas técnicas no mundo (aparece como "LRU Cache" no LeetCode). Faça como se estivesse em uma entrevista: planeje a estrutura em voz alta antes de codificar.
+</Callout>
+
+## Requisitos
+
+`CacheLru<K, V>` com:
+
+| Método | Comportamento | Custo |
+|---|---|---|
+| `new CacheLru<>(capacidade)` | Capacidade ≥ 1 | — |
+| `new CacheLru<>(capacidade, aoDespejar)` | Chama `aoDespejar.accept(chave, valor)` a cada despejo | — |
+| `obter(k)` | Valor ou `null`; **marca como usado agora** | O(1) |
+| `colocar(k, v)` | Insere ou atualiza (e marca como usado). Se passar da capacidade, despeja o menos recente | O(1) |
+| `remover(k)` | Remove e devolve o valor (ou `null`) | O(1) |
+| `contem(k)` | Consulta **sem** marcar como usado | O(1) |
+| `tamanho()` | Número de itens | O(1) |
+| `chavesDoMaisRecenteAoMaisAntigo()` | Lista imutável | O(n) |
+
+## Regras
+
+- Atualizar uma chave existente **não** aumenta o tamanho e conta como uso.
+- `contem` **não** conta como uso (importante para métricas e para não "salvar" itens do despejo sem querer).
+- Chave nula: `IllegalArgumentException`.
+
+## Exemplo
+
+```text
+capacidade 2
+colocar(a,1)   → [a]
+colocar(b,2)   → [b, a]
+obter(a)       → [a, b]        (a vira o mais recente)
+colocar(c,3)   → [c, a]        (b, o menos recente, é despejado)
+```
+
+## O teste de desempenho
+
+`desempenho` faz 300 mil operações com 50 mil chaves e exige menos de **2 segundos**. Uma implementação com `ArrayList` ou `LinkedList` da JDK (que precisa **procurar** o item para movê-lo) leva minutos. Só uma solução realmente O(1) passa.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `CacheLruTest` passam, inclusive `desempenho`.
+- [ ] Você **não** usou `LinkedHashMap` (use-o depois, para comparar).
+- [ ] Os nós da lista são uma classe interna privada: nada da estrutura interna vaza na API.
+
+## Desafios opcionais
+
+- Reimplemente com `LinkedHashMap(capacidade, 0.75f, true)` + `removeEldestEntry` e compare o tamanho do código.
+- **TTL:** cada item expira após N segundos, além da regra LRU. Use um `Clock` injetável para testar.
+- **Thread-safety:** o que acontece se duas threads usarem o cache ao mesmo tempo? (Spoiler: módulo 06.)
+
+<Dicas>
+<Dica nivel={1}>
+Você precisa de duas coisas ao mesmo tempo: achar um item pela chave em O(1) (qual estrutura?) e saber a **ordem de uso**, movendo qualquer item para a frente em O(1) (qual estrutura permite remover um elemento do meio em O(1) **se você já tiver uma referência para ele**?).
+</Dica>
+<Dica nivel={2}>
+Combine `HashMap<K, No<K, V>>` com uma lista **duplamente encadeada** escrita por você. O mapa aponta para o **nó**, então você nunca precisa procurar na lista. O nó guarda chave, valor, anterior e próximo. Guarde a **chave** no nó: na hora de despejar o último da lista, você precisa dela para removê-lo do mapa.
+</Dica>
+<Dica nivel={3}>
+Crie dois nós **sentinela** vazios, `cabeca` e `cauda`, ligados um ao outro no construtor. Assim, `inserirNaFrente(no)` é sempre "entre a cabeça e o primeiro", o menos recente é sempre `cauda.anterior`, e `desligar(no)` é só `no.anterior.proximo = no.proximo; no.proximo.anterior = no.anterior;`, sem nenhum `if` de lista vazia.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/cache/CacheLru.java" />
+
+### Como explicar em uma entrevista
+
+1. **Requisitos:** "get e put em O(1), capacidade fixa, despejo do menos recente."
+2. **Estrutura:** "um HashMap para acesso O(1) pela chave e uma lista duplamente encadeada para a ordem de uso. O mapa aponta para os nós, então mover um nó é O(1)."
+3. **Detalhe que mostra experiência:** "uso nós sentinela para eliminar casos especiais, e guardo a chave no nó para conseguir remover do mapa no despejo."
+4. **Complexidade:** O(1) de tempo por operação e O(capacidade) de memória.
+5. **Trade-offs:** "em produção eu usaria o Caffeine, que tem políticas melhores que o LRU puro (W-TinyLFU) e é thread-safe. Esta implementação não é thread-safe."
+
+### Detalhes da implementação
+
+- **`No` é `private static`.** `static` porque o nó não precisa de referência ao cache que o contém (economiza memória); `private` porque é detalhe interno.
+- **Dimensionar o `HashMap`.** `capacidade / 0.75 + 1` evita que o mapa faça *rehash* enquanto o cache cresce até o limite.
+- **Listener nulo vira no-op.** `(k, v) -> { }` evita um `if (aoDespejar != null)` a cada despejo (padrão *Null Object*).
+
+### A versão com `LinkedHashMap`
+
+```java
+public class CacheLruSimples<K, V> extends LinkedHashMap<K, V> {
+    private final int capacidade;
+
+    public CacheLruSimples(int capacidade) {
+        super(capacidade, 0.75f, true);        // accessOrder = true: get move para o fim
+        this.capacidade = capacidade;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<K, V> maisAntigo) {
+        return size() > capacidade;
+    }
+}
+```
+
+Quinze linhas. Mas repare no que ela expõe: por herdar de `LinkedHashMap`, quem usa o cache ganha acesso a `putAll`, `entrySet().clear()` e outros métodos que podem contornar suas regras. É o problema da **herança versus composição** do módulo 02 aparecendo na prática.
+
+### Avalie sua solução
+
+- Seu `contem` altera a ordem? Não deveria.
+- O que acontece no seu código quando a capacidade é 1 e você atualiza a mesma chave?
+- Você esqueceu de remover a chave do **mapa** ao despejar? (Vazamento de memória clássico.)
+
+</Solucao>

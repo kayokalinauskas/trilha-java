@@ -1,0 +1,15 @@
+{
+  "specversion": "1.0",
+  "id": "0d1e2f3a-4b5c-4d6e-8f70-819203a4b504",
+  "source": "/servicos/pedidos",
+  "type": "br.com.loja.pedidos.pedido-confirmado.v2",
+  "time": "2026-09-01T10:00:00Z",
+  "subject": "PED-150",
+  "datacontenttype": "application/json",
+  "data": {
+    "pedidoId": "PED-150",
+    "clienteId": "CLI-12",
+    "valorTotal": { "quantia": "35.00", "moeda": "BRL" },
+    "cepDestino": "80010-000"
+  }
+}

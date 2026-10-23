@@ -1,0 +1,243 @@
+---
+titulo: "Redis: estruturas, atomicidade e os limites do lock distribuído"
+descricao: As estruturas de dados do Redis, expiração, operações atômicas (INCR, SET NX PX), pipelines e scripts Lua; os usos no backend (cache, rate limit, lock, sessões, filas com streams), a crítica ao Redlock e o fencing token, persistência RDB e AOF, a questão da licença e o Spring Data Redis.
+modulo: 15-system-design
+ordem: 2
+duracao: 60
+objetivos:
+  - Escolher a estrutura do Redis adequada a cada problema (string, hash, list, set, sorted set, stream)
+  - Implementar contadores e rate limit distribuídos com operações atômicas e Lua
+  - Explicar por que um lock no Redis não garante exclusão mútua sozinho e como o fencing token protege o recurso
+  - Configurar persistência e política de memória conforme o uso do Redis
+tags: [Redis, Valkey, rate limit, lock distribuído, Redlock, fencing token, streams, Spring Data Redis, Lettuce]
+flashcards:
+  - frente: Por que INCR no Redis é seguro com várias instâncias da aplicação?
+    verso: O Redis executa os comandos um de cada vez (um único fluxo de execução de comandos). O INCR lê, soma e grava sem que outro comando se intrometa, então duas instâncias nunca perdem um incremento.
+  - frente: Como adquirir um lock simples no Redis?
+    verso: "SET lock:recurso <valor-aleatório> NX PX 30000 - só grava se não existir (NX) e expira sozinho (PX). Para liberar, um script Lua apaga a chave SÓ se o valor ainda for o seu."
+  - frente: Por que um lock com expiração não garante exclusão mútua?
+    verso: Uma pausa longa (GC, rede) pode fazer o lock expirar enquanto o dono ainda acha que o tem. Outro processo adquire, e os dois escrevem. A proteção é um fencing token - um número crescente que o recurso verifica, rejeitando tokens antigos.
+  - frente: Pipeline × MULTI/EXEC × Lua
+    verso: Pipeline - envia vários comandos sem esperar cada resposta (menos idas à rede, sem atomicidade). MULTI/EXEC - executa o bloco sem intercalar outros comandos, mas não desfaz nada se um falhar. Lua - lógica condicional atômica no servidor.
+  - frente: RDB × AOF
+    verso: RDB - fotografias periódicas (compactas, rápidas de restaurar, perdem o que veio depois da última). AOF - registra cada escrita; com fsync a cada segundo, perde no máximo cerca de um segundo.
+---
+
+Na aula anterior, o Redis apareceu como cache. Ele é mais que isso: é um **servidor de estruturas de dados em memória**. Contadores, filas, rankings, conjuntos e locks, todos acessíveis pela rede, compartilhados entre as instâncias da sua aplicação, e com operações **atômicas**.
+
+É por isso que ele aparece em quase toda entrevista de system design. E é por isso que vale conhecer os limites: o Redis é ótimo para estado compartilhado de curta duração, e perigoso quando tratado como banco de dados principal ou como fonte de verdade para exclusão mútua.
+
+## As estruturas
+
+| Estrutura | Comandos típicos | Uso no backend |
+|---|---|---|
+| **string** | `GET`, `SET`, `INCR`, `SET ... EX` | cache de JSON, contadores, flags, locks |
+| **hash** | `HSET`, `HGET`, `HINCRBY` | um objeto com campos (sessão, carrinho) |
+| **list** | `LPUSH`, `RPOP`, `LRANGE` | fila simples, últimos N itens |
+| **set** | `SADD`, `SISMEMBER`, `SINTER` | conjuntos sem repetição (tags, quem já votou) |
+| **sorted set** | `ZADD`, `ZRANGE`, `ZREMRANGEBYSCORE` | ranking, janela deslizante por tempo, agendamento |
+| **stream** | `XADD`, `XREADGROUP`, `XACK` | log de eventos com grupos de consumidores |
+
+Toda chave pode ter **expiração**: `SET sessao:abc ... EX 1800`, ou `EXPIRE chave 60` depois. `TTL chave` mostra quanto falta. Chaves expiradas somem sozinhas, o que torna o Redis natural para dados temporários.
+
+## Atomicidade: o que faz o Redis ser útil
+
+O Redis executa os comandos **um de cada vez**, num único fluxo de execução (há threads para E/S de rede, mas os comandos em si não se intercalam). Consequências:
+
+- **`INCR` é atômico.** Dez instâncias incrementando o mesmo contador nunca perdem uma contagem, sem lock nenhum.
+- **`SET chave valor NX PX 30000`** grava **só se não existir** (`NX`) e expira em 30 s (`PX`). Em um comando: é a base de locks e de deduplicação ("já processei esta requisição?").
+- Um comando lento (um `KEYS *` numa base grande) **bloqueia todos os outros**. Use `SCAN` para varrer chaves.
+
+Para combinar comandos, há três ferramentas diferentes:
+
+| | O que faz | Atômico? |
+|---|---|---|
+| **pipeline** | envia vários comandos de uma vez e lê as respostas no final | não: só economiza idas à rede |
+| **`MULTI` / `EXEC`** | enfileira comandos e os executa juntos, sem intercalar | sim, mas **sem rollback** se um falhar |
+| **script Lua** (`EVAL`) | lógica com `if` executada no servidor | sim; o servidor fica ocupado enquanto roda, então mantenha curto |
+
+## Rate limit distribuído
+
+No módulo 11, o rate limit por IP morava na memória de cada instância. Com três instâncias, cada uma tinha o seu balde. Com o Redis, o contador é um só. A versão mais simples é a **janela fixa**: um contador por cliente por minuto.
+
+```java
+@Component
+public class LimitadorDeRequisicoes {
+
+    // INCR e PEXPIRE no mesmo script: se a instância cair entre os dois,
+    // não sobra uma chave sem expiração bloqueando o cliente para sempre
+    private static final RedisScript<Long> INCREMENTAR = RedisScript.of("""
+            local atual = redis.call('INCR', KEYS[1])
+            if atual == 1 then
+              redis.call('PEXPIRE', KEYS[1], ARGV[1])
+            end
+            return atual""", Long.class);
+
+    private static final long LIMITE_POR_MINUTO = 100;
+
+    private final StringRedisTemplate redis;
+
+    public LimitadorDeRequisicoes(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
+
+    public boolean permitir(String cliente) {
+        long minuto = Instant.now().getEpochSecond() / 60;
+        String chave = "limite:" + cliente + ":" + minuto;
+        Long usos = redis.execute(INCREMENTAR, List.of(chave), "60000");
+        return usos != null && usos <= LIMITE_POR_MINUTO;
+    }
+}
+```
+
+A janela fixa deixa passar até o dobro do limite na virada do minuto (100 no fim de um, 100 no começo do outro). Se isso importa, use uma **janela deslizante** com sorted set (cada requisição é um membro com o horário como *score*; `ZREMRANGEBYSCORE` remove as antigas e `ZCARD` conta) ou um token bucket, como o do Bucket4j com backend Redis.
+
+## Lock distribuído, e por que desconfiar dele
+
+Duas instâncias rodam o mesmo job agendado; só uma deveria processar o fechamento do dia. O lock no Redis:
+
+```java
+public Optional<String> tentarTravar(String recurso, Duration validade) {
+    String dono = UUID.randomUUID().toString();   // identifica QUEM travou
+    Boolean travou = redis.opsForValue().setIfAbsent("lock:" + recurso, dono, validade);
+    return Boolean.TRUE.equals(travou) ? Optional.of(dono) : Optional.empty();
+}
+
+private static final RedisScript<Long> LIBERAR = RedisScript.of("""
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          return redis.call('DEL', KEYS[1])
+        end
+        return 0""", Long.class);
+
+public void liberar(String recurso, String dono) {
+    redis.execute(LIBERAR, List.of("lock:" + recurso), dono);   // só apaga se ainda for o dono
+}
+```
+
+O valor aleatório e o script de liberação evitam um bug clássico: o lock do processo A expira, B adquire, e A, ao terminar, apaga o lock **de B**.
+
+Mas há um problema mais fundo. O lock **expira**, e um processo não sabe quando está pausado. Uma pausa de GC, uma VM congelada ou um pacote atrasado podem fazer o lock vencer enquanto o dono ainda acha que o tem:
+
+<Figura legenda="Sem fencing token, dois processos escrevem acreditando ter o lock. Com o token, o recurso rejeita o atrasado">
+<svg viewBox="0 0 680 260" width="680" role="img" aria-label="Linha do tempo: cliente 1 obtém o lock com token 33 e pausa; o lock expira; cliente 2 obtém token 34 e grava; cliente 1 volta e tenta gravar com 33, e o armazenamento rejeita">
+  <defs><marker id="m1502" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="44" class="d-title">Cliente 1</text>
+  <text x="10" y="114" class="d-title">Cliente 2</text>
+  <text x="10" y="194" class="d-title">Recurso</text>
+  <path d="M100 40 H670" class="d-line"/>
+  <path d="M100 110 H670" class="d-line"/>
+  <path d="M100 190 H670" class="d-line"/>
+  <rect x="110" y="24" width="90" height="30" rx="6" class="d-ok"/><text x="155" y="44" text-anchor="middle" class="d-mono">lock: 33</text>
+  <rect x="210" y="24" width="210" height="30" rx="6" class="d-accent"/><text x="315" y="44" text-anchor="middle" class="d-label">pausa de GC (o lock expira)</text>
+  <rect x="300" y="94" width="90" height="30" rx="6" class="d-ok"/><text x="345" y="114" text-anchor="middle" class="d-mono">lock: 34</text>
+  <path d="M400 124 L440 176" class="d-line" marker-end="url(#m1502)"/>
+  <rect x="420" y="176" width="110" height="30" rx="6" class="d-ok"/><text x="475" y="196" text-anchor="middle" class="d-mono">grava (34)</text>
+  <path d="M430 54 L570 176" class="d-line" marker-end="url(#m1502)"/>
+  <rect x="545" y="176" width="125" height="30" rx="6" class="d-violet"/><text x="607" y="196" text-anchor="middle" class="d-mono">33 negado</text>
+  <text x="10" y="235" class="d-label">O recurso guarda o maior token já visto e recusa escrita com token menor.</text>
+</svg>
+</Figura>
+
+Martin Kleppmann analisou esse problema no texto *How to do distributed locking* (2016), uma crítica ao **Redlock**, o algoritmo proposto pelo criador do Redis para locks sobre vários nós independentes. O argumento central: um lock baseado em tempo não garante exclusão mútua diante de pausas e relógios imprecisos; para **correção**, o recurso protegido precisa verificar um **fencing token**, um número que cresce a cada aquisição. Nem o `SET NX PX` nem o Redlock geram esse número: ele precisa vir de algo com ordem garantida (uma sequência do banco, por exemplo), e o recurso precisa saber verificá-lo. O criador do Redis, Salvatore Sanfilippo, publicou uma resposta (*Is Redlock safe?*), e o debate é leitura recomendada.
+
+A conclusão prática:
+
+- Lock no Redis para **eficiência** (evitar trabalho duplicado, em que rodar duas vezes custa só processamento): ótimo.
+- Lock para **correção** (dois processos escrevendo quebram o dado): o recurso precisa se defender. Um `UPDATE ... WHERE versao = ?` (lock otimista, módulo 9), uma constraint única ou um fencing token resolvem; o lock sozinho, não.
+
+## Outros usos
+
+- **Sessões.** O Spring Session com Redis guarda a sessão HTTP fora da instância: qualquer instância atende qualquer usuário.
+- **Filas leves com streams.** `XADD` acrescenta, `XREADGROUP` distribui entre consumidores de um grupo, `XACK` confirma. Mensagens não confirmadas ficam numa lista de pendentes e podem ser reassumidas (`XAUTOCLAIM`). Serve para volumes moderados; para retenção longa, reprocessamento e alto volume, o Kafka (módulo 12) é a ferramenta.
+- **Deduplicação.** `SET processado:<id> 1 NX EX 86400` responde "já vi esta mensagem?" numa operação.
+
+## Persistência, memória e o que o Redis não é
+
+O Redis guarda tudo em memória, e pode persistir em disco de dois jeitos:
+
+| | RDB | AOF |
+|---|---|---|
+| Como | fotografia periódica da base | registro de cada escrita |
+| Perda numa queda | tudo desde a última fotografia | com `appendfsync everysec`, cerca de 1 s |
+| Restaurar | rápido | mais lento (replica as escritas) |
+
+Os dois podem ser usados juntos. Mesmo assim, o Redis **não é, por padrão, um banco primário**: a replicação é assíncrona (uma falha do primário pode perder as últimas escritas) e o volume de dados é limitado pela memória. Trate o que está nele como algo que pode ser reconstruído.
+
+<Callout tipo="erro" titulo="Redis como cache sem política de memória">
+A política padrão de memória cheia (`maxmemory-policy`) é `noeviction`: ao atingir o limite, as **escritas falham**. Para um Redis usado como cache, configure `maxmemory` e uma política como `allkeys-lru` ou `allkeys-lfu`, para que as chaves menos usadas sejam descartadas.
+</Callout>
+
+<Callout tipo="novidade" titulo="A licença do Redis e o Valkey">
+Em 2024, o Redis deixou a licença BSD e passou a licenças de código disponível (RSALv2 e SSPLv1). Em resposta, a Linux Foundation criou o **Valkey**, um fork a partir do Redis 7.2, com licença BSD. Em 2025, o **Redis 8** voltou a oferecer uma opção open source, a **AGPLv3**. Para o código da aplicação, os dois falam o mesmo protocolo nos comandos desta aula; a escolha costuma ser do time de plataforma ou do provedor de nuvem. Confira a licença vigente na documentação oficial antes de decidir.
+</Callout>
+
+## Spring Data Redis
+
+O `spring-boot-starter-data-redis` configura o cliente **Lettuce** (o padrão) e os templates:
+
+- `StringRedisTemplate`: chaves e valores como `String`; você serializa o JSON. É o mais previsível.
+- `RedisTemplate` com serializadores configurados, para objetos.
+- `opsForValue()`, `opsForHash()`, `opsForZSet()`, `opsForStream()`: uma API por estrutura.
+- `execute(RedisScript, chaves, argumentos)` para Lua; `executePipelined(...)` para pipelines.
+
+Nos testes, o Testcontainers sobe um Redis real (módulo 10), com `@ServiceConnection`.
+
+<Callout tipo="dica" titulo="Redis Cluster e chaves relacionadas">
+No Redis Cluster, as chaves são distribuídas em 16384 *hash slots*. Comandos com várias chaves (e scripts Lua) só funcionam se todas estiverem no mesmo slot. Use *hash tags*: só o trecho entre chaves entra no cálculo, então `carrinho:{usuario-42}` e `sessao:{usuario-42}` caem no mesmo slot.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você faria um rate limit com várias instâncias?" ou "Como garantir que só uma instância rode o job?"
+
+- Contador no Redis com `INCR` e expiração **no mesmo script** Lua; janela fixa × deslizante (sorted set) × token bucket.
+- Lock com `SET NX PX`, valor aleatório e liberação condicional via Lua.
+- **O limite do lock**: pausas fazem ele expirar; para correção, **fencing token** ou verificação no próprio recurso (versão, constraint). Citar a discussão Kleppmann × Redlock mostra maturidade.
+- O Redis é estado compartilhado de curta duração, não banco primário.
+</Callout>
+
+<Quiz
+  id="15-redis"
+  questoes={[
+    {
+      pergunta: 'Por que fazer INCR e PEXPIRE no mesmo script Lua no rate limiter?',
+      opcoes: ['Por desempenho apenas', 'Para que uma queda entre os dois comandos não deixe uma chave sem expiração', 'Porque o INCR não é atômico', 'Porque o Lettuce exige'],
+      correta: 1,
+      explicacao: 'O script é atômico. Com dois comandos separados, uma falha no meio deixaria o contador eterno, bloqueando o cliente.',
+    },
+    {
+      pergunta: 'Por que o lock guarda um valor aleatório e a liberação usa um script que compara esse valor?',
+      opcoes: ['Para criptografar o lock', 'Para que um processo cujo lock já expirou não apague o lock que agora pertence a outro', 'Para o lock durar mais', 'Para funcionar no Redis Cluster'],
+      correta: 1,
+      explicacao: 'Sem a comparação, o DEL de quem perdeu o lock removeria o lock de quem o adquiriu depois.',
+    },
+    {
+      pergunta: 'O cliente 1 obtém o lock, sofre uma pausa de GC e o lock expira. O cliente 2 obtém o lock e grava. O que impede o cliente 1 de sobrescrever ao acordar?',
+      opcoes: ['Nada; por isso o recurso precisa rejeitar escritas com fencing token antigo', 'O Redis cancela a escrita do cliente 1', 'O TTL do lock', 'O Redlock garante que isso não acontece'],
+      correta: 0,
+      explicacao: 'O lock sozinho não resolve. O recurso guarda o maior token visto e recusa tokens menores.',
+    },
+    {
+      pergunta: 'Qual a diferença entre pipeline e MULTI/EXEC?',
+      opcoes: ['Nenhuma', 'Pipeline só economiza idas à rede; MULTI/EXEC executa o bloco sem intercalar outros comandos', 'Pipeline tem rollback', 'MULTI/EXEC é mais rápido sempre'],
+      correta: 1,
+      explicacao: 'Pipeline não é atômico. MULTI/EXEC é, mas sem rollback se um comando falhar.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Redis: estruturas em memória compartilhadas (string, hash, list, set, sorted set, stream), com **expiração** por chave.
+- Comandos executam **um de cada vez**: `INCR` e `SET NX PX` são atômicos; comandos lentos bloqueiam todos.
+- Pipeline economiza rede; `MULTI`/`EXEC` não intercala; **Lua** dá lógica condicional atômica.
+- Rate limit: contador + expiração no mesmo script; janela deslizante com sorted set.
+- Lock com `SET NX PX` serve para **eficiência**; para **correção**, **fencing token** ou verificação no recurso.
+- RDB e AOF reduzem a perda, mas o Redis não é banco primário por padrão; configure `maxmemory-policy` num cache.
+- Licença: Redis 8 com opção AGPLv3; o fork **Valkey** existe. Spring Data Redis usa o **Lettuce**.
+
+## Referências
+
+- Documentação do Redis — *Data types*, *Persistence*, *Key eviction*, *Distributed locks*
+- Martin Kleppmann — *How to do distributed locking* (2016) e *Designing Data-Intensive Applications*, capítulo 8
+- Documentação do Spring Data Redis — *Redis Support* e *Scripting*
+- Documentação do Valkey

@@ -1,0 +1,345 @@
+---
+titulo: Regras de arquitetura com ArchUnit
+codigo: "10.04"
+resumo: Transforme cinco decisões de arquitetura de um time em regras ArchUnit que quebram o build. Cada regra precisa aceitar um projeto limpo e acusar o projeto que a viola — regra que aceita tudo, ou recusa tudo, não protege nada.
+modulo: 10-testes
+ordem: 4
+dificuldade: medio
+tempo: 2h
+conceitos: [ArchUnit, arquitetura em camadas, dependências, ciclos, injeção por construtor]
+aulas: [10-testes/06-tdd-e-arquitetura, 08-spring-boot/03-ioc-e-injecao-de-dependencias, 09-persistencia/05-transacoes-com-spring]
+java:
+  modulo: m10-testes
+  arquivos: [src/test/java/dev/trilhajava/m10/arquitetura/RegrasDeArquitetura.java]
+---
+
+## Contexto
+
+Um time de pagamentos definiu, num documento do Confluence, as regras de arquitetura dos seus serviços. Um ano depois, ninguém lembrava do documento: controllers acessavam repositórios, entidades importavam classes do Spring e dois pacotes do domínio dependiam um do outro. Cada atalho parecia inofensivo sozinho; juntos, tornaram impossível trocar o banco, testar o domínio sem subir o Spring ou separar o serviço em dois.
+
+O tech lead pediu que as regras virassem **testes**, rodando no build de cada serviço: quem quebrar uma decisão de arquitetura quebra o build, com uma mensagem que explica o porquê. Você vai escrever essas regras.
+
+## O que você vai praticar
+
+- **ArchUnit: arquitetura como teste.** O ArchUnit importa o bytecode das classes (`new ClassFileImporter().importPackages(...)`) e verifica regras sobre ele: quem depende de quem, quem tem qual anotação, onde há ciclos. Uma regra é um objeto `ArchRule`; `regra.check(classes)` lança `AssertionError` com a lista de violações, e `regra.evaluate(classes).hasViolation()` só responde sim ou não. Veja [TDD e testes de arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+- **As três portas de entrada da API.** `layeredArchitecture()` descreve camadas e quem pode acessar quem; `noClasses()`, `noFields()` e `noMethods()` escrevem proibições ("nenhuma classe que ... deve ..."); `slices()` corta o código em fatias e procura ciclos entre elas. Todas terminam com `.because("...")`, o motivo que aparece na mensagem de erro. Veja [TDD e testes de arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+- **Arquitetura em camadas com o domínio no centro.** As dependências apontam para dentro: a `api` chama a `aplicacao`, que usa o `dominio`; a `infra` implementa interfaces (portas) declaradas no domínio e é plugada pelo Spring. Ninguém chama a `infra` direto, e o domínio não conhece framework. Veja [TDD e testes de arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+- **Injeção por construtor.** Um `@Autowired` num campo esconde a dependência, impede o campo de ser `final` e obriga o teste a usar reflexão ou subir o Spring. Pelo construtor, a dependência fica explícita e o teste é um `new`. Veja [IoC e injeção de dependências](../../../aulas/08-spring-boot/03-ioc-e-injecao-de-dependencias/).
+- **Onde começa e termina a transação.** `@Transactional` pertence ao caso de uso (a classe da `aplicacao`), que sabe quais operações precisam dar certo juntas. No controller, a transação engole a serialização da resposta e mistura HTTP com consistência de dados. Veja [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/).
+- **Uma regra também precisa falhar.** Uma regra escrita errado pode aceitar tudo, e ninguém percebe até o estrago estar feito. Por isso cada regra sua é conferida contra um projeto que a respeita **e** contra um que a viola de propósito, como o vermelho do TDD. Veja [TDD e testes de arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `src/main/java/dev/trilhajava/m10/arquitetura/exemplos` (não precisa mudar), há **seis mini aplicações** de uma conta bancária, todas com o mesmo formato:
+
+```text
+<raiz>
+├── api          ContaController         @RestController; recebe o ServicoDeContas pelo construtor
+├── aplicacao    ServicoDeContas         @Service; método depositar(...) com @Transactional
+├── dominio
+│   ├── cliente  Cliente                 classe simples, sem anotações
+│   └── conta    Conta                   conhece o Cliente (titular)
+│                RepositorioDeContas     interface (a porta)
+└── infra        RepositorioDeContasEmMemoria   @Repository; implementa RepositorioDeContas
+```
+
+| Raiz (depois de `dev.trilhajava.m10.arquitetura.exemplos.`) | O que tem de diferente |
+|---|---|
+| `limpo` | nada: segue todas as regras |
+| `violacao.camadas` | o `ContaController` recebe e usa o `RepositorioDeContasEmMemoria` (da `infra`) direto, pulando o serviço |
+| `violacao.dominio` | a `Conta` é anotada com `@Component` (do Spring) |
+| `violacao.injecao` | o `ServicoDeContas` recebe o repositório num campo com `@Autowired`, sem construtor |
+| `violacao.transacao` | o método `depositar` do `ContaController` tem `@Transactional` |
+| `violacao.ciclo` | o `Cliente` passa a ter uma `List<Conta>`; como a `Conta` já conhece o `Cliente`, `dominio.cliente` e `dominio.conta` dependem um do outro |
+
+Cada exemplo de violação quebra **exatamente uma** regra; todo o resto é idêntico ao `limpo`. O `pom.xml` já tem o ArchUnit (`archunit-junit5`) e as anotações do Spring.
+
+### O que você implementa
+
+Em `src/test/java/dev/trilhajava/m10/arquitetura/RegrasDeArquitetura.java` (a classe já existe, vazia), cinco métodos públicos e estáticos. Cada um recebe o **pacote raiz** de uma aplicação e devolve **uma** regra para ela:
+
+```java
+public static ArchRule camadas(String raiz)              // regra 1
+public static ArchRule dominioIndependente(String raiz)  // regra 2
+public static ArchRule semInjecaoEmCampo(String raiz)    // regra 3
+public static ArchRule transacoesForaDaApi(String raiz)  // regra 4
+public static ArchRule semCiclosNoDominio(String raiz)   // regra 5
+```
+
+- A raiz vem **sem** os `..` do final: `"dev.trilhajava.m10.arquitetura.exemplos.limpo"`. As camadas são os subpacotes `raiz + ".api"`, `raiz + ".aplicacao"`, `raiz + ".dominio"` e `raiz + ".infra"`, incluindo os subpacotes deles.
+- Receber a raiz como parâmetro é o que permite aplicar **a mesma regra** aos seis exemplos. Num projeto de verdade, você a usaria com um valor fixo (veja os desafios).
+- Cada regra tem um `.because(...)` com o motivo, em português. É a frase que o desenvolvedor vai ler quando o build quebrar.
+- A classe fica em `src/test/java` porque regras de arquitetura são testes: rodam no build e não vão para produção.
+
+| Regra aplicada a... | `limpo` | a violação dela | as outras quatro violações |
+|---|---|---|---|
+| qualquer uma das cinco | passa | **falha** | passa |
+
+## Regras
+
+1. **Camadas (`camadas`).** Quatro camadas, com estas permissões:
+
+   | Camada | Pode ser acessada por |
+   |---|---|
+   | `api` | ninguém |
+   | `aplicacao` | `api` e `infra` (adaptadores podem implementar portas da aplicação) |
+   | `dominio` | `api`, `aplicacao` e `infra` |
+   | `infra` | ninguém (o Spring a pluga por trás das interfaces) |
+
+   **O problema que evita:** o controller que usa o repositório concreto pula o caso de uso (e a transação, e as validações dele) e amarra a API à tecnologia de persistência; trocar o banco passa a exigir mexer nos controllers. Só contam as dependências **entre** as quatro camadas: `api` usar `java.math.BigDecimal` ou anotações do Spring MVC não é violação. **Deve pegar** `violacao.camadas`, onde o `ContaController` tem um campo, um parâmetro de construtor e duas chamadas para `RepositorioDeContasEmMemoria`.
+
+2. **Domínio independente (`dominioIndependente`).** Nenhuma classe de `dominio` (e subpacotes) depende de classes em `org.springframework..` nem nas camadas `api`, `aplicacao` ou `infra`. "Depender" inclui qualquer uso: anotação, herança, campo, parâmetro, chamada. **O problema que evita:** o domínio é onde estão as regras de negócio; se ele importa o framework, não dá para testá-lo sem o Spring nem sobreviver a uma troca de framework, e se importa as camadas de fora, a seta das dependências se inverte. **Deve pegar** `violacao.dominio`, onde a `Conta` é anotada com `@Component`.
+
+3. **Sem injeção em campo (`semInjecaoEmCampo`).** Nenhum campo de nenhuma classe da aplicação (qualquer pacote sob a raiz) é anotado com `@Autowired` (`org.springframework.beans.factory.annotation.Autowired`). **O problema que evita:** dependência escondida, campo que não pode ser `final` e classe que só funciona dentro do Spring; no teste, é preciso reflexão ou um contexto inteiro só para criar o objeto. **Deve pegar** `violacao.injecao`, onde `ServicoDeContas.contas` é um campo `@Autowired`. `@Autowired` num **construtor** não é violação.
+
+4. **Transações fora da API (`transacoesForaDaApi`).** `@Transactional` (`org.springframework.transaction.annotation.Transactional`) não aparece em `api`: **nem** na classe, **nem** em métodos. **O problema que evita:** a transação que abre no controller fica aberta enquanto a resposta é montada (e, com JPA, carrega relacionamentos preguiçosos na serialização), e a decisão de "o que precisa dar certo junto" sai do caso de uso, que é quem sabe disso. **Deve pegar** `violacao.transacao`, onde o **método** `depositar` do controller tem `@Transactional`. Uma regra que olha só as classes deixa esse caso passar; a regra precisa cobrir os dois lugares.
+
+5. **Sem ciclos no domínio (`semCiclosNoDominio`).** Cada subpacote direto de `dominio` (`dominio.conta`, `dominio.cliente`, ...) é uma fatia, e as fatias não formam ciclos: se `conta` depende de `cliente`, `cliente` não pode depender, direta ou indiretamente, de `conta`. Dependências **dentro** de uma mesma fatia (inclusive dos subpacotes dela) são livres. **O problema que evita:** dois pacotes em ciclo são, na prática, um só: não dá para entender, testar ou extrair um sem o outro, e qualquer mudança se propaga nos dois sentidos. **Deve pegar** `violacao.ciclo` (`cliente → conta → cliente`). No `limpo`, `conta → cliente` sozinho não é ciclo e passa.
+
+## Passo a passo sugerido
+
+Uma regra por vez, e experimente depois de cada uma (veja **Experimente**, logo abaixo).
+
+1. **Monte um jeito de experimentar.** Crie, em `src/test/java/dev/trilhajava/m10/arquitetura`, a classe `ExperimenteRegras` da seção seguinte (ou um teste JUnit seu que faça o mesmo). Comece com o mapa de regras vazio e confira que o programa roda e importa os seis pacotes.
+2. **A regra mais simples primeiro: injeção (regra 3).** `noFields().that()...should().beAnnotatedWith(Autowired.class)`. Rode: `limpo` passa, `violacao.injecao` falha.
+3. **Domínio independente (regra 2).** `noClasses().that().resideInAPackage(...)` com `.should().dependOnClassesThat().resideInAnyPackage(...)`. Confira que ela passa em `violacao.camadas`: lá a `api` usa a `infra`, mas o domínio continua limpo.
+4. **Transações (regra 4).** Escreva primeiro só a proibição nas classes e rode contra `violacao.transacao`: ela **passa**, e é exatamente esse o erro que o exercício quer que você veja. Depois cubra os métodos também.
+5. **Ciclos (regra 5).** `slices().matching(...)`, com o `(*)` no lugar certo. Experimente pôr o `(*)` um nível acima (em `raiz + ".(*).."`) e veja o que muda.
+6. **Camadas (regra 1).** `layeredArchitecture()`, uma `.layer(...)` por camada e um `whereLayer(...)` por linha da tabela. Rode nos seis pacotes: deve falhar **só** em `violacao.camadas`.
+7. **Leia as mensagens.** Troque o `evaluate` por `check` numa violação de cada vez e leia o que o ArchUnit escreve: é o que o seu time vai ler no build.
+8. **Brinque.** Crie uma violação sua (copie o `limpo` para `violacao.minha` e quebre alguma coisa) e veja qual regra acusa.
+
+## Experimente
+
+As regras ficam em `src/test/java`, então o programa de experimento também: no IntelliJ, a seta verde ao lado do `main` roda com as dependências de teste (ArchUnit incluído). O programa aplica as cinco regras aos seis pacotes e mostra o que passa e o que falha:
+
+```java
+package dev.trilhajava.m10.arquitetura;
+
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.lang.ArchRule;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+
+public class ExperimenteRegras {
+
+    static final String EXEMPLOS = "dev.trilhajava.m10.arquitetura.exemplos";
+
+    public static void main(String[] args) {
+        Map<String, Function<String, ArchRule>> regras = new LinkedHashMap<>();
+        regras.put("camadas", RegrasDeArquitetura::camadas);
+        regras.put("dominioIndependente", RegrasDeArquitetura::dominioIndependente);
+        regras.put("semInjecaoEmCampo", RegrasDeArquitetura::semInjecaoEmCampo);
+        regras.put("transacoesForaDaApi", RegrasDeArquitetura::transacoesForaDaApi);
+        regras.put("semCiclosNoDominio", RegrasDeArquitetura::semCiclosNoDominio);
+
+        List<String> pacotes = List.of("limpo", "violacao.camadas", "violacao.dominio",
+                "violacao.injecao", "violacao.transacao", "violacao.ciclo");
+
+        for (String pacote : pacotes) {
+            String raiz = EXEMPLOS + "." + pacote;
+            JavaClasses classes = new ClassFileImporter().importPackages(raiz);
+            System.out.println(pacote);
+            regras.forEach((nome, regra) -> {
+                boolean violou = regra.apply(raiz).evaluate(classes).hasViolation();
+                System.out.println("  " + (violou ? "FALHA " : "passa ") + nome);
+            });
+        }
+    }
+}
+```
+
+Com as cinco regras prontas, a saída esperada é esta (uma linha `INFO ... PluginLoader` do ArchUnit pode aparecer antes):
+
+```text
+limpo
+  passa camadas
+  passa dominioIndependente
+  passa semInjecaoEmCampo
+  passa transacoesForaDaApi
+  passa semCiclosNoDominio
+violacao.camadas
+  FALHA camadas
+  passa dominioIndependente
+  passa semInjecaoEmCampo
+  passa transacoesForaDaApi
+  passa semCiclosNoDominio
+violacao.dominio
+  passa camadas
+  FALHA dominioIndependente
+  passa semInjecaoEmCampo
+  passa transacoesForaDaApi
+  passa semCiclosNoDominio
+violacao.injecao
+  passa camadas
+  passa dominioIndependente
+  FALHA semInjecaoEmCampo
+  passa transacoesForaDaApi
+  passa semCiclosNoDominio
+violacao.transacao
+  passa camadas
+  passa dominioIndependente
+  passa semInjecaoEmCampo
+  FALHA transacoesForaDaApi
+  passa semCiclosNoDominio
+violacao.ciclo
+  passa camadas
+  passa dominioIndependente
+  passa semInjecaoEmCampo
+  passa transacoesForaDaApi
+  FALHA semCiclosNoDominio
+```
+
+Ou seja, um `FALHA` por bloco de violação, na regra correspondente, e nenhum no `limpo`. Enquanto uma regra ainda não existe, tire a linha dela do mapa.
+
+**Para ler a mensagem**, troque o `evaluate(...)` por `check(...)` num pacote de violação: `RegrasDeArquitetura.semInjecaoEmCampo(raiz).check(classes)` lança um `AssertionError`. Estas são mensagens reais, da solução de referência (as suas mudam no texto do `because` e na descrição da regra; as linhas de violação devem ser as mesmas):
+
+`semInjecaoEmCampo` em `violacao.injecao`:
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'no fields that are declared in classes that reside in a package 'dev.trilhajava.m10.arquitetura.exemplos.violacao.injecao..' should be annotated with @Autowired, because injeção por construtor deixa as dependências explícitas, os campos final e o teste sem Spring' was violated (1 times):
+Field <dev.trilhajava.m10.arquitetura.exemplos.violacao.injecao.aplicacao.ServicoDeContas.contas> is annotated with @Autowired in (ServicoDeContas.java:0)
+```
+
+`transacoesForaDaApi` em `violacao.transacao` (uma regra composta: a descrição junta as duas partes com `and`):
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'no classes that reside in a package 'dev.trilhajava.m10.arquitetura.exemplos.violacao.transacao.api..' should be annotated with @Transactional and no methods that are declared in classes that reside in a package 'dev.trilhajava.m10.arquitetura.exemplos.violacao.transacao.api..' should be annotated with @Transactional, because a fronteira da transação é o caso de uso (aplicacao), não o controller' was violated (1 times):
+Method <dev.trilhajava.m10.arquitetura.exemplos.violacao.transacao.api.ContaController.depositar(long, java.math.BigDecimal)> is annotated with @Transactional in (ContaController.java:24)
+```
+
+`camadas` em `violacao.camadas` (4 violações: o campo, o parâmetro do construtor e as duas chamadas):
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'Layered architecture considering only dependencies in layers, consisting of
+layer 'API' ('dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.api..')
+layer 'Aplicação' ('dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.aplicacao..')
+layer 'Domínio' ('dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.dominio..')
+layer 'Infra' ('dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra..')
+where layer 'API' may not be accessed by any layer
+where layer 'Aplicação' may only be accessed by layers ['API', 'Infra']
+where layer 'Infra' may not be accessed by any layer
+where layer 'Domínio' may only be accessed by layers ['API', 'Aplicação', 'Infra'], because as dependências apontam para o domínio; a infra é plugada por interfaces' was violated (4 times):
+Constructor <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.api.ContaController.<init>(dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra.RepositorioDeContasEmMemoria)> has parameter of type <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra.RepositorioDeContasEmMemoria> in (ContaController.java:0)
+Field <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.api.ContaController.repositorio> has type <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra.RepositorioDeContasEmMemoria> in (ContaController.java:0)
+Method <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.api.ContaController.depositar(long, java.math.BigDecimal)> calls method <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra.RepositorioDeContasEmMemoria.buscar(long)> in (ContaController.java:23)
+Method <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.api.ContaController.depositar(long, java.math.BigDecimal)> calls method <dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.infra.RepositorioDeContasEmMemoria.salvar(dev.trilhajava.m10.arquitetura.exemplos.violacao.camadas.dominio.conta.Conta)> in (ContaController.java:25)
+```
+
+`semCiclosNoDominio` em `violacao.ciclo` (o ArchUnit mostra o ciclo e, para cada fatia, as dependências que o formam):
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching 'dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.(*)..' should be free of cycles, because ciclos entre módulos do domínio impedem entender, testar e separar cada um' was violated (1 times):
+Cycle detected: Slice cliente -> 
+                Slice conta -> 
+                Slice cliente
+  1. Dependencies of Slice cliente
+    - Field <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente.contas> has generic type <java.util.List<dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta>> with type argument depending on <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta> in (Cliente.java:0)
+    - Method <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente.contas()> has generic return type <java.util.List<dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta>> with type argument depending on <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta> in (Cliente.java:0)
+  2. Dependencies of Slice conta
+    - Constructor <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta.<init>(long, dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente)> has parameter of type <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente> in (Conta.java:0)
+    - Field <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta.titular> has type <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente> in (Conta.java:0)
+    - Method <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.conta.Conta.titular()> has return type <dev.trilhajava.m10.arquitetura.exemplos.violacao.ciclo.dominio.cliente.Cliente> in (Conta.java:0)
+```
+
+O `:0` aparece em campos, assinaturas e anotações de classe, que não têm linha no bytecode; chamadas de método trazem a linha de verdade.
+
+Dois recados que o ArchUnit dá quando a regra está **mal escrita**, também reais:
+
+- Pacote digitado errado no `that()` (por exemplo `".dominoi.."`): a regra não encontra classe nenhuma e falha até no `limpo`. A mensagem começa assim (e continua explicando como desligar essa checagem, o que você **não** quer fazer):
+
+  ```text
+  Rule 'no classes that reside in a package 'dev.trilhajava.m10.arquitetura.exemplos.limpo.dominoi..' should depend on classes that reside in a package 'org.springframework..'' failed to check any classes. This means either that no classes have been passed to the rule at all, or that no classes passed to the rule matched the `that()` clause.
+  ```
+
+- Pacote digitado errado numa camada (por exemplo `".aplicaco.."`): a regra de camadas falha até no `limpo`, com a linha `Layer 'Aplicação' is empty`.
+
+O perigoso é o erro **sem** recado: um pacote digitado errado no `should()` (`"org.springframwork.."`) faz a regra 2 passar em tudo, inclusive em `violacao.dominio`. Só o teste contra a violação pega esse erro.
+
+## Critérios de aceite
+
+- [ ] Cada uma das cinco regras passa no `limpo`, falha na violação correspondente e passa nas outras quatro (a saída do `ExperimenteRegras` fica igual à de cima).
+- [ ] Cada regra tem um `.because(...)` que explica o motivo para quem quebrou o build.
+- [ ] Nas violações, as linhas da mensagem apontam as mesmas classes e membros das mensagens acima.
+- [ ] Você sabe explicar, para cada exemplo de violação, que problema real ele causaria num serviço em produção.
+
+## Desafios opcionais
+
+- **Use as regras de verdade.** Crie um teste com `@AnalyzeClasses(packages = "dev.trilhajava.m10.arquitetura.exemplos.limpo")` e um campo `@ArchTest static final ArchRule camadas = RegrasDeArquitetura.camadas("dev.trilhajava.m10.arquitetura.exemplos.limpo");` por regra, rode com `mvn test`, e depois aponte para `violacao.camadas` e veja o build quebrar.
+- **Aplique as suas regras ao projeto integrador** (`dev.trilhajava.fintech`): é o que o marco 3 exige.
+- **Regra de nomes:** classes anotadas com `@RestController` ficam em `api` e terminam com `Controller`; classes com `@Repository` ficam em `infra`.
+- **Regra extra:** classes anotadas com `@Entity` só podem estar em `dominio`.
+- **Legado:** use o `FreezingArchRule` para adotar a regra de camadas num projeto que já a viola, sem quebrar o build pelas violações que já existem, mas sem aceitar nenhuma nova.
+
+<Dicas>
+<Dica nivel={1}>
+Três pontos de partida, todos com `import static`: `layeredArchitecture()` (de `com.tngtech.archunit.library.Architectures`) para as camadas; `noClasses()`, `noFields()` e `noMethods()` (de `com.tngtech.archunit.lang.syntax.ArchRuleDefinition`) para as proibições; `slices()` (de `com.tngtech.archunit.library.dependencies.SlicesRuleDefinition`) para os ciclos. Depois do ponto, o autocompletar do IntelliJ mostra o resto da frase: a API do ArchUnit se lê como inglês.
+</Dica>
+<Dica nivel={2}>
+- Pacotes no ArchUnit usam `..` como "qualquer coisa": `raiz + ".api.."` é o pacote `api` e todos os subpacotes dele; `"org.springframework.."` é o Spring inteiro.
+- Camadas: `.layer("API").definedBy(raiz + ".api..")` para cada uma, depois `.whereLayer("API").mayNotBeAccessedByAnyLayer()` e `.whereLayer("Aplicação").mayOnlyBeAccessedByLayers("API", "Infra")`. Comece com `layeredArchitecture().consideringOnlyDependenciesInLayers()` para que `java..` e o Spring não entrem na conta.
+- Campos: `noFields().that().areDeclaredInClassesThat().resideInAPackage(raiz + "..").should().beAnnotatedWith(Autowired.class)`.
+</Dica>
+<Dica nivel={3}>
+- Duas regras numa só: `CompositeArchRule.of(regraDasClasses).and(regraDosMetodos).because("...")`. As classes com `noClasses().that().resideInAPackage(raiz + ".api..").should().beAnnotatedWith(Transactional.class)`; os métodos com `noMethods().that().areDeclaredInClassesThat().resideInAPackage(raiz + ".api..")...`.
+- Ciclos: `slices().matching(raiz + ".dominio.(*)..").should().beFreeOfCycles()`. O `(*)` captura o nome do subpacote logo abaixo de `dominio`, e cada nome diferente vira uma fatia (`conta`, `cliente`).
+- Domínio: `noClasses().that().resideInAPackage(raiz + ".dominio..").should().dependOnClassesThat().resideInAnyPackage("org.springframework..", raiz + ".api..", raiz + ".aplicacao..", raiz + ".infra..")`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m10-testes/solucao/src/test/java/dev/trilhajava/m10/arquitetura/RegrasDeArquitetura.java" />
+
+### Os exemplos de violação
+
+<Tabs>
+<Tab rotulo="camadas">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/arquitetura/exemplos/violacao/camadas/api/ContaController.java" titulo="violacao/camadas: o controller usa a infra" />
+</Tab>
+<Tab rotulo="domínio">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/arquitetura/exemplos/violacao/dominio/dominio/conta/Conta.java" titulo="violacao/dominio: entidade com @Component" />
+</Tab>
+<Tab rotulo="injeção">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/arquitetura/exemplos/violacao/injecao/aplicacao/ServicoDeContas.java" titulo="violacao/injecao: @Autowired no campo" />
+</Tab>
+<Tab rotulo="transação">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/arquitetura/exemplos/violacao/transacao/api/ContaController.java" titulo="violacao/transacao: @Transactional no controller" />
+</Tab>
+<Tab rotulo="ciclo">
+<CodigoJava caminho="m10-testes/solucao/src/main/java/dev/trilhajava/m10/arquitetura/exemplos/violacao/ciclo/dominio/cliente/Cliente.java" titulo="violacao/ciclo: cliente → conta → cliente" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **`consideringOnlyDependenciesInLayers`.** A regra de camadas fala só das dependências entre as quatro camadas. Com `consideringAllDependencies()`, seria preciso declarar também o que cada camada pode acessar fora da aplicação (`java..`, Spring), o que é outra regra, com outro motivo.
+- **`aplicacao` acessível pela `infra`.** Numa arquitetura hexagonal, portas podem morar na aplicação e os adaptadores da infra as implementam. Proibir isso tornaria a regra mais estrita que a arquitetura que ela descreve.
+- **`because` em todas.** Quem quebra a regra lê o motivo na hora, no próprio build. É isso que faz a regra ser respeitada, e não contornada com um `@Disabled`.
+- **Regra composta para `@Transactional`.** A anotação pode estar na classe **ou** no método; verificar só um dos dois deixa uma porta aberta, e é justamente pelo método que o exemplo entra.
+- **O domínio proíbe as três camadas, não só o Spring.** A regra de camadas já cobriria `dominio → infra`, mas a regra 2 é a que o time lê como "o domínio é puro"; repetir as camadas nela deixa a intenção inteira num lugar só, e ela continua valendo se a regra de camadas mudar.
+- **Testar a regra contra uma violação.** O ArchUnit 1.x já recusa um `that()` que não encontra classe nenhuma, mas um pacote errado no `should()`, uma camada esquecida ou uma anotação do pacote errado (há um `@Transactional` do Jakarta, também) fazem a regra passar sempre. Só o exemplo de violação prova que ela funciona.
+
+### Alternativas e trade-offs
+
+- **`GeneralCodingRules.NO_CLASSES_SHOULD_USE_FIELD_INJECTION`.** A regra 3 já vem pronta no ArchUnit e cobre também `@Inject`, `@Resource` e `@Value` em campos. Para projetos reais, é a melhor escolha; aqui, escrevê-la à mão ensina a API. Ela não recebe raiz: vale para todas as classes importadas.
+- **Campos `@ArchTest` em vez de métodos.** Num projeto só, o formato da aula (`@AnalyzeClasses` + `@ArchTest static final ArchRule ...`) é mais curto e o JUnit roda cada regra como um teste. Os métodos com raiz existem aqui porque a mesma regra precisa ser aplicada a seis projetos; num time com vários serviços, é exatamente assim que uma biblioteca de regras compartilhada é feita.
+- **`FreezingArchRule`.** `FreezingArchRule.freeze(camadas(raiz))` grava as violações atuais num arquivo e só falha com violações **novas**. É o caminho para adotar regras num legado: o build não quebra no primeiro dia, e a dívida só diminui.
+- **Regras de nome.** `classes().that().areAnnotatedWith(RestController.class).should().haveSimpleNameEndingWith("Controller").andShould().resideInAPackage(raiz + ".api..")`. São baratas e pegam muita coisa, mas ficam frágeis se o time não concordar com a convenção.
+- **`onionArchitecture()`.** Para uma arquitetura hexagonal/cebola declarada, o ArchUnit tem uma DSL própria (`domainModels`, `domainServices`, `applicationServices`, `adapter`), com as permissões já embutidas.
+
+### Avalie sua solução
+
+- Sua regra de camadas continuaria funcionando se o time criasse um pacote `api.v2`? E um pacote `compartilhado`, fora das quatro camadas?
+- O que acontece com a regra de ciclos se o domínio tiver só um subpacote? E se as classes estiverem direto em `dominio`, sem subpacote?
+- Troque, na sua regra 4, o `Transactional` do Spring pelo `jakarta.transaction.Transactional`. Ela ainda pega `violacao.transacao`? Que conclusão isso traz sobre regras que citam anotações?
+- Qual das suas regras é a mais fácil de contornar sem quebrar o build? (Dica: pense em reflexão, em classes fora da raiz ou em pacotes com nomes novos.)
+
+</Solucao>

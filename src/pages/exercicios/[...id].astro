@@ -1,0 +1,249 @@
+---
+import { getEntries, getEntry, render } from 'astro:content';
+import Leitura from '../../layouts/Leitura.astro';
+import Icon from '../../components/Icon.astro';
+import RodarTestes from '../../components/mdx/RodarTestes.astro';
+import { mdxComponents } from '../../components/mdx';
+import { DIFICULDADE_LABEL, getExercicios, pad2, type Exercicio } from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+export async function getStaticPaths() {
+  const exercicios = await getExercicios();
+  return exercicios.map((ex, i) => ({
+    params: { id: ex.id },
+    props: { ex, anterior: exercicios[i - 1], proximo: exercicios[i + 1] },
+  }));
+}
+
+const { ex, anterior, proximo } = Astro.props as { ex: Exercicio; anterior?: Exercicio; proximo?: Exercicio };
+const modulo = (await getEntry(ex.data.modulo))!;
+const aulas = await getEntries(ex.data.aulas);
+const { Content, headings: todos } = await render(ex);
+// No sumário: só as seções do enunciado (h2). Títulos de dentro da solução ficam de fora para não "vazar".
+const headings = [
+  ...todos.filter((h) => h.depth === 2),
+  { depth: 2, slug: 'dicas', text: 'Dicas' },
+  { depth: 2, slug: 'solucao', text: 'Solução' },
+];
+const e = ex.data;
+---
+
+<Leitura title={`${e.codigo} · ${e.titulo}`} description={e.resumo} modulo={modulo} headings={headings} atual={`e:${ex.id}`}>
+  <header slot="header" class="ex-head">
+    <nav class="crumbs" aria-label="Você está em">
+      <a href={url('exercicios')}>Exercícios</a> / <a href={url(`modulos/${modulo.id}`)}>Módulo {pad2(modulo.data.numero)}</a>
+    </nav>
+    <p class="eyebrow">{e.marco ? `Projeto integrador · Marco ${e.marco}` : `Exercício ${e.codigo}`}</p>
+    <h1>{e.titulo}</h1>
+    <p class="lead">{e.resumo}</p>
+    <div class="row meta">
+      {e.marco && <span class="badge marco"><Icon name="flag" size={13} /> Fintech Core</span>}
+      <span class={`badge dif-${e.dificuldade}`}>{DIFICULDADE_LABEL[e.dificuldade]}</span>
+      <span class="badge"><Icon name="clock" size={13} /> {e.tempo}</span>
+      {e.conceitos.map((c) => <span class="badge">{c}</span>)}
+    </div>
+    <div class="status card" data-status-ex={ex.id} data-pagefind-ignore>
+      <p class="st-label">Seu status</p>
+      <div class="st-opts" role="radiogroup" aria-label="Status do exercício">
+        <button type="button" role="radio" data-st="" aria-checked="true">Não iniciado</button>
+        <button type="button" role="radio" data-st="fazendo" aria-checked="false">Fazendo</button>
+        <button type="button" role="radio" data-st="concluido" aria-checked="false">Concluído</button>
+      </div>
+      <p class="st-extra muted" data-st-extra></p>
+    </div>
+    {
+      aulas.length > 0 && (
+        <p class="pre muted">
+          Base teórica:{' '}
+          {aulas.map((a, i) => (
+            <>
+              {i > 0 && ', '}
+              <a href={url(`aulas/${a.id}`)}>{a.data.titulo}</a>
+            </>
+          ))}
+        </p>
+      )
+    }
+  </header>
+
+  <div class="prose" data-exercicio={ex.id}>
+    {e.java && <RodarTestes modulo={e.java.modulo} teste={e.java.teste} arquivos={e.java.arquivos} />}
+    <Content components={mdxComponents} />
+  </div>
+
+  <nav slot="footer" class="pager" aria-label="Navegação entre exercícios" data-pagefind-ignore>
+    {
+      anterior ? (
+        <a class="pg" href={url(`exercicios/${anterior.id}`)}>
+          <small>
+            <Icon name="arrow-left" size={14} /> Anterior
+          </small>
+          <strong>
+            {anterior.data.codigo} · {anterior.data.titulo}
+          </strong>
+        </a>
+      ) : (
+        <span />
+      )
+    }
+    {
+      proximo && (
+        <a class="pg next" href={url(`exercicios/${proximo.id}`)}>
+          <small>
+            Próximo <Icon name="arrow-right" size={14} />
+          </small>
+          <strong>
+            {proximo.data.codigo} · {proximo.data.titulo}
+          </strong>
+        </a>
+      )
+    }
+  </nav>
+</Leitura>
+
+<script>
+  import { aoMudar, marcarExercicio, statusExercicio, toast, type StatusExercicio } from '../../lib/progresso';
+
+  const box = document.querySelector<HTMLElement>('[data-status-ex]');
+  if (box) {
+    const id = box.dataset.statusEx!;
+    const botoes = [...box.querySelectorAll<HTMLButtonElement>('[data-st]')];
+    const extra = box.querySelector<HTMLElement>('[data-st-extra]')!;
+    const render = () => {
+      const s = statusExercicio(id);
+      botoes.forEach((b) => b.setAttribute('aria-checked', String((s?.status ?? '') === b.dataset.st)));
+      const partes = [];
+      if (s?.dicas) partes.push(`${s.dicas} dica(s) aberta(s)`);
+      if (s?.viuSolucao) partes.push('solução visualizada');
+      extra.textContent = partes.join(' · ');
+    };
+    render();
+    aoMudar(render);
+    botoes.forEach((b) =>
+      b.addEventListener('click', () => {
+        marcarExercicio(id, (b.dataset.st || null) as StatusExercicio | null);
+        if (b.dataset.st === 'concluido') toast('Exercício concluído! Compare com a solução de referência para ver outras abordagens.');
+      }),
+    );
+  }
+</script>
+
+<style>
+  .ex-head {
+    margin-bottom: 32px;
+    max-width: var(--measure);
+  }
+  .crumbs {
+    font-size: 0.85rem;
+    color: var(--text-3);
+  }
+  .crumbs a {
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .crumbs a:hover {
+    color: var(--accent);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .meta {
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-top: 22px;
+    padding: 12px 16px;
+  }
+  .st-label {
+    font-weight: 700;
+    font-size: 0.88rem;
+  }
+  .st-opts {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+  }
+  .st-opts button {
+    padding: 5px 14px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-3);
+    font-size: 0.84rem;
+    font-weight: 600;
+  }
+  .st-opts button[aria-checked='true'] {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+  }
+  .st-opts button[data-st='concluido'][aria-checked='true'] {
+    background: var(--ok);
+    color: var(--accent-ink);
+  }
+  .st-opts button[data-st='fazendo'][aria-checked='true'] {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  .st-extra {
+    font-size: 0.82rem;
+  }
+  .pre {
+    margin-top: 14px;
+    font-size: 0.9rem;
+  }
+  .pre a {
+    color: var(--accent);
+  }
+  .pager {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    max-width: var(--measure);
+    margin-top: 56px;
+  }
+  .pg {
+    display: grid;
+    gap: 4px;
+    padding: 14px 18px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    text-decoration: none;
+  }
+  .pg:hover {
+    border-color: var(--accent);
+  }
+  .pg small {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .pg.next {
+    text-align: right;
+    grid-column: 2;
+  }
+  .pg.next small {
+    justify-content: flex-end;
+  }
+  @media (max-width: 600px) {
+    .pager {
+      grid-template-columns: 1fr;
+    }
+    .pg.next {
+      grid-column: 1;
+    }
+    .st-opts button {
+      padding: 5px 10px;
+    }
+  }
+</style>

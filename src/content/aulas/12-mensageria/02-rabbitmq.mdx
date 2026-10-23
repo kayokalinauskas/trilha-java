@@ -1,0 +1,738 @@
+---
+titulo: RabbitMQ na prática com Spring AMQP 4
+descricao: "O modelo AMQP de verdade: exchanges direct, topic, fanout e headers, bindings, quorum queues, ack e nack, prefetch, publisher confirms e dead letter exchange no RabbitMQ 4; Spring AMQP 4 com RabbitTemplate, @RabbitListener e conversor JSON do Jackson 3; e como operar quando a fila cresce e o consumidor não dá conta."
+modulo: 12-mensageria
+ordem: 2
+duracao: 110
+objetivos:
+  - Escolher entre exchange direct, topic, fanout e headers e prever para quais filas uma routing key é copiada
+  - Declarar exchanges, quorum queues, DLX e bindings em código com Declarables e QueueBuilder
+  - Publicar JSON com RabbitTemplate e message_id, e esperar o publisher confirm antes de considerar a mensagem entregue
+  - Consumir com @RabbitListener em ack automático e manual, decidindo entre ack, nack com requeue e nack sem requeue
+  - Ajustar prefetch e concorrência para consumidores lentos e explicar o efeito na vazão e na distribuição do trabalho
+  - Diagnosticar filas crescendo, consumidores lentos, timeouts de ack e erros de conexão e de declaração
+tags: [RabbitMQ, AMQP, Spring AMQP, exchange, quorum queue, DLX, publisher confirms, prefetch]
+flashcards:
+  - frente: Para que serve uma exchange no RabbitMQ?
+    verso: Ela recebe as mensagens do publicador e decide para quais filas copiá-las, pelas regras dos bindings. O publicador nunca escreve direto numa fila; a exchange padrão ("") só simula isso, roteando pela routing key igual ao nome da fila.
+  - frente: Topic exchange - o que casam "*" e "#"?
+    verso: Com routing keys separadas por pontos ("imagem.sp"), "*" casa exatamente uma palavra ("imagem.*") e "#" casa zero ou mais ("#" recebe tudo; "imagem.#" recebe imagem, imagem.sp e imagem.sp.centro).
+  - frente: O que é prefetch e por que 250 é ruim para mensagens lentas?
+    verso: É quantas mensagens não confirmadas o broker empurra para cada consumidor. Com 250 e mensagens de 2 segundos, um consumidor fica com 250 na mão (8 minutos de trabalho) enquanto outros, que chegaram depois, ficam ociosos. Para trabalho lento, prefetch baixo (1 a 10).
+  - frente: O que o Spring faz, por padrão, quando o @RabbitListener lança exceção?
+    verso: No modo AUTO, rejeita a mensagem COM requeue (defaultRequeueRejected = true). Ela volta para a fila e é reentregue na hora. Se a falha for permanente, vira um loop. Saídas - AmqpRejectAndDontRequeueException, default-requeue-rejected=false ou retry limitado.
+  - frente: O que um publisher confirm garante?
+    verso: Que o broker assumiu a responsabilidade pela mensagem. Para quorum queues, o ack sai quando a maioria das réplicas gravou. Sem confirms, convertAndSend só escreve no socket e retorna; se o broker cair nesse instante, a mensagem se perde em silêncio.
+  - frente: Quando uma mensagem vai para a dead letter exchange?
+    verso: Quando é rejeitada sem requeue (rejected), quando o TTL expira (expired), quando a fila passa do limite de tamanho (maxlen) ou quando uma quorum queue passa do delivery-limit (delivery_limit). O header x-death registra a fila de origem, o motivo e a contagem.
+  - frente: Por que quorum queues no RabbitMQ 4?
+    verso: São replicadas com Raft (o padrão recomendado para dados que não podem se perder) e as classic mirrored queues foram removidas no 4.0. Elas também limitam reentregas (delivery-limit, padrão 20), o que corta loops de mensagens envenenadas.
+  - frente: Para que servem os "pacotes confiáveis" do JacksonJsonMessageConverter?
+    verso: O conversor usa o header __TypeId__ para saber qual classe instanciar. Restringir os pacotes impede que uma mensagem forjada faça o Jackson instanciar uma classe arbitrária do classpath, e o erro "is not in the trusted packages" aparece quando a classe não está na lista.
+---
+
+Uma rede de clínicas conclui cerca de 40 mil exames por dia. Cada exame concluído dispara três trabalhos: os de imagem (raio-x, tomografia) precisam de um laudo em PDF, que leva alguns segundos para ser gerado; todo paciente recebe um aviso por SMS ou e-mail de que o resultado saiu; e o painel da unidade de São Paulo mostra, numa TV da recepção, os exames que acabaram de ficar prontos. Na primeira versão, o serviço de laboratório chamava tudo isso por HTTP, em sequência, dentro da mesma requisição. Bastou o provedor de SMS ficar lento numa segunda-feira de manhã para a tela do laboratório travar: o técnico clicava em "concluir exame" e esperava 30 segundos.
+
+A solução foi colocar um **broker** no meio. O laboratório publica um evento "exame concluído" e volta ao trabalho; quem gera laudos, quem avisa pacientes e quem alimenta o painel consome no próprio ritmo. A escolha do time foi o **RabbitMQ**: roteamento flexível por configuração, filas com confirmação por mensagem e uma operação que um time pequeno consegue manter. Nesta aula você vai construir essa integração com o **RabbitMQ 4** e o **Spring AMQP 4** (do Spring Boot 4.1) e, mais importante, entender o que acontece com cada mensagem em cada etapa: quando ela pode se perder, quando ela pode duplicar e quando ela pode entrar num loop que derruba o consumidor. A [aula anterior](../../12-mensageria/01-por-que-mensageria/) mostrou por que usar mensageria; esta mostra como usar um broker de filas sem se machucar.
+
+## A intuição: os Correios de uma cidade pequena
+
+Pense na agência dos Correios de uma cidade pequena. Quem envia uma carta (o **publicador**) não entrega na casa de ninguém: deixa a carta no balcão da agência (a **exchange**). A agência tem regras de triagem afixadas na parede (os **bindings**): "cartas para o bairro Centro vão para a caixa postal 1", "cartas registradas também vão para a caixa do arquivo". Cada caixa postal (a **fila**) guarda as cartas até alguém buscar. E o carteiro que esvazia uma caixa (o **consumidor**) assina um recibo para cada carta entregue (o **ack**).
+
+A analogia já mostra quatro coisas que confundem quem começa:
+
+- **O remetente não conhece as caixas postais.** Ele só sabe o endereço escrito na carta (a **routing key**). Se a agência mudar as regras e criar uma caixa nova para "cartas de São Paulo", nenhum remetente precisa mudar nada. É o desacoplamento que você quer.
+- **Uma carta pode ser copiada para várias caixas.** Se duas regras casam, cada caixa recebe a sua cópia. Por outro lado, se nenhuma regra casa, a carta vai para o lixo. Sem aviso.
+- **Dois carteiros na mesma caixa dividem o trabalho.** Cada carta sai da caixa uma vez só, para um dos dois. Para que dois setores recebam *todas* as cartas, cada um precisa da sua caixa.
+- **Sem recibo, a carta volta para a caixa.** Se o carteiro tropeça e perde a carta antes de assinar o recibo, a agência devolve a carta à caixa e outro carteiro a entrega. Bom para não perder nada, mas significa que a mesma carta pode ser entregue duas vezes.
+
+<Figura legenda="A topologia da clínica. O publicador fala só com a exchange; os bindings decidem quais filas recebem uma cópia. A routing key imagem.sp casa três bindings e gera três cópias">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="rmq-topo-titulo rmq-topo-desc">
+  <title id="rmq-topo-titulo">Topologia de exames da clínica no RabbitMQ</title>
+  <desc id="rmq-topo-desc">O laboratório publica com a routing key imagem.sp na exchange topic clinica.exames. Três bindings casam: imagem.* leva à fila exames.laudos-de-imagem, # leva à fila exames.avisos-ao-paciente e *.sp leva à fila exames.painel-sp. As filas de laudos e avisos têm dead letter exchange clinica.exames.dlx, do tipo fanout, ligada à fila exames.dlq.</desc>
+  <defs><marker id="mk-rmq-topo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="110" width="150" height="62" rx="10" class="d-accent"/>
+  <text x="85" y="136" text-anchor="middle" class="d-title">laboratório</text>
+  <text x="85" y="158" text-anchor="middle" class="d-mono">imagem.sp</text>
+  <path d="M160 141 H214" class="d-line" marker-end="url(#mk-rmq-topo)"/>
+  <rect x="218" y="108" width="176" height="66" rx="33" class="d-violet"/>
+  <text x="306" y="136" text-anchor="middle" class="d-mono">clinica.exames</text>
+  <text x="306" y="156" text-anchor="middle" class="d-label">exchange topic</text>
+  <rect x="510" y="20" width="240" height="44" rx="8" class="d-ok"/>
+  <text x="630" y="47" text-anchor="middle" class="d-mono" textLength="220" lengthAdjust="spacingAndGlyphs">exames.laudos-de-imagem</text>
+  <rect x="510" y="96" width="240" height="44" rx="8" class="d-ok"/>
+  <text x="630" y="123" text-anchor="middle" class="d-mono" textLength="224" lengthAdjust="spacingAndGlyphs">exames.avisos-ao-paciente</text>
+  <rect x="510" y="172" width="240" height="44" rx="8" class="d-ok"/>
+  <text x="630" y="199" text-anchor="middle" class="d-mono">exames.painel-sp</text>
+  <path d="M394 128 L506 44" class="d-line" marker-end="url(#mk-rmq-topo)"/>
+  <text x="420" y="74" class="d-label">imagem.*</text>
+  <path d="M394 138 L506 118" class="d-line" marker-end="url(#mk-rmq-topo)"/>
+  <text x="446" y="118" class="d-label">#</text>
+  <path d="M394 150 L506 192" class="d-line" marker-end="url(#mk-rmq-topo)"/>
+  <text x="430" y="186" class="d-label">*.sp</text>
+  <rect x="218" y="246" width="176" height="56" rx="28" class="d-box"/>
+  <text x="306" y="270" text-anchor="middle" class="d-mono" textLength="156" lengthAdjust="spacingAndGlyphs">clinica.exames.dlx</text>
+  <text x="306" y="290" text-anchor="middle" class="d-label">exchange fanout</text>
+  <rect x="510" y="252" width="240" height="44" rx="8" class="d-info"/>
+  <text x="630" y="279" text-anchor="middle" class="d-mono">exames.dlq</text>
+  <path d="M394 274 H506" class="d-line" marker-end="url(#mk-rmq-topo)"/>
+  <path d="M510 64 C470 150 430 220 394 258" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-rmq-topo)"/>
+  <text x="10" y="224" class="d-text">rejeitadas sem requeue,</text>
+  <text x="10" y="244" class="d-text">expiradas ou acima do</text>
+  <text x="10" y="264" class="d-text">delivery-limit vão para a DLX</text>
+  <text x="10" y="320" class="d-label">sangue.rj casa só "#": uma cópia, para os avisos. Nenhuma fila sem binding recebe nada.</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+O RabbitMQ fala **AMQP 0-9-1**, um protocolo aberto e binário (o RabbitMQ 4 também fala AMQP 1.0, MQTT e STOMP, mas o Spring AMQP usa o 0-9-1). Os termos abaixo são os do protocolo, e aparecem nas mensagens de erro, no painel de gestão e nas entrevistas.
+
+| Termo | O que é | Na clínica |
+|---|---|---|
+| **Broker** | O servidor que recebe, guarda e entrega mensagens | O RabbitMQ |
+| **Conexão** | Uma conexão TCP longa entre a aplicação e o broker | Uma por aplicação, aberta na subida |
+| **Canal** (*channel*) | Uma "conexão virtual" multiplexada dentro da conexão; todo comando AMQP acontece num canal | Um por consumidor e alguns para publicar |
+| **Virtual host** (*vhost*) | Um espaço isolado de exchanges, filas e permissões dentro do mesmo broker | `/` no desenvolvimento; um por sistema em produção |
+| **Exchange** | Recebe as mensagens e as copia para filas segundo os bindings | `clinica.exames` |
+| **Fila** (*queue*) | Guarda as mensagens em ordem até um consumidor confirmar | `exames.laudos-de-imagem` |
+| **Binding** | Uma regra que liga uma exchange a uma fila, com uma chave ou padrão | `imagem.*` |
+| **Routing key** | O "endereço" que o publicador coloca na mensagem | `imagem.sp` |
+| **Ack** | O consumidor confirma que terminou; o broker apaga a mensagem | Laudo gerado |
+| **Nack / reject** | O consumidor recusa; com *requeue* ela volta para a fila, sem *requeue* vai para a DLX ou é descartada | Provedor de SMS fora; paciente sem contato |
+| **Prefetch** (*QoS*) | Quantas mensagens sem ack o broker entrega a um consumidor de uma vez | 1 para laudos, 20 para avisos |
+| **Publisher confirm** | O broker avisa o publicador de que assumiu a mensagem | O laboratório só considera publicado depois do ack |
+| **DLX** (*dead letter exchange*) | A exchange para onde vão as mensagens "mortas" de uma fila | `clinica.exames.dlx` |
+| **DLQ** (*dead letter queue*) | A fila ligada à DLX, onde alguém investiga e reprocessa | `exames.dlq` |
+
+### Os quatro tipos de exchange
+
+| Tipo | Roteia por | Exemplo | Quando usar |
+|---|---|---|---|
+| **direct** | routing key **igual** à chave do binding | binding `pdf` recebe só `pdf` | Comandos e trabalho por tipo: "gerar-laudo", "reprocessar" |
+| **topic** | padrão com `*` (exatamente uma palavra) e `#` (zero ou mais), palavras separadas por ponto | `imagem.*` recebe `imagem.sp` e não `imagem.sp.centro` | Eventos com hierarquia; é a escolha padrão para eventos de domínio |
+| **fanout** | ignora a routing key: copia para **todas** as filas ligadas | DLX, invalidação de cache em todas as instâncias | Broadcast puro |
+| **headers** | valores dos headers da mensagem (`x-match: all` ou `any`) | `formato=pdf` **e** `urgente=true` | Raro; quando o roteamento depende de vários atributos que não cabem numa chave |
+
+Existe ainda a **exchange padrão** (nome vazio, `""`): uma direct exchange em que toda fila está ligada automaticamente com o próprio nome como chave. É ela que faz `convertAndSend("exames.dlq", mensagem)` "publicar direto numa fila". Prático para testes e para respostas, mas, em produção, publicar na exchange padrão acopla o publicador ao nome da fila, exatamente o que a exchange existe para evitar.
+
+Duas consequências do modelo valem ouro:
+
+- **Publicar numa exchange sem fila que case descarta a mensagem, em silêncio.** O broker não acusa erro. Por isso a topologia é declarada pela aplicação na subida, e existem o flag `mandatory` (o broker devolve a mensagem sem rota ao publicador) e a *alternate exchange* (o broker manda a mensagem sem rota para outra exchange).
+- **Cada fila recebe a sua cópia; consumidores da mesma fila competem.** "Três consumidores na mesma fila" divide o trabalho (o padrão *competing consumers*); "três filas ligadas à mesma exchange" multiplica (publish/subscribe). Os dois combinam: três instâncias do serviço de avisos consomem da mesma fila de avisos, e essa fila é uma entre várias ligadas à exchange.
+
+### Tipos de fila no RabbitMQ 4
+
+| Tipo | Como guarda | Use para | Não use para |
+|---|---|---|---|
+| **Quorum** | Replicada em vários nós com o algoritmo de consenso Raft; sempre durável | Tudo o que não pode se perder: pedidos, pagamentos, laudos | Filas temporárias, exclusivas ou não duráveis (ela não suporta) |
+| **Classic** | Num nó só (sem réplica desde o 4.0) | Dados descartáveis, filas temporárias, respostas | Dados críticos num cluster: se o nó cair, a fila fica indisponível |
+| **Stream** | Log append-only, lido por posição (como no Kafka) | Reprocessar histórico, muitos leitores do mesmo fluxo | Fila de trabalho com ack por mensagem |
+
+<Callout tipo="novidade" titulo="RabbitMQ 4: o fim das classic mirrored queues">
+O RabbitMQ 4.0 removeu o espelhamento de classic queues. Para dados que precisam sobreviver à queda de um nó, o caminho são as **quorum queues**. Elas trazem um bônus de segurança: contam as reentregas de cada mensagem e, a partir do 4.0, param depois de **20** por padrão (`delivery-limit`); passando disso, a mensagem é descartada ou, se a fila tiver DLX, vai para ela com o motivo `delivery_limit`. Uma mensagem que derruba o consumidor em loop deixa de girar para sempre.
+</Callout>
+
+## O código que vamos construir
+
+Tudo nesta aula existe no projeto Maven da trilha, em `java/m12-mensageria/aulas`, no pacote `dev.trilhajava.m12.aulas.rabbitmq`, e compila no CI. As peças:
+
+| Classe | Papel |
+|---|---|
+| `ExameConcluido`, `TipoDeExame` | O evento: um `record` com id, paciente, tipo, unidade e instante, e a regra da routing key |
+| `TopologiaDeExames` | Exchanges, filas, bindings, o conversor JSON e uma fábrica de containers com prefetch 1 |
+| `PublicadorDeExames` | Publica com `message_id`, com e sem esperar o publisher confirm |
+| `ConsumidorDeLaudos` | `@RabbitListener` com ack automático, 2 a 4 consumidores, prefetch 1 |
+| `ConsumidorDeAvisos` | `@RabbitListener` com ack **manual**: ack, nack com e sem requeue |
+| `ClinicaApplication` | A aplicação; publica quatro exames de demonstração na subida |
+
+O evento é pequeno e imutável. Repare em duas decisões: o `id` é gerado por quem publica e viaja de ponta a ponta (é ele que permite deduplicar depois), e a routing key é derivada do conteúdo por uma regra única, em vez de cada chamador montar a string do seu jeito.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/rabbitmq/ExameConcluido.java" />
+
+A routing key segue o formato `tipo.unidade`: `imagem.sp`, `sangue.rj`, `urina.rj`. Escolher o formato é uma decisão de design que dura anos: depois que dez consumidores fizerem binding com `imagem.*`, mudar a ordem das palavras quebra todos eles. Do mais geral para o mais específico (`tipo.unidade`, e não o contrário) é a convenção que deixa os padrões mais naturais. E coloque na chave só o que alguém vai querer usar para **filtrar**: o id do paciente nunca vai para a routing key.
+
+## Mão na massa
+
+Os passos 1, 4, 6 e 7 precisam de um RabbitMQ rodando, e usamos o Docker para isso. Os passos 2, 3 e 5 rodam só com o Maven, sem broker, e são os que o CI executa. Para rodar os testes da aula:
+
+```bash
+cd java/m12-mensageria/aulas
+mvn test -Dtest='TopologiaDeExamesTest,ConversorJsonTest,ConsumidorDeLaudosTest'
+```
+
+### Passo 1: subir o RabbitMQ 4 com o painel de gestão
+
+**O que vamos fazer e por quê.** A imagem `rabbitmq:4-management` traz o broker e o plugin de gestão (o painel web e a API HTTP). A porta 5672 é a do AMQP, usada pela aplicação; a 15672 é a do painel.
+
+```bash
+docker run -d --name rabbit-clinica -p 5672:5672 -p 15672:15672 rabbitmq:4-management
+docker exec rabbit-clinica rabbitmq-diagnostics -q check_running
+```
+
+Saída esperada do segundo comando, depois de alguns segundos de inicialização:
+
+```text
+RabbitMQ on node rabbit@<id-do-container> is fully booted and running
+```
+
+Abra `http://localhost:15672` e entre com `guest` / `guest`. Esse usuário existe só para desenvolvimento: por padrão, o RabbitMQ **recusa o login do `guest` vindo de qualquer máquina que não seja o próprio host do broker** (no Docker, o acesso pela porta mapeada funciona porque o painel roda dentro do container). Em produção, apague o `guest` e crie um usuário por aplicação, com permissões só no vhost dela.
+
+Na aba *Queues and Streams* ainda não há nenhuma fila. Quem vai criá-las é a aplicação.
+
+### Passo 2: declarar a topologia em código
+
+**O que vamos fazer e por quê.** Exchanges, filas e bindings podem ser criados à mão no painel, mas aí o ambiente de homologação fica diferente do de produção, e ninguém sabe por quê. A prática comum é a aplicação **declarar** a topologia de que precisa: o Spring Boot cria um `RabbitAdmin`, que, na primeira conexão, envia ao broker os comandos `exchange.declare`, `queue.declare` e `queue.bind` para cada bean do tipo `Exchange`, `Queue`, `Binding` ou `Declarables`. Declarar é **idempotente**: se já existe com os mesmos argumentos, nada acontece.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/rabbitmq/TopologiaDeExames.java" destacar="33-66" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- `new TopicExchange(EXCHANGE)` cria uma exchange **durável** (sobrevive ao restart do broker) e que não se apaga sozinha quando a última fila se desliga (`autoDelete = false`). São os padrões do construtor de um argumento.
+- A fila de laudos é uma **quorum queue** (`.quorum()` vira o argumento `x-queue-type=quorum`), com DLX (`x-dead-letter-exchange`) e com `deliveryLimit(5)` (`x-delivery-limit`): depois de 5 reentregas, a mensagem vai para a DLQ. O padrão de 20 é generoso para um laudo que leva segundos: 20 tentativas de 2 segundos, com retry dentro de cada uma, prendem um consumidor por minutos com uma mensagem que nunca vai dar certo.
+- A fila do painel é **clássica**, de propósito: o painel só mostra o que ficou pronto na última hora. `maxLength(1_000)` com `Overflow.dropHead` descarta as mais antigas quando passa de mil, e `ttl(3_600_000)` faz cada mensagem expirar em uma hora. Replicar com Raft algo que vai ser descartado em uma hora seria custo sem benefício.
+- Os bindings usam os três padrões que importam: `imagem.*` (laudos só de imagem, de qualquer unidade), `#` (avisos de tudo) e `*.sp` (o painel de SP, qualquer tipo).
+- A DLQ é ligada a uma exchange **fanout**: não importa a routing key com que a mensagem morreu, ela chega na DLQ. O RabbitMQ preserva a routing key original ao fazer o *dead-lettering*, o que ajuda a investigar e a reprocessar depois.
+
+Como o teste não precisa de broker, dá para conferir o que a aplicação vai pedir ao RabbitMQ:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/rabbitmq/TopologiaDeExamesTest.java" semImports />
+
+```bash
+mvn test -Dtest=TopologiaDeExamesTest
+```
+
+Saída real (os `println` mostram os argumentos e os bindings):
+
+```text
+exames.laudos-de-imagem <- imagem.*
+exames.avisos-ao-paciente <- #
+exames.painel-sp <- *.sp
+{x-dead-letter-exchange=clinica.exames.dlx, x-queue-type=quorum, x-delivery-limit=5}
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Esses argumentos `x-...` são exatamente o que aparece no painel, na página da fila, em *Features*. Guarde essa informação para a seção "Quando dá errado": quando você muda um argumento de uma fila que já existe, o broker recusa a declaração.
+
+<Callout tipo="dica" titulo="Policies: argumentos que dá para mudar depois">
+Argumentos `x-...` passados na declaração são **imutáveis**: para mudar, só apagando e recriando a fila. O RabbitMQ oferece uma alternativa, as **policies**: regras definidas no broker (por `rabbitmqctl set_policy` ou pelo painel) que aplicam DLX, TTL, tamanho máximo e delivery-limit a todas as filas cujo nome casa um padrão, e que podem ser alteradas a qualquer momento. Times maduros costumam deixar na aplicação só o que define a fila (nome, tipo, bindings) e colocar os limites operacionais em policies, controladas por quem opera.
+</Callout>
+
+### Passo 3: JSON no corpo, com o Jackson 3
+
+**O que vamos fazer e por quê.** O corpo de uma mensagem AMQP é um array de bytes; o broker não sabe nem quer saber o que tem dentro. Quem decide o formato é a aplicação, por meio de um `MessageConverter`. O padrão do Spring AMQP (`SimpleMessageConverter`) usa serialização Java para objetos, o que você **não** quer: só outra aplicação Java, com as mesmas classes, consegue ler, e desserializar bytes vindos da rede com a serialização Java é uma fonte clássica de vulnerabilidades. JSON resolve os dois problemas.
+
+O bean `conversorJson` (no arquivo do passo 2) é o que basta: o Spring Boot encontra um único `MessageConverter` no contexto e o usa no `RabbitTemplate` e nos containers de `@RabbitListener`.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/rabbitmq/ConversorJsonTest.java" semImports />
+
+```bash
+mvn test -Dtest=ConversorJsonTest
+```
+
+Saída real:
+
+```text
+application/json
+{__TypeId__=dev.trilhajava.m12.aulas.rabbitmq.ExameConcluido}
+{"id":"0f8e2c1a-6b1d-4a39-9d0e-2b7c5d8a9f10","pacienteId":"PAC-1001","tipo":"IMAGEM","unidade":"sp","concluidoEm":"2026-10-05T13:30:00Z"}
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- O conversor define `content_type = application/json` nas propriedades da mensagem. Ferramentas e consumidores de outras linguagens sabem como ler.
+- O `Instant` virou texto ISO-8601 (`"2026-10-05T13:30:00Z"`). No Jackson 3, o suporte a `java.time` faz parte do `jackson-databind` e datas saem como texto por padrão; no Jackson 2 era preciso registrar o módulo JSR-310 e desligar a escrita como número.
+- O header **`__TypeId__`** leva o nome completo da classe. Quando o consumidor não diz qual tipo quer, o conversor usa esse header para escolher a classe. Isso é conveniente entre aplicações Java que compartilham o mesmo `record`, mas acopla o consumidor ao **nome da classe do publicador**: renomear o pacote do publicador quebra todos os consumidores que dependem do header. Num `@RabbitListener` cujo parâmetro é `ExameConcluido`, o Spring usa o tipo do parâmetro, e o header é ignorado.
+- O segundo argumento do construtor, `"dev.trilhajava.m12.aulas.rabbitmq"`, é a lista de **pacotes confiáveis**: o conversor só aceita, em `__TypeId__`, classes desses pacotes. Sem isso, uma mensagem forjada poderia pedir ao Jackson para instanciar uma classe qualquer do classpath. A primeira versão deste teste usava o conversor sem a lista, e falhou; a mensagem está em "Quando dá errado".
+
+<Callout tipo="novidade" titulo="Spring AMQP 4 e Jackson 3">
+O Spring AMQP 4 usa o Jackson 3: o conversor é o `JacksonJsonMessageConverter`, que recebe um `tools.jackson.databind.json.JsonMapper` (o Spring Boot 4 já cria um, com as configurações de `spring.jackson.*`). O antigo `Jackson2JsonMessageConverter`, do Jackson 2, está obsoleto. As anotações (`@JsonProperty` e afins) continuam no pacote `com.fasterxml.jackson.annotation`.
+</Callout>
+
+### Passo 4: publicar e esperar o publisher confirm
+
+**O que vamos fazer e por quê.** Publicar com o `RabbitTemplate` é uma linha. O problema é o que essa linha **não** garante. Por padrão, `convertAndSend` serializa, escreve os bytes no socket e retorna. Se o broker cair nesse instante, se a exchange não existir ou se nenhuma fila casar, a sua aplicação não fica sabendo. Para um aviso de marketing, tudo bem. Para "exame concluído", que dispara o laudo de um paciente, não.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/rabbitmq/PublicadorDeExames.java" destacar="36-56" />
+
+E as propriedades que ligam o mecanismo (arquivo `aulas-rabbitmq.properties`):
+
+```properties
+spring.rabbitmq.publisher-confirm-type=correlated
+spring.rabbitmq.publisher-returns=true
+spring.rabbitmq.template.mandatory=true
+```
+
+**O que acabou de acontecer.**
+
+- `publisher-confirm-type=correlated` liga o modo *confirm* no canal de publicação. A partir daí, o broker responde a cada mensagem com `basic.ack` (assumi a responsabilidade) ou `basic.nack` (não consegui, por exemplo por erro interno). Quando o ack sai depende da fila: numa **quorum queue**, depois que a **maioria das réplicas** gravou; para mensagens persistentes em filas duráveis, depois de gravar em disco.
+- `CorrelationData` liga a confirmação, que chega de forma assíncrona, à mensagem que você publicou. O `getFuture()` devolve um `CompletableFuture` de `Confirm`, que completa quando o ack ou o nack chega.
+- `mandatory=true` pede ao broker para **devolver** (`basic.return`) a mensagem que não casou com nenhuma fila, em vez de descartá-la. Detalhe que pega muita gente: uma mensagem sem rota **também recebe ack** (o broker cumpriu o papel dele: roteou para zero filas). O RabbitMQ envia o `basic.return` **antes** do ack, e o Spring o guarda em `correlacao.getReturned()`. Por isso o código confere o `returned` primeiro, e só depois o `ack()`.
+- O prazo (`get(prazo...)`) existe porque uma confirmação que nunca chega também é falha: a conexão pode cair entre a publicação e o ack. Nesse caso a mensagem **pode ou não** ter sido gravada. É aqui que nasce a duplicidade: se o publicador republica por segurança, e a primeira tinha sido gravada, o consumidor recebe duas. O `message_id` estável é o que permite ao consumidor descartar a segunda ([aula 5](../../12-mensageria/05-consumidores-idempotentes/)).
+- `InterruptedException` restaura a flag de interrupção (`Thread.currentThread().interrupt()`) antes de lançar: engolir a interrupção impede o desligamento ordenado da aplicação.
+
+Agora rode a aplicação. Pela IDE, execute o `main` de `ClinicaApplication`. Ela declara a topologia, liga os consumidores e publica quatro exames:
+
+| Paciente | Tipo | Unidade | Routing key | Filas que recebem |
+|---|---|---|---|---|
+| PAC-1001 | IMAGEM | sp | `imagem.sp` | laudos, avisos, painel-sp |
+| PAC-1002 | SANGUE | sp | `sangue.sp` | avisos, painel-sp |
+| PAC-1003 | IMAGEM | rj | `imagem.rj` | laudos, avisos |
+| PAC-SEM-CONTATO | URINA | rj | `urina.rj` | avisos |
+
+Saída esperada no log (resumida; a ordem das linhas dos consumidores varia, porque eles rodam em threads próprias):
+
+```text
+Publicado e confirmado: imagem.sp (PAC-1001)
+Publicado e confirmado: sangue.sp (PAC-1002)
+Publicado e confirmado: imagem.rj (PAC-1003)
+Publicado e confirmado: urina.rj (PAC-SEM-CONTATO)
+Aviso enviado: paciente=PAC-1001 exame=IMAGEM
+Aviso enviado: paciente=PAC-1002 exame=SANGUE
+Aviso enviado: paciente=PAC-1003 exame=IMAGEM
+Aviso descartado para a DLQ: Paciente sem contato cadastrado: PAC-SEM-CONTATO
+Laudo gerado: exame=... paciente=PAC-1001
+Laudo gerado: exame=... paciente=PAC-1003
+```
+
+Com a aplicação ainda no ar, liste as filas:
+
+```bash
+docker exec rabbit-clinica rabbitmqctl -q list_queues name type messages consumers
+```
+
+Saída esperada:
+
+```text
+name	type	messages	consumers
+exames.laudos-de-imagem	quorum	0	2
+exames.avisos-ao-paciente	quorum	0	1
+exames.painel-sp	classic	2	0
+exames.dlq	quorum	1	0
+```
+
+Leia linha a linha: as filas com consumidor foram esvaziadas; o painel de SP acumulou as duas mensagens de `*.sp` porque ninguém consome dela nesta aplicação (a TV da recepção seria outro serviço); e a DLQ guarda o aviso do paciente sem contato. A fila de laudos tem **2** consumidores por causa do `concurrency = "2-4"`, que você vê no passo 5.
+
+<Callout tipo="atencao" titulo="Saídas dos passos 1, 4, 6 e 7">
+O Docker da máquina onde esta aula foi escrita estava indisponível; as saídas desses passos foram derivadas da topologia e do código, e não copiadas de uma execução. A dos passos 2, 3 e 5 são reais. Rodando no seu ambiente, os ids, os horários e a ordem das linhas dos consumidores vão variar.
+</Callout>
+
+### Passo 5: consumir com @RabbitListener e ack automático
+
+**O que vamos fazer e por quê.** Consumir é anotar um método. O Spring cria um *listener container* (um `SimpleMessageListenerContainer`), que abre um canal, se registra como consumidor da fila (`basic.consume`), recebe as mensagens, converte o corpo para o tipo do parâmetro e chama o seu método. O que importa entender é **quando ele confirma** cada mensagem.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/rabbitmq/ConsumidorDeLaudos.java" destacar="24-36" />
+
+**O que acabou de acontecer.**
+
+- O modo padrão é `AcknowledgeMode.AUTO`: o container faz o **ack quando o método retorna** normalmente e o **nack quando ele lança exceção**. Ack só depois do trabalho feito garante *at-least-once*: se a aplicação morrer no meio do laudo, a mensagem não confirmada volta para a fila e outro consumidor a pega.
+- E o nack, por padrão, é **com requeue** (`defaultRequeueRejected = true`). Uma exceção qualquer devolve a mensagem para a fila, e ela é entregue de novo na hora. Para falhas transitórias com retry, é o que se quer; para uma falha que nunca vai passar, é um loop.
+- Por isso o código traduz a falha **permanente** (`LaudoInvalidoException`) em `AmqpRejectAndDontRequeueException`. Essa exceção é um sinal para o container: rejeitar **sem** requeue, mesmo com `defaultRequeueRejected = true`. A mensagem vai para a DLX. A tradução acontece **na borda**, no consumidor: a regra de negócio não fica sabendo que existe RabbitMQ.
+- `concurrency = "2-4"` abre 2 consumidores (cada um com o seu canal e a sua thread) e deixa o container subir até 4 quando há trabalho acumulado, voltando a 2 quando ociosos. Mais de um consumidor na mesma fila significa que **a ordem de processamento deixa de ser garantida**: o laudo do exame 2 pode ficar pronto antes do laudo do exame 1.
+- `containerFactory = "fabricaDeLaudos"` escolhe a fábrica do passo 2, com prefetch 1. As demais configurações vêm de `spring.rabbitmq.listener.simple.*` graças ao `SimpleRabbitListenerContainerFactoryConfigurer`, que aplica as propriedades do Boot a uma fábrica criada por você.
+
+O `ClinicaApplication` também liga o retry do container e desliga o requeue padrão:
+
+```properties
+spring.rabbitmq.listener.simple.default-requeue-rejected=false
+spring.rabbitmq.listener.simple.retry.enabled=true
+spring.rabbitmq.listener.simple.retry.max-retries=2
+spring.rabbitmq.listener.simple.retry.initial-interval=1s
+spring.rabbitmq.listener.simple.retry.multiplier=2
+```
+
+Com isso, uma falha transitória é tentada 3 vezes (a original e 2 repetições, com 1 s e 2 s de espera) **dentro do consumidor**, sem devolver a mensagem ao broker; esgotadas as tentativas, ela é rejeitada sem requeue e vai para a DLQ. A [aula 6](../../12-mensageria/06-retry-e-dlq/) aprofunda o retry: quando fazê-lo em memória, quando usar filas de espera com TTL e como excluir falhas permanentes da política.
+
+Dá para testar o listener **sem broker**. O `TestRabbitTemplate`, do `spring-rabbit-test` (já incluído pelo `spring-boot-starter-amqp-test`), entrega a mensagem diretamente ao listener registrado para a fila, passando pelo mesmo conversor e pela mesma invocação do método:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/rabbitmq/ConsumidorDeLaudosTest.java" destacar="37-55" />
+
+```bash
+mvn test -Dtest=ConsumidorDeLaudosTest
+```
+
+Saída real (resumida):
+
+```text
+ERROR o.s.amqp.rabbit.listener.BlockingQueueConsumer -- Null consumer tag received for queue exames.laudos-de-imagem
+INFO  d.t.m12.aulas.rabbitmq.ConsumidorDeLaudos -- Laudo gerado: exame=97bb9cd4-... paciente=PAC-1001
+org.springframework.amqp.rabbit.support.ListenerExecutionFailedException: Listener method 'public void dev.trilhajava.m12.aulas.rabbitmq.ConsumidorDeLaudos.receber(dev.trilhajava.m12.aulas.rabbitmq.ExameConcluido)' threw exception
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- A `ConnectionFactory` é um mock do Mockito, montado como na documentação do Spring AMQP: conexão e canal falsos, com `isOpen()` verdadeiro. Os containers "sobem" sobre esse canal, e o `TestRabbitTemplate` procura, pelo nome da fila, o listener certo.
+- As linhas `Null consumer tag received` são esperadas: o canal falso não devolve o identificador que um broker de verdade devolveria ao `basic.consume`. Não indicam falha do teste.
+- No segundo teste, a exceção chega ao teste embrulhada: `ListenerExecutionFailedException` (do Spring, por fora) → `AmqpRejectAndDontRequeueException` (a tradução do consumidor) → `LaudoInvalidoException` (a causa raiz). É essa cadeia que o container examina para decidir entre requeue e rejeição.
+- O que esse teste **não** cobre: o ack e o nack de verdade, o prefetch, a DLX. Para isso é preciso um broker real, com Testcontainers e `@ServiceConnection` ([aula 10.05](../../10-testes/05-testcontainers/)), como faz o exercício deste módulo.
+
+### Passo 6: ack manual, nack e a DLQ por dentro
+
+**O que vamos fazer e por quê.** O modo AUTO cobre a grande maioria dos casos. Mas ver o protocolo "na mão" ajuda a entender o que o Spring faz por você, e há situações em que você precisa decidir caso a caso: confirmar só depois de um processamento assíncrono, ou devolver para a fila uma falha e mandar para a DLQ outra.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/rabbitmq/ConsumidorDeAvisos.java" destacar="27-41" />
+
+**O que acabou de acontecer.**
+
+- `ackMode = "MANUAL"` desliga o ack automático **só para este listener**. Agora o método recebe o `Channel` e a *delivery tag* (o número sequencial da entrega naquele canal, no header `AmqpHeaders.DELIVERY_TAG`).
+- `basicAck(etiqueta, false)`: confirma só esta entrega. Com `true` no segundo argumento (*multiple*), confirmaria esta e todas as anteriores do canal ainda pendentes; útil em lote, perigoso se você não controla a ordem.
+- `basicNack(etiqueta, false, false)`: rejeita **sem requeue**. A fila tem DLX, então a mensagem vai para `clinica.exames.dlx` e de lá para a DLQ.
+- `basicNack(etiqueta, false, true)`: rejeita **com requeue**. A mensagem volta para a fila e será entregue de novo, em geral imediatamente. Sem limite, isso é o loop. Aqui o limite vem da quorum queue: a cada reentrega, o broker incrementa a contagem, e ao passar do `delivery-limit` (20 nesta fila, o padrão), a mensagem vai para a DLX com o motivo `delivery_limit`.
+- Esquecer o ack é um bug sério: a mensagem fica "Unacked" até o canal fechar e, nas quorum queues, até o **timeout de ack do consumidor** (30 minutos por padrão), quando o broker fecha o canal e devolve todas as mensagens pendentes dele.
+
+No painel, abra *Queues and Streams* → `exames.dlq` → *Get messages* → *Get Message(s)*. A mensagem do paciente sem contato aparece com o corpo JSON intacto e com os headers que o broker acrescentou ao fazer o dead-lettering. Esperado, em essência:
+
+```text
+x-death:
+  count: 1
+  reason: rejected
+  queue: exames.avisos-ao-paciente
+  exchange: clinica.exames
+  routing-keys: urina.rj
+  time: <instante>
+x-first-death-exchange: clinica.exames
+x-first-death-queue: exames.avisos-ao-paciente
+x-first-death-reason: rejected
+message_id: <o id do exame>
+```
+
+Com isso, quem investiga sabe de onde a mensagem veio, por quê e quantas vezes morreu, e consegue **reprocessar**: republicar na exchange original, com a mesma routing key, depois de corrigir a causa (o cadastro do paciente, neste caso). Os motivos possíveis são `rejected` (nack ou reject sem requeue), `expired` (TTL), `maxlen` (fila acima do tamanho máximo, com overflow `drop-head`) e `delivery_limit`.
+
+### Passo 7: prefetch e o consumidor lento
+
+**O que vamos fazer e por quê.** O prefetch é o ajuste que mais muda o comportamento de um consumidor, e o que menos gente entende. O broker não espera o consumidor pedir: ele **empurra** mensagens pelo canal até atingir o limite de mensagens sem ack daquele consumidor. Com o padrão do Spring AMQP, **250**, e laudos que levam 2 segundos, o primeiro consumidor a se conectar recebe 250 laudos: mais de 8 minutos de trabalho na mão de uma thread. Os consumidores que sobem depois (em outra instância, por exemplo) encontram a fila "vazia" e ficam ociosos, porque as mensagens já foram entregues, embora ainda não processadas.
+
+<Figura legenda="Prefetch alto num trabalho lento concentra a fila num só consumidor. Com prefetch 1, cada consumidor só recebe a próxima mensagem quando confirma a anterior, e o trabalho se distribui">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-labelledby="rmq-pref-titulo rmq-pref-desc">
+  <title id="rmq-pref-titulo">Efeito do prefetch na distribuição de trabalho</title>
+  <desc id="rmq-pref-desc">À esquerda, prefetch 250: o consumidor A recebe 250 mensagens não confirmadas e o consumidor B, que chegou depois, recebe zero. À direita, prefetch 1: cada um dos dois consumidores tem uma mensagem em andamento e as demais ficam prontas na fila, disponíveis para quem confirmar primeiro.</desc>
+  <rect x="10" y="10" width="360" height="280" rx="12" class="d-box"/>
+  <text x="190" y="40" text-anchor="middle" class="d-title">prefetch 250 (padrão)</text>
+  <rect x="30" y="60" width="320" height="44" rx="8" class="d-info"/>
+  <text x="190" y="87" text-anchor="middle" class="d-text">fila: 0 prontas</text>
+  <rect x="30" y="130" width="320" height="60" rx="8" class="d-accent"/>
+  <text x="190" y="155" text-anchor="middle" class="d-text">consumidor A</text>
+  <text x="190" y="177" text-anchor="middle" class="d-mono">250 sem ack</text>
+  <rect x="30" y="206" width="320" height="60" rx="8" class="d-box"/>
+  <text x="190" y="231" text-anchor="middle" class="d-text">consumidor B (chegou depois)</text>
+  <text x="190" y="253" text-anchor="middle" class="d-mono">0 sem ack, ocioso</text>
+  <rect x="390" y="10" width="360" height="280" rx="12" class="d-box"/>
+  <text x="570" y="40" text-anchor="middle" class="d-title">prefetch 1 (fabricaDeLaudos)</text>
+  <rect x="410" y="60" width="320" height="44" rx="8" class="d-info"/>
+  <text x="570" y="87" text-anchor="middle" class="d-text">fila: 248 prontas</text>
+  <rect x="410" y="130" width="320" height="60" rx="8" class="d-ok"/>
+  <text x="570" y="155" text-anchor="middle" class="d-text">consumidor A</text>
+  <text x="570" y="177" text-anchor="middle" class="d-mono">1 sem ack</text>
+  <rect x="410" y="206" width="320" height="60" rx="8" class="d-ok"/>
+  <text x="570" y="231" text-anchor="middle" class="d-text">consumidor B</text>
+  <text x="570" y="253" text-anchor="middle" class="d-mono">1 sem ack</text>
+</svg>
+</Figura>
+
+Para ver no painel, troque temporariamente os exames de demonstração por um laço que publica 50 exames de imagem (`ExameConcluido.novo("PAC-" + i, TipoDeExame.IMAGEM, "sp", agora)`) e rode de novo. Na página da fila `exames.laudos-de-imagem`, observe os contadores:
+
+| Momento | Ready | Unacked | Consumidores |
+|---|---|---|---|
+| Logo após publicar | 48 | 2 | 2 |
+| Depois de alguns segundos com fila acumulada | cai | até 4 | até 4 (o container escala) |
+| Ao final | 0 | 0 | volta a 2 depois de ocioso |
+
+Agora mude `fabrica.setPrefetchCount(1)` para 250 e repita: *Unacked* vai a 50 de uma vez, *Ready* a 0, e consumidores extras não recebem nada até as mensagens voltarem para a fila. Com 50 laudos de 2 segundos, isso é a diferença entre 25 e 50 segundos para drenar a fila com 2 consumidores, e piora com mais instâncias.
+
+A regra prática, resumida da documentação do RabbitMQ: valores de **100 a 300** costumam dar a melhor vazão para mensagens rápidas (milissegundos); **1** é o mais conservador e distribui melhor o trabalho lento, ao custo de uma ida e volta de rede por mensagem. Entre os dois, meça. E lembre que o prefetch também é **memória**: 250 mensagens de 200 KB, em 10 consumidores por instância, são 500 MB de heap só de mensagens em trânsito.
+
+## Quando dá errado
+
+As mensagens abaixo marcadas como reais foram copiadas da execução do código desta aula; as demais seguem o formato documentado pelo RabbitMQ e pelo Spring AMQP (veja o aviso do passo 4).
+
+### Connection refused (real)
+
+Rodando o `ClinicaApplication` sem o RabbitMQ no ar:
+
+```text
+INFO  o.s.a.r.l.SimpleMessageListenerContainer : Broker not available; cannot force queue declarations during start: java.net.ConnectException: Connection refused: getsockopt
+ERROR o.s.a.r.l.SimpleMessageListenerContainer : Failed to check/redeclare auto-delete queue(s).
+org.springframework.amqp.AmqpConnectException: java.net.ConnectException: Connection refused: getsockopt
+...
+ERROR o.s.boot.SpringApplication               : Application run failed
+org.springframework.amqp.AmqpConnectException: java.net.ConnectException: Connection refused: getsockopt
+```
+
+**Como ler:** os containers dos listeners não derrubam a aplicação quando o broker está fora; eles registram o erro e ficam tentando reconectar (é o comportamento desejado em produção: o broker volta e o consumo recomeça sozinho). Quem derrubou a subida foi o `ApplicationRunner` de demonstração, que tentou publicar. **Como corrigir:** suba o broker (passo 1) e confira `spring.rabbitmq.host` e `port`. Em produção, decida conscientemente o que a aplicação faz quando não consegue publicar: falhar a requisição, ou gravar no outbox ([aula 4](../../12-mensageria/04-transactional-outbox/)) e publicar depois.
+
+### Classe fora dos pacotes confiáveis (real)
+
+A primeira versão do `ConversorJsonTest` usava `new JacksonJsonMessageConverter(json)`, sem a lista de pacotes, e chamava `fromMessage` sem informar o tipo:
+
+```text
+[ERROR] ConversorJsonTest.idaEVoltaEmJson -- Time elapsed: 0.018 s <<< ERROR!
+java.lang.IllegalArgumentException: The class 'dev.trilhajava.m12.aulas.rabbitmq.ExameConcluido' is not in the trusted packages: [java.util, java.lang]. If you believe this class is safe to deserialize, please provide its name. If the serialization is only done by a trusted source, you can also enable trust all (*).
+```
+
+**Como ler:** o conversor foi decidir a classe pelo header `__TypeId__` e encontrou uma classe fora da lista de confiança, que por padrão só tem `java.util` e `java.lang`. **Como corrigir:** passe os seus pacotes ao construtor, como em `TopologiaDeExames`. A sugestão da própria mensagem, "trust all (`*`)", desliga a proteção: só faz sentido quando **todo** publicador da fila é confiável, o que raramente dá para garantir em sistemas que crescem. Num `@RabbitListener` com parâmetro tipado, esse erro não aparece, porque o tipo vem do método.
+
+### PRECONDITION_FAILED: inequivalent arg
+
+Alguém declarou `exames.laudos-de-imagem` como fila clássica num ambiente e, depois, o código passou a declarar como quorum. Na subida, o canal é fechado pelo broker com:
+
+```text
+PRECONDITION_FAILED - inequivalent arg 'x-queue-type' for queue 'exames.laudos-de-imagem' in vhost '/': received the value 'quorum' of type 'longstr' but current is none
+```
+
+**Como ler:** a fila já existe com outros argumentos, e argumentos de fila são imutáveis. O RabbitMQ não "atualiza" a fila: recusa a declaração. **Como corrigir:** em desenvolvimento, apague a fila. Em produção, apagar perde as mensagens: crie uma fila nova com outro nome (`exames.laudos-de-imagem.v2`), ligue-a à exchange, mude os consumidores para ela, espere a antiga esvaziar e então desligue a antiga. Limites que mudam com frequência (TTL, tamanho, delivery-limit) devem ir para policies, não para a declaração.
+
+### O loop de requeue
+
+Sem `default-requeue-rejected=false`, sem retry e sem `AmqpRejectAndDontRequeueException`, um `NullPointerException` no consumidor de laudos produz, sem parar:
+
+```text
+WARN  o.s.a.r.l.ConditionalRejectingErrorHandler : Execution of Rabbit message listener failed.
+org.springframework.amqp.rabbit.support.ListenerExecutionFailedException: Listener method '...ConsumidorDeLaudos.receber(...)' threw exception
+...
+```
+
+**Como ler:** a mesma mensagem é entregue, falha, volta para a fila e é entregue de novo, milhares de vezes por minuto. A CPU sobe, o log enche o disco, e as mensagens boas atrás dela esperam. Numa quorum queue, o `delivery-limit` acaba cortando o ciclo depois de 20 voltas (ou do número que você configurar); numa fila clássica, não há corte. **Como corrigir:** as três defesas desta aula juntas: retry limitado em memória, rejeição sem requeue ao final, e DLQ com alerta. Uma exceção à regra: erros de **conversão** (JSON inválido, tipo errado) são tratados pelo `ConditionalRejectingErrorHandler` do Spring como fatais e rejeitados sem requeue mesmo na configuração padrão, porque nenhuma reentrega vai consertar um corpo malformado.
+
+### Timeout de ack do consumidor
+
+Um consumidor com ack manual esqueceu o `basicAck` num caminho do código. Trinta minutos depois:
+
+```text
+Consumer 'amq.ctag-...' on channel 1 and queue 'exames.avisos-ao-paciente' in vhost '/' has timed out waiting for a consumer acknowledgement of a delivery with delivery tag = 10. Timeout used: 1800000 ms.
+```
+
+**Como ler:** o broker cansou de esperar o ack daquela entrega, fechou o canal e devolveu **todas** as mensagens pendentes dele para a fila. Elas serão reentregues, possivelmente a outro consumidor, que pode processá-las de novo. **Como corrigir:** garanta que todo caminho termina em ack ou nack (um `finally` ou, melhor, o modo AUTO). Se o processamento legítimo leva mais de 30 minutos, a fila não é o mecanismo certo para acompanhá-lo: confirme a mensagem ao **aceitar** o trabalho, registre o andamento num banco e publique um novo evento ao final.
+
+### A fila que só cresce
+
+Não é uma mensagem de erro, é um gráfico: *Ready* sobe o dia inteiro na `exames.laudos-de-imagem`. Três causas comuns, em ordem de frequência:
+
+1. **Não há consumidor.** `consumers = 0` no `list_queues`. Um deploy derrubou o serviço, ou o container de listeners parou depois de um erro fatal. Alerta obrigatório: fila importante com zero consumidores.
+2. **Os consumidores não dão conta.** A taxa de publicação é maior que a de ack. Olhe a métrica *consumer utilisation* da fila: perto de 100%, os consumidores estão sempre ocupados, e a saída é mais consumidores (concorrência, instâncias) ou consumidores mais rápidos. Bem abaixo de 100% com fila crescendo, o gargalo é a entrega: prefetch baixo demais para mensagens rápidas, ou rede.
+3. **Os consumidores estão travados.** *Unacked* alto e parado: os consumidores receberam as mensagens e não confirmam. Thread presa numa chamada HTTP sem timeout é o caso clássico. Um *thread dump* (`jcmd <pid> Thread.print`) mostra onde.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Topologia implícita e esperança" depois="Topologia declarada, confirmação e destino para o que falha">
+```java
+// Fila criada à mão no painel, sem DLX
+rabbit.convertAndSend("exames", chave, exame);
+// e segue a vida: sem confirm, sem mandatory
+
+@RabbitListener(queues = "exames.laudos")
+void receber(ExameConcluido exame) {
+    gerador.gerar(exame);  // exceção = requeue
+}                          // = loop
+// prefetch 250 para uma tarefa de 2 s
+```
+
+```java
+// Declarables na aplicação: quorum + DLX + delivery-limit
+publicador.publicarComConfirmacao(exame, Duration.ofSeconds(5));
+// publisher confirms + mandatory
+
+@RabbitListener(queues = FILA_LAUDOS,
+        containerFactory = "fabricaDeLaudos")
+void receber(ExameConcluido exame) {
+    try { gerador.gerar(exame); }
+    catch (LaudoInvalidoException e) {
+        throw new AmqpRejectAndDontRequeueException(...);
+    }
+}  // prefetch 1, retry limitado, DLQ com alerta
+```
+</Comparar>
+
+- **Achar que "entregue" significa "processado uma vez".** O RabbitMQ entrega **pelo menos uma vez** quando você usa ack depois do trabalho: queda do consumidor, timeout de ack e republicação por falta de confirm geram duplicatas. Todo consumidor que faz algo não idempotente (cobrar, enviar SMS) precisa deduplicar pelo `message_id`.
+- **Publicar dentro da transação do banco e confiar que os dois acontecem juntos.** Se o commit falhar depois do publish, o evento sai sobre um exame que não existe; se o publish falhar depois do commit, o evento se perde. Publisher confirms não resolvem isso; o outbox resolve.
+- **Uma fila por tudo.** Colocar laudos (lentos, críticos) e painel (rápido, descartável) na mesma fila obriga a escolher um prefetch, uma política de retry e um tipo de fila que não serve para nenhum dos dois. Uma fila por **consumidor com necessidades diferentes** é a granularidade certa.
+- **Contar com a ordem.** Uma fila entrega em ordem para **um** consumidor. Com concorrência, retries ou requeue, a ordem de processamento muda. Se a ordem importa (eventos do mesmo pedido), use um só consumidor por fila (ou *single active consumer*, que mantém um consumidor ativo e outros de reserva) e particione por chave em várias filas. Se a ordem importa muito e o volume é alto, é sinal de que o problema pede Kafka.
+- **Mensagens grandes.** RabbitMQ é otimizado para mensagens pequenas (KB). Um PDF de laudo de 5 MB no corpo da mensagem pressiona memória do broker, rede e prefetch. Guarde o arquivo num armazenamento de objetos e mande na mensagem só a referência.
+- **Uma conexão por mensagem.** Abrir conexão TCP é caro e o broker sofre com *connection churn*. O Spring Boot usa uma `CachingConnectionFactory`: uma conexão longa e canais reaproveitados. Não crie `ConnectionFactory` à mão por requisição.
+- **DLQ sem dono.** Uma DLQ que ninguém olha é só um jeito mais cerimonioso de perder mensagens. Toda DLQ precisa de alerta (mais de zero mensagens), de um responsável e de um procedimento de reprocessamento.
+
+**Quando NÃO usar RabbitMQ:**
+
+- Para **reprocessar o histórico** de eventos (um consumidor novo que precisa ler os eventos dos últimos 30 dias) ou para muitos consumidores independentes lendo o mesmo fluxo enorme: um log como o Kafka (ou as streams do próprio RabbitMQ) atende melhor, porque a mensagem não é apagada quando alguém a consome. Esse é o assunto da [próxima aula](../../12-mensageria/03-kafka/).
+- Quando quem chama **precisa da resposta agora** para continuar ("o CPF é válido?"). Request/reply sobre AMQP existe, mas uma chamada HTTP com timeout é mais simples de entender e de depurar.
+- Para **duas tarefas dentro do mesmo processo**. Um `@Async` ou um executor resolve, sem infraestrutura nova. O broker paga quando há processos diferentes, ritmos diferentes ou a necessidade de sobreviver a reinícios.
+- Como **banco de dados**. Mensagens que ficam dias na fila para "consultar depois" pedem uma tabela. Filas longas consomem memória e disco do broker e deixam a recuperação de um nó lenta.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Escrever o `@RabbitListener` é a parte fácil. O que separa quem usa RabbitMQ de quem opera RabbitMQ em produção são as decisões abaixo, e a capacidade de justificá-las para o time.
+
+### Quanta garantia você está comprando, e quanto custa
+
+Cada camada de segurança tem um custo de latência ou de vazão, e nem toda mensagem precisa de todas:
+
+| Camada | Protege contra | Custo |
+|---|---|---|
+| Fila durável + mensagem persistente | Restart do broker | Escrita em disco |
+| Quorum queue (3 réplicas) | Queda de um nó | Cada mensagem gravada em 3 nós; ack só depois da maioria; mais memória e disco |
+| Publisher confirms esperando cada mensagem | Perda entre o publicador e o broker | Uma ida e volta por mensagem; vazão de publicação cai muito |
+| Confirms assíncronos (em lote) | O mesmo | Código mais complexo: reconciliar confirmações fora de ordem |
+| Ack manual / AUTO depois do trabalho | Queda do consumidor | Duplicatas possíveis; consumidor precisa ser idempotente |
+| Outbox | Inconsistência entre banco e broker | Tabela, relay, latência de segundos |
+
+Para os eventos de exame, o time escolheu tudo: é dado de saúde, e um laudo que não sai é um paciente sem diagnóstico. Para o painel da recepção, nada disso: fila clássica com TTL. A pergunta que conduz a decisão é sempre **"o que acontece se esta mensagem se perder, e o que acontece se ela chegar duas vezes?"**. Se a resposta for "nada grave", não pague pela garantia.
+
+O `publicarComConfirmacao` desta aula espera cada confirmação de forma síncrona. É simples e correto, e aguenta algumas centenas de mensagens por segundo por thread, dependendo da latência até o broker. Acima disso, o padrão é publicar várias mensagens e tratar as confirmações de forma assíncrona (com um `ConfirmCallback` no `RabbitTemplate` ou combinando os `CompletableFuture`), ou deixar que o relay do outbox publique em lote e marque como enviadas só as confirmadas.
+
+### Cluster, réplicas e o que acontece quando um nó cai
+
+Quorum queues precisam de um cluster com número **ímpar** de nós, no mínimo **3**: com 3 réplicas, a fila tolera a perda de 1 nó e continua aceitando escritas; com 5, tolera 2. Cluster de 2 nós é o pior dos mundos: o custo de replicar sem a tolerância a falhas (a maioria de 2 é 2). Os nós de um cluster RabbitMQ precisam de rede de baixa latência entre si: um cluster espalhado entre regiões distantes é um erro comum. Para replicar entre regiões, as ferramentas são outras (*federation*, *shovel*), com semântica assíncrona.
+
+Durante a queda de um nó, o líder de cada quorum queue afetada é reeleito entre as réplicas restantes, e clientes conectados ao nó perdido reconectam (o Spring faz isso sozinho). Publicações em andamento sem confirm são exatamente as que podem se perder ou duplicar. É por isso que confirm e idempotência aparecem juntos em toda conversa séria sobre mensageria.
+
+### Proteções do broker: memória, disco e fluxo
+
+O broker se protege: quando o uso de memória passa do limite configurado (`vm_memory_high_watermark`) ou o espaço livre em disco cai abaixo de `disk_free_limit`, ele dispara um **alarme** e **bloqueia todas as conexões que publicam**, no cluster inteiro, até a situação normalizar. Os consumidores continuam funcionando. Do lado da aplicação, isso aparece como `convertAndSend` travado ou confirmações que não chegam: o prazo do `publicarComConfirmacao` vence e a exceção sobe. Duas consequências práticas:
+
+- Um consumidor parado por horas pode, ao encher as filas, **impedir todos os outros sistemas de publicar** no mesmo broker. Filas sem limite de tamanho são um risco para o cluster, não só para o seu serviço. Por isso `x-max-length` (com `reject-publish` quando perder dados não é opção, ou `drop-head` quando só o recente importa) e alertas de profundidade de fila não são opcionais.
+- Use conexões **separadas** para publicar e consumir. Se publicação e consumo compartilham a conexão, um bloqueio por alarme trava também o consumo, que é justamente o que esvaziaria as filas. No Spring AMQP, `rabbitTemplate.setUsePublisherConnection(true)` (num `RabbitTemplateCustomizer`) faz o template publicar por uma conexão própria, separada da que os listeners usam.
+
+### O que observar, e quando acordar alguém
+
+O RabbitMQ 4 expõe métricas no formato Prometheus pelo plugin `rabbitmq_prometheus` (porta 15692), e o painel mostra as mesmas taxas em tempo real. Para cada fila importante, monitore:
+
+| Sinal | Alerta típico | O que indica |
+|---|---|---|
+| Mensagens prontas (*ready*) | Crescendo por N minutos seguidos | Consumo mais lento que a publicação |
+| Mensagens sem ack (*unacked*) | Alto e estável | Consumidores travados |
+| Consumidores | Igual a 0 numa fila crítica | Serviço fora ou listener parado |
+| Mensagens na DLQ | Maior que 0 | Falhas permanentes acontecendo |
+| Taxa de reentrega (*redeliver*) | Alta | Requeue em loop, timeouts de ack |
+| Alarmes de memória e disco | Qualquer um | O cluster inteiro está bloqueando publicadores |
+
+No lado da aplicação, o Spring AMQP instrumenta os listeners e o template com Micrometer (observação habilitada por `spring.rabbitmq.listener.simple.observation-enabled`), o que permite medir o tempo de processamento por mensagem e correlacionar com o rastreamento distribuído do [módulo 14](../../14-devops/05-observabilidade/). O alerta mais útil, e o mais esquecido, é a **idade da mensagem mais antiga** ou a "latência de ponta a ponta": o tempo entre `concluidoEm` e o processamento. Ele traduz "fila com 10 mil mensagens" em algo que o negócio entende: "laudos saindo com 40 minutos de atraso".
+
+### Quem é dono da topologia
+
+Nesta aula, a aplicação declara tudo. Isso funciona bem quando **um time** é dono do publicador e dos consumidores. Quando vários times compartilham o broker, surgem conflitos: o time de avisos quer mudar um argumento de uma fila que o time de laudos declara. A convenção que escala: **quem publica é dono da exchange**; **quem consome é dono da sua fila e dos seus bindings**. O publicador não conhece as filas; cada consumidor declara a própria fila e o próprio binding, na própria aplicação. Limites operacionais ficam em policies, versionadas num repositório de infraestrutura (o RabbitMQ aceita importar *definitions* em JSON). Segurança acompanha: um usuário por aplicação, permissões de *configure*, *write* e *read* restritas por expressão regular aos nomes que ela usa, TLS entre aplicação e broker, e nada de `guest`.
+
+### Como justificar a escolha para o time
+
+Uma boa justificativa cabe num ADR curto e compara com as alternativas reais:
+
+- **Por que um broker, e não HTTP direto?** O laboratório não pode esperar o SMS; o pico da manhã precisa ser absorvido; o gerador de laudos precisa poder ficar fora do ar por minutos sem perder nada.
+- **Por que RabbitMQ, e não Kafka?** Trabalho distribuído por mensagem, com ack individual, retry e DLQ por mensagem, roteamento por padrão de chave, volume de dezenas de milhares de mensagens por dia (longe do limite de qualquer dos dois) e ninguém precisa reler o histórico. Kafka resolveria, com mais conceitos (partições, offsets, grupos) e sem DLQ nativa.
+- **Por que não um serviço gerenciado (SQS, por exemplo)?** Uma opção legítima, que tira a operação do time. Pesa o *lock-in*, o modelo de roteamento mais simples (filas sem exchanges; o roteamento vai para outro serviço) e o custo por requisição em volume alto.
+- **Quando trocar de abordagem?** Se surgirem consumidores que precisam reprocessar dias de eventos, se o volume crescer para centenas de milhares de mensagens por segundo, ou se o fluxo virar a fonte de verdade (event sourcing), o log do Kafka passa a compensar a complexidade. As streams do RabbitMQ são um meio-termo para o primeiro caso, sem trocar de tecnologia.
+
+<Callout tipo="entrevista">
+**"Como você garante que uma mensagem não se perde no RabbitMQ?"** Uma boa resposta percorre o caminho inteiro: do lado do publicador, *publisher confirms* (e `mandatory` ou alternate exchange para mensagens sem rota) e, se a mensagem nasce de uma transação de banco, outbox; no broker, quorum queue durável com mensagens persistentes; no consumidor, ack só depois do trabalho feito. E fecha com a consequência: isso dá *at-least-once*, então o consumidor precisa ser idempotente.
+
+**"O que acontece quando o listener lança exceção?"** No Spring AMQP, o padrão é nack com requeue, que vira loop para falhas permanentes. Mostra experiência citar `AmqpRejectAndDontRequeueException`, `default-requeue-rejected=false`, retry limitado, DLX/DLQ com `x-death` e o `delivery-limit` das quorum queues no RabbitMQ 4.
+
+**"O que é prefetch e como você escolhe o valor?"** Limite de mensagens sem ack por consumidor. Alto (100 a 300) para mensagens rápidas, baixo (1 a 10) para trabalho lento ou desigual; o valor certo se mede, olhando *consumer utilisation* e o tempo para drenar a fila. Mencionar o custo em memória e a concentração do trabalho num consumidor é diferencial.
+
+**"Quando você usaria Kafka em vez de RabbitMQ?"** Reprocessamento de histórico, muitos consumidores independentes do mesmo fluxo, volumes muito altos, ordem por chave com paralelismo. RabbitMQ para filas de trabalho com roteamento flexível e controle por mensagem.
+
+**Para sênior:** "a fila de laudos está crescendo, o que você faz?" Uma boa resposta tem método: olhar consumidores (zero?), *unacked* (travados?), *utilisation* (saturados?), taxa de publicação (pico legítimo?), e só então escalar consumidores, ajustar prefetch ou investigar a dependência lenta, sem esquecer que filas enormes ameaçam o cluster inteiro pelos alarmes de memória e disco.
+</Callout>
+
+## Checkpoint
+
+A unidade do Rio de Janeiro também quer um painel, igual ao de São Paulo. E o time de faturamento pediu uma fila que receba **só os exames de imagem da unidade de São Paulo**, que têm preço diferenciado. Acrescente as duas filas à topologia (sem mexer no publicador) e responda: com as filas novas, para quais filas vai cada um dos quatro exames de demonstração do passo 4?
+
+<details>
+<summary>Solução</summary>
+
+Duas filas e dois bindings novos no `Declarables` de `TopologiaDeExames`:
+
+```java
+Queue painelRj = QueueBuilder.durable("exames.painel-rj")
+        .maxLength(1_000)
+        .overflow(QueueBuilder.Overflow.dropHead)
+        .ttl(3_600_000)
+        .build();
+Queue faturamentoImagemSp = QueueBuilder.durable("exames.faturamento-imagem-sp")
+        .quorum()
+        .deadLetterExchange(DLX)
+        .build();
+
+// ...dentro do new Declarables(...):
+BindingBuilder.bind(painelRj).to(exames).with("*.rj"),
+BindingBuilder.bind(faturamentoImagemSp).to(exames).with("imagem.sp")
+```
+
+| Routing key | Filas |
+|---|---|
+| `imagem.sp` | laudos, avisos, painel-sp, faturamento-imagem-sp |
+| `sangue.sp` | avisos, painel-sp |
+| `imagem.rj` | laudos, avisos, painel-rj |
+| `urina.rj` | avisos, painel-rj |
+
+**Por que assim.** O publicador não mudou: é o desacoplamento da exchange funcionando. O painel do RJ copia as características do painel de SP (clássica, limitada, com TTL), porque tem a mesma natureza descartável. A fila de faturamento é quorum com DLX, porque dinheiro não pode sumir. O binding `imagem.sp` não usa curinga: numa topic exchange, uma chave sem `*` nem `#` casa só com ela mesma, como numa direct.
+
+**Alternativa a evitar.** Um único painel com binding `#` e filtro por unidade no consumidor funcionaria, mas cada TV receberia (e descartaria) os exames de todas as unidades; com dez unidades, 90% do trabalho seria jogado fora. Filtrar no broker é mais barato.
+
+</details>
+
+<Quiz
+  id="12-rabbitmq"
+  questoes={[
+    {
+      pergunta: 'Numa topic exchange com os bindings "imagem.*", "#" e "*.sp", para quantas filas vai uma mensagem com routing key "imagem.sp.centro"?',
+      opcoes: ['Três', 'Duas', 'Uma', 'Nenhuma'],
+      correta: 2,
+      explicacao: 'O "*" casa exatamente uma palavra, então "imagem.*" não casa três palavras, e "*.sp" também não. Só "#" (zero ou mais palavras) casa: uma cópia.',
+    },
+    {
+      pergunta: 'O @RabbitListener lança uma exceção comum, sem retry e sem configuração extra. O que acontece com a mensagem?',
+      opcoes: ['Vai para a DLQ', 'É descartada', 'Volta para a fila e é reentregue, podendo entrar em loop', 'Fica bloqueada até o restart da aplicação'],
+      correta: 2,
+      explicacao: 'No modo AUTO, o padrão do Spring AMQP é nack com requeue (defaultRequeueRejected = true). Para ir à DLX, rejeite sem requeue: AmqpRejectAndDontRequeueException, default-requeue-rejected=false ou retry que rejeita ao final.',
+    },
+    {
+      pergunta: 'Com publisher confirms e mandatory ligados, você publica numa routing key que nenhuma fila casa. O que o publicador recebe?',
+      opcoes: ['Um nack', 'Nada: a mensagem é descartada em silêncio', 'Um basic.return com a mensagem e, depois, um ack', 'Uma exceção no convertAndSend'],
+      correta: 2,
+      explicacao: 'O broker cumpriu o papel dele (roteou para zero filas), então confirma com ack; antes disso, por causa do mandatory, devolve a mensagem. Por isso o código confere getReturned() antes de confiar no ack.',
+    },
+    {
+      pergunta: 'Cada laudo leva 2 segundos e o prefetch está em 250. Por que subir uma segunda instância não acelera o processamento da fila acumulada?',
+      opcoes: ['Porque o RabbitMQ só permite um consumidor por fila', 'Porque a primeira instância já recebeu as mensagens sem ack e a fila está sem mensagens prontas', 'Porque quorum queues não distribuem trabalho', 'Porque o prefetch é global no broker'],
+      correta: 1,
+      explicacao: 'O broker empurra até 250 mensagens sem ack para cada consumidor. As mensagens já entregues ao primeiro não são redistribuídas até ele confirmar ou o canal cair. Com prefetch baixo, elas ficam prontas na fila para quem estiver livre.',
+    },
+    {
+      pergunta: 'Por que o JacksonJsonMessageConverter da aula recebe uma lista de pacotes confiáveis?',
+      opcoes: ['Para o JSON ficar menor', 'Para impedir que o header __TypeId__ de uma mensagem forjada faça o Jackson instanciar uma classe arbitrária', 'Porque o Jackson 3 exige', 'Para o RabbitMQ validar o esquema da mensagem'],
+      correta: 1,
+      explicacao: 'Quando o tipo vem do header, uma lista de confiança restringe quais classes podem ser instanciadas. Sem ela, o conversor só aceita java.util e java.lang e recusa as classes do seu domínio com "is not in the trusted packages".',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O publicador fala com a **exchange**; os **bindings** decidem as filas. **direct** (chave igual), **topic** (`*` uma palavra, `#` zero ou mais), **fanout** (todas as filas), **headers** (atributos). Sem fila que case, a mensagem é descartada, a menos que haja `mandatory` ou alternate exchange.
+- Mesma fila: consumidores **competem**. Filas diferentes: cada uma recebe a sua **cópia**.
+- RabbitMQ 4: **quorum queues** para o que não pode se perder (replicadas, com `delivery-limit` padrão 20); clássicas para o descartável; streams para reler histórico.
+- Topologia declarada em código com `Declarables` e `QueueBuilder`; argumentos são imutáveis, limites operacionais vão bem em **policies**.
+- Spring AMQP 4: `JacksonJsonMessageConverter` (Jackson 3) com pacotes confiáveis; `message_id` em toda mensagem.
+- **Publisher confirms** + `mandatory` para saber que o broker assumiu a mensagem; confira o `returned` antes do `ack`.
+- `@RabbitListener` em modo AUTO: ack ao retornar, nack **com requeue** na exceção. Falha permanente: `AmqpRejectAndDontRequeueException`. Retry limitado e **DLX → DLQ** com `x-death`, alerta e reprocessamento.
+- **Prefetch** alto para mensagens rápidas, baixo para lentas; concorrência quebra a ordem.
+- Em produção: cluster de 3 nós, alarmes de memória e disco bloqueiam publicadores, monitore *ready*, *unacked*, consumidores, DLQ e a idade das mensagens.
+
+## Próximo passo
+
+Pratique no [exercício 12.01, Roteamento de notificações com RabbitMQ](../../../exercicios/12-mensageria/01-roteamento-rabbitmq/): uma topologia de notificações de e-commerce com topic exchange, fila de urgentes, auditoria e DLQ, consumida com retry limitado. Depois, siga para a [aula 12.03, Kafka](../../12-mensageria/03-kafka/), e compare o modelo de filas desta aula com o modelo de log particionado.
+
+## Referências
+
+- RabbitMQ — [AMQP 0-9-1 Model Explained](https://www.rabbitmq.com/tutorials/amqp-concepts)
+- RabbitMQ — [Exchanges](https://www.rabbitmq.com/docs/exchanges)
+- RabbitMQ — [Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues)
+- RabbitMQ — [Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms)
+- RabbitMQ — [Consumers](https://www.rabbitmq.com/docs/consumers) (prefetch, timeout de ack, single active consumer)
+- RabbitMQ — [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
+- RabbitMQ — [Policies](https://www.rabbitmq.com/docs/policies) e [Memory and Disk Alarms](https://www.rabbitmq.com/docs/alarms)
+- RabbitMQ — [Monitoring with Prometheus](https://www.rabbitmq.com/docs/prometheus)
+- Spring AMQP — [Reference Documentation](https://docs.spring.io/spring-amqp/reference/) (containers, ack mode, conversores, `TestRabbitTemplate`)
+- Spring Boot — [Messaging: AMQP](https://docs.spring.io/spring-boot/reference/messaging/amqp.html)

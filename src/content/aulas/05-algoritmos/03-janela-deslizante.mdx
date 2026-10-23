@@ -1,0 +1,156 @@
+---
+titulo: Janela deslizante
+descricao: Janelas de tamanho fixo e variável para problemas com trechos contíguos — médias móveis, maior sequência sem repetição, menor trecho que atinge uma meta.
+modulo: 05-algoritmos
+ordem: 3
+duracao: 45
+objetivos:
+  - Reconhecer problemas de "trecho contíguo" que pedem janela deslizante
+  - Implementar janelas de tamanho fixo somando o que entra e subtraindo o que sai
+  - Implementar janelas variáveis que expandem e encolhem
+  - Justificar por que o laço dentro do laço continua O(n)
+tags: [sliding window, dois ponteiros, O(n)]
+flashcards:
+  - frente: Qual o sinal de que um problema pede janela deslizante?
+    verso: Perguntas sobre um trecho CONTÍGUO (subarray/substring) mais longo, mais curto ou com soma/condição específica.
+  - frente: Como calcular a soma de cada janela de k elementos em O(n)?
+    verso: Mantenha a soma corrente; a cada passo, some o elemento que entra e subtraia o que sai (i − k).
+  - frente: Por que a janela variável com while dentro do for é O(n)?
+    verso: Os ponteiros início e fim só andam para a frente; cada elemento entra e sai da janela no máximo uma vez.
+  - frente: Quando a janela variável NÃO funciona para "soma ≥ meta"?
+    verso: Com números negativos — encolher a janela deixa de ser garantia de diminuir a soma. Aí se usa soma de prefixos.
+---
+
+Muitos problemas de negócio perguntam sobre **períodos contínuos**: "o maior intervalo de dias dentro do orçamento", "a média móvel de 7 dias", "o menor número de horas seguidas para bater a meta". A força bruta testa todos os trechos, O(n²) ou pior. A **janela deslizante** resolve em O(n) com dois índices que só andam para a frente.
+
+## Janela de tamanho fixo
+
+> Média móvel de k dias.
+
+**Força bruta:** para cada posição, somar os k elementos. O(n × k).
+
+**Janela:** a soma da janela seguinte é a soma atual **+ o que entra − o que sai**.
+
+<Figura legenda="Ao deslizar, só dois elementos mudam: o que entra e o que sai">
+<svg viewBox="0 0 620 150" width="620" role="img" aria-label="Array 10,20,30,40,50 com janela de 3 elementos; ao deslizar, sai o 10 e entra o 40">
+  <rect x="40" y="40" width="80" height="44" rx="8" class="d-box"/><text x="80" y="67" text-anchor="middle" class="d-mono">10</text>
+  <rect x="130" y="40" width="80" height="44" rx="8" class="d-box"/><text x="170" y="67" text-anchor="middle" class="d-mono">20</text>
+  <rect x="220" y="40" width="80" height="44" rx="8" class="d-box"/><text x="260" y="67" text-anchor="middle" class="d-mono">30</text>
+  <rect x="310" y="40" width="80" height="44" rx="8" class="d-box"/><text x="350" y="67" text-anchor="middle" class="d-mono">40</text>
+  <rect x="400" y="40" width="80" height="44" rx="8" class="d-box"/><text x="440" y="67" text-anchor="middle" class="d-mono">50</text>
+  <rect x="34" y="32" width="272" height="60" rx="12" fill="none" stroke="var(--info)" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="124" y="26" width="272" height="72" rx="12" fill="none" stroke="var(--accent)" stroke-width="2"/>
+  <text x="80" y="120" text-anchor="middle" class="d-label">sai</text>
+  <text x="350" y="120" text-anchor="middle" class="d-label">entra</text>
+  <text x="520" y="55" class="d-text">60 → 90</text>
+  <text x="520" y="78" class="d-label">(60 − 10 + 40)</text>
+</svg>
+</Figura>
+
+```java
+double soma = 0;
+for (int i = 0; i < valores.length; i++) {
+    soma += valores[i];                 // entra
+    if (i >= k) soma -= valores[i - k]; // sai
+    if (i >= k - 1) medias[i - k + 1] = soma / k;
+}
+```
+
+O(n), independentemente de k.
+
+## Janela de tamanho variável
+
+Quando o tamanho não é fixo, a janela **expande** pelo fim e **encolhe** pelo início conforme uma condição.
+
+### Maior trecho que respeita uma condição
+
+> Maior sequência de produtos visualizados sem repetir nenhum.
+
+```java
+Map<String, Integer> ultimaPosicao = new HashMap<>();
+int inicio = 0, maior = 0;
+for (int fim = 0; fim < produtos.length; fim++) {
+    Integer anterior = ultimaPosicao.put(produtos[fim], fim);
+    if (anterior != null && anterior >= inicio) {
+        inicio = anterior + 1;          // pula para depois da repetição
+    }
+    maior = Math.max(maior, fim - inicio + 1);
+}
+```
+
+Repare no `anterior >= inicio`: uma repetição que ficou **fora** da janela atual não importa.
+
+### Menor trecho que atinge uma meta
+
+> Menor número de horas seguidas cuja soma de vendas atinge a meta (valores positivos).
+
+```java
+int inicio = 0, menor = Integer.MAX_VALUE;
+long soma = 0;
+for (int fim = 0; fim < vendas.length; fim++) {
+    soma += vendas[fim];                   // expande
+    while (soma >= meta) {                 // enquanto a condição vale, tenta encolher
+        menor = Math.min(menor, fim - inicio + 1);
+        soma -= vendas[inicio++];
+    }
+}
+return menor == Integer.MAX_VALUE ? 0 : menor;
+```
+
+### O molde geral
+
+```text
+para fim de 0 até n-1:
+    incluir elemento[fim] no estado da janela
+    enquanto a janela é inválida (ou pode melhorar):
+        remover elemento[inicio] do estado; inicio++
+    atualizar a resposta com a janela [inicio, fim]
+```
+
+O "estado da janela" pode ser uma soma, um contador de caracteres (`Map<Character, Integer>`), um conjunto…
+
+## Por que é O(n), se tem um `while` dentro do `for`?
+
+Porque `inicio` e `fim` **só avançam**, cada um no máximo n vezes. O total de passos do `while`, somado ao longo de toda a execução, é no máximo n. Tempo total: O(n) + O(n) = O(n). É a mesma análise amortizada da aula anterior — e você deve dizê-la em voz alta na entrevista, porque o entrevistador vai perguntar.
+
+<Callout tipo="atencao" titulo="Números negativos quebram a janela">
+A janela variável para "soma ≥ meta" depende de uma propriedade: **encolher a janela nunca aumenta a soma**. Com valores negativos, isso deixa de valer. Para "subarray com soma exatamente K" com negativos, a técnica é **soma de prefixos + HashMap** (guardar quantas vezes cada soma acumulada apareceu).
+</Callout>
+
+## Onde isso aparece no backend
+
+- **Rate limiting** por janela deslizante (quantas requisições nos últimos 60 s) — você vai implementar no módulo 11.
+- **Médias móveis** em métricas e alertas (latência média dos últimos 5 minutos).
+- **Detecção de fraude**: "mais de 5 transações em 10 minutos".
+- **Gatherers.windowSliding** (Java 24) faz a janela fixa por você numa Stream.
+
+<Quiz
+  id="05-janela"
+  questoes={[
+    {
+      pergunta: 'Qual problema NÃO é um bom candidato a janela deslizante?',
+      opcoes: ['Maior substring sem caracteres repetidos', 'Média móvel de 7 dias', 'Par de elementos (em qualquer posição) com soma X', 'Menor subarray com soma ≥ meta (positivos)'],
+      correta: 2,
+      explicacao: 'Janela é para trechos CONTÍGUOS. Pares em qualquer posição pedem hash ou dois ponteiros com ordenação.',
+    },
+    {
+      pergunta: 'Em "maior sequência sem repetir", por que checar `anterior >= inicio`?',
+      opcoes: ['Para evitar NullPointerException', 'Porque repetições que já saíram da janela não importam', 'Para ordenar os elementos', 'Não é necessário'],
+      correta: 1,
+      explicacao: 'Se a ocorrência anterior está antes do início da janela atual, ela não causa repetição dentro da janela.',
+    },
+    {
+      pergunta: 'A janela variável com while dentro do for tem complexidade…',
+      opcoes: ['O(n²)', 'O(n log n)', 'O(n)', 'O(k × n)'],
+      correta: 2,
+      explicacao: 'Os dois ponteiros só avançam; cada elemento entra e sai uma única vez.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Trecho contíguo** + "maior/menor/com soma" → janela deslizante.
+- Janela **fixa**: some o que entra, subtraia o que sai.
+- Janela **variável**: expande pelo fim, encolhe pelo início enquanto a condição pede.
+- É O(n) porque os ponteiros só avançam; com negativos, use soma de prefixos.

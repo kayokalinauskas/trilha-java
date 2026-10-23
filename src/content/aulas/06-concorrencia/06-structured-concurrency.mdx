@@ -1,0 +1,134 @@
+---
+titulo: Structured concurrency, scoped values e coleções concorrentes
+descricao: Tratar tarefas paralelas como uma unidade (StructuredTaskScope, em preview), passar contexto com ScopedValue (Java 25) e escolher as coleções concorrentes certas.
+modulo: 06-concorrencia
+ordem: 6
+duracao: 40
+objetivos:
+  - Entender o problema que structured concurrency resolve
+  - Conhecer a API StructuredTaskScope e seu estado atual (preview)
+  - Usar ScopedValue no lugar de ThreadLocal para contexto de requisição
+  - Escolher coleções e filas concorrentes adequadas
+tags: [structured concurrency, ScopedValue, Java 25, coleções concorrentes]
+flashcards:
+  - frente: Que problema a structured concurrency resolve?
+    verso: Tarefas paralelas "órfãs" — se uma subtarefa falha, as outras continuam rodando sem ninguém esperá-las. Com escopo estruturado, as subtarefas vivem e morrem juntas com o bloco que as criou.
+  - frente: Qual o estado da StructuredTaskScope no Java 25?
+    verso: Ainda em preview (exige --enable-preview); a API mudou entre as versões de preview.
+  - frente: O que é um ScopedValue?
+    verso: Um valor imutável ligado a um escopo de execução (e às threads filhas), final no Java 25 (JEP 506). Alternativa mais barata e segura ao ThreadLocal.
+  - frente: Quando usar CopyOnWriteArrayList?
+    verso: Quando a lista é lida muito mais do que alterada (ex. listeners); cada escrita copia o array inteiro.
+  - frente: Qual fila usar para produtor/consumidor com limite?
+    verso: Uma BlockingQueue limitada, como ArrayBlockingQueue — put bloqueia quando cheia, take bloqueia quando vazia.
+---
+
+Esta aula fecha o módulo com as novidades mais recentes da plataforma e com as estruturas concorrentes que você vai usar no dia a dia.
+
+## O problema: tarefas órfãs
+
+Com `CompletableFuture` ou `ExecutorService`, nada impede isto:
+
+```java
+Future<Cliente> cliente = executor.submit(() -> buscarCliente(id));
+Future<List<Pedido>> pedidos = executor.submit(() -> buscarPedidos(id));
+Cliente c = cliente.get();          // se lançar exceção aqui...
+List<Pedido> p = pedidos.get();     // ...ninguém espera nem cancela a busca de pedidos
+```
+
+Se `buscarCliente` falha, a busca de pedidos **continua rodando** sozinha, consumindo recursos para um resultado que ninguém vai usar. Em sistemas grandes, esses "vazamentos" de tarefas são difíceis de rastrear.
+
+## Structured concurrency
+
+A ideia: **subtarefas paralelas pertencem ao bloco de código que as criou**. Elas começam e terminam dentro dele; se uma falha, as outras são canceladas; e o bloco só termina quando todas terminaram — como acontece com o código sequencial.
+
+```java
+// Java 25 — API em PREVIEW (compile e rode com --enable-preview)
+try (var escopo = StructuredTaskScope.open()) {
+    Subtask<Cliente> cliente = escopo.fork(() -> buscarCliente(id));
+    Subtask<List<Pedido>> pedidos = escopo.fork(() -> buscarPedidos(id));
+
+    escopo.join();   // espera as duas; se uma falhar, cancela a outra e lança
+    return new Painel(cliente.get(), pedidos.get());
+}
+```
+
+Cada `fork` roda em uma **virtual thread**. A estrutura do código espelha a estrutura das tarefas, e ferramentas de observabilidade conseguem mostrar a árvore "requisição → subtarefas".
+
+<Callout tipo="novidade" titulo="Preview: acompanhe, mas não dependa ainda">
+`StructuredTaskScope` está em *preview* há várias versões (JEP 505 no Java 25), e a API mudou entre elas. Em código de produção, prefira `CompletableFuture` ou executores por enquanto; em entrevistas, saber **o problema que ela resolve** já é um diferencial.
+</Callout>
+
+## Scoped values: contexto sem `ThreadLocal`
+
+Aplicações precisam carregar **contexto** ao longo de uma requisição: o usuário autenticado, o *tenant*, o *correlation id* dos logs. A solução clássica é o `ThreadLocal`, que tem problemas:
+
+- é **mutável** (qualquer código pode alterá-lo no meio do caminho);
+- precisa ser **limpo manualmente** (esquecer o `remove()` em um pool de threads vaza dados de uma requisição para a próxima — um bug de segurança real);
+- com milhões de virtual threads, cada cópia custa memória.
+
+O **`ScopedValue`**, final no **Java 25** (JEP 506), resolve os três:
+
+```java
+static final ScopedValue<Usuario> USUARIO = ScopedValue.newInstance();
+
+// no filtro de entrada da requisição
+ScopedValue.where(USUARIO, usuarioAutenticado).run(() -> controller.processar(requisicao));
+
+// em qualquer ponto abaixo, na mesma thread (ou em subtarefas estruturadas)
+Usuario atual = USUARIO.get();
+```
+
+O valor é **imutável**, vale só **dentro do escopo** do `run` e some sozinho ao sair — não há o que limpar. Frameworks como o Spring vão adotando esses recursos aos poucos; o mais importante é entender por que o `ThreadLocal` mal usado é perigoso.
+
+## Coleções concorrentes
+
+| Estrutura | Quando usar |
+|---|---|
+| `ConcurrentHashMap` | mapa compartilhado; use `merge`/`compute` para atualizações atômicas |
+| `CopyOnWriteArrayList` | lista **muito lida e pouco alterada** (listeners, configurações); cada escrita copia tudo |
+| `ConcurrentLinkedQueue` | fila sem bloqueio, sem limite |
+| `ArrayBlockingQueue` / `LinkedBlockingQueue` | **produtor/consumidor**: `put` bloqueia quando cheia, `take` quando vazia |
+| `ConcurrentSkipListMap` | mapa **ordenado** concorrente (o `TreeMap` concorrente) |
+
+```java
+BlockingQueue<Pedido> fila = new ArrayBlockingQueue<>(1_000);   // limite = backpressure
+
+// produtor
+fila.put(pedido);                       // espera se a fila estiver cheia
+
+// consumidor
+Pedido proximo = fila.take();           // espera se a fila estiver vazia
+```
+
+A fila **limitada** é uma forma simples de *backpressure*: se os consumidores não dão conta, os produtores desaceleram, em vez de a memória explodir. No módulo 12 você vai ver a mesma ideia em escala, com Kafka e RabbitMQ.
+
+<Quiz
+  id="06-structured"
+  questoes={[
+    {
+      pergunta: 'Qual o principal benefício da structured concurrency?',
+      opcoes: ['Deixa cada tarefa mais rápida', 'Subtarefas vivem e morrem com o bloco que as criou; falha em uma cancela as outras', 'Elimina a necessidade de virtual threads', 'Substitui o banco de dados'],
+      correta: 1,
+      explicacao: 'Evita tarefas órfãs e deixa o ciclo de vida explícito na estrutura do código.',
+    },
+    {
+      pergunta: 'Qual o risco de ThreadLocal em pools de threads?',
+      opcoes: ['Nenhum', 'Sem remove(), o valor de uma requisição pode vazar para a próxima que usar a mesma thread', 'ThreadLocal não funciona em pools', 'Deixa o código mais lento'],
+      correta: 1,
+      explicacao: 'A thread é reaproveitada, e o valor fica lá. ScopedValue some automaticamente ao sair do escopo.',
+    },
+    {
+      pergunta: 'Produtores geram pedidos mais rápido do que os consumidores processam. Qual estrutura evita estourar a memória?',
+      opcoes: ['ArrayList sincronizada', 'ArrayBlockingQueue com capacidade', 'ConcurrentLinkedQueue', 'CopyOnWriteArrayList'],
+      correta: 1,
+      explicacao: 'A fila limitada bloqueia o put quando cheia, freando os produtores (backpressure).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Structured concurrency** (preview): subtarefas pertencem ao bloco que as criou; falhas cancelam as irmãs.
+- **ScopedValue** (Java 25): contexto imutável, com escopo e sem limpeza manual — no lugar do `ThreadLocal`.
+- Coleções concorrentes: `ConcurrentHashMap`, `CopyOnWriteArrayList` (muita leitura), `BlockingQueue` limitada (produtor/consumidor com backpressure).

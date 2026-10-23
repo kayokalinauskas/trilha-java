@@ -1,0 +1,162 @@
+---
+titulo: Cache-aside com Redis que aguenta produção
+codigo: "15.01"
+resumo: Coloque um Redis na frente de um banco lento com o padrão cache-aside e os quatro cuidados que separam um cache de produção de um de tutorial — TTL com jitter, cache negativo, single-flight contra o stampede e o Redis fora do ar tratado como lentidão, não como erro —, além da invalidação por remoção na escrita.
+modulo: 15-system-design
+ordem: 1
+dificuldade: medio
+tempo: 2h–2h30
+conceitos: [cache-aside, Redis, StringRedisTemplate, TTL, jitter, cache negativo, cache stampede, single-flight, CompletableFuture, invalidação, Testcontainers]
+aulas: [15-system-design/01-cache, 15-system-design/02-redis]
+java:
+  modulo: m15-system-design
+  teste: CacheAsideTest
+---
+
+## Contexto
+
+A página de produto de um e-commerce faz, em média, 4 mil leituras por segundo, e cada uma consulta o banco. A consulta leva 50 ms e o banco já passa dos 80% de CPU no horário de almoço. O time decidiu colocar um Redis na frente. A primeira versão, feita numa tarde, tinha cinco linhas: "procura no Redis; se não achar, busca no banco e grava". Funcionou por duas semanas. Depois:
+
+- uma carga de preços gravou 50 mil produtos de uma vez, com TTL de exatamente 10 minutos. Dez minutos depois, **todas** as chaves expiraram no mesmo segundo, e o banco recebeu 50 mil consultas de uma vez;
+- um robô passou a pedir `/produtos/qualquer-coisa` com ids inventados. Nenhum existe, nada vai para o cache, e cada pedido vai direto ao banco;
+- o produto da vitrine (5 mil leituras por segundo) expirou. Nos 50 ms seguintes, **todas** as leituras deram *miss* e dispararam a mesma consulta: o *cache stampede*;
+- num domingo, o Redis ficou fora por 3 minutos. A aplicação respondeu 500 em todas as páginas de produto, embora o banco estivesse de pé.
+
+Sua missão é reescrever o `CatalogoComCache` para que nada disso aconteça.
+
+<Callout tipo="atencao" titulo="Precisa de Docker">
+Os testes sobem um Redis de verdade (`redis:8-alpine`) com Testcontainers. Deixe o Docker (Docker Desktop, Rancher Desktop ou Podman) rodando antes de executar. Sem Docker, os testes são **pulados** (aparecem como *skipped*), e não aprovados.
+</Callout>
+
+## O que já existe
+
+Em `dev.trilhajava.m15.cache` (a `CacheApplication`):
+
+- `Produto(id, nome, preco)`, um record;
+- `BancoDeProdutos`: a fonte da verdade, com 100 produtos (`p1` a `p100`, o `pN` custa `N.90`). Cada `buscar(id)` leva **50 ms** e é **contado** (`consultas()`), para os testes saberem quantas vezes o cache deixou passar. Pronto; não altere;
+- `CatalogoComCache` (esboço), com as constantes `TTL` (10 min), `JITTER_MAXIMO` (60 s), `TTL_NEGATIVO` (30 s), `AUSENTE` (`"__ausente__"`) e o método `chave(id)`, que devolve `produto:` seguido do id. Recebe no construtor o banco, um `StringRedisTemplate` e o `JsonMapper` do Jackson 3 (`tools.jackson.databind.json.JsonMapper`).
+
+Você implementa `buscar(String id)` e `atualizar(Produto)`.
+
+## Os requisitos
+
+**1. Cache-aside.** `buscar` consulta o Redis primeiro. No *miss*, busca no banco, grava no Redis e devolve. A segunda leitura do mesmo produto não vai ao banco.
+
+| No Redis | Valor |
+|---|---|
+| chave | `produto:p1` (use `chave(id)`) |
+| valor | o produto em JSON: `{"id":"p1","nome":"Produto 1","preco":1.90}` |
+
+**2. TTL com jitter.** Todo produto gravado expira em `TTL` **mais** um valor aleatório entre 0 e `JITTER_MAXIMO`: entre 600 e 660 segundos. Trinta produtos carregados juntos não podem expirar todos no mesmo segundo.
+
+**3. Cache negativo.** Se o produto não existe no banco, grave o marcador `AUSENTE` com `TTL_NEGATIVO` (30 s). Na leitura, o marcador vira `Optional.empty()`, sem ir ao banco e sem tentar desserializar `"__ausente__"` como JSON. O TTL é curto para que um produto recém-cadastrado apareça logo.
+
+**4. Invalidação por remoção.** `atualizar(produto)` grava no banco e **apaga** a chave no Redis. **Não** grave o valor novo no cache. A próxima leitura dá *miss* e busca o valor atual. (O porquê está nos "Passo a passo" da solução, e na aula 1: pense em duas atualizações simultâneas.)
+
+**5. Single-flight.** Vinte leituras **simultâneas** da mesma chave fria fazem **uma** consulta ao banco: a primeira thread carrega, e as outras esperam o resultado dela. Vale dentro da instância; não precisa de lock no Redis.
+
+**6. Redis fora do ar é lentidão, não erro.** Se o Redis não responde, `buscar` cai direto no banco e devolve o produto, sem exceção e em poucos segundos (o teste exige menos de 3). Falhar ao gravar ou ao invalidar também não pode derrubar a operação: registre um aviso no log e siga.
+
+<Callout tipo="dica" titulo="O timeout do cliente Redis">
+O teste roda com `spring.data.redis.timeout=300ms`. Sem um timeout curto, o Lettuce espera o padrão dele (60 s) antes de desistir de um comando, e o "cair no banco" chega tarde demais: a thread da requisição fica presa esperando um Redis que não vai responder. Em produção, configure `spring.data.redis.timeout` (e `spring.data.redis.connect-timeout`) com valores da ordem de centenas de milissegundos, compatíveis com a latência que você promete.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] `CacheAsideTest` passa (8 testes).
+- [ ] Duas leituras de `p1` fazem uma consulta ao banco.
+- [ ] O TTL de um produto fica entre 595 e 660 segundos, e 30 produtos carregados juntos têm pelo menos 8 TTLs diferentes.
+- [ ] Um id inexistente, lido duas vezes, vai ao banco uma vez; a chave fica com TTL de até 30 s.
+- [ ] Depois de `atualizar`, a chave **não existe** no Redis, e a próxima leitura traz o preço novo.
+- [ ] 20 leituras simultâneas de `p5` fazem **uma** consulta.
+- [ ] Com o contêiner do Redis pausado, `buscar("p7")` devolve o produto em menos de 3 s; com o Redis de volta, o cache volta a funcionar.
+
+## Desafios opcionais
+
+- Faça o *single-flight* **entre instâncias**: antes de ir ao banco, tente `SET lock:produto:p5 <uuid> NX PX 2000` (aula 2). Quem não conseguir o lock espera alguns milissegundos e relê o cache. O que acontece se a instância que tem o lock morrer no meio?
+- Coloque um Caffeine pequeno (TTL de 5 s) **na frente** do Redis: um cache em dois níveis. O que acontece com a invalidação nas outras instâncias?
+- Troque a remoção imediata por **remoção dupla com atraso** (*delayed double delete*): apague, espere 500 ms, apague de novo. Que corrida isso fecha, e qual continua aberta?
+- Escreva a mesma coisa com `@Cacheable(sync = true)` e um `RedisCacheManager` com TTL. Quantos dos 8 testes você consegue manter?
+
+<Dicas>
+<Dica nivel={1}>
+Faça por partes, rodando os testes a cada uma: (1) cache-aside puro (testes 1 e 2); (2) TTL com jitter; (3) cache negativo; (4) `atualizar`; (5) *single-flight*; (6) o `try/catch` do Redis fora do ar. O *single-flight* é o único que pede uma estrutura nova na classe.
+</Dica>
+<Dica nivel={2}>
+- Leitura e gravação: `redis.opsForValue().get(chave)` e `redis.opsForValue().set(chave, valor, duracao)`. A sobrecarga com `Duration` grava o valor e a expiração num comando só (`SET ... PX`).
+- JSON: `json.writeValueAsString(produto)` e `json.readValue(texto, Produto.class)`. No Jackson 3, essas exceções são não verificadas: nada de `throws` espalhado.
+- Jitter: `TTL.plusMillis(ThreadLocalRandom.current().nextLong(JITTER_MAXIMO.toMillis() + 1))`.
+- Redis fora do ar: as exceções do Spring Data Redis estendem `DataAccessException` (por exemplo, `RedisConnectionFailureException` e `QueryTimeoutException`). Capture essa, e não `Exception`: um bug seu não deve virar "Redis fora do ar".
+</Dica>
+<Dica nivel={3}>
+*Single-flight* com um mapa de "cargas em andamento":
+
+```java
+private final Map<String, CompletableFuture<Optional<Produto>>> emVoo = new ConcurrentHashMap<>();
+
+CompletableFuture<Optional<Produto>> novo = new CompletableFuture<>();
+CompletableFuture<Optional<Produto>> existente = emVoo.putIfAbsent(chave, novo);
+if (existente != null) {
+    return existente.join();          // alguém já está carregando: espere o resultado dele
+}
+// eu carrego: busco no banco, gravo no Redis, novo.complete(resultado)
+// em caso de exceção: novo.completeExceptionally(e), para ninguém ficar esperando para sempre
+// no finally: emVoo.remove(chave, novo)
+```
+
+O `putIfAbsent` do `ConcurrentHashMap` é atômico: entre 20 threads, exatamente uma recebe `null` e vira a "dona" da carga. O `remove(chave, novo)` (com dois argumentos) só remove se o valor ainda for o seu.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/cache/CatalogoComCache.java" />
+
+O `application.properties` do módulo não tem nada do 15.01: o timeout curto vem do próprio teste (`@SpringBootTest(properties = "spring.data.redis.timeout=300ms")`), e o endereço do Redis vem do `@ServiceConnection`. Numa aplicação de verdade, o timeout iria para o arquivo:
+
+```properties
+# fora do exercício: o que eu colocaria em produção
+spring.data.redis.timeout=300ms
+spring.data.redis.connect-timeout=500ms
+```
+
+### Passo a passo
+
+1. **Ler do cache primeiro, dentro de um `try`.** Se o `get` lança `DataAccessException`, o Redis está fora (ou lento demais para o timeout): a leitura vai direto ao banco. O sistema fica mais lento, porque todo o tráfego cai no banco, mas continua respondendo. Repare que esse caminho **não** passa pelo *single-flight*: é uma decisão consciente para manter o código simples; veja as alternativas.
+2. **Hit: distinguir o marcador.** `AUSENTE.equals(emCache)` vem **antes** de desserializar. Sem isso, o `readValue` tentaria interpretar `__ausente__` como JSON e lançaria exceção.
+3. **Miss: carregar uma vez.** O `putIfAbsent` elege uma thread "dona" da carga por chave. As outras recebem o `CompletableFuture` dela e fazem `join()`. Quando a dona termina, todas recebem o mesmo `Optional`. O `finally` remove a entrada, para que a próxima expiração dispare uma nova carga, e o `completeExceptionally` garante que, se o banco falhar, as threads que esperavam recebam o erro em vez de travar.
+4. **Gravar com TTL, sempre.** O produto vai com `TTL + jitter`; a ausência vai com `TTL_NEGATIVO`. Nenhuma chave sem expiração: o TTL é a rede de segurança que limita por quanto tempo um erro de invalidação pode durar.
+5. **Falhar ao gravar não é falhar a leitura.** O produto já veio do banco; se o `set` no Redis falhar, o cliente recebe o produto do mesmo jeito.
+6. **Invalidar é apagar.** Imagine duas atualizações do mesmo produto, A (preço 10) e B (preço 12), com a estratégia "atualizar o cache":
+
+   | Tempo | A | B | Banco | Redis |
+   |---|---|---|---|---|
+   | t1 | grava 10 no banco | | 10 | |
+   | t2 | | grava 12 no banco | 12 | |
+   | t3 | | grava 12 no Redis | 12 | 12 |
+   | t4 | grava 10 no Redis | | 12 | **10** |
+
+   O banco diz 12, o cache diz 10, e fica assim até o TTL vencer. Com a remoção, a ordem não importa: apagar duas vezes dá no mesmo, e a próxima leitura busca o que estiver no banco.
+
+<Callout tipo="atencao" titulo="Apagar não fecha todas as janelas">
+Ainda existe uma corrida rara: uma leitura dá *miss*, lê o preço **antigo** do banco, demora, e grava no Redis **depois** que o `atualizar` já apagou a chave. O valor velho fica até o TTL. Numa aplicação com transação, apague **depois do commit** (a aula 1 mostra o `afterCommit`); e o TTL continua sendo o limite do estrago. Aqui o `BancoDeProdutos` não tem transação, então a remoção logo após o `salvar` basta.
+</Callout>
+
+### Alternativas e trade-offs
+
+- **`@Cacheable(sync = true)` do Spring Cache.** Resolve o cache-aside com uma anotação, e o `sync = true` pede ao provedor que só uma thread carregue cada chave. Mas a sincronização vale **dentro de uma instância**: com o `RedisCacheManager` e 10 instâncias, até 10 consultas iguais ainda podem chegar ao banco ao mesmo tempo. É o mesmo alcance do `ConcurrentHashMap` deste exercício, com menos controle: jitter por chave, cache negativo com TTL próprio e o comportamento com o Redis fora do ar pedem configuração extra (um `CacheErrorHandler`, por exemplo). Anotação é ótima para o caso simples; código explícito deixa as decisões à vista.
+- ***Single-flight* entre instâncias com lock no Redis.** Reduz as N consultas (uma por instância) a uma, ao custo de uma ida a mais ao Redis em todo *miss* e de decidir o que fazer com quem não pegou o lock (esperar, reler, servir valor velho). Vale para consultas muito caras; para 50 ms e poucas instâncias, o *single-flight* local basta.
+- **Renovação antecipada** (`refreshAfterWrite` no Caffeine, ou recarregar em segundo plano quando faltar pouco para expirar): elimina o *miss* das chaves quentes. Mais complexo, e recarrega também chaves que ninguém vai ler de novo.
+- **Circuit breaker no Redis** (13.04): hoje, com o Redis fora, **toda** leitura paga os 300 ms do timeout antes de cair no banco. Um circuito aberto pularia o Redis direto por alguns segundos. Com milhares de leituras por segundo, é uma melhora real.
+- **Write-through** (gravar no cache junto com o banco): a leitura logo após a escrita já sai do cache, mas volta a corrida da tabela acima. Faz sentido quando só um processo escreve cada chave.
+
+### Avalie sua solução
+
+- Você capturou `DataAccessException` ou `Exception`? O que acontece com um erro de desserialização (um JSON antigo, de uma versão anterior do `Produto`) em cada caso? Como a **versão na chave** (`produto:v2:p1`, aula 1) ajudaria?
+- Com 5 mil leituras por segundo e o Redis fora, quantas consultas por segundo o banco recebe? Ele aguenta? O que você colocaria entre a aplicação e o banco nesse cenário?
+- O cache negativo tem 30 s. Um produto foi cadastrado agora, mas alguém pediu por ele há 10 s: por quanto tempo ele "não existe"? Como o cadastro poderia resolver isso sem esperar?
+- Se o `banco.buscar` lançar exceção para a thread dona, o que as outras 19 recebem? E a próxima requisição, depois disso?
+
+</Solucao>

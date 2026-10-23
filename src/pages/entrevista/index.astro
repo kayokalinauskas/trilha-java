@@ -1,0 +1,838 @@
+---
+import { getCollection, render } from 'astro:content';
+import Base from '../../layouts/Base.astro';
+import Icon from '../../components/Icon.astro';
+import '../../styles/prose.css';
+
+const perguntas = (await getCollection('entrevista')).sort(
+  (a, b) => (a.data.modulo?.id ?? 'zz').localeCompare(b.data.modulo?.id ?? 'zz') || a.data.pergunta.localeCompare(b.data.pergunta),
+);
+const renderizadas = await Promise.all(perguntas.map(async (p) => ({ p, Content: (await render(p)).Content })));
+const temas = [...new Set(perguntas.map((p) => p.data.tema))].sort();
+const totalEn = perguntas.filter((p) => p.data.idioma === 'en').length;
+
+/** Tipo de rodada, usado para montar o loop: comportamental, técnica ou system design. */
+const rodada = (tema: string) =>
+  /behavioral|comportamental|carreira/i.test(tema) ? 'comportamental' : /system design/i.test(tema) ? 'system-design' : 'tecnica';
+
+const frases = [
+  {
+    titulo: 'Ganhar tempo para pensar',
+    itens: ["That's a good question. Let me think about it for a second.", 'Can I take a moment to organize my thoughts?'],
+  },
+  {
+    titulo: 'Esclarecer a pergunta',
+    itens: ['Just to make sure I understood: you mean…?', 'Could you give me an example?', 'Are we assuming…?'],
+  },
+  {
+    titulo: 'Pensar em voz alta',
+    itens: ["My first idea is… but the problem with that is…", "Let me walk you through my approach.", "The trade-off here is…"],
+  },
+  {
+    titulo: 'Quando você não sabe',
+    itens: ["I haven't worked with that directly, but here's how I'd approach it…", "I'm not sure, but my guess would be… and I'd confirm it in the docs."],
+  },
+  {
+    titulo: 'Pedir para repetir',
+    itens: ['Sorry, could you repeat the last part?', 'Could you say that a bit more slowly?'],
+  },
+];
+---
+
+<Base title="Simulador de entrevista" description="Perguntas técnicas e comportamentais de entrevistas de backend Java, no Brasil e no exterior, com resposta-modelo.">
+  <section class="head">
+    <div class="container head-grid">
+      <div>
+        <p class="eyebrow">Simulador de entrevista</p>
+        <h1>Responda antes de ver a resposta</h1>
+        <p class="lead">
+          {perguntas.length} perguntas de processos seletivos reais — {perguntas.length - totalEn} em português e {totalEn} em inglês, para vagas
+          internacionais. Responda em voz alta, marque os pontos-chave que você cobriu e se autoavalie.
+        </p>
+      </div>
+      <div class="card simulado-box">
+        <p class="sb-t"><Icon name="play" size={16} /> Modo simulado</p>
+        <p class="muted" data-formato-desc>5 perguntas sorteadas, 3 minutos cada, uma de cada vez.</p>
+        <div class="row">
+          <label class="sel">
+            <span>Formato</span>
+            <select id="sim-formato">
+              <option value="rapido">Rápido</option>
+              <option value="loop">Loop completo</option>
+            </select>
+          </label>
+          <label class="sel">
+            <span>Idioma</span>
+            <select id="sim-idioma">
+              <option value="pt">Português</option>
+              <option value="en">English</option>
+              <option value="">Misturado</option>
+            </select>
+          </label>
+        </div>
+        <label class="check" data-so-com-voz hidden>
+          <input type="checkbox" id="sim-escuta" />
+          <span>Modo escuta: ouvir a pergunta antes de ler</span>
+        </label>
+        <button type="button" class="btn btn-primary btn-sm" id="iniciar-simulado">Iniciar simulado</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="container">
+    <details class="card frases" lang="en">
+      <summary lang="pt-BR">
+        <Icon name="globe" size={16} /> Frases úteis para entrevistas em inglês
+      </summary>
+      <div class="frases-grid">
+        {
+          frases.map((g) => (
+            <div>
+              <p class="bl-t" lang="pt-BR">{g.titulo}</p>
+              <ul>
+                {g.itens.map((f) => (
+                  <li>{f}</li>
+                ))}
+              </ul>
+            </div>
+          ))
+        }
+      </div>
+    </details>
+
+    <div class="barra" role="group" aria-label="Filtros">
+      <label class="sel">
+        <span>Idioma</span>
+        <select data-f="idioma">
+          <option value="">Todos</option>
+          <option value="pt">Português</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+      <label class="sel">
+        <span>Nível</span>
+        <select data-f="nivel">
+          <option value="">Todos</option>
+          <option value="jr">Júnior</option>
+          <option value="pleno">Pleno</option>
+        </select>
+      </label>
+      <label class="sel">
+        <span>Tema</span>
+        <select data-f="tema">
+          <option value="">Todos</option>
+          {temas.map((t) => <option value={t}>{t}</option>)}
+        </select>
+      </label>
+      <label class="sel">
+        <span>Progresso</span>
+        <select data-f="progresso">
+          <option value="">Todas</option>
+          <option value="nova">Nunca treinadas</option>
+          <option value="revisar">Precisam de revisão</option>
+          <option value="dominadas">Dominadas</option>
+        </select>
+      </label>
+      <p class="cont" aria-live="polite"><span data-cont>{perguntas.length}</span> pergunta(s)</p>
+    </div>
+
+    <div class="sim-hud" id="sim-hud" hidden>
+      <span>Pergunta <strong data-sim-n>1</strong> de <strong data-sim-total>5</strong></span>
+      <span class="etapa" data-sim-etapa hidden></span>
+      <span class="timer" data-timer>3:00</span>
+      <button type="button" class="btn btn-ghost btn-sm" id="sair-simulado">Sair do simulado</button>
+    </div>
+
+    <ol class="lista" id="lista">
+      {
+        renderizadas.map(({ p, Content }) => (
+          <li
+            class="q card"
+            data-q={p.id}
+            data-idioma={p.data.idioma}
+            data-nivel={p.data.nivel}
+            data-tema={p.data.tema}
+            data-rodada={rodada(p.data.tema)}
+            lang={p.data.idioma === 'en' ? 'en' : 'pt-BR'}
+          >
+            <div class="q-meta">
+              <span class="badge">{p.data.tema}</span>
+              <span class={`badge badge-dot lvl-${p.data.nivel}`}>{p.data.nivel === 'jr' ? 'Júnior' : 'Pleno'}</span>
+              {p.data.idioma === 'en' && (
+                <span class="badge">
+                  <Icon name="globe" size={12} /> EN
+                </span>
+              )}
+              <span class="nota" data-nota />
+            </div>
+            <h2 class="q-t">{p.data.pergunta}</h2>
+            <p class="q-oculta" hidden lang="pt-BR">
+              Ouça a pergunta e responda. <button type="button" class="link" data-mostrar-texto>Mostrar o texto</button>
+            </p>
+
+            <div class="q-acoes">
+              <button type="button" class="btn btn-sm" data-revelar>
+                <Icon name="eye" size={15} /> Revelar resposta-modelo
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm" data-ouvir hidden lang="pt-BR">
+                <Icon name="volume" size={15} /> Ouvir a pergunta
+              </button>
+            </div>
+
+            <div class="q-resp" hidden data-pagefind-ignore>
+              <div class="bloco">
+                <p class="bl-t">
+                  <Icon name="target" size={15} /> O que o entrevistador avalia
+                </p>
+                <p>{p.data.intencao}</p>
+              </div>
+              <div class="bloco">
+                <p class="bl-t">
+                  <Icon name="check-circle" size={15} /> Pontos-chave — marque os que você cobriu
+                </p>
+                <ul class="pontos">
+                  {p.data.pontosChave.map((pt) => (
+                    <li>
+                      <label>
+                        <input type="checkbox" />
+                        <span>{pt}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              {p.data.armadilha && (
+                <div class="bloco armadilha">
+                  <p class="bl-t">
+                    <Icon name="alert" size={15} /> Armadilha comum
+                  </p>
+                  <p>{p.data.armadilha}</p>
+                </div>
+              )}
+              <div class="bloco modelo">
+                <p class="bl-t">
+                  <Icon name="sparkles" size={15} /> Resposta-modelo
+                </p>
+                <div class="prose">
+                  <Content />
+                </div>
+              </div>
+              <div class="auto">
+                <p class="bl-t">Como foi a sua resposta?</p>
+                <div class="notas" role="group" aria-label="Autoavaliação">
+                  <button type="button" data-n="0">Não sabia</button>
+                  <button type="button" data-n="1">Parcial</button>
+                  <button type="button" data-n="2">Boa</button>
+                  <button type="button" data-n="3">Excelente</button>
+                </div>
+              </div>
+            </div>
+          </li>
+        ))
+      }
+    </ol>
+
+    <div class="card resumo" id="sim-resumo" hidden>
+      <h2>Simulado concluído</h2>
+      <p data-resumo-texto></p>
+      <ul class="etapas-resumo" data-resumo-etapas hidden></ul>
+      <div class="row">
+        <button type="button" class="btn btn-primary" id="novo-simulado">Novo simulado</button>
+        <button type="button" class="btn" id="voltar-lista">Voltar à lista</button>
+      </div>
+    </div>
+  </div>
+</Base>
+
+<script>
+  import { aoMudar, avaliarResposta, ler, toast } from '../../lib/progresso';
+
+  const cards = [...document.querySelectorAll<HTMLElement>('[data-q]')];
+  const filtros: Record<string, string> = { idioma: '', nivel: '', tema: '', progresso: '' };
+  const ROTULOS = ['Não sabia', 'Parcial', 'Boa', 'Excelente'];
+
+  function pintarNotas() {
+    const p = ler();
+    for (const c of cards) {
+      const r = p.entrevista[c.dataset.q!];
+      const el = c.querySelector<HTMLElement>('[data-nota]')!;
+      el.textContent = r ? `Última: ${ROTULOS[r.nota]}` : '';
+      el.dataset.n = r ? String(r.nota) : '';
+      c.querySelectorAll<HTMLButtonElement>('button[data-n]').forEach((b) => b.setAttribute('aria-pressed', String(r?.nota === Number(b.dataset.n))));
+    }
+  }
+
+  function filtrar() {
+    if (simulado) return;
+    const p = ler();
+    let n = 0;
+    for (const c of cards) {
+      const r = p.entrevista[c.dataset.q!];
+      const prog = !r ? 'nova' : r.nota < 2 ? 'revisar' : 'dominadas';
+      const ok =
+        (!filtros.idioma || c.dataset.idioma === filtros.idioma) &&
+        (!filtros.nivel || c.dataset.nivel === filtros.nivel) &&
+        (!filtros.tema || c.dataset.tema === filtros.tema) &&
+        (!filtros.progresso || prog === filtros.progresso);
+      c.hidden = !ok;
+      if (ok) n++;
+    }
+    document.querySelector('[data-cont]')!.textContent = String(n);
+  }
+
+  document.querySelectorAll<HTMLSelectElement>('[data-f]').forEach((s) =>
+    s.addEventListener('change', () => {
+      filtros[s.dataset.f!] = s.value;
+      filtrar();
+    }),
+  );
+
+  // ---------------- leitura em voz alta ----------------
+  const temVoz = 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined';
+
+  function falar(c: HTMLElement) {
+    if (!temVoz) return;
+    const lang = c.dataset.idioma === 'en' ? 'en-US' : 'pt-BR';
+    const fala = new SpeechSynthesisUtterance(c.querySelector('.q-t')!.textContent ?? '');
+    fala.lang = lang;
+    fala.rate = 0.95;
+    const voz = speechSynthesis.getVoices().find((v) => v.lang.replace('_', '-').startsWith(lang));
+    if (voz) fala.voice = voz;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(fala);
+  }
+
+  function mostrarTexto(c: HTMLElement, visivel: boolean) {
+    c.querySelector<HTMLElement>('.q-t')!.hidden = !visivel;
+    c.querySelector<HTMLElement>('.q-oculta')!.hidden = visivel;
+  }
+
+  if (temVoz) {
+    document.querySelectorAll<HTMLElement>('[data-ouvir], [data-so-com-voz]').forEach((el) => (el.hidden = false));
+  }
+
+  for (const c of cards) {
+    const resp = c.querySelector<HTMLElement>('.q-resp')!;
+    const botao = c.querySelector<HTMLButtonElement>('[data-revelar]')!;
+    botao.addEventListener('click', () => {
+      resp.hidden = !resp.hidden;
+      botao.lastChild!.textContent = resp.hidden ? ' Revelar resposta-modelo' : ' Esconder resposta';
+      if (!resp.hidden) mostrarTexto(c, true);
+      if (simulado && !resp.hidden) pararTimer();
+    });
+    c.querySelector('[data-ouvir]')!.addEventListener('click', () => falar(c));
+    c.querySelector('[data-mostrar-texto]')!.addEventListener('click', () => mostrarTexto(c, true));
+    c.querySelectorAll<HTMLButtonElement>('button[data-n]').forEach((b) =>
+      b.addEventListener('click', () => {
+        avaliarResposta(c.dataset.q!, Number(b.dataset.n));
+        if (simulado) {
+          notasSimulado.push(Number(b.dataset.n));
+          proximaDoSimulado();
+        } else {
+          toast('Autoavaliação salva. Perguntas com nota baixa aparecem em "Precisam de revisão".');
+        }
+      }),
+    );
+  }
+
+  // ---------------- modo simulado ----------------
+  interface Etapa {
+    nome: string;
+    rodada: string;
+    perguntas: number;
+    segundos: number;
+  }
+
+  /** Um loop no formato comum das vagas internacionais, do recrutador ao hiring manager. */
+  const LOOP: Etapa[] = [
+    { nome: 'Triagem com recrutador', rodada: 'comportamental', perguntas: 2, segundos: 120 },
+    { nome: 'Entrevista técnica', rodada: 'tecnica', perguntas: 2, segundos: 240 },
+    { nome: 'System design', rodada: 'system-design', perguntas: 1, segundos: 600 },
+    { nome: 'Hiring manager', rodada: 'comportamental', perguntas: 1, segundos: 180 },
+  ];
+  const RAPIDO: Etapa[] = [{ nome: '', rodada: '', perguntas: 5, segundos: 180 }];
+
+  const DESCRICOES: Record<string, string> = {
+    rapido: '5 perguntas sorteadas, 3 minutos cada, uma de cada vez.',
+    loop: '4 etapas como num processo internacional: recrutador, técnica, system design e hiring manager. Cerca de 25 minutos.',
+  };
+
+  const hud = document.getElementById('sim-hud')!;
+  const resumo = document.getElementById('sim-resumo')!;
+  const lista = document.getElementById('lista')!;
+  const barra = document.querySelector<HTMLElement>('.barra')!;
+  const selFormato = document.getElementById('sim-formato') as HTMLSelectElement;
+  const selIdioma = document.getElementById('sim-idioma') as HTMLSelectElement;
+  const chkEscuta = document.getElementById('sim-escuta') as HTMLInputElement;
+  let simulado: { card: HTMLElement; etapa: Etapa }[] | null = null;
+  let indice = 0;
+  let notasSimulado: number[] = [];
+  let timer: number | undefined;
+
+  selFormato.addEventListener('change', () => {
+    document.querySelector('[data-formato-desc]')!.textContent = DESCRICOES[selFormato.value];
+    if (selFormato.value === 'loop') selIdioma.value = 'en';
+  });
+
+  function embaralhar<T>(itens: T[]) {
+    for (let i = itens.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [itens[i], itens[j]] = [itens[j], itens[i]];
+    }
+    return itens;
+  }
+
+  /** Sorteia as perguntas de cada etapa, sem repetir; uma etapa sem perguntas no idioma é pulada. */
+  function sortear(etapas: Etapa[], idioma: string) {
+    const usadas = new Set<HTMLElement>();
+    const roteiro: { card: HTMLElement; etapa: Etapa }[] = [];
+    for (const etapa of etapas) {
+      const pool = embaralhar(
+        cards.filter((c) => (!idioma || c.dataset.idioma === idioma) && (!etapa.rodada || c.dataset.rodada === etapa.rodada) && !usadas.has(c)),
+      );
+      for (const card of pool.slice(0, etapa.perguntas)) {
+        usadas.add(card);
+        roteiro.push({ card, etapa });
+      }
+    }
+    return roteiro;
+  }
+
+  function iniciarSimulado() {
+    simulado = sortear(selFormato.value === 'loop' ? LOOP : RAPIDO, selIdioma.value);
+    if (!simulado.length) {
+      toast('Não há perguntas suficientes com essa combinação.');
+      simulado = null;
+      return;
+    }
+    indice = 0;
+    notasSimulado = [];
+    barra.hidden = true;
+    resumo.hidden = true;
+    lista.hidden = false;
+    hud.hidden = false;
+    hud.querySelector('[data-sim-total]')!.textContent = String(simulado.length);
+    mostrarAtual();
+    hud.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function mostrarAtual() {
+    const { card: atual, etapa } = simulado![indice];
+    cards.forEach((c) => {
+      c.hidden = c !== atual;
+      c.querySelector<HTMLElement>('.q-resp')!.hidden = true;
+      c.querySelector<HTMLButtonElement>('[data-revelar]')!.lastChild!.textContent = ' Revelar resposta-modelo';
+      c.querySelectorAll<HTMLInputElement>('input[type=checkbox]').forEach((i) => (i.checked = false));
+    });
+    hud.querySelector('[data-sim-n]')!.textContent = String(indice + 1);
+    const rotulo = hud.querySelector<HTMLElement>('[data-sim-etapa]')!;
+    rotulo.hidden = !etapa.nome;
+    rotulo.textContent = etapa.nome;
+    const escuta = temVoz && chkEscuta.checked;
+    mostrarTexto(atual, !escuta);
+    if (escuta) falar(atual);
+    iniciarTimer(etapa.segundos);
+  }
+
+  function iniciarTimer(segundos: number) {
+    pararTimer();
+    const el = hud.querySelector<HTMLElement>('[data-timer]')!;
+    let restante = segundos;
+    const tick = () => {
+      const m = Math.floor(restante / 60);
+      const s = String(restante % 60).padStart(2, '0');
+      el.textContent = `${m}:${s}`;
+      el.classList.toggle('acabando', restante <= 30);
+      if (restante-- <= 0) {
+        pararTimer();
+        toast('Tempo esgotado! Revele a resposta e compare.');
+      }
+    };
+    tick();
+    timer = window.setInterval(tick, 1000);
+  }
+
+  function pararTimer() {
+    if (timer) window.clearInterval(timer);
+    timer = undefined;
+  }
+
+  const media = (notas: number[]) => notas.reduce((a, b) => a + b, 0) / Math.max(1, notas.length);
+
+  function proximaDoSimulado() {
+    indice++;
+    if (simulado && indice < simulado.length) {
+      mostrarAtual();
+      return;
+    }
+    pararTimer();
+    if (temVoz) speechSynthesis.cancel();
+    const geral = media(notasSimulado);
+    const texto =
+      geral >= 2.5
+        ? 'Excelente! Você está pronto para esse tipo de pergunta. Tente um simulado em inglês ou do nível acima.'
+        : geral >= 1.5
+          ? 'Bom resultado. Revise as perguntas marcadas como "Parcial". Elas aparecem no filtro "Precisam de revisão".'
+          : 'Ótimo que você treinou: agora você sabe exatamente o que estudar. Volte às aulas dos temas em que marcou "Não sabia".';
+    resumo.querySelector('[data-resumo-texto]')!.textContent = `Média de autoavaliação: ${geral.toFixed(1)} de 3. ${texto}`;
+
+    // No loop, a média por etapa mostra onde está o ponto fraco.
+    const porEtapa = resumo.querySelector<HTMLElement>('[data-resumo-etapas]')!;
+    const etapas = [...new Set(simulado!.map((s) => s.etapa))].filter((e) => e.nome);
+    porEtapa.hidden = etapas.length < 2;
+    porEtapa.replaceChildren(
+      ...etapas.map((e) => {
+        const notas = simulado!.flatMap((s, i) => (s.etapa === e ? [notasSimulado[i]] : []));
+        const li = document.createElement('li');
+        li.innerHTML = `<span></span><strong></strong>`;
+        li.querySelector('span')!.textContent = e.nome;
+        li.querySelector('strong')!.textContent = `${media(notas).toFixed(1)} de 3`;
+        return li;
+      }),
+    );
+    resumo.hidden = false;
+    lista.hidden = true;
+    hud.hidden = true;
+  }
+
+  function sairSimulado() {
+    simulado = null;
+    pararTimer();
+    if (temVoz) speechSynthesis.cancel();
+    cards.forEach((c) => mostrarTexto(c, true));
+    hud.hidden = true;
+    resumo.hidden = true;
+    lista.hidden = false;
+    barra.hidden = false;
+    filtrar();
+  }
+
+  document.getElementById('iniciar-simulado')!.addEventListener('click', iniciarSimulado);
+  document.getElementById('novo-simulado')!.addEventListener('click', iniciarSimulado);
+  document.getElementById('sair-simulado')!.addEventListener('click', sairSimulado);
+  document.getElementById('voltar-lista')!.addEventListener('click', sairSimulado);
+
+  pintarNotas();
+  filtrar();
+  aoMudar(() => {
+    pintarNotas();
+    filtrar();
+  });
+</script>
+
+<style>
+  .head {
+    padding-block: 40px 32px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 260px at 90% 0%, var(--violet-soft), transparent 70%);
+  }
+  .head-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 32px;
+    align-items: end;
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .simulado-box {
+    padding: 20px;
+    display: grid;
+    gap: 10px;
+  }
+  .sb-t {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .simulado-box .muted {
+    font-size: 0.88rem;
+  }
+  .simulado-box > .btn {
+    justify-self: start;
+  }
+  .check {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    font-size: 0.85rem;
+    color: var(--text-2);
+    cursor: pointer;
+    min-height: 24px;
+  }
+  .check input {
+    margin-top: 3px;
+    accent-color: var(--accent);
+  }
+  .frases {
+    margin-top: 24px;
+    padding: 0;
+  }
+  .frases summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 18px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .frases-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+    gap: 16px;
+    padding: 0 18px 18px;
+    font-size: 0.9rem;
+    color: var(--text-2);
+  }
+  .frases-grid ul {
+    margin: 0;
+    padding-left: 18px;
+    display: grid;
+    gap: 4px;
+  }
+  .etapa {
+    font-weight: 600;
+    color: var(--text-2);
+  }
+  .q-oculta {
+    margin-top: 12px;
+    color: var(--text-3);
+    font-style: italic;
+  }
+  .link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-style: normal;
+    font-weight: 600;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .etapas-resumo {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+  .etapas-resumo li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+  }
+  .sel {
+    display: grid;
+    gap: 4px;
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .sel select {
+    min-height: 36px;
+    padding: 4px 32px 4px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    font-size: 0.88rem;
+  }
+  .barra {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: end;
+    padding-block: 24px 16px;
+  }
+  .cont {
+    margin-left: auto;
+    font-size: 0.85rem;
+    color: var(--text-3);
+  }
+  .sim-hud {
+    position: sticky;
+    top: calc(var(--header-h) + 8px);
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-block: 24px 16px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow);
+    font-size: 0.9rem;
+  }
+  .timer {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: var(--accent);
+  }
+  .timer.acabando {
+    color: var(--danger);
+  }
+  .sim-hud .btn {
+    margin-left: auto;
+  }
+  .lista {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 14px;
+  }
+  .q {
+    padding: clamp(18px, 3vw, 26px);
+  }
+  .q-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .nota {
+    margin-left: auto;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-3);
+  }
+  .nota[data-n='0'],
+  .nota[data-n='1'] {
+    color: var(--warn);
+  }
+  .nota[data-n='2'],
+  .nota[data-n='3'] {
+    color: var(--ok);
+  }
+  .q-t {
+    margin-top: 12px;
+    font-size: 1.2rem;
+    line-height: 1.35;
+  }
+  .q-acoes {
+    margin-top: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .q-resp {
+    margin-top: 18px;
+    display: grid;
+    gap: 14px;
+    animation: abrir 0.3s var(--ease);
+  }
+  @keyframes abrir {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+  .bloco {
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    font-size: 0.95rem;
+    color: var(--text-2);
+  }
+  .bl-t {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 6px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-3);
+  }
+  .armadilha {
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  }
+  .armadilha .bl-t {
+    color: var(--danger);
+  }
+  .modelo .bl-t {
+    color: var(--accent);
+  }
+  .modelo .prose {
+    max-width: none;
+    font-size: 0.97rem;
+  }
+  .pontos {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+  .pontos label {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    cursor: pointer;
+  }
+  .pontos input {
+    margin-top: 5px;
+    accent-color: var(--ok);
+  }
+  .pontos input:checked + span {
+    color: var(--text);
+  }
+  .auto {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+  .auto .bl-t {
+    margin: 0;
+  }
+  .notas {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .notas button {
+    padding: 6px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .notas button:hover {
+    border-color: var(--border-strong);
+  }
+  .notas button[aria-pressed='true'] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  .resumo {
+    margin-top: 24px;
+    padding: 28px;
+    display: grid;
+    gap: 12px;
+  }
+  @media (max-width: 860px) {
+    .head-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  @media (max-width: 560px) {
+    .barra .sel {
+      flex: 1 1 45%;
+    }
+    .cont {
+      margin-left: 0;
+    }
+  }
+</style>

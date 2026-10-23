@@ -1,0 +1,189 @@
+---
+titulo: Locking otimista, pessimista e migrações com Flyway
+descricao: Como impedir lost updates com @Version e retentativas, quando travar linhas com PESSIMISTIC_WRITE (sem deadlock), idempotência no banco, e como versionar o schema com Flyway — inclusive mudanças sem downtime.
+modulo: 09-persistencia
+ordem: 6
+duracao: 60
+objetivos:
+  - Aplicar lock otimista com @Version e tratar conflitos com retentativa
+  - Aplicar lock pessimista na ordem certa para evitar deadlocks
+  - Usar constraints para idempotência e condições de corrida
+  - Versionar e evoluir o schema com Flyway, inclusive com expand and contract
+tags: [locking, Version, deadlock, Flyway, migrações]
+flashcards:
+  - frente: Como o @Version impede o lost update?
+    verso: O UPDATE inclui "WHERE versao = ?" e incrementa a versão. Se outra transação alterou a linha antes, nenhuma linha é afetada e o Hibernate lança OptimisticLockException (no Spring, ObjectOptimisticLockingFailureException).
+  - frente: Otimista ou pessimista — quando usar cada um?
+    verso: Otimista quando conflitos são raros (não trava nada; conflito vira retentativa). Pessimista quando a disputa pela mesma linha é alta (ex. saldo de conta muito movimentada, última vaga), para evitar retentativas em cascata.
+  - frente: Como evitar deadlock ao travar duas linhas?
+    verso: Travar sempre na mesma ordem (ex. menor id primeiro). A→B e B→A simultâneos passam a disputar a mesma primeira linha em vez de cada um segurar uma.
+  - frente: Por que nunca editar uma migração Flyway já aplicada?
+    verso: O Flyway guarda o checksum de cada migração aplicada; editá-la quebra a validação e, pior, deixa ambientes com schemas diferentes. Corrija com uma NOVA migração.
+  - frente: O que é o padrão expand and contract?
+    verso: Mudar o schema em etapas compatíveis com a versão anterior da aplicação (adicionar coluna nova → migrar dados e código → remover a antiga depois), para fazer deploys sem downtime.
+---
+
+Duas requisições leem o saldo 100, cada uma debita 30 e grava 70. Deveria ser 40. É o **lost update** do módulo 07 — agora escondido atrás do dirty checking, onde é ainda mais fácil de não perceber. Esta aula fecha o módulo com as ferramentas para concorrência no banco e para evoluir o schema com segurança.
+
+## Lock otimista com `@Version`
+
+"Otimista" porque **não trava nada**: assume que conflitos são raros e só **detecta** quando acontecem.
+
+```java
+@Entity
+public class Conta {
+    @Version
+    private long versao;
+}
+```
+
+```sql
+-- o que o Hibernate gera no flush
+UPDATE conta SET saldo = 70.00, versao = 8 WHERE id = 42 AND versao = 7;
+-- 0 linhas afetadas? alguém gravou antes → exceção, nada é sobrescrito
+```
+
+O conflito aparece como `ObjectOptimisticLockingFailureException` (uma `OptimisticLockingFailureException` do Spring). A transação é desfeita, e quem chamou decide: devolver `409` ao cliente ou **tentar de novo** — lendo os dados atualizados.
+
+### Retentativa: sempre numa transação nova
+
+```java
+@Service
+public class TransferenciasComRetentativa {       // um bean SEPARADO do serviço transacional
+
+    public void transferir(long origem, long destino, BigDecimal valor) {
+        for (int tentativa = 1; tentativa <= 10; tentativa++) {
+            try {
+                servico.transferir(origem, destino, valor);   // passa pelo proxy: transação nova a cada volta
+                return;
+            } catch (OptimisticLockingFailureException conflito) {
+                esperar(tentativa);                           // backoff com jitter
+            }
+        }
+        throw new TransferenciaConcorrenteException(10, ...);
+    }
+}
+```
+
+Por que outro bean? Porque o laço não pode estar **dentro** da transação que falhou (ela está condenada) e `this.transferir()` pularia o proxy (aula 5). O `Spring Retry` e o Resilience4j (módulo 13) oferecem isso com anotações — mas agora você sabe o que elas fazem.
+
+## Lock pessimista
+
+Quando a mesma linha é disputada o tempo todo (a conta de uma loja que recebe mil PIX por minuto, a última vaga de uma turma), retentativas viram uma tempestade. O lock **pessimista** trava a linha ao ler:
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)            // SELECT ... FOR UPDATE
+@Query("select c from Conta c where c.id = :id")
+Optional<Conta> buscarComLock(long id);
+```
+
+As outras transações que pedirem a mesma linha **esperam** o commit. Sem retentativas, sem desperdício — mas com espera, e com um novo risco.
+
+### Deadlock: sempre na mesma ordem
+
+```text
+T1: trava A ──────────► quer B (espera T2)
+T2: trava B ──────────► quer A (espera T1)          ← ninguém anda: deadlock
+```
+
+O banco detecta e mata uma das transações (erro), ou ambas esperam até o *lock timeout*. A solução é simples e universal: **travar sempre na mesma ordem**.
+
+```java
+UUID primeira = origem.compareTo(destino) < 0 ? origem : destino;
+UUID segunda  = primeira.equals(origem) ? destino : origem;
+Conta a = contas.buscarParaAtualizar(primeira).orElseThrow(...);
+Conta b = contas.buscarParaAtualizar(segunda).orElseThrow(...);
+```
+
+Agora A→B e B→A disputam a **mesma** primeira linha: uma espera a outra terminar, e ninguém fica preso segurando o que o outro quer.
+
+| | Otimista (`@Version`) | Pessimista (`FOR UPDATE`) |
+|---|---|---|
+| Trava? | não | sim, até o commit |
+| Conflito | exceção → retentativa ou 409 | espera |
+| Melhor quando | conflitos raros, leituras longas (edição de cadastro) | alta disputa pela mesma linha |
+| Riscos | retentativas em cascata sob carga | deadlock (ordene!), espera, pool esgotado |
+
+<Callout tipo="dica" titulo="O banco como aliado: constraints">
+Muitas condições de corrida se resolvem sem lock nenhum:
+- `UNIQUE (chave_idempotencia)`: duas requisições com a mesma chave nunca criam duas transferências — a segunda recebe uma violação e pode devolver a resposta da primeira;
+- `CHECK (saldo >= 0)`: a última linha de defesa contra saldo negativo;
+- `UPDATE conta SET saldo = saldo - :v WHERE id = :id AND saldo >= :v`: debitar e verificar num comando atômico (módulo 07).
+</Callout>
+
+## Flyway: o schema como código
+
+O schema evolui junto com o código — e precisa evoluir **igual** em todos os ambientes (sua máquina, CI, homologação, produção). O **Flyway** aplica scripts SQL versionados, em ordem, e registra cada um na tabela `flyway_schema_history`.
+
+```text
+src/main/resources/db/migration/
+├── V1__cria_contas_e_movimentos.sql
+├── V2__cria_transferencias.sql
+└── V3__adiciona_limite_diario.sql
+```
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-flyway</artifactId>   <!-- Boot 4: starter próprio -->
+</dependency>
+<dependency>
+  <groupId>org.flywaydb</groupId>
+  <artifactId>flyway-database-postgresql</artifactId>   <!-- suporte ao PostgreSQL -->
+</dependency>
+```
+
+Na subida, o Flyway compara o que está na pasta com o histórico e aplica só o que falta. Junto com `ddl-auto=validate`, você tem a garantia de que o banco e as entidades estão alinhados.
+
+<Callout tipo="erro" titulo="Nunca edite uma migração aplicada">
+O Flyway guarda o *checksum* de cada script. Editar o `V2` depois de aplicado faz a validação falhar em todo ambiente que já o rodou — e, se alguém "resolver" com `repair`, os ambientes passam a ter schemas diferentes. Errou? Escreva o `V3` corrigindo.
+</Callout>
+
+### Mudanças sem downtime: *expand and contract*
+
+Num deploy, a versão antiga e a nova da aplicação rodam **ao mesmo tempo** por alguns minutos. Renomear uma coluna de uma vez quebra a versão antiga. O caminho seguro:
+
+1. **Expand** (V5): adicionar `nome_titular`, mantendo `titular`. A aplicação nova grava nas duas.
+2. **Migrate** (V6): copiar os dados antigos (`UPDATE conta SET nome_titular = titular WHERE nome_titular IS NULL`), em lotes se a tabela for grande.
+3. **Contract** (V7, num deploy posterior): remover `titular`, quando nenhuma versão em produção o usa.
+
+O mesmo vale para `NOT NULL` novo (primeiro com default ou preenchimento), índices em tabelas grandes (`CREATE INDEX CONCURRENTLY` no PostgreSQL, numa migração sem transação) e mudanças de tipo.
+
+## Desenvolvimento com PostgreSQL de verdade
+
+H2 em modo PostgreSQL serve para exercícios rápidos, mas não é PostgreSQL. No projeto integrador (marco 2), um `compose.yaml` sobe o PostgreSQL 18, e o `spring-boot-docker-compose` inicia o container sozinho no `mvn spring-boot:run`. No módulo 10, os testes passam a rodar contra PostgreSQL real com **Testcontainers**.
+
+<Callout tipo="entrevista">
+"Dois usuários editam o mesmo registro ao mesmo tempo. O que acontece no seu sistema?" Mostre as opções: **lock otimista** com `@Version` (conflito → 409 ou retentativa), **pessimista** com `FOR UPDATE` (espera; ordem fixa contra deadlock) e **constraints** como garantia final. E "como você evolui o banco sem downtime?": migrações versionadas (Flyway/Liquibase), nunca editar as aplicadas, **expand and contract**.
+</Callout>
+
+<Quiz
+  id="09-locking"
+  questoes={[
+    {
+      pergunta: 'Por que o laço de retentativa não pode estar dentro do método @Transactional que conflitou?',
+      opcoes: ['Por desempenho', 'Porque a transação que falhou está condenada; cada tentativa precisa de uma transação nova (e this.metodo() pularia o proxy)', 'Porque o Hibernate proíbe laços', 'Não há problema'],
+      correta: 1,
+      explicacao: 'Retentativa = nova transação a cada volta, chamada por outro bean.',
+    },
+    {
+      pergunta: 'Transferências A→B e B→A simultâneas, com lock pessimista, travam para sempre. Correção:',
+      opcoes: ['Aumentar o lock timeout', 'Travar as contas sempre na mesma ordem (ex. menor id primeiro)', 'Usar EAGER', 'Remover o @Transactional'],
+      correta: 1,
+      explicacao: 'Ordem fixa de aquisição elimina a espera circular.',
+    },
+    {
+      pergunta: 'A migração V3 tinha um erro e já foi aplicada em homologação. O que fazer?',
+      opcoes: ['Editar a V3 e rodar de novo', 'Criar uma V4 corrigindo', 'Apagar a flyway_schema_history', 'Voltar para ddl-auto=update'],
+      correta: 1,
+      explicacao: 'Migrações aplicadas são imutáveis; a correção é uma nova migração.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **`@Version`** detecta lost updates; o conflito vira **retentativa** (em outro bean, transação nova, com backoff) ou `409`.
+- **`PESSIMISTIC_WRITE`** trava linhas disputadas; trave **sempre na mesma ordem** para não haver deadlock.
+- **Constraints** (`UNIQUE`, `CHECK`, `UPDATE ... WHERE`) resolvem muitas corridas sem lock.
+- **Flyway**: schema versionado, `ddl-auto=validate`, migrações aplicadas são imutáveis, **expand and contract** para deploys sem downtime.

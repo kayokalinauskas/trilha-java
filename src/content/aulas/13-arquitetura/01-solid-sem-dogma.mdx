@@ -1,0 +1,745 @@
+---
+titulo: SOLID sem dogma
+descricao: "SOLID como ferramenta de decisão, não como lista de mandamentos: o problema real que cada princípio resolve, código antes e depois num fechamento de pedido, os sinais de violação em code review, o custo da abstração prematura, coesão e acoplamento como métricas de fundo, inversão de dependência no Spring e refatoração segura com teste de caracterização."
+modulo: 13-arquitetura
+ordem: 1
+duracao: 110
+objetivos:
+  - Explicar cada princípio SOLID pelo problema concreto que ele evita e apontar o sinal de violação num diff de code review
+  - Refatorar um cálculo legado em regras plugáveis (Strategy) protegido por um teste de caracterização com 2.000 entradas reproduzíveis
+  - Escrever um teste de contrato que roda contra todas as implementações de uma interface (Liskov na prática)
+  - Montar o grafo de dependências no Spring com injeção por construtor, listas de beans, @Primary e @Qualifier, e ler os erros de injeção mais comuns
+  - Medir a direção das dependências entre pacotes com o jdeps e relacionar acoplamento aferente e eferente com estabilidade
+  - Decidir quando NÃO abstrair, justificando o custo de indireção e de abstração prematura para o time
+tags: [SOLID, SRP, OCP, LSP, ISP, DIP, coesão, acoplamento, refatoração, golden master, injeção de dependência]
+flashcards:
+  - frente: Princípio da Responsabilidade Única (SRP), na formulação mais útil
+    verso: Um módulo deve responder a um único ator, isto é, ter um único motivo para mudar. Se o fiscal e o marketing pedem mudanças na mesma classe, ela tem duas responsabilidades. Tamanho e número de métodos são sintomas, não a definição.
+  - frente: Princípio Aberto/Fechado (OCP)
+    verso: Acrescentar um comportamento deve ser escrever código novo, e não editar o que já funciona. No Spring, uma interface com várias implementações injetadas como lista resolve o caso típico. Aplique no eixo em que as mudanças realmente acontecem.
+  - frente: Princípio de Substituição de Liskov (LSP)
+    verso: Toda implementação de um tipo precisa cumprir o contrato dele sem surpreender quem usa - não exige mais, não entrega menos, não lança exceção fora do previsto. Na prática, verifica-se com um teste de contrato que roda contra todas as implementações.
+  - frente: Princípio da Segregação de Interfaces (ISP)
+    verso: Quem usa uma interface não deve depender de métodos que não usa. Interfaces pequenas, desenhadas pelo cliente (uma porta por caso de uso), reduzem o efeito de cada mudança e facilitam dublês de teste.
+  - frente: Inversão de dependência (DIP) versus injeção de dependência
+    verso: DIP é a DIREÇÃO das setas - a regra de negócio define a abstração (a porta) e o detalhe a implementa. Injeção de dependência é o MECANISMO que entrega as implementações (o Spring, ou um new no teste). Dá para ter injeção sem inversão.
+  - frente: O que é um teste de caracterização (golden master)?
+    verso: Um teste que registra o comportamento ATUAL do código legado, certo ou errado, e compara o código novo com ele em muitas entradas. Permite refatorar sem entender cada regra antes. Corrigir bugs fica para outro commit, com outro teste.
+  - frente: Instabilidade de um pacote (métrica de Robert Martin)
+    verso: I = Ce / (Ca + Ce), em que Ce são as dependências que saem do pacote e Ca as que chegam. Perto de 0 é estável (muitos dependem dele, ele depende de pouco); perto de 1, instável. As dependências devem apontar para os pacotes mais estáveis.
+  - frente: O que o Spring injeta num parâmetro List de construtor quando não existe nenhum bean daquele tipo?
+    verso: Num cenário de construtor único, uma lista vazia, sem erro. A aplicação sobe e a regra simplesmente não roda. Por isso vale um teste que confira quantas implementações foram injetadas, ou uma validação na inicialização.
+---
+
+Sexta-feira, fim de tarde. O time comercial pede um cupom novo para a campanha do fim de semana, e a pessoa que pegou a tarefa abre o `ServicoDePedidos`: um método `finalizar` de 200 linhas que calcula descontos, aplica teto, grava no banco com SQL escrito à mão e monta o HTML do e-mail de confirmação. O cupom novo é um `if` a mais, no meio dos outros. O deploy sai, o cupom funciona e, na segunda-feira, o financeiro descobre que o desconto de atacado passou a ser arredondado de outro jeito: um centavo a menos em milhares de pedidos. Ninguém mexeu no atacado de propósito; a mudança veio junto, no mesmo método, num refactor "aproveitando que estava ali".
+
+Esse é o terreno onde SOLID faz sentido. Não como uma lista de cinco mandamentos para recitar na entrevista, mas como cinco ferramentas, cada uma para um problema específico: classes que mudam por motivos demais, mudanças que exigem editar o que funciona, implementações que surpreendem quem as usa, interfaces grandes demais e regras de negócio amarradas a detalhes de infraestrutura. Nesta aula você vai reconhecer cada problema num código realista, aplicar a ferramenta, medir o resultado e, tão importante quanto, saber quando **não** aplicá-la. No caminho, vai refatorar um cálculo de descontos legado sem mudar um único centavo, protegido por um teste que compara o código novo com o antigo em 2.000 carrinhos.
+
+## A intuição: a cozinha de um restaurante
+
+Pense na cozinha de um restaurante movimentado. Ela não é organizada por dogma; é organizada pelo que dá errado quando não está.
+
+- **Cada praça tem um responsável.** A pessoa da grelha não tempera a salada. Se o chef muda o ponto da carne, só a grelha muda o procedimento. Quando duas praças dividem a mesma bancada, um pedido de mudança numa atrapalha a outra. Esse é o **S**.
+- **O cardápio cresce sem reformar a cozinha.** Um prato novo usa as praças que já existem e acrescenta uma ficha técnica. Ninguém derruba uma parede para incluir um risoto. Esse é o **O**.
+- **Qualquer cozinheiro da praça pode assumir o turno.** Se a ficha diz "ponto médio, 180 gramas", quem estiver na grelha entrega isso; quem entrega 120 gramas ou "do jeito que acho melhor" quebra o restaurante, mesmo sendo bom cozinheiro. Esse é o **L**.
+- **O garçom não precisa saber operar o forno.** Ele conversa com a cozinha por uma comanda com os campos que lhe interessam. Esse é o **I**.
+- **A cozinha define o que precisa do fornecedor, não o contrário.** O restaurante especifica "tomate italiano, caixa de 10 kg, entrega até as 8h"; qualquer fornecedor que cumpra a especificação serve. Se o restaurante tivesse que mudar as receitas a cada troca de fornecedor, quem manda seria o fornecedor. Esse é o **D**.
+
+E repare no que um bom chef **não** faz: não cria uma praça só para o molho de um prato que sai uma vez por mês, não escreve uma ficha técnica genérica para "qualquer proteína em qualquer ponto" antes de existir o segundo prato com proteína. Organização tem custo. É esse equilíbrio que a aula persegue.
+
+## Vocabulário
+
+| Termo | O que significa nesta aula |
+|---|---|
+| **Coesão** | O quanto as partes de uma classe ou pacote trabalham juntas pelo mesmo motivo. Alta coesão: tudo ali muda junto. |
+| **Acoplamento** | O quanto uma parte depende de outra. Toda dependência é um caminho por onde uma mudança se propaga. |
+| **Abstração** | Um tipo (em geral uma interface) que descreve **o que** é feito sem dizer **como**. `RegraDeDesconto` é uma abstração; `DescontoVip` é uma implementação. |
+| **Contrato** | O que uma abstração promete: entradas aceitas, saídas, exceções, efeitos. Fica no Javadoc e, melhor ainda, num teste. |
+| **Indireção** | Cada camada extra entre quem chama e quem faz. Uma interface com uma implementação é um nível de indireção: mais um arquivo para abrir ao ler o código. |
+| **Porta** | Uma interface definida pelo núcleo da aplicação para falar com o mundo externo (`RepositorioDePedidos`, `Notificador`). |
+| **Adaptador** | A implementação de uma porta com uma tecnologia concreta (JDBC, e-mail, memória). |
+| **Injeção de dependência** | Entregar a um objeto as dependências de que ele precisa, em vez de ele mesmo criá-las com `new`. O Spring faz isso pelo construtor (aula [IoC e injeção de dependências](../../08-spring-boot/03-ioc-e-injecao-de-dependencias/)). |
+| **Inversão de dependência** | A direção das setas: a regra de negócio define a abstração e o detalhe técnico depende dela, não o contrário. |
+| **Refatoração** | Mudar a estrutura do código **sem** mudar o comportamento observável. |
+| **Teste de caracterização** | Também chamado de *golden master*: um teste que registra o que o código faz hoje (certo ou errado) e acusa qualquer diferença. |
+| **YAGNI** | *You aren't gonna need it*, "você não vai precisar disso": não construa flexibilidade para uma necessidade que ainda não existe. |
+
+## Os cinco princípios como ferramentas
+
+Os princípios foram reunidos por Robert C. Martin no início dos anos 2000, e a sigla SOLID veio depois. Cada um nasceu de um problema de manutenção. A forma mais segura de usá-los é partir do problema: se o problema não existe no seu código, o princípio não tem nada a resolver ali.
+
+### S: um único motivo para mudar
+
+A frase "uma classe deve fazer uma coisa só" gera discussões infinitas sobre o que é "uma coisa". A formulação mais útil, do próprio Martin, é outra: **um módulo deve responder a um único ator**. Ator é quem pede mudanças: o financeiro, o fiscal, o marketing, o time de plataforma. Se dois atores pedem mudanças na mesma classe, ela tem dois motivos para mudar, e cada pedido de um coloca em risco o que o outro precisa.
+
+O `ServicoDePedidos` do começo da aula, resumido:
+
+```java
+// Antes: quatro atores no mesmo método
+public void finalizar(Pedido pedido) {
+    // 1. descontos e teto            (dono: comercial)
+    // 2. arredondamento e impostos   (dono: financeiro/fiscal)
+    // 3. INSERT INTO pedidos ...     (dono: time técnico)
+    // 4. HTML do e-mail              (dono: marketing)
+}
+```
+
+A versão separada que você vai construir divide por ator: `CalculadoraDeDescontos` e as regras (comercial), `Dinheiro.arredondar` (financeiro, num lugar só), `RepositorioDePedidos` e seu adaptador (técnico), `Notificador` e seu adaptador (marketing). O `FechamentoDePedido` só orquestra: chama cada parte na ordem certa.
+
+**O problema real que o SRP resolve** não é estético. É o bug da segunda-feira: uma mudança pedida por um ator alterando, sem querer, o comportamento que outro ator depende. Com as responsabilidades separadas, o diff do cupom novo toca um arquivo novo e mais nada; quem revisa vê na hora que o arredondamento do atacado não foi tocado.
+
+**Sinais de violação em code review:**
+
+- o mesmo arquivo aparece em pull requests de times ou assuntos diferentes na mesma semana;
+- conflitos de merge frequentes numa classe;
+- o nome precisa de "e" ou de um termo vago para descrever a classe (`GerenciadorDePedidos`, `PedidoHelper`, `PedidoUtils`);
+- o teste de uma regra comercial precisa de banco ou de servidor de e-mail para rodar;
+- o construtor recebe oito dependências, e cada método usa duas delas (baixa coesão: grupos de métodos que não conversam entre si).
+
+**Quando não separar:** se duas coisas sempre mudam juntas, pelo mesmo ator, separá-las só espalha a mudança por dois arquivos. Uma classe de 400 linhas coesa é melhor do que oito classes de 50 linhas que precisam ser editadas juntas a cada pedido. Tamanho não é o critério; motivo de mudança é.
+
+### O: estender sem editar
+
+O cálculo de descontos legado é uma sequência de `if`s. Cada campanha nova é mais um `if` no mesmo método, e cada edição reabre o risco sobre todas as regras anteriores (o arredondamento do atacado mudou justamente assim). O princípio aberto/fechado diz: o módulo deve ser **aberto para extensão** (dá para acrescentar comportamento) e **fechado para modificação** (sem editar o código que já funciona e está testado).
+
+A ferramenta clássica é o padrão **Strategy**: cada regra vira uma implementação de uma interface comum, e o código que as usa conhece só a interface.
+
+```java
+// Antes: cada campanha é mais um if, no meio dos outros
+if (carrinho.tipoDeCliente() == TipoDeCliente.VIP) { ... }
+if (cupom != null && cupom.equalsIgnoreCase("PRIMEIRA10")) { ... }
+for (ItemDoPedido item : itens) { if (item.quantidade() >= 10) { ... } }
+// a próxima campanha entra aqui, e o teto logo abaixo precisa continuar certo
+```
+
+Depois, no código desta aula: uma interface `RegraDeDesconto` com um método, uma classe por regra, e uma `CalculadoraDeDescontos` que recebe **todas** as regras como lista. No Spring, cada regra é um `@Component` e o container injeta a lista inteira. Uma regra nova é um arquivo novo; a calculadora não muda, não precisa ser revisada e seus testes continuam valendo.
+
+<Figura legenda="Com Strategy e injeção de lista, cada regra é um bean; uma regra nova entra sem editar a calculadora">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-labelledby="ocp-titulo ocp-desc">
+  <title id="ocp-titulo">Regras de desconto injetadas como lista na calculadora</title>
+  <desc id="ocp-desc">Quatro caixas à esquerda representam beans: DescontoVip, DescontoPrimeiraCompra, DescontoAtacado e, destacada como nova, DescontoAniversario. Setas saem de cada uma para uma caixa à direita, CalculadoraDeDescontos, que recebe a lista de RegraDeDesconto. A legenda diz que uma regra nova é uma classe nova com @Component e que a calculadora não muda.</desc>
+  <defs><marker id="mk-solid-ocp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="24" width="270" height="44" rx="8" class="d-box"/>
+  <text x="155" y="51" text-anchor="middle" class="d-mono">DescontoVip</text>
+  <rect x="20" y="80" width="270" height="44" rx="8" class="d-box"/>
+  <text x="155" y="107" text-anchor="middle" class="d-mono">DescontoPrimeiraCompra</text>
+  <rect x="20" y="136" width="270" height="44" rx="8" class="d-box"/>
+  <text x="155" y="163" text-anchor="middle" class="d-mono">DescontoAtacado</text>
+  <rect x="20" y="192" width="270" height="44" rx="8" class="d-ok"/>
+  <text x="155" y="219" text-anchor="middle" class="d-mono">DescontoAniversario</text>
+  <text x="155" y="254" text-anchor="middle" class="d-label">bean novo: nenhuma outra edição</text>
+  <path d="M290 46 L468 128" class="d-line" marker-end="url(#mk-solid-ocp)"/>
+  <path d="M290 102 L468 140" class="d-line" marker-end="url(#mk-solid-ocp)"/>
+  <path d="M290 158 L468 156" class="d-line" marker-end="url(#mk-solid-ocp)"/>
+  <path d="M290 214 L468 170" class="d-line" marker-end="url(#mk-solid-ocp)"/>
+  <rect x="470" y="96" width="270" height="104" rx="10" class="d-accent"/>
+  <text x="605" y="126" text-anchor="middle" class="d-mono">CalculadoraDeDescontos</text>
+  <text x="605" y="152" text-anchor="middle" class="d-label">recebe a lista de</text>
+  <text x="605" y="176" text-anchor="middle" class="d-mono">RegraDeDesconto</text>
+  <text x="380" y="288" text-anchor="middle" class="d-label">Regra nova = classe nova com @Component; a calculadora não muda</text>
+</svg>
+</Figura>
+
+**Sinais de violação:** um `switch` ou cadeia de `if` sobre um tipo, um código ou uma flag que cresce a cada sprint; o mesmo método aparecendo no diff de toda funcionalidade comercial; testes antigos quebrando quando se acrescenta um caso novo.
+
+**Quando não aplicar:** fechar o código para modificação tem custo (interface, uma classe por caso, injeção). Faça isso **no eixo em que as mudanças realmente acontecem**. Se entra uma campanha nova por mês, Strategy compensa. Se a regra de arredondamento muda uma vez por década, um método bem testado basta. E um `switch` sobre um `sealed interface` com pattern matching (aula [sealed e pattern matching](../../02-poo/06-sealed-e-pattern-matching/)) é a escolha certa quando o conjunto de casos é **fechado por natureza** e o que cresce são as operações sobre eles: o compilador avisa cada `switch` que esqueceu um caso. O OCP pergunta "o que vai variar?"; a resposta decide o desenho.
+
+### L: implementações sem surpresas
+
+O princípio de substituição de Liskov, de Barbara Liskov, diz que onde o código espera um tipo, qualquer implementação desse tipo deve funcionar **sem que quem usa precise saber qual é**. Em termos práticos: a implementação não exige mais do que o contrato pede (pré-condições) e não entrega menos do que ele promete (pós-condições).
+
+O contrato da `RegraDeDesconto` está escrito no Javadoc dela: devolve `Optional.empty()` quando não se aplica, nunca `null`; o valor tem duas casas e fica entre zero e o subtotal; não lança exceção para carrinho válido. A `CalculadoraDeDescontos` confia nisso: ela soma os valores sem conferir escala nem sinal. Uma regra que devolva `new BigDecimal("20")` (escala zero) não quebra nada hoje, mas a soma passa a ter escala variável, e o dia em que alguém comparar com `equals` em vez de `compareTo` (aula [Mockito](../../10-testes/03-mockito/) mostrou essa armadilha) aparece um bug impossível de reproduzir.
+
+Violações que aparecem no dia a dia:
+
+```java
+public class RepositorioDePedidosSomenteLeitura implements RepositorioDePedidos {
+    @Override
+    public void salvar(PedidoFechado pedido) {
+        throw new UnsupportedOperationException("réplica de leitura");   // quem usa a porta é surpreendido
+    }
+    // ...
+}
+```
+
+- **lançar onde o contrato não prevê**: o `UnsupportedOperationException` acima, ou um `buscar` que lança `PedidoNaoEncontradoException` quando o contrato diz "vazio quando não existe";
+- **exigir mais**: a implementação só aceita cupom em maiúsculas, enquanto a interface aceita qualquer texto;
+- **entregar menos**: a lista "ordenada por data" que um adaptador devolve fora de ordem, o desconto com escala zero;
+- **efeitos escondidos**: uma regra de desconto que, além de calcular, grava um log de auditoria no banco. Quem chama `avaliar` dez vezes para simular cenários vai gravar dez auditorias.
+
+O LSP é o que torna os fakes de teste confiáveis: um repositório em memória só serve para testar o caso de uso se ele se comportar como o de verdade. E a forma de garantir isso não é revisão de código; é **teste de contrato**: um mesmo teste que roda contra todas as implementações da interface. Você vai escrever um no passo 4.
+
+**Sinais em code review:** `instanceof` ou `getClass()` sobre uma abstração para tratar uma implementação de jeito especial; `UnsupportedOperationException` numa implementação de interface do próprio projeto; Javadoc da implementação dizendo "atenção: diferente das outras, este...". A clássica `Quadrado extends Retangulo`, em que `setLargura` também muda a altura, é a versão didática do mesmo problema: herança modelando "é um" do mundo real em vez de "se comporta como" no código.
+
+**Quando relaxar:** coleções imutáveis do JDK (`List.of`) lançam `UnsupportedOperationException` em `add`, e isso está documentado como operação opcional da interface `List`. É uma escolha consciente de quem desenhou a API, com o custo conhecido. No seu código de domínio, prefira dividir a interface (próximo princípio) a ter métodos opcionais.
+
+### I: interfaces desenhadas por quem usa
+
+O princípio de segregação de interfaces diz que nenhum código deve depender de métodos que não usa. A violação típica é a interface "de serviço" que cresce por acumulação:
+
+```java
+// Antes: uma interface para tudo o que existe sobre pedidos
+public interface ServicoDePedidos {
+    PedidoFechado fechar(String numero, Carrinho carrinho);
+    void cancelar(String numero, String motivo);
+    Optional<PedidoFechado> buscar(String numero);
+    List<PedidoFechado> listarPorCliente(String clienteId);
+    RelatorioMensal relatorio(YearMonth mes);
+    void reprocessarNotasFiscais(LocalDate dia);
+    // ... mais oito métodos
+}
+
+// Depois: uma interface por necessidade de quem chama
+public interface FecharPedido { PedidoFechado fechar(String numero, Carrinho carrinho); }
+public interface ConsultarPedidos { Optional<PedidoFechado> buscar(String numero); }
+```
+
+O controller da tela de acompanhamento depende de `ConsultarPedidos`, e só. Três ganhos concretos: a dependência fica explícita na assinatura (quem lê o construtor sabe o que a classe pode fazer), o dublê de teste vira uma lambda (`numero -> Optional.of(pedido)`), e uma mudança em `reprocessarNotasFiscais` não obriga a recompilar nem a revisar o controller. As portas `RepositorioDePedidos` e `Notificador` desta aula seguem a mesma ideia: cada uma tem só o que o caso de uso precisa. A aula de [arquitetura hexagonal](../../13-arquitetura/03-hexagonal/) leva isso ao extremo, com uma porta de entrada por caso de uso.
+
+**Sinais de violação:** implementações com métodos vazios ou lançando exceção "porque a interface obriga"; um mock com vinte métodos em que o teste programa um; mudanças em um método de interface quebrando compilação em módulos que nunca o chamam.
+
+**Quando não segregar:** interfaces de repositório do Spring Data (`JpaRepository`) trazem dezenas de métodos, e tudo bem: são a fronteira com uma biblioteca, e você não vai implementá-las à mão. Segregar uma interface que tem um único cliente também não traz nada. O critério é: **clientes diferentes, com necessidades diferentes, dependendo da mesma interface**.
+
+### D: a regra não depende do detalhe
+
+O princípio de inversão de dependência tem duas partes: módulos de alto nível (regras de negócio) não dependem de módulos de baixo nível (banco, HTTP, e-mail); os dois dependem de abstrações. E as abstrações não dependem de detalhes; os detalhes dependem delas.
+
+A palavra importante é **inversão**. Sem ela, a seta de dependência vai da regra para o detalhe: o `ServicoDePedidos` importa `JdbcTemplate` e `JavaMailSender`, e trocar o provedor de e-mail obriga a editar e retestar a regra de negócio. Com a porta definida **no pacote do núcleo**, a seta se inverte: o adaptador de e-mail importa `Notificador` do núcleo, e o núcleo não sabe que o adaptador existe.
+
+<Figura legenda="Inversão de dependência: a porta pertence ao núcleo, e o adaptador aponta para ela">
+<svg viewBox="0 0 800 360" width="800" role="img" aria-labelledby="dip-titulo dip-desc">
+  <title id="dip-titulo">Direção das dependências antes e depois da inversão</title>
+  <desc id="dip-desc">À esquerda, antes: FechamentoDePedido aponta para JdbcTemplate e para JavaMailSender; a regra depende do detalhe. À direita, depois: dentro de uma área chamada núcleo estão FechamentoDePedido e as portas RepositorioDePedidos e Notificador, e FechamentoDePedido aponta para as portas. Fora do núcleo, abaixo, os adaptadores RepositorioJdbc e NotificadorPorEmail apontam para cima, para as portas que implementam: o detalhe depende da regra.</desc>
+  <defs><marker id="mk-solid-dip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="175" y="26" text-anchor="middle" class="d-title">Antes</text>
+  <rect x="20" y="44" width="310" height="50" rx="8" class="d-box"/>
+  <text x="175" y="74" text-anchor="middle" class="d-mono">FechamentoDePedido</text>
+  <path d="M110 94 L96 190" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <path d="M240 94 L254 190" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <rect x="20" y="192" width="150" height="46" rx="8" class="d-box"/>
+  <text x="95" y="220" text-anchor="middle" class="d-mono">JdbcTemplate</text>
+  <rect x="180" y="192" width="150" height="46" rx="8" class="d-box"/>
+  <text x="255" y="220" text-anchor="middle" class="d-mono">JavaMailSender</text>
+  <text x="175" y="276" text-anchor="middle" class="d-text">a regra aponta para o detalhe</text>
+  <text x="175" y="298" text-anchor="middle" class="d-label">trocar o banco = editar a regra</text>
+  <path d="M380 20 L380 340" class="d-line"/>
+  <text x="595" y="26" text-anchor="middle" class="d-title">Depois</text>
+  <rect x="410" y="40" width="370" height="166" rx="12" class="d-accent"/>
+  <text x="595" y="60" text-anchor="middle" class="d-label">núcleo: regras e portas</text>
+  <rect x="430" y="68" width="330" height="44" rx="8" class="d-box"/>
+  <text x="595" y="95" text-anchor="middle" class="d-mono">FechamentoDePedido</text>
+  <path d="M510 112 L510 140" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <path d="M695 112 L695 140" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <rect x="420" y="142" width="180" height="48" rx="8" class="d-info"/>
+  <text x="510" y="171" text-anchor="middle" class="d-mono">RepositorioDePedidos</text>
+  <rect x="620" y="142" width="150" height="48" rx="8" class="d-info"/>
+  <text x="695" y="171" text-anchor="middle" class="d-mono">Notificador</text>
+  <path d="M510 262 L510 192" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <path d="M695 262 L695 192" class="d-line" marker-end="url(#mk-solid-dip)"/>
+  <text x="518" y="236" class="d-label">implementa</text>
+  <text x="703" y="236" class="d-label">implementa</text>
+  <rect x="420" y="264" width="180" height="48" rx="8" class="d-ok"/>
+  <text x="510" y="293" text-anchor="middle" class="d-mono">RepositorioJdbc</text>
+  <rect x="620" y="264" width="150" height="48" rx="8" class="d-ok"/>
+  <text x="695" y="293" text-anchor="middle" class="d-mono" textLength="136" lengthAdjust="spacingAndGlyphs">NotificadorPorEmail</text>
+  <text x="595" y="340" text-anchor="middle" class="d-text">o detalhe aponta para a regra</text>
+</svg>
+</Figura>
+
+Duas confusões aparecem em toda entrevista:
+
+- **Injeção de dependência não é inversão de dependência.** Injeção é o mecanismo: alguém de fora entrega as dependências (o Spring, ou você com `new` no teste). Inversão é a direção. Um serviço que recebe `JdbcTemplate` pelo construtor usa injeção, mas não inverte nada: continua dependendo do detalhe.
+- **A abstração pertence a quem a usa.** Se a interface `Notificador` mora no pacote do adaptador de e-mail, com métodos como `enviarHtml(String destinatario, String template)`, ela é uma abstração do detalhe, não da necessidade. A porta fala a língua do domínio (`pedidoFechado(PedidoFechado)`) e mora no núcleo.
+
+**Sinais de violação em code review:** imports de `org.springframework.jdbc`, `jakarta.mail`, clientes HTTP ou SDKs de fornecedor dentro de classes de regra de negócio; entidades de domínio anotadas com detalhes de serialização de um fornecedor; testes de regra que precisam de Testcontainers para rodar.
+
+**Quando não inverter:** em um CRUD sem regra, em que o "caso de uso" é salvar o que chegou, uma porta entre o controller e o Spring Data é cerimônia. Uma aplicação pequena, com um banco e sem planos de trocar, pode depender do repositório Spring Data diretamente na camada de serviço; o custo de introduzir a porta depois, se precisar, é baixo e localizado.
+
+## Coesão e acoplamento: as métricas por baixo de tudo
+
+Os cinco princípios são aplicações de duas ideias mais antigas, dos anos 1970: **alta coesão** (o que muda junto fica junto) e **baixo acoplamento** (o que muda separado depende pouco entre si). Quando você não tiver certeza de qual princípio se aplica, pergunte: esta mudança aumenta a coesão ou reduz o acoplamento? Se não faz nenhum dos dois, provavelmente é só cerimônia.
+
+Essas ideias podem ser medidas. As métricas de pacote de Robert Martin são as mais usadas para discutir arquitetura:
+
+- **Acoplamento aferente (Ca)**: quantos pacotes de fora dependem deste. Muitos dependentes = o pacote é difícil de mudar, porque cada mudança se propaga.
+- **Acoplamento eferente (Ce)**: de quantos pacotes de fora este depende. Muitas dependências = o pacote é frágil, porque muda sempre que algo de que depende muda.
+- **Instabilidade**: `I = Ce / (Ca + Ce)`, de 0 a 1. Perto de 0, o pacote é estável: muitos dependem dele e ele depende de pouco. Perto de 1, instável: depende de muito e ninguém depende dele.
+
+A regra que sai disso, o **princípio das dependências estáveis**, é a versão em escala do DIP: **dependa na direção da estabilidade**. O núcleo de regras deve ser estável (muitos adaptadores dependem dele, ele depende só do JDK); os adaptadores, instáveis (dependem do núcleo e de bibliotecas, ninguém depende deles). No código desta aula, o pacote `solid` tem Ce igual a zero em relação aos pacotes do projeto: depende só do JDK e de anotações do Spring. Os pacotes `adaptadores` e `legado` dependem dele. Você vai conferir isso com uma ferramenta do JDK no passo 6.
+
+Para coesão de classe, a métrica clássica é a família **LCOM** (*lack of cohesion of methods*): grosso modo, conta pares de métodos que não compartilham nenhum campo. Uma classe em que metade dos métodos usa os campos `a` e `b` e a outra metade usa `c` e `d` são duas classes num arquivo só. Ferramentas de análise estática calculam variantes dela; mais útil do que o número é o padrão que ele revela.
+
+<Callout tipo="atencao" titulo="Métrica é termômetro, não meta">
+Transformar métricas em meta ("toda classe com LCOM abaixo de X") produz código otimizado para a métrica. Use os números para **achar onde olhar** e para acompanhar tendência (o acoplamento do módulo de pedidos subiu 40% neste trimestre?). A decisão continua sendo de pessoas, com o contexto de negócio.
+</Callout>
+
+## O custo da abstração prematura
+
+Cada princípio aplicado acrescenta estrutura: uma interface, uma classe, um nível de indireção. Estrutura tem custo, e ele é pago **todo dia**, por quem lê o código, e não só no dia em que foi escrita.
+
+```java
+// Abstração prematura: um único imposto, um único jeito de calcular, quatro tipos
+public interface EstrategiaDeCalculoDeImposto { BigDecimal calcular(ContextoDeImposto contexto); }
+public class EstrategiaDeCalculoDeImpostoPadrao implements EstrategiaDeCalculoDeImposto { ... }
+public class FabricaDeEstrategiaDeCalculoDeImposto { ... }
+public record ContextoDeImposto(Map<String, Object> parametros) { }
+```
+
+Para entender quanto de imposto um pedido paga, quem lê precisa abrir quatro arquivos, descobrir qual implementação a fábrica devolve e adivinhar quais chaves o `Map` de parâmetros tem. E quando o segundo imposto chegar, há uma boa chance de ele não caber na abstração inventada antes de existir o caso real: o contexto genérico não tem o dado de que ele precisa, e a interface precisa mudar de qualquer jeito.
+
+Os custos concretos da abstração prematura:
+
+- **Leitura mais lenta.** "Ir para a definição" leva à interface, não ao código. Toda indireção é um salto mental.
+- **Abstração errada.** Desenhada a partir de um caso só, ela generaliza o eixo errado. Desfazer uma abstração errada custa mais do que criar a certa depois, porque o código já se moldou a ela.
+- **Mais superfície para manter.** Mais tipos, mais testes, mais configuração do Spring.
+- **Falsa sensação de flexibilidade.** O código parece pronto para mudar, mas no eixo que ninguém vai mudar.
+
+A heurística que funciona é a **regra de três**: a primeira vez, escreva direto; a segunda, note a duplicação e talvez tolere; a terceira, extraia a abstração, agora com três casos reais para guiar o desenho. O YAGNI completa: não construa o ponto de extensão até existir quem vá estendê-lo. O código desta aula tem `RegraDeDesconto` porque já existem três regras e o comercial pede uma nova por mês. Não tem `EstrategiaDeArredondamento` porque arredondamento é um só, e `Dinheiro.arredondar` resolve.
+
+<Callout tipo="dica" titulo="O teste da explicação">
+Antes de criar uma interface, tente completar a frase: "esta interface existe porque **hoje** há duas implementações, ou porque o teste precisa trocar esta dependência, ou porque esta é uma fronteira com o mundo externo". Se nenhuma das três se aplica, a interface está esperando um futuro que talvez não chegue. Repare que "o teste precisa trocar" é um motivo legítimo: `RepositorioDePedidos` tem uma única implementação de produção e mesmo assim se justifica.
+</Callout>
+
+## O código que vamos construir
+
+Tudo o que aparece a partir daqui está em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.solid`, e roda no CI. O domínio é o fechamento de pedido de uma loja online de cafés:
+
+| Tipo | Papel |
+|---|---|
+| `Carrinho`, `ItemDoPedido`, `TipoDeCliente` | Os dados de entrada: quem compra, o que compra, o cupom digitado |
+| `legado.CalculadoraDeDescontosLegada` | O cálculo como estava em produção. **Referência de comportamento**; não muda |
+| `RegraDeDesconto` e `DescontoVip`, `DescontoPrimeiraCompra`, `DescontoAtacado` | As regras comerciais, uma por classe (OCP) |
+| `CalculadoraDeDescontos`, `Orcamento`, `Desconto` | Soma as regras e aplica o teto de 12% |
+| `FechamentoDePedido` | O caso de uso: orquestra cálculo, gravação e aviso (SRP) |
+| `RepositorioDePedidos`, `Notificador` | Portas, no núcleo (DIP, ISP) |
+| `adaptadores.RepositorioDePedidosEmMemoria`, `adaptadores.NotificadorPorLog` | Adaptadores das portas |
+| `ConfiguracaoDaLoja` | Liga tudo no Spring |
+
+As regras comerciais, extraídas do legado:
+
+1. **VIP**: 5% sobre o subtotal.
+2. **Cupom PRIMEIRA10**: 10% para cliente novo, limitado a R$ 50,00. O cupom é comparado sem diferenciar maiúsculas e minúsculas.
+3. **Atacado**: item com 10 unidades ou mais ganha 3% sobre o subtotal daquele item, **arredondado item a item**.
+4. **Teto**: a soma dos descontos não passa de 12% do subtotal.
+5. Arredondamento: duas casas, meio para cima (`RoundingMode.HALF_UP`).
+
+A regra 3 tem um detalhe que parece irrelevante e é exatamente o tipo de coisa que uma refatoração quebra sem perceber: arredondar cada item e somar não dá o mesmo que somar e arredondar no fim. Guarde isso; vai aparecer em "Quando dá errado".
+
+## Mão na massa
+
+Para rodar os testes, entre na pasta do módulo:
+
+```bash
+cd java/m13-arquitetura/aulas
+mvn test -Dtest=CaracterizacaoDosDescontosTest   # uma classe
+mvn test                                          # o módulo inteiro
+```
+
+### Passo 1: conhecer o legado e os tipos de entrada
+
+**O que vamos fazer e por quê.** Antes de mudar qualquer coisa, leia o código que está em produção e os tipos que ele recebe. Não tente entender cada regra a fundo agora: o objetivo é saber o que entra e o que sai.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/Carrinho.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/legado/CalculadoraDeDescontosLegada.java" />
+
+**O que acabou de acontecer.** O legado recebe um `Carrinho` e devolve um `BigDecimal`: o total. Repare em três coisas. Primeiro, o método mistura todas as regras e o teto num fluxo só, com números mágicos espalhados (`0.05`, `0.10`, `50.00`, `0.03`, `0.12`). Segundo, a única saída é o total: não há como saber **quais** descontos foram aplicados, o que o comercial pede há tempos para exibir no resumo do pedido. Terceiro, cada `setScale(2, RoundingMode.HALF_UP)` está num lugar diferente, e a posição de cada um faz parte do comportamento. O Javadoc diz "não altere": esta classe será o oráculo do teste de caracterização.
+
+### Passo 2: a rede de proteção antes de qualquer mudança
+
+**O que vamos fazer e por quê.** Refatorar sem teste é torcer. Mas escrever um teste para cada regra exige entender cada regra, e o legado tem combinações (VIP com atacado, cupom com teto) que ninguém documentou. O teste de caracterização inverte o problema: em vez de dizer o que o código **deveria** fazer, ele compara o código novo com o que o antigo **faz**, em muitas entradas variadas.
+
+Primeiro, um gerador de carrinhos reproduzível: a mesma semente sempre produz a mesma sequência.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/solid/GeradorDeCarrinhos.java" />
+
+Depois, o teste:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/solid/CaracterizacaoDosDescontosTest.java" />
+
+```bash
+mvn test -Dtest=CaracterizacaoDosDescontosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.solid.CaracterizacaoDosDescontosTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.126 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `new Random(2026)` com semente fixa faz o teste ser determinístico: os 2.000 carrinhos são os mesmos em toda execução, em qualquer máquina. Um teste com dados aleatórios **sem** semente fixa que falha uma vez em cem é pior do que nenhum teste.
+- O gerador cobre o espaço que importa: os três tipos de cliente, de 1 a 4 itens, quantidades de 1 a 15 (então o limite de 10 do atacado aparece dos dois lados), preços de R$ 0,50 a R$ 600,49 (então o limite de R$ 50,00 do cupom aparece dos dois lados), cupom ausente, cupom certo, cupom em minúsculas e cupons que não existem.
+- `.as("carrinho nº %d: %s", i, carrinho)` faz a mensagem de falha trazer o carrinho exato que divergiu. Sem isso, você saberia que algo mudou, mas não com qual entrada.
+- `isEqualTo` compara `BigDecimal` com `equals`, que considera a escala: `13190.9` e `13190.90` seriam diferentes. Aqui isso é desejado: o total que vai para a nota fiscal tem duas casas, e o teste congela isso também.
+
+<Callout tipo="info" titulo="Na vida real, este teste vem primeiro">
+O teste referencia `CalculadoraDeDescontos`, que você vai ver nos passos 3 e 4. Numa refatoração de verdade, a ordem é: crie a classe nova com um único método que **delega para o legado**, escreva o teste de caracterização (que passa trivialmente), faça commit. Só então comece a mover as regras, uma por vez, rodando o teste a cada passo. O teste nunca fica vermelho por mais de alguns minutos.
+</Callout>
+
+Quando o legado não pode ser chamado do teste (está em outro sistema, depende de um banco de produção), a variante é **gravar** as saídas: rode o legado uma vez sobre as entradas geradas, salve um arquivo com pares entrada e saída, e o teste compara o código novo com o arquivo. É daí que vem o nome *golden master*: a gravação de referência.
+
+### Passo 3: uma regra por classe
+
+**O que vamos fazer e por quê.** Cada regra do legado vira uma implementação de `RegraDeDesconto`. A interface tem um método e um contrato explícito:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/RegraDeDesconto.java" />
+
+A regra do cupom:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/DescontoPrimeiraCompra.java" />
+
+E a do atacado, com o arredondamento item a item preservado:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/DescontoAtacado.java" />
+
+**O que acabou de acontecer.**
+
+- Cada regra cabe numa tela, tem nome de negócio e pode ser lida sem conhecer as outras. Quando o comercial perguntar "como funciona o desconto de atacado?", a resposta é um arquivo.
+- Os números mágicos viraram constantes com nome (`PERCENTUAL`, `LIMITE`, `QUANTIDADE_MINIMA`). Isso não é SOLID; é só legibilidade, e costuma ser o primeiro ganho de qualquer refatoração.
+- O `Desconto` devolvido tem **motivo**: a informação que o legado jogava fora agora pode aparecer no resumo do pedido. Uma refatoração bem feita frequentemente destrava funcionalidades que a estrutura antiga impedia.
+- O arredondamento está em `Dinheiro.arredondar`, um único lugar. O `DescontoAtacado` arredonda **dentro** do `map`, item a item, exatamente como o legado. Parece um detalhe; o passo 2 existe para pegar quem achar que é.
+- `@Component` marca cada regra como bean. Fora do Spring, nos testes, elas são criadas com `new`: a anotação não amarra a classe ao container.
+
+### Passo 4: a calculadora e o teste de contrato
+
+**O que vamos fazer e por quê.** A calculadora recebe a lista de regras, soma o que cada uma concedeu e aplica o teto. Ela não conhece nenhuma regra concreta.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/CalculadoraDeDescontos.java" destacar="16-19, 24-26" />
+
+Como a calculadora confia no contrato das regras, o contrato precisa de um teste que valha para **todas** elas. É o LSP transformado em verificação automática:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/solid/ContratoDasRegrasDeDescontoTest.java" />
+
+```bash
+mvn test -Dtest=ContratoDasRegrasDeDescontoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.solid.ContratoDasRegrasDeDescontoTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.076 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `List.copyOf(regras)` no construtor guarda uma cópia imutável: ninguém de fora consegue acrescentar ou remover uma regra depois que a calculadora foi criada.
+- `regra.avaliar(carrinho).stream()` transforma o `Optional` num stream de zero ou um elemento, e o `flatMap` junta só as regras que se aplicaram. Nenhum `if`, nenhum `null`.
+- `soma.min(teto)` aplica o teto. A calculadora é o único lugar que conhece o teto, porque ele é uma regra **sobre a combinação** de descontos, não sobre um desconto isolado. Colocá-lo em cada regra seria duplicar a mesma decisão em quatro arquivos.
+- O teste de contrato é um `@ParameterizedTest` alimentado por `@MethodSource("regras")`: o JUnit executa o mesmo método uma vez para cada implementação, e o relatório mostra quatro execuções. A quarta é o `DescontoAniversario`, a solução do checkpoint no fim da aula; por isso são quatro, e não três.
+- Cada asserção tem `.as(...)` com o nome da regra. Sem isso, quando o teste falha, a mensagem diz só "expected: 2, but was: 0", sem dizer qual das quatro implementações quebrou o contrato.
+- Uma regra nova acrescentada à lista `regras()` herda as verificações sem nenhuma linha a mais. Em projetos maiores, o mesmo efeito se obtém com uma classe abstrata de teste (`ContratoDeRepositorioTest`) estendida por um teste de cada implementação: a do JDBC e o fake em memória passam pelo mesmo contrato.
+
+### Passo 5: portas, caso de uso e o Spring montando o grafo
+
+**O que vamos fazer e por quê.** Agora o fechamento do pedido, separado por ator. O caso de uso depende de quatro coisas, todas abstrações ou valores do núcleo:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/FechamentoDePedido.java" destacar="14-17" />
+
+As portas são interfaces pequenas, no mesmo pacote do caso de uso:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/RepositorioDePedidos.java" />
+
+O adaptador mora em outro pacote e importa a porta, nunca o contrário:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/adaptadores/RepositorioDePedidosEmMemoria.java" />
+
+A configuração liga tudo. `@ComponentScan` sem argumentos varre o pacote da própria classe e os subpacotes:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/ConfiguracaoDaLoja.java" />
+
+E o teste sobe o contexto do Spring de verdade, sem Spring Boot, só com o container do Spring Framework:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/solid/FechamentoDePedidoNoSpringTest.java" />
+
+```bash
+mvn test -Dtest=FechamentoDePedidoNoSpringTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.solid.FechamentoDePedidoNoSpringTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.461 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `FechamentoDePedido` tem um único construtor e nenhuma anotação nele. A documentação do Spring Framework é explícita: se a classe declara um único construtor, ele é sempre usado, mesmo sem `@Autowired`. É a forma recomendada: os campos ficam `final`, a classe pode ser criada com `new` num teste e uma dependência a mais faz o teste parar de compilar, em vez de receber `null` em silêncio.
+- O parâmetro `List<RegraDeDesconto>` da calculadora recebe **todos** os beans daquele tipo. A ordem da lista segue a ordem de registro das definições, a não ser que as regras implementem `Ordered` ou usem `@Order` ou `@Priority`. Para somar descontos, a ordem não importa; para regras que se compõem (uma aplicada sobre o resultado da outra), ela passa a importar, e confiar na ordem de varredura de pacotes seria um bug esperando para acontecer.
+- O `Clock` é um bean declarado com `@Bean`. O caso de uso usa `Instant.now(relogio)`, nunca `Instant.now()`: tempo é dependência, como ensinou a aula de Mockito.
+- No primeiro teste, o carrinho VIP com 12 cafés de R$ 49,90 e um filtro de R$ 12,50 tem subtotal R$ 611,30. VIP: 5% = R$ 30,565, arredondado para R$ 30,57. Atacado no café: 3% de R$ 598,80 = R$ 17,964, arredondado para R$ 17,96. Soma R$ 48,53, abaixo do teto de R$ 73,36. Total: **R$ 562,77**. Faça a conta uma vez à mão; é assim que se ganha confiança num teste com números.
+- O segundo teste é o OCP demonstrado: `registerBean` acrescenta uma regra "Black Friday" de R$ 10,00 ao contexto antes do `refresh()`. A calculadora, que não foi editada nem recompilada, passa a aplicar três descontos e o total cai para R$ 552,77.
+
+### Passo 6: medindo a direção das dependências com o jdeps
+
+**O que vamos fazer e por quê.** O DIP afirma que o núcleo não depende dos adaptadores. Afirmação de arquitetura que ninguém verifica vira desejo. O JDK traz o `jdeps`, que analisa os `.class` compilados e lista as dependências entre pacotes:
+
+```bash
+mvn -q compile
+jdeps -verbose:package -e "dev\.trilhajava\..*" target/classes
+```
+
+Saída real:
+
+```text
+classes -> target\classes
+   dev.trilhajava.m13.aulas.solid.adaptadores         -> dev.trilhajava.m13.aulas.solid                     classes
+   dev.trilhajava.m13.aulas.solid.legado              -> dev.trilhajava.m13.aulas.solid                     classes
+```
+
+**O que acabou de acontecer.** `-verbose:package` mostra as dependências no nível de pacote, e `-e` filtra só as que casam com a expressão (as do próprio projeto; sem o filtro, a saída lista também `java.base` e o Spring). Há duas setas, e as duas **chegam** ao pacote `solid`; nenhuma sai dele. Em termos das métricas: o núcleo tem Ce = 0 e Ca = 2, instabilidade 0; os adaptadores e o legado têm instabilidade 1. É exatamente a figura do DIP, agora confirmada pelo bytecode. Se alguém fizer o `FechamentoDePedido` importar `RepositorioDePedidosEmMemoria`, uma terceira linha aparece: `solid -> solid.adaptadores`, e o ciclo fica visível.
+
+Para transformar isso em regra que quebra o build, o caminho é o **ArchUnit**, usado no exercício desta aula e na aula de [TDD e arquitetura](../../10-testes/06-tdd-e-arquitetura/): um teste que afirma "classes do pacote `solid` não dependem de classes de `..adaptadores..`" e falha no CI quando alguém cruza a fronteira.
+
+### Passo 7: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.solid.CaracterizacaoDosDescontosTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.solid.ContratoDasRegrasDeDescontoTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.solid.FechamentoDePedidoNoSpringTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Quatro métodos de teste, sete execuções, menos de um segundo. Repare na divisão de trabalho: o teste de caracterização protege o **comportamento** durante a refatoração; o de contrato protege a **substituibilidade** das regras; o do Spring protege a **montagem**. Nenhum deles testa regra por regra com exemplos escritos à mão, e para uma refatoração isso é suficiente. Depois que o código novo estiver em produção e o legado for apagado, o teste de caracterização perde o oráculo: é a hora de substituí-lo por testes de exemplo de cada regra, agora que você as entende.
+
+## Quando dá errado
+
+As mensagens abaixo foram geradas quebrando o código de propósito e rodando a suíte.
+
+### O golden master pega o arredondamento
+
+Alguém "simplifica" o `DescontoAtacado` para somar os itens e arredondar uma vez no fim:
+
+```java
+BigDecimal valor = Dinheiro.arredondar(carrinho.itens().stream()
+        .filter(item -> item.quantidade() >= QUANTIDADE_MINIMA)
+        .map(item -> item.subtotal().multiply(PERCENTUAL))
+        .reduce(BigDecimal.ZERO, BigDecimal::add));
+```
+
+```text
+[ERROR] dev.trilhajava.m13.aulas.solid.CaracterizacaoDosDescontosTest.mesmoTotalQueOLegadoEmDoisMilCarrinhos -- Time elapsed: 0.075 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+[carrinho nº 8: Carrinho[clienteId=cliente-859, tipoDeCliente=RECORRENTE, itens=[ItemDoPedido[sku=SKU-0, quantidade=14, precoUnitario=68.00], ItemDoPedido[sku=SKU-1, quantidade=13, precoUnitario=512.96], ItemDoPedido[sku=SKU-2, quantidade=10, precoUnitario=597.84]], cupom=null]]
+expected: 13190.92
+ but was: 13190.91
+```
+
+**Como ler:** a descrição entre colchetes é o `.as(...)` do teste: o carrinho de número 8 da sequência, inteiro. *expected* é o legado; *but was*, o código novo. Os três itens têm 10 ou mais unidades. Item a item: R$ 28,56 + R$ 200,0544 (vira 200,05) + R$ 179,352 (vira 179,35) = R$ 407,96. Somando antes de arredondar: R$ 407,9664, que vira R$ 407,97. Um centavo. Multiplique por todos os pedidos de atacado do mês e é o bug da segunda-feira. **Como corrigir:** desfazer a mudança. Se o negócio **quiser** o arredondamento no fim (é defensável), isso é uma mudança de regra: um commit separado, aprovado pelo financeiro, com o golden master atualizado de propósito e um teste de exemplo documentando a regra nova.
+
+### O contrato pega a escala
+
+Uma regra nova devolve `new BigDecimal("20")` em vez de `new BigDecimal("20.00")`:
+
+```text
+org.opentest4j.AssertionFailedError:
+[DescontoAniversario: escala de 20]
+expected: 2
+ but was: 0
+	at dev.trilhajava.m13.aulas.solid.ContratoDasRegrasDeDescontoTest.lambda$todaRegraCumpreOContrato$0(ContratoDasRegrasDeDescontoTest.java:32)
+```
+
+**Como ler:** o teste de contrato diz qual implementação violou qual cláusula. O golden master não pegaria isso: a regra é nova, o legado não tem nada equivalente, e a escala diferente não muda o total arredondado. É por isso que os dois testes existem. **Como corrigir:** passar o valor por `Dinheiro.arredondar`.
+
+### Dois beans para a mesma porta
+
+Um adaptador de e-mail é criado e registrado, mas o de log continua lá:
+
+```text
+org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'fechamentoDePedido' defined in file [...FechamentoDePedido.class]: Unsatisfied dependency expressed through constructor parameter 2: No qualifying bean of type 'dev.trilhajava.m13.aulas.solid.Notificador' available: expected single matching bean but found 2: temporarioErrosTest.NotificadorPorEmail,notificadorPorLog
+Caused by: org.springframework.beans.factory.NoUniqueBeanDefinitionException: No qualifying bean of type 'dev.trilhajava.m13.aulas.solid.Notificador' available: expected single matching bean but found 2: temporarioErrosTest.NotificadorPorEmail,notificadorPorLog
+```
+
+**Como ler:** *constructor parameter 2* é o terceiro parâmetro do construtor (a contagem começa em zero): o `Notificador`. O Spring achou dois candidatos e não escolhe sozinho. **Como corrigir**, conforme a intenção:
+
+- só um deve existir por ambiente: ative cada adaptador por perfil (`@Profile("dev")` no de log) ou por propriedade (`@ConditionalOnProperty`, no Spring Boot);
+- um é o padrão e o outro é exceção: `@Primary` no padrão (ou, desde o Spring Framework 6.2, `@Fallback` no que só deve ser usado na falta de outro);
+- o consumidor precisa escolher: `@Qualifier("nome")` no parâmetro do construtor;
+- todos devem ser usados (avisar por e-mail **e** por push): injete `List<Notificador>` e chame todos, que é o mesmo desenho das regras de desconto.
+
+### A lista vazia que não avisa
+
+Esta é silenciosa, e por isso é a mais perigosa. Uma configuração registra a calculadora e o caso de uso, mas esquece de varrer o pacote das regras. O contexto sobe sem erro, e o pedido de um cliente VIP com 12 cafés sai assim:
+
+```text
+SEM REGRAS -> descontos=[] total=598.80
+```
+
+**Como ler:** não há mensagem de erro para ler, e esse é o ponto. A documentação do Spring Framework explica: por padrão, um ponto de injeção de coleção exige pelo menos um elemento, **mas** num construtor único, arrays, coleções e mapas são resolvidos como instâncias vazias quando não há candidatos. A aplicação funciona, só que sem nenhum desconto. **Como se proteger:** um teste de montagem que conta as regras injetadas (como o primeiro teste do passo 5, que confere os motivos dos descontos aplicados), ou uma verificação na inicialização (`if (regras.isEmpty()) throw new IllegalStateException(...)` no construtor) quando "nenhuma regra" nunca for um estado válido.
+
+### Dependência circular
+
+Dois serviços que dependem um do outro pelo construtor:
+
+```text
+org.springframework.beans.factory.UnsatisfiedDependencyException: Error creating bean with name 'temporarioErrosTest.ServicoDeEstoque': Unsatisfied dependency expressed through constructor parameter 0: Error creating bean with name 'temporarioErrosTest.ServicoDeCompras': Unsatisfied dependency expressed through constructor parameter 0: Error creating bean with name 'temporarioErrosTest.ServicoDeEstoque': Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?
+Caused by: org.springframework.beans.factory.BeanCurrentlyInCreationException: Error creating bean with name 'temporarioErrosTest.ServicoDeEstoque': Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?
+```
+
+**Como ler:** a cadeia mostra o caminho: estoque precisa de compras, compras precisa de estoque, e o Spring encontra o estoque "em criação" pela segunda vez. Com injeção por construtor, o ciclo é impossível de resolver, e isso é uma qualidade: o erro aparece na subida, não em produção. **Como corrigir:** não com `@Lazy` ou injeção por campo, que escondem o ciclo. Um ciclo entre serviços é um problema de desenho: em geral, há uma terceira responsabilidade que os dois compartilham e que deve virar uma classe própria, ou um dos lados deveria reagir a um evento do outro em vez de chamá-lo diretamente.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="SOLID como checklist" depois="SOLID como resposta a um problema">
+
+```java
+// Interface para cada classe, "por SOLID"
+public interface CalculadoraDeDescontosService { ... }
+public class CalculadoraDeDescontosServiceImpl
+        implements CalculadoraDeDescontosService { ... }
+
+public interface DinheiroUtils { ... }
+public class DinheiroUtilsImpl implements DinheiroUtils { ... }
+// 2 arquivos por conceito, 1 implementação cada,
+// nenhum teste troca nenhuma delas
+```
+
+```java
+// Interface onde há variação, fronteira ou teste
+public interface RegraDeDesconto { ... }   // 4 implementações
+public interface Notificador { ... }       // fronteira externa
+public interface RepositorioDePedidos { ... } // fronteira + fake
+
+public class CalculadoraDeDescontos { ... }   // classe concreta
+final class Dinheiro { ... }                  // função pura
+```
+
+</Comparar>
+
+As armadilhas mais frequentes em code review:
+
+- **O par `Service`/`ServiceImpl` automático.** Uma interface com uma implementação, que ninguém troca nem em teste, é indireção pura. O Spring injeta classes concretas sem problema, e o Mockito também cria dublês de classes concretas. Crie a interface quando a segunda implementação ou a fronteira aparecer.
+- **SRP levado ao átomo.** Classes de um método só, cada uma com uma dependência, encadeadas em cinco níveis para fazer uma operação simples. A coesão caiu: a regra de negócio, que deveria estar num lugar, está espalhada. O SRP fala de **motivos para mudar**, não de "cada classe faz uma operação".
+- **OCP no eixo errado.** Plug-ins para tudo, configurações para cada número, motores de regras genéricos, quando o que muda na prática é outra coisa. Antes de abrir um ponto de extensão, olhe o histórico do Git: onde as mudanças aconteceram no último ano?
+- **Herança para reaproveitar código.** `DescontoAtacado extends DescontoVip` porque os dois calculam percentual é um convite à violação de Liskov. Reaproveite com composição ou com uma função (`Dinheiro.arredondar`), e deixe a herança para quando o subtipo realmente se comporta como o tipo.
+- **Portas que vazam o detalhe.** `RepositorioDePedidos` com um método `buscarPorSql(String)` ou devolvendo `ResultSet`. A porta existe, mas a inversão não: o núcleo continua conhecendo o banco.
+- **Refatoração misturada com mudança de regra.** No mesmo commit, você extrai a regra e "corrige" o arredondamento. Quando o golden master falhar, você não sabe se foi a extração ou a correção, e quem revisa também não. Um commit muda estrutura; outro muda comportamento.
+- **Golden master eterno.** O teste de caracterização é andaime: depois que a refatoração termina e o legado é removido, ele não tem mais oráculo. Mantê-lo com uma cópia congelada do legado "para sempre" transforma um bug antigo em especificação permanente.
+
+**Quando NÃO aplicar SOLID com rigor:** scripts e ferramentas de uso único; protótipos para validar uma hipótese de produto (que vão ser jogados fora, de verdade); CRUDs sem regra; código de integração fino que só traduz um formato em outro. Nesses casos, código direto, legível e testado vale mais do que a estrutura. A pergunta é sempre a mesma: **que mudança provável esta estrutura facilita, e quanto ela custa hoje?**
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Saber aplicar os princípios é o esperado de quem é pleno. O que diferencia a senioridade é decidir **onde** aplicar, com que custo, e convencer o time com argumentos que não sejam "o livro diz".
+
+**Decida pelo histórico de mudanças, não pela intuição.** O Git responde onde o código muda. Arquivos que aparecem em muitos commits, com muitos autores, e que também são complexos, são os pontos em que separar responsabilidades e abrir extensões rende mais. A técnica é chamada de análise de *hotspots*: cruzar frequência de mudança com complexidade. Um arquivo enorme e feio que ninguém toca há dois anos não precisa de refatoração; precisa de paz. Um arquivo médio que muda toda semana, sim.
+
+**Refatoração tem custo de oportunidade, e o negócio precisa enxergar o retorno.** "Vou aplicar SOLID no módulo de pedidos" não é um argumento para o gestor de produto. "Cada campanha comercial custa três dias e já causou dois incidentes de cobrança este ano; com a refatoração, uma campanha nova vira um arquivo e meio dia de trabalho, com o risco de afetar outras regras eliminado por um teste" é. Leve números: tempo de entrega das últimas mudanças, incidentes ligados à área, conflitos de merge. E prefira refatorar **junto** com uma demanda de negócio que passa pela área (a regra do escoteiro: deixe o código um pouco melhor do que encontrou) a pedir uma sprint de "dívida técnica" sem entrega visível.
+
+**Refatoração em produção é feita em passos reversíveis.** Para trocas de alto risco, o código novo pode rodar **em paralelo** com o antigo por um tempo: o sistema responde com o legado, calcula também com o novo, registra as divergências (métrica e log com o carrinho) e só troca quando as divergências chegarem a zero por dias. É o golden master em produção, com tráfego real, e uma *feature flag* permite voltar em segundos. O custo é processamento duplicado e código de comparação temporário; para cálculo de dinheiro, costuma valer.
+
+**Abstração tem custo operacional, não só de leitura.** Cada bean a mais aumenta, pouco, o tempo de subida da aplicação; cada nível de indireção torna o *stack trace* mais longo e o *profiling* mais difícil de ler; cada ponto de extensão é uma superfície que precisa de teste de contrato. Em uma equipe que recebe pessoas novas com frequência, código direto reduz o tempo até a primeira entrega. Em uma plataforma usada por dez times, pontos de extensão bem desenhados evitam que todos editem o mesmo arquivo. O contexto da equipe faz parte da decisão.
+
+**Segurança e auditoria também são argumentos.** Regras de desconto, de crédito e de permissão separadas por classe são mais fáceis de auditar: o auditor lê um arquivo, não um método de 200 linhas. E portas bem definidas são lugares naturais para controles transversais: o adaptador de notificação é onde se mascara dado pessoal antes de logar; o de repositório, onde se aplica o filtro de *tenant*. Quando a regra está misturada com o detalhe, esses controles se espalham e alguém esquece um.
+
+**Torne a arquitetura verificável.** Uma decisão como "o núcleo não depende de adaptadores" vale tanto quanto o teste que a garante. ArchUnit no CI, o `jdeps` numa revisão, um módulo Maven separado para o núcleo (o compilador impede o import proibido) ou o Spring Modulith (aula de [monólito modular](../../13-arquitetura/04-monolito-modular/)). Quanto mais cara a violação, mais forte a barreira: convenção para o que é barato errar, compilador para o que é caro.
+
+**Saiba quando trocar de abordagem.** Os sinais de que a estrutura atual não serve mais: a abstração precisa de um parâmetro novo a cada implementação nova (o eixo de variação mudou); metade das implementações ignora metade do contrato (a interface agrupou coisas diferentes); o teste de contrato precisa de exceções por implementação (não há mais um contrato comum). Nesses casos, a decisão madura é **desfazer** a abstração, voltar ao código direto e esperar o desenho certo aparecer, em vez de remendar a interface. Registre a decisão num ADR curto (contexto, decisão, consequências) para que, daqui a um ano, ninguém refaça a mesma abstração pelo mesmo caminho errado. A [última aula deste módulo, sobre decisões e evolução da arquitetura](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), aprofunda esse registro.
+
+**Como justificar uma escolha para o time.** Uma boa proposta de refatoração cabe em cinco linhas: o problema observado (com evidência), a mudança proposta, o custo (arquivos, horas, risco), a rede de proteção (que testes garantem o comportamento) e como desfazer se der errado. Proponha em passos que possam ser revisados separadamente: primeiro o teste de caracterização, depois cada extração. Pull requests de 200 linhas são revisados de verdade; de 2.000 linhas, aprovados por cansaço.
+
+<Callout tipo="entrevista">
+**"O que é SOLID?"** Não recite as cinco definições. Escolha dois princípios e conte um caso concreto: "o cálculo de descontos era um método com um `if` por campanha; cada campanha nova arriscava as anteriores. Cobri o legado com um teste de caracterização de 2.000 carrinhos com semente fixa, extraí uma interface `RegraDeDesconto`, e o Spring injeta todas as implementações como lista. Campanha nova virou classe nova. Isso é o aberto/fechado". Termine com a ressalva: "não aplico onde a mudança não acontece; abstração tem custo".
+
+**"Qual a diferença entre injeção e inversão de dependência?"** Injeção é o mecanismo (quem entrega as dependências); inversão é a direção (a regra define a porta, o detalhe implementa). Um serviço que recebe `JdbcTemplate` pelo construtor tem injeção sem inversão. Bônus: dizer que a porta mora no pacote de quem a usa.
+
+**"Dê um exemplo de violação de Liskov que você viu."** Implementação que lança `UnsupportedOperationException`, repositório que lança exceção onde o contrato diz `Optional.empty()`, valor com escala diferente. E como você previne: teste de contrato rodando contra todas as implementações, inclusive os fakes.
+
+**"Como você refatora um código legado sem testes?"** Teste de caracterização primeiro, com entradas variadas e reproduzíveis; refatoração em passos pequenos, um commit por passo; nunca misturar mudança de estrutura com mudança de regra; corrigir bugs encontrados depois, em commit separado.
+
+**"Quando você não criaria uma interface?"** Quando só existe uma implementação, ela não é fronteira com o mundo externo e nenhum teste precisa substituí-la. Cite a regra de três e o custo de indireção. Quem responde "sempre crio interface" mostra que aplica regra sem entender o porquê.
+</Callout>
+
+## Checkpoint
+
+O comercial pede uma campanha nova: o cupom **ANIVERSARIO** dá **R$ 20,00** de desconto para cliente **recorrente**, mas nunca mais do que o subtotal do carrinho. O teto de 12% continua valendo sobre a soma.
+
+1. Implemente a regra sem editar a `CalculadoraDeDescontos` nem o `FechamentoDePedido`.
+2. Garanta que ela cumpre o contrato de `RegraDeDesconto`.
+3. Responda: o teste de caracterização continua verde? Deveria?
+
+<details>
+<summary>Solução</summary>
+
+Uma classe nova, `@Component`, no pacote das regras:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/solid/DescontoAniversario.java" />
+
+Para o contrato, basta acrescentar `new DescontoAniversario()` ao `regras()` do `ContratoDasRegrasDeDescontoTest`, e o gerador de carrinhos ganhou o cupom `"ANIVERSARIO"` para que a regra realmente se aplique em parte dos carrinhos. É essa a quarta execução que você viu no passo 4.
+
+**Por que `Dinheiro.arredondar(VALOR.min(carrinho.subtotal()))`.** O `min` cumpre a cláusula "nunca mais que o subtotal" (um carrinho com um item de R$ 12,50 recebe R$ 12,50 de desconto, não R$ 20,00). O `arredondar` garante a escala 2 mesmo se o subtotal vier com outra escala. Sem ele, o contrato pega a violação, com a mensagem que você viu em "Quando dá errado".
+
+**O golden master continua verde, e está certo.** Ele monta a calculadora com a lista explícita das três regras do legado, então a regra nova não participa. Isso é coerente: o teste compara o código novo com o comportamento **antigo**, e o comportamento antigo não tinha esse cupom. Se o golden master usasse as regras vindas do Spring, ele ficaria vermelho nos carrinhos de cliente recorrente com o cupom novo, e essa divergência seria **intencional**. Nesse caso, a decisão certa não é "consertar" o teste em silêncio, mas registrar a mudança: o golden master cumpriu seu papel na refatoração, e a regra nova ganha testes de exemplo próprios.
+
+**Alternativa.** Uma regra genérica "cupom de valor fixo" configurada por propriedades (`cupom`, `tipoDeCliente`, `valor`) evitaria uma classe por campanha. Vale quando as campanhas forem muitas e todas desse formato. Com uma campanha só, é abstração prematura: a regra de três ainda não chegou.
+
+</details>
+
+<Quiz
+  id="13-solid"
+  questoes={[
+    {
+      pergunta: 'Na formulação de Robert Martin, o que caracteriza uma violação do SRP?',
+      opcoes: ['A classe tem mais de 200 linhas', 'A classe muda por pedidos de mais de um ator (o comercial e o financeiro, por exemplo)', 'A classe tem mais de 5 métodos', 'A classe não implementa nenhuma interface'],
+      correta: 1,
+      explicacao: 'Um motivo para mudar equivale a um ator. Tamanho e número de métodos são sintomas possíveis, não a definição: uma classe grande e coesa, que muda por um único motivo, não viola o SRP.',
+    },
+    {
+      pergunta: 'Um teste de caracterização compara o código novo com o legado em 2.000 carrinhos e falha num carrinho com três itens de atacado: esperado 13190.92, obtido 13190.91. O que fazer?',
+      opcoes: ['Atualizar o valor esperado, porque o código novo arredonda de um jeito mais simples', 'Desfazer a mudança de arredondamento; se o negócio quiser a regra nova, fazê-la num commit separado, aprovado e com teste próprio', 'Trocar isEqualTo por isCloseTo com tolerância de um centavo', 'Remover o carrinho problemático do gerador'],
+      correta: 1,
+      explicacao: 'Refatorar é mudar a estrutura sem mudar o comportamento. A divergência de um centavo é uma mudança de regra; ela pode ser desejável, mas precisa ser decidida e registrada separadamente.',
+    },
+    {
+      pergunta: 'Um construtor único recebe `List<RegraDeDesconto>` e nenhum bean desse tipo existe no contexto. O que acontece?',
+      opcoes: ['A aplicação não sobe: NoSuchBeanDefinitionException', 'O Spring injeta null', 'O Spring injeta uma lista vazia, e a aplicação funciona sem nenhum desconto', 'O Spring cria uma implementação padrão'],
+      correta: 2,
+      explicacao: 'Num cenário de construtor único, arrays, coleções e mapas são resolvidos como instâncias vazias quando não há candidatos. Por isso vale um teste de montagem ou uma validação no construtor.',
+    },
+    {
+      pergunta: 'Qual afirmação sobre inversão de dependência está correta?',
+      opcoes: ['Basta usar injeção pelo construtor para cumprir o DIP', 'A interface deve ficar no pacote do adaptador, junto da implementação', 'A regra de negócio define a porta no próprio pacote, e o adaptador depende dela', 'Toda classe deve ter uma interface'],
+      correta: 2,
+      explicacao: 'Injeção é o mecanismo; inversão é a direção. A porta pertence a quem a usa, e as setas de dependência apontam do detalhe para o núcleo, o que o jdeps confirma no bytecode.',
+    },
+    {
+      pergunta: 'Qual é o melhor motivo para NÃO criar uma interface `CalculadoraDeImposto` hoje?',
+      opcoes: ['Interfaces deixam o código mais lento', 'Só existe um cálculo, ele não é fronteira com o mundo externo e nenhum teste precisa substituí-lo', 'O Spring não injeta interfaces', 'O Mockito não consegue criar dublês de interfaces'],
+      correta: 1,
+      explicacao: 'Sem variação, sem fronteira e sem necessidade de teste, a interface é só indireção. Pela regra de três, a abstração vem quando os casos reais aparecem para guiar o desenho.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- SOLID é um conjunto de **ferramentas para problemas específicos**. Comece pelo problema; se ele não existe no seu código, o princípio não tem o que resolver.
+- **S**: um motivo para mudar, ou seja, um ator. Sinal: arquivos editados por assuntos diferentes, conflitos, testes de regra que precisam de banco.
+- **O**: estender escrevendo código novo (Strategy e injeção de `List<T>` no Spring), no eixo em que as mudanças realmente acontecem.
+- **L**: implementações que cumprem o contrato, verificadas por um **teste de contrato** que roda contra todas elas, inclusive os fakes.
+- **I**: interfaces desenhadas por quem usa; uma porta por necessidade.
+- **D**: a regra define a porta, o detalhe implementa. Injeção é o mecanismo; inversão é a direção. Confira com `jdeps` ou ArchUnit.
+- Por baixo de tudo: **coesão alta, acoplamento baixo**, dependências apontando para o que é estável (`I = Ce / (Ca + Ce)`).
+- Abstração prematura custa leitura, manutenção e, muitas vezes, uma abstração errada. Regra de três e YAGNI.
+- Em legado: **teste de caracterização** com entradas reproduzíveis primeiro, passos pequenos depois, estrutura e regra em commits separados.
+- No Spring: construtor único sem `@Autowired`; `@Primary`, `@Qualifier`, perfis ou lista quando há vários candidatos; a lista vazia não avisa; ciclo de construtores é problema de desenho.
+
+## Próximo passo
+
+No [exercício 13.01, Refatorando o frete](../../../exercicios/13-arquitetura/01-motor-de-frete/), você aplica o mesmo roteiro a uma calculadora de frete legada: golden master de 2.000 pedidos, uma classe por modalidade e por promoção, e um teste de arquitetura garantindo que o motor não conhece nenhuma modalidade concreta. Depois, a aula [Padrões de projeto](../../13-arquitetura/02-padroes-de-projeto/) mostra os padrões que aparecem por trás destes princípios (Strategy, Decorator, Template Method e outros) e quando cada um vale o custo.
+
+## Referências
+
+- [Spring Framework: Using @Autowired](https://docs.spring.io/spring-framework/reference/core/beans/annotation-config/autowired.html) (injeção de coleções, ordem com `@Order`, construtor único e coleções vazias)
+- [Spring Framework: Dependency Injection](https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html) (injeção por construtor e dependências circulares)
+- [Spring Framework: Fine-tuning Annotation-based Autowiring with @Primary or @Fallback](https://docs.spring.io/spring-framework/reference/core/beans/annotation-config/autowired-primary.html)
+- [JUnit User Guide: Parameterized Tests](https://docs.junit.org/current/writing-tests/parameterized-classes-and-tests.html)
+- [The jdeps Command (JDK 25)](https://docs.oracle.com/en/java/javase/25/docs/specs/man/jdeps.html)
+- [ArchUnit User Guide](https://www.archunit.org/userguide/html/000_Index.html)
+- [Javadoc de `java.math.BigDecimal` (JDK 25)](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/math/BigDecimal.html)

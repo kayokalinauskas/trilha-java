@@ -1,0 +1,245 @@
+---
+import { getEntry, render } from 'astro:content';
+import Leitura from '../../layouts/Leitura.astro';
+import Icon from '../../components/Icon.astro';
+import { mdxComponents } from '../../components/mdx';
+import { formatarDuracao, getAulas, getExercicios, pad2, type Aula } from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+export async function getStaticPaths() {
+  const aulas = await getAulas();
+  return aulas.map((aula, i) => ({
+    params: { id: aula.id },
+    props: { aula, anterior: aulas[i - 1], proxima: aulas[i + 1] },
+  }));
+}
+
+const { aula, anterior, proxima } = Astro.props as { aula: Aula; anterior?: Aula; proxima?: Aula };
+const modulo = (await getEntry(aula.data.modulo))!;
+const { Content, headings } = await render(aula);
+const exerciciosRelacionados = (await getExercicios()).filter((e) => e.data.aulas.some((a) => a.id === aula.id));
+const a = aula.data;
+---
+
+<Leitura title={a.titulo} description={a.descricao} modulo={modulo} headings={headings} atual={`a:${aula.id}`}>
+  <header slot="header" class="aula-head">
+    <nav class="crumbs" aria-label="Você está em">
+      <a href={url(`modulos/${modulo.id}`)}>Módulo {pad2(modulo.data.numero)} · {modulo.data.titulo}</a>
+    </nav>
+    <p class="eyebrow">Aula {a.ordem}</p>
+    <h1>{a.titulo}</h1>
+    <p class="lead">{a.descricao}</p>
+    <div class="row meta">
+      <span class="badge"><Icon name="clock" size={13} /> {formatarDuracao(a.duracao)}</span>
+      {a.flashcards.length > 0 && <span class="badge"><Icon name="cards" size={13} /> {a.flashcards.length} flashcards</span>}
+      {a.tags.map((t) => <span class="badge">{t}</span>)}
+    </div>
+    <div class="objetivos card">
+      <p class="obj-t"><Icon name="target" size={16} /> Nesta aula você vai</p>
+      <ul>
+        {a.objetivos.map((o) => <li>{o}</li>)}
+      </ul>
+    </div>
+  </header>
+
+  <div class="prose">
+    <Content components={mdxComponents} />
+  </div>
+
+  <footer slot="footer" class="aula-foot" data-pagefind-ignore>
+    <div class="concluir card" data-aula={aula.id}>
+      <div>
+        <p class="c-t">Terminou a aula?</p>
+        <p class="muted">Marque como concluída para acompanhar seu progresso e liberar os flashcards para revisão.</p>
+      </div>
+      <button type="button" class="btn btn-primary" data-concluir>
+        <Icon name="check" size={16} /> <span>Marcar como concluída</span>
+      </button>
+    </div>
+
+    {
+      exerciciosRelacionados.length > 0 && (
+        <div class="pratique">
+          <p class="eyebrow">Pratique agora</p>
+          <div class="grid-auto">
+            {exerciciosRelacionados.map((e) => (
+              <a class="card card-link ex-card" href={url(`exercicios/${e.id}`)}>
+                <span class="mono">{e.data.codigo}</span>
+                <strong>{e.data.titulo}</strong>
+                <small class="muted">{e.data.resumo}</small>
+              </a>
+            ))}
+          </div>
+        </div>
+      )
+    }
+
+    <nav class="pager" aria-label="Navegação entre aulas">
+      {
+        anterior ? (
+          <a class="pg prev" href={url(`aulas/${anterior.id}`)}>
+            <small>
+              <Icon name="arrow-left" size={14} /> Anterior
+            </small>
+            <strong>{anterior.data.titulo}</strong>
+          </a>
+        ) : (
+          <span />
+        )
+      }
+      {
+        proxima && (
+          <a class="pg next" href={url(`aulas/${proxima.id}`)}>
+            <small>
+              Próxima <Icon name="arrow-right" size={14} />
+            </small>
+            <strong>{proxima.data.titulo}</strong>
+          </a>
+        )
+      }
+    </nav>
+  </footer>
+</Leitura>
+
+<script>
+  import { aoMudar, aulaConcluida, marcarAula, toast } from '../../lib/progresso';
+
+  const box = document.querySelector<HTMLElement>('[data-aula]');
+  const botao = box?.querySelector<HTMLButtonElement>('[data-concluir]');
+  if (box && botao) {
+    const id = box.dataset.aula!;
+    const render = () => {
+      const feita = aulaConcluida(id);
+      box.classList.toggle('feita', feita);
+      botao.querySelector('span')!.textContent = feita ? 'Concluída ✓ (desfazer)' : 'Marcar como concluída';
+      botao.classList.toggle('btn-primary', !feita);
+    };
+    render();
+    aoMudar(render);
+    botao.addEventListener('click', () => {
+      const feita = !aulaConcluida(id);
+      marcarAula(id, feita);
+      if (feita) toast('Aula concluída! Os flashcards dela entraram na sua fila de revisão.');
+    });
+  }
+</script>
+
+<style>
+  .aula-head {
+    margin-bottom: 36px;
+    max-width: var(--measure);
+  }
+  .crumbs a {
+    font-size: 0.85rem;
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .crumbs a:hover {
+    color: var(--accent);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .meta {
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .objetivos {
+    margin-top: 24px;
+    padding: 16px 20px;
+  }
+  .obj-t {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+  .objetivos ul {
+    padding-left: 1.2em;
+    color: var(--text-2);
+    font-size: 0.95rem;
+    display: grid;
+    gap: 4px;
+  }
+  .aula-foot {
+    max-width: var(--measure);
+    margin-top: 56px;
+    display: grid;
+    gap: 32px;
+  }
+  .concluir {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 20px 22px;
+  }
+  .concluir.feita {
+    border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+    background: color-mix(in srgb, var(--ok-soft) 40%, var(--surface));
+  }
+  .c-t {
+    font-weight: 700;
+    font-size: 1.05rem;
+  }
+  .concluir .muted {
+    font-size: 0.9rem;
+  }
+  .pratique .eyebrow {
+    margin-bottom: 12px;
+  }
+  .ex-card {
+    display: grid;
+    gap: 4px;
+    padding: 16px 18px;
+  }
+  .ex-card .mono {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--accent);
+  }
+  .pager {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .pg {
+    display: grid;
+    gap: 4px;
+    padding: 14px 18px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    text-decoration: none;
+    transition: border-color 0.15s;
+  }
+  .pg:hover {
+    border-color: var(--accent);
+  }
+  .pg small {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .pg.next {
+    text-align: right;
+    grid-column: 2;
+  }
+  .pg.next small {
+    justify-content: flex-end;
+  }
+  @media (max-width: 600px) {
+    .pager {
+      grid-template-columns: 1fr;
+    }
+    .pg.next {
+      grid-column: 1;
+    }
+  }
+</style>

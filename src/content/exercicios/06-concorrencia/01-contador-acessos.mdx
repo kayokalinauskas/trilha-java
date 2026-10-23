@@ -1,0 +1,76 @@
+---
+titulo: Contador de acessos thread-safe
+codigo: "06.01"
+resumo: Conte acessos por endpoint a partir de milhares de threads simultâneas sem perder nenhum incremento e sem serializar o servidor com synchronized.
+modulo: 06-concorrencia
+ordem: 1
+dificuldade: facil
+tempo: 1h
+conceitos: [race condition, ConcurrentHashMap, LongAdder, operações atômicas]
+aulas: [06-concorrencia/01-threads-e-memoria, 06-concorrencia/02-sincronizacao]
+java:
+  modulo: m06-concorrencia
+  teste: ContadorDeAcessosTest
+---
+
+## Contexto
+
+Um gateway de API guarda quantas vezes cada endpoint foi chamado, para o painel de uso e para cobrança por volume. A primeira versão usava um `HashMap<String, Long>` com `map.put(k, map.get(k) + 1)`: em produção, os números ficavam **menores que o real** — e, de vez em quando, o `HashMap` corrompia a estrutura interna e travava uma thread em laço infinito. A segunda versão colocou `synchronized` em todos os métodos: os números acertaram, mas a latência do gateway subiu, porque todas as requisições passaram a esperar na fila do mesmo lock.
+
+Você vai escrever a terceira versão: **correta e escalável**.
+
+## Requisitos
+
+| Método | Comportamento |
+|---|---|
+| `registrar(endpoint)` | +1 no endpoint; chamado por todas as threads do servidor |
+| `total(endpoint)` | Total do endpoint (0 se nunca chamado) |
+| `totalGeral()` | Soma de todos |
+| `topEndpoints(n)` | Os n endpoints mais acessados; empate em ordem alfabética |
+
+## Regras
+
+- **Proibido** `synchronized` em todos os métodos (ou um lock global).
+- Nenhum incremento pode ser perdido: o teste roda **16 threads × 20.000 registros**, três vezes, com largada simultânea.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ContadorDeAcessosTest` passam, nas três rodadas.
+- [ ] `registrar` é uma linha, sem nenhum `get` seguido de `put`.
+- [ ] Você consegue explicar por que `volatile` não resolveria.
+
+## Desafios opcionais
+
+- Faça um benchmark simples comparando `AtomicLong` e `LongAdder` com 64 threads.
+- Adicione `zerar()` e discuta: é possível zerar de forma atômica **e** sem perder registros que chegam durante o reset?
+
+<Dicas>
+<Dica nivel={1}>
+Dois problemas separados: (1) criar o contador de um endpoint novo sem que duas threads criem dois; (2) incrementar sem perder atualizações. Existe uma estrutura de mapa e um tipo de contador feitos para cada um.
+</Dica>
+<Dica nivel={2}>
+`ConcurrentHashMap.computeIfAbsent` é atômico por chave. `LongAdder` (ou `AtomicLong`) incrementa sem lock.
+</Dica>
+<Dica nivel={3}>
+`porEndpoint.computeIfAbsent(endpoint, k -> new LongAdder()).increment();`. Para o top N: transforme as entradas em pares (endpoint, `sum()`) e ordene por valor decrescente, depois pela chave.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m06-concorrencia/solucao/src/main/java/dev/trilhajava/m06/ContadorDeAcessos.java" />
+
+### Por que funciona
+
+- **`computeIfAbsent` é atômico**: se duas threads registram um endpoint novo ao mesmo tempo, só um `LongAdder` é criado, e as duas incrementam o mesmo.
+- **`LongAdder`** espalha as somas em células e só as junta no `sum()`. Com muitas threads escrevendo, a disputa cai drasticamente em relação a um único `AtomicLong`.
+- **Leitura "fotográfica"**: `topEndpoints` e `totalGeral` leem enquanto outras threads escrevem, então podem ficar alguns incrementos atrás — aceitável para um painel. Se fosse cobrança exata de um período fechado, você "congelaria" o período (por exemplo, trocando o mapa por um novo e lendo o antigo).
+
+### Avalie sua solução
+
+- Rode o teste concorrente algumas vezes. Uma solução com race condition às vezes passa — por isso ele repete três vezes.
+- Troque `LongAdder` por um `Long` com `merge(k, 1L, Long::sum)`: também é correto. Qual escala melhor sob disputa, e por quê?
+
+</Solucao>

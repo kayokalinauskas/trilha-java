@@ -1,0 +1,169 @@
+---
+titulo: Agregações, CTEs e window functions
+descricao: GROUP BY e HAVING, subconsultas e CTEs para quebrar consultas complexas, e as window functions que resolvem rankings, acumulados e comparações com a linha anterior.
+modulo: 07-sql
+ordem: 4
+duracao: 60
+objetivos:
+  - Agregar com GROUP BY, filtrar grupos com HAVING
+  - Organizar consultas complexas com subconsultas e CTEs (WITH)
+  - Usar window functions (RANK, ROW_NUMBER, SUM OVER, LAG)
+  - Gerar séries com CTE recursiva
+tags: [GROUP BY, HAVING, CTE, window functions, SQL analítico]
+flashcards:
+  - frente: Qual a diferença entre WHERE e HAVING?
+    verso: WHERE filtra linhas antes do agrupamento; HAVING filtra grupos depois (pode usar agregações como COUNT(*) > 2).
+  - frente: O que uma window function faz de diferente de GROUP BY?
+    verso: Calcula sobre um conjunto de linhas relacionadas (a "janela") SEM colapsar as linhas — cada linha continua no resultado com o valor calculado ao lado.
+  - frente: Qual a diferença entre RANK e ROW_NUMBER?
+    verso: ROW_NUMBER numera 1, 2, 3 sem empates; RANK dá a mesma posição aos empatados e pula a seguinte (1, 1, 3).
+  - frente: O que LAG faz?
+    verso: Devolve o valor de uma linha anterior na ordem da janela — útil para variação em relação ao período anterior.
+  - frente: Por que não dá para filtrar RANK() direto no WHERE?
+    verso: Window functions são calculadas no SELECT, depois do WHERE. Calcule numa CTE/subconsulta e filtre por fora.
+---
+
+Relatórios de negócio quase sempre envolvem **agregar** (somar, contar, tirar médias) e **comparar** (ranking, variação, acumulado). Esta aula cobre as ferramentas para isso — e mostra por que muitas perguntas que parecem exigir código Java se resolvem em uma consulta.
+
+## GROUP BY e HAVING
+
+```sql
+SELECT pr.categoria,
+       COUNT(DISTINCT p.id)                AS pedidos,
+       SUM(i.quantidade * i.preco_unitario) AS faturamento
+  FROM item_pedido i
+  JOIN pedido  p  ON p.id  = i.pedido_id
+  JOIN produto pr ON pr.id = i.produto_id
+ WHERE p.status = 'PAGO'                    -- filtra LINHAS
+ GROUP BY pr.categoria
+HAVING SUM(i.quantidade * i.preco_unitario) > 100   -- filtra GRUPOS
+ ORDER BY faturamento DESC;
+```
+
+Regra: toda coluna do `SELECT` que **não** é agregada precisa estar no `GROUP BY`. Funções mais usadas: `COUNT(*)`, `COUNT(DISTINCT x)`, `SUM`, `AVG`, `MIN`, `MAX`, e no PostgreSQL `STRING_AGG` e `ARRAY_AGG`.
+
+<Callout tipo="erro" titulo="A média do nível errado">
+"Ticket médio por cidade" é a média do **valor dos pedidos**. Fazer `AVG(quantidade * preco_unitario)` direto nos **itens** dá a média por item — um número diferente e errado. Primeiro some cada pedido (subconsulta ou CTE), depois tire a média. É uma das pegadinhas do exercício 07.02.
+</Callout>
+
+## Subconsultas e CTEs
+
+Consultas grandes ficam legíveis quando divididas em etapas com nome. Uma **CTE** (`WITH`) é uma "tabela temporária" que existe só naquela consulta:
+
+```sql
+WITH total_por_pedido AS (
+    SELECT pedido_id, SUM(quantidade * preco_unitario) AS total
+      FROM item_pedido
+     GROUP BY pedido_id
+)
+SELECT c.cidade, ROUND(AVG(t.total), 2) AS ticket_medio
+  FROM total_por_pedido t
+  JOIN pedido  p ON p.id = t.pedido_id AND p.status = 'PAGO'
+  JOIN cliente c ON c.id = p.cliente_id
+ GROUP BY c.cidade;
+```
+
+É o mesmo princípio de extrair métodos com nome no Java: cada etapa faz uma coisa.
+
+## Window functions
+
+Uma **window function** calcula um valor sobre um conjunto de linhas relacionadas (a janela) **sem colapsar as linhas** — ao contrário do `GROUP BY`.
+
+```sql
+função(...) OVER (PARTITION BY grupo ORDER BY ordem)
+```
+
+### Ranking dentro de grupos
+
+"O melhor cliente de cada cidade":
+
+```sql
+WITH totais AS (
+    SELECT c.cidade, c.nome, SUM(i.quantidade * i.preco_unitario) AS total
+      FROM cliente c
+      JOIN pedido p      ON p.cliente_id = c.id AND p.status = 'PAGO'
+      JOIN item_pedido i ON i.pedido_id = p.id
+     GROUP BY c.id, c.cidade, c.nome
+)
+SELECT cidade, nome, total
+  FROM (SELECT t.*, RANK() OVER (PARTITION BY cidade ORDER BY total DESC) AS posicao
+          FROM totais t) r
+ WHERE posicao = 1;
+```
+
+| Função | Empates |
+|---|---|
+| `ROW_NUMBER()` | 1, 2, 3 (desempate arbitrário) |
+| `RANK()` | 1, 1, 3 |
+| `DENSE_RANK()` | 1, 1, 2 |
+
+### Acumulados e médias móveis
+
+```sql
+SELECT data,
+       SUM(total) OVER (ORDER BY data)                                     AS acumulado,
+       AVG(total) OVER (ORDER BY data ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS media_7_dias
+  FROM vendas_diarias;
+```
+
+É a janela deslizante do módulo 05, feita pelo banco.
+
+### Comparando com a linha anterior
+
+```sql
+SELECT mes, faturamento,
+       faturamento - LAG(faturamento) OVER (ORDER BY mes) AS variacao
+  FROM faturamento_mensal;
+```
+
+`LAG` (anterior) e `LEAD` (seguinte) resolvem "variação mês a mês", "tempo desde o último pedido" e similares. Na primeira linha não há anterior: `NULL`.
+
+## CTE recursiva: gerando séries
+
+A tabela de pedidos só tem os dias **com** venda. Para achar os dias **sem** venda, é preciso um calendário:
+
+```sql
+WITH RECURSIVE deslocamento (n) AS (
+    SELECT 0
+    UNION ALL
+    SELECT n + 1 FROM deslocamento WHERE n < 6
+)
+SELECT DATE '2026-03-01' + n AS dia FROM deslocamento;
+```
+
+A parte depois do `UNION ALL` referencia a própria CTE até a condição parar. No PostgreSQL também existe `generate_series(início, fim, passo)`, mais direto. CTEs recursivas também percorrem **hierarquias** (categorias e subcategorias, organogramas).
+
+<Callout tipo="entrevista">
+SQL analítico aparece em entrevistas de backend com frequência crescente, principalmente "o segundo maior salário por departamento" (window function) e "a variação em relação ao mês anterior" (LAG). Saber que o `WHERE` não enxerga window functions — e resolver com CTE — mostra domínio real da linguagem.
+</Callout>
+
+<Quiz
+  id="07-agregacoes"
+  questoes={[
+    {
+      pergunta: 'Clientes com mais de 3 pedidos pagos: onde vai a condição de quantidade?',
+      opcoes: ['WHERE COUNT(*) > 3', 'HAVING COUNT(*) > 3', 'ORDER BY', 'No SELECT'],
+      correta: 1,
+      explicacao: 'Condições sobre agregações filtram grupos: HAVING.',
+    },
+    {
+      pergunta: 'Dois vendedores empatados em 1º lugar. O que RANK() atribui ao próximo?',
+      opcoes: ['2', '3', '1', 'NULL'],
+      correta: 1,
+      explicacao: 'RANK pula posições após empates (1, 1, 3); DENSE_RANK daria 2.',
+    },
+    {
+      pergunta: 'Qual função mostra o faturamento do mês anterior ao lado do atual?',
+      opcoes: ['LEAD', 'LAG', 'RANK', 'COALESCE'],
+      correta: 1,
+      explicacao: 'LAG olha a linha anterior na ordem da janela.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `WHERE` filtra linhas; `GROUP BY` agrupa; `HAVING` filtra grupos.
+- Agregue no nível certo (pedido antes de cidade); CTEs deixam as etapas legíveis.
+- Window functions: `RANK`/`ROW_NUMBER` por grupo, `SUM OVER` acumulado, `LAG`/`LEAD` para comparar — sem colapsar linhas.
+- Filtre window functions por fora (CTE); `WITH RECURSIVE` gera séries e percorre hierarquias.

@@ -1,0 +1,403 @@
+---
+titulo: API stateless com JWT e papéis
+codigo: "11.02"
+resumo: Proteja a API de um app de delivery com Spring Security 7 — login que emite JWT HS256, Resource Server que valida assinatura, expiração e emissor, papéis por rota e 401/403 no formato Problem Details — e ataque a sua própria API com tokens forjados, vencidos, de outro emissor e sem assinatura.
+modulo: 11-seguranca
+ordem: 2
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [SecurityFilterChain, OAuth2 Resource Server, JwtEncoder, JwtDecoder, papéis, AuthenticationEntryPoint, Problem Details, stateless]
+aulas: [11-seguranca/02-spring-security-7, 11-seguranca/03-jwt-e-resource-server, 11-seguranca/01-autenticacao-e-senhas, 08-spring-boot/05-validacao-e-erros]
+java:
+  modulo: m11-seguranca
+  arquivos:
+    - src/main/java/dev/trilhajava/m11/delivery/SegurancaConfig.java
+    - src/main/java/dev/trilhajava/m11/delivery/EmissorDeTokens.java
+    - src/main/java/dev/trilhajava/m11/delivery/AuthController.java
+    - src/main/java/dev/trilhajava/m11/delivery/RespostasDeSeguranca.java
+---
+
+## Contexto
+
+Um app de delivery vai ganhar três tipos de usuário: clientes, que acompanham os próprios pedidos; entregadores, que concluem entregas; e a equipe do painel administrativo. Até hoje, a API era aberta: o app mandava `?usuario=ana` na URL, e qualquer pessoa com um `curl` via os pedidos de qualquer cliente.
+
+O time decidiu por **login com JWT**: o app troca usuário e senha por um token assinado, de vida curta, e manda esse token em toda requisição. A API não guarda sessão nenhuma; ela confere a assinatura, a validade e o emissor do token, e lê dele quem é o usuário e quais papéis ele tem. Como várias instâncias da API rodam atrás de um balanceador, não depender de sessão é um requisito, não um detalhe.
+
+Você vai escrever toda a segurança dessa API e depois atacá-la com tokens forjados para provar que ela resiste.
+
+## O que você vai praticar
+
+- **A cadeia de filtros do Spring Security.** Toda requisição passa por uma `SecurityFilterChain` antes de chegar a qualquer controller. Você declara uma como `@Bean`, com a DSL de `HttpSecurity`: quais rotas são públicas, quais exigem papel, e como a autenticação acontece. A primeira regra que casa com a requisição decide. Veja [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/).
+- **Stateless, sem sessão e sem CSRF.** Com `SessionCreationPolicy.STATELESS`, o Spring Security não cria sessão HTTP nem cookie. Sem cookie, o navegador não manda credenciais sozinho, e por isso a proteção contra CSRF pode ser desligada. Mesma aula.
+- **JWT e Resource Server.** Um JWT tem três partes em Base64URL (cabeçalho, claims e assinatura). Validar é bem mais do que decodificar: é conferir o algoritmo, a assinatura, a expiração e o emissor. O módulo OAuth2 Resource Server faz isso a partir de um `JwtDecoder`, e um `JwtEncoder` emite os tokens. Veja [JWT e Resource Server](../../../aulas/11-seguranca/03-jwt-e-resource-server/).
+- **Dos claims às autoridades.** O Spring Security decide acesso por autoridades (`ROLE_ADMIN`, por exemplo). Um `JwtAuthenticationConverter` com um `JwtGrantedAuthoritiesConverter` transforma o claim `roles` do token nessas autoridades. Mesma aula.
+- **Login sem enumeração de usuários.** O `AuthenticationManager` confere usuário e senha com o `PasswordEncoder` (BCrypt). "Usuário não existe" e "senha errada" precisam produzir **a mesma** resposta. Veja [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/).
+- **401 e 403 em Problem Details.** Os erros de segurança acontecem nos filtros, antes do Spring MVC, então um `@RestControllerAdvice` não os vê. Quem escreve essas respostas é um `AuthenticationEntryPoint` (401) e um `AccessDeniedHandler` (403). O formato é o mesmo do resto da API (RFC 9457). Veja [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/) e a aula de Spring Security 7.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m11.delivery` (não precisa mudar):
+
+- `DeliveryApplication` — a aplicação Spring Boot. Carrega `delivery.properties` e habilita `JwtProperties`.
+- `delivery.properties` — o segredo do HS256 (`delivery.jwt.segredo`, com 52 bytes), o emissor (`delivery.jwt.emissor=delivery-api`) e a validade (`delivery.jwt.validade=15m`). Também liga `spring.mvc.problemdetails.enabled`, para que os erros do Spring MVC (um 400 de validação, por exemplo) saiam em Problem Details.
+- `JwtProperties` — `record JwtProperties(String segredo, String emissor, Duration validade)`, ligado às propriedades `delivery.jwt.*`. Recusa, na subida, um segredo com menos de 32 bytes. Injete-o onde precisar.
+- `UsuariosDeExemplo` — um `PasswordEncoder` (o `DelegatingPasswordEncoder`, com BCrypt) e um `UserDetailsService` em memória com três usuários:
+
+| Usuário | Senha | Papel |
+|---|---|---|
+| `ana` | `cafe-com-leite-123` | CLIENTE |
+| `bruno` | `moto-rapida-456` | ENTREGADOR |
+| `carla` | `painel-admin-789` | ADMIN |
+
+- Os controllers de negócio. Eles leem o usuário de `@AuthenticationPrincipal Jwt token`, ou seja, **do token**:
+
+| Rota | Responde | Quem pode |
+|---|---|---|
+| `GET /publico/status` | `{"status":"ok"}` | qualquer um, sem token |
+| `GET /pedidos/meus` | `{"usuario":"ana","pedidos":["PED-1001","PED-1002"]}` | qualquer usuário autenticado |
+| `POST /entregas/{id}/concluir` | `{"entrega":7,"concluidaPor":"bruno"}` | ENTREGADOR ou ADMIN |
+| `GET /admin/relatorio` | `{"pedidosHoje":42}` | só ADMIN |
+
+Com o código inicial, a aplicação sobe com a configuração padrão do Spring Security: **todas** as rotas, até `/publico/status`, respondem `401` pedindo HTTP Basic (`WWW-Authenticate: Basic realm="Realm"`) e devolvem um cookie `JSESSIONID`. É exatamente o que você vai trocar.
+
+### O que você implementa
+
+Quatro classes, já criadas e vazias, no mesmo pacote. Os nomes das classes, dos records e das rotas são fixos; os nomes dos métodos `@Bean` são uma sugestão (o Spring injeta pelo tipo).
+
+```java
+// SegurancaConfig (@Configuration)
+@Bean SecurityFilterChain api(HttpSecurity http, RespostasDeSeguranca respostas,
+        Converter<Jwt, AbstractAuthenticationToken> papeisDoToken) throws Exception   // regras 5 a 10
+@Bean SecretKey chaveDeAssinatura(JwtProperties propriedades)                         // regra 11
+@Bean JwtDecoder jwtDecoder(SecretKey chave, JwtProperties propriedades)              // regra 7
+@Bean JwtEncoder jwtEncoder(SecretKey chave)                                          // regra 2
+@Bean Converter<Jwt, AbstractAuthenticationToken> papeisDoToken()                     // regra 8
+@Bean AuthenticationManager authenticationManager(UserDetailsService usuarios,
+        PasswordEncoder codificador)                                                  // regra 3
+
+// EmissorDeTokens (@Service)
+public record TokenEmitido(String accessToken, String tokenType, long expiresIn) {}
+public EmissorDeTokens(JwtEncoder encoder, JwtProperties propriedades)
+public TokenEmitido emitir(Authentication autenticado)                                // regras 1 e 2
+
+// AuthController (@RestController)
+public record Credenciais(@NotBlank String usuario, @NotBlank String senha) {}
+public AuthController(AuthenticationManager autenticacao, EmissorDeTokens emissor)
+@PostMapping("/auth/token")
+public ResponseEntity<?> token(@Valid @RequestBody Credenciais credenciais)          // regras 1, 3 e 4
+
+// RespostasDeSeguranca (@Component)
+public class RespostasDeSeguranca implements AuthenticationEntryPoint, AccessDeniedHandler
+public RespostasDeSeguranca(JsonMapper json)        // tools.jackson.databind.json.JsonMapper (Jackson 3)
+public void commence(HttpServletRequest requisicao, HttpServletResponse resposta,
+        AuthenticationException erro) throws IOException                              // 401, regra 6
+public void handle(HttpServletRequest requisicao, HttpServletResponse resposta,
+        AccessDeniedException erro) throws IOException                                // 403, regra 8
+```
+
+Os erros seguem o formato Problem Details, com o `type` numa base fixa, `https://api.delivery.dev/problemas/`:
+
+| Situação | Status | `type` |
+|---|---|---|
+| login com usuário ou senha inválidos | 401 | `…/credenciais-invalidas` |
+| sem token, ou com um token recusado | 401, com `WWW-Authenticate: Bearer…` | `…/nao-autenticado` |
+| autenticado, mas sem o papel exigido | 403 | `…/acesso-negado` |
+
+Os textos de `title` e `detail` são livres. Um resumo de entradas e saídas:
+
+| Requisição | Resposta |
+|---|---|
+| `POST /auth/token` com `{"usuario":"ana","senha":"cafe-com-leite-123"}` | `200` `{"accessToken":"eyJ…","tokenType":"Bearer","expiresIn":900}` |
+| `POST /auth/token` com a senha errada, ou com `zezinho` | `401` `credenciais-invalidas` (as duas iguais) |
+| `POST /auth/token` com `{"usuario":""}` | `400` (validação), em Problem Details |
+| `GET /publico/status`, sem token | `200` |
+| `GET /pedidos/meus`, sem token | `401` `nao-autenticado` |
+| `GET /pedidos/meus` com o token da ana | `200`, com os pedidos da ana |
+| `POST /entregas/7/concluir` com o token da ana | `403` `acesso-negado` |
+| `GET /admin/relatorio` com o token da carla | `200` |
+
+## Regras
+
+**Login**
+
+1. **`POST /auth/token` troca usuário e senha por um token.** A resposta `200` tem exatamente três campos: `accessToken` (o JWT), `tokenType` (sempre `"Bearer"`) e `expiresIn` (a validade em **segundos**, lida de `JwtProperties`). Exemplo: login da ana → `{"accessToken":"eyJ…","tokenType":"Bearer","expiresIn":900}`. Se a validade nas propriedades mudar para `5m`, o `expiresIn` passa a ser `300`, sem mudar código.
+2. **O token é um JWT HS256 assinado com o segredo das propriedades**, com estes claims: `iss` = o emissor (`delivery-api`), `sub` = o usuário, `roles` = a lista dos papéis **sem** o prefixo `ROLE_`, em ordem alfabética, `iat` = agora e `exp` = agora + a validade. Exemplo: o payload do token da ana, decodificado, é `{"iss":"delivery-api","sub":"ana","exp":1791193902,"iat":1791193002,"roles":["CLIENTE"]}` (`exp − iat = 900`). Atenção: no Spring Security 7, o `Authentication` devolvido pelo login da ana traz **duas** autoridades, `ROLE_CLIENTE` e `FACTOR_PASSWORD` (a autoridade de fator, do suporte a autenticação multifator). Só o que começa com `ROLE_` vira papel; `roles` precisa ser exatamente `["CLIENTE"]`.
+3. **Usuário inexistente e senha errada dão a mesma resposta.** `401`, `Content-Type: application/problem+json`, `type` = `…/credenciais-invalidas`, e o **mesmo** `detail` nos dois casos. Exemplo: `{"usuario":"ana","senha":"senha-errada"}` e `{"usuario":"zezinho","senha":"qualquer"}` produzem corpos idênticos. Se as respostas diferissem, um atacante descobriria quais usuários existem.
+4. **Corpo inválido no login é `400`, não `401`.** `usuario` ou `senha` ausentes ou em branco (`@NotBlank`) → `400` em Problem Details, gerado pela validação do Spring MVC. Exemplo: `{"usuario":""}` → `400` com `"title":"Bad Request"`. Cuidado com a armadilha: quando o Spring MVC rejeita uma requisição, o servidor pode encaminhá-la internamente para `/error`. Se `/error` não for público, esse encaminhamento passa pela cadeia de filtros sem token, e o seu `400` aparece para o cliente como um `401` `nao-autenticado`, o que confunde qualquer pessoa que esteja depurando o app.
+
+**Autenticação por token**
+
+5. **Só duas portas abertas.** `POST /auth/token` e tudo sob `/publico/**` funcionam sem token. Todo o resto exige `Authorization: Bearer` seguido do token. Exemplos: `GET /publico/status` sem token → `200`; `GET /auth/token` (método errado) sem token → `401`, porque só o `POST` é público.
+6. **Sem token → `401` `nao-autenticado`, com `WWW-Authenticate`.** O header começa com `Bearer`, como manda a RFC 6750. Exemplo: `GET /pedidos/meus` sem token → `401`, `WWW-Authenticate: Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource"` e o corpo `{"type":"https://api.delivery.dev/problemas/nao-autenticado","title":"Não autenticado","status":401,"detail":"…","instance":"/pedidos/meus"}`.
+7. **Token recusado → o mesmo `401` `nao-autenticado`.** O decoder recusa o token quando:
+   - a assinatura não confere: um token de ADMIN assinado com `um-segredo-diferente-com-mais-de-32-bytes!!`;
+   - ele expirou: `exp` dois minutos no passado (o Spring Security tolera 60 segundos de diferença de relógio; dois minutos já passam disso);
+   - o emissor é outro: `iss` = `outra-api`, mesmo assinado com o segredo certo;
+   - ele não tem assinatura: cabeçalho `{"alg":"none"}`;
+   - ele nem é um JWT: `Bearer abc.def.ghi`.
+
+   Nesses casos, o `WWW-Authenticate` traz também `error="invalid_token"` e uma descrição. O corpo é o mesmo da regra 6.
+
+**Autorização**
+
+8. **O claim `roles` vira as autoridades `ROLE_*`, e as rotas exigem papéis.** `roles: ["ADMIN"]` vira `ROLE_ADMIN`, que é o que `hasRole("ADMIN")` confere. `POST /entregas/**` exige ENTREGADOR ou ADMIN; `/admin/**` exige ADMIN; as outras rotas autenticadas aceitam qualquer papel. Faltando o papel → `403` `acesso-negado`. Exemplos: ana em `POST /entregas/7/concluir` → `403`; bruno na mesma rota → `200` `{"entrega":7,"concluidaPor":"bruno"}`; bruno em `GET /admin/relatorio` → `403`; carla → `200` `{"pedidosHoje":42}`.
+9. **A identidade vem do token, nunca de um parâmetro.** `GET /pedidos/meus` com o token da ana → `{"usuario":"ana","pedidos":["PED-1001","PED-1002"]}`. Não existe forma de pedir os pedidos de outra pessoa nessa rota.
+10. **Stateless.** Nenhuma resposta cria sessão HTTP nem manda `Set-Cookie`. Exemplo: `GET /pedidos/meus` com o token da ana → `200` sem `Set-Cookie` (no código inicial, a mesma chamada devolvia um `JSESSIONID`). CSRF desligado: sem cookie, não há o que um site malicioso possa aproveitar.
+
+**Segredo**
+
+11. **O segredo só existe em `delivery.properties`.** Nenhum `.java` contém o segredo; a chave é montada a partir de `JwtProperties` (`new SecretKeySpec(bytes UTF-8 do segredo, "HmacSHA256")`). Encoder e decoder usam **a mesma** chave. Exemplo: troque o valor em `delivery.properties`, reinicie, e os tokens emitidos antes da troca passam a dar `401`.
+
+## Passo a passo sugerido
+
+Suba a aplicação depois de cada passo e experimente com `curl` ou com o programa do **Experimente**.
+
+1. **Suba o código inicial e observe.** Rode `DeliveryApplication` (pelo ▶ do IntelliJ, ou com o comando do **Experimente**). `curl -i localhost:8080/publico/status` devolve `401` com `WWW-Authenticate: Basic` e um `Set-Cookie: JSESSIONID`. Esse é o comportamento padrão que você vai substituir.
+2. **A cadeia de filtros, ainda sem JWT (regras 5 e 10).** Em `SegurancaConfig`, declare a `SecurityFilterChain` com CSRF desligado, sessão `STATELESS`, `POST /auth/token`, `/publico/**` e `/error` públicos, e `anyRequest().authenticated()`. `GET /publico/status` passa a dar `200`.
+3. **Chave, encoder e emissor (regras 1, 2 e 11).** Monte a `SecretKey` a partir de `JwtProperties` e um `NimbusJwtEncoder` com ela. Em `EmissorDeTokens`, monte o `JwtClaimsSet` e chame `encoder.encode(...)`, com o cabeçalho `JwsHeader.with(MacAlgorithm.HS256)`.
+4. **O login (regras 1, 3 e 4).** Declare o `AuthenticationManager` (um `DaoAuthenticationProvider` dentro de um `ProviderManager`) e escreva o `AuthController`. Faça o login da ana e decodifique a segunda parte do `accessToken` (entre os dois pontos) com `Base64.getUrlDecoder()`, como o programa do **Experimente** faz: confira os claims da regra 2. Evite colar tokens em sites de terceiros; um token válido é uma credencial. Se `roles` vier com `FACTOR_PASSWORD`, filtre pelo prefixo.
+5. **O decoder (regra 7).** Um `NimbusJwtDecoder` com a mesma chave, fixando HS256, e um validador que confira o emissor. Ligue-o à cadeia com `oauth2ResourceServer(... jwt ...)`. `GET /pedidos/meus` com o token da ana dá `200`.
+6. **Papéis (regra 8).** O conversor de `roles` para `ROLE_*` e as regras por rota. Bruno conclui entregas; ana recebe `403`.
+7. **Problem Details (regras 3, 6 e 7).** Escreva `RespostasDeSeguranca` e registre-a como ponto de entrada e como tratador de acesso negado. Confira o corpo e o `WWW-Authenticate` de um `401`.
+8. **Ataque a sua API.** Rode o programa do **Experimente** e confira cada linha da tabela.
+
+## Experimente
+
+Suba a API (porta 8080) pelo ▶ ao lado do `main` de `DeliveryApplication` no IntelliJ, ou no terminal, na pasta do starter:
+
+```bash
+mvn spring-boot:run "-Dspring-boot.run.main-class=dev.trilhajava.m11.delivery.DeliveryApplication"
+```
+
+O `-Dspring-boot.run.main-class` é necessário porque o módulo tem outras aplicações (as dos exercícios 11.03 e 11.04).
+
+Para as primeiras chamadas, `curl` basta. No Bash:
+
+```bash
+curl -i localhost:8080/publico/status
+curl -i -X POST localhost:8080/auth/token -H "Content-Type: application/json" \
+     -d '{"usuario": "ana", "senha": "cafe-com-leite-123"}'
+curl -i localhost:8080/pedidos/meus -H "Authorization: Bearer COLE_O_TOKEN_AQUI"
+```
+
+No PowerShell, use `curl.exe` (o `curl` puro é um apelido de outro comando) e mande o corpo a partir de um arquivo, para não brigar com as aspas: salve o JSON em `login-ana.json` e use `-d "@login-ana.json"`.
+
+Para os ataques, é mais prático um programa. Este, num arquivo seu em `src/main/java/dev/trilhajava/m11/delivery/` (ou em `src/test/java`), faz login com os três usuários, chama as rotas, forja tokens com a biblioteca Nimbus (que já vem com o Resource Server) e imprime o status e o `type` de cada resposta. Rode-o com a API no ar:
+
+```java
+package dev.trilhajava.m11.delivery;
+
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.PlainJWT;
+import com.nimbusds.jwt.SignedJWT;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.Date;
+import java.util.List;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
+/** Ataca a API rodando em localhost:8080 e imprime o que ela respondeu. */
+public class ExperimenteDelivery {
+
+    static final String SEGREDO = "segredo-de-desenvolvimento-com-pelo-menos-32-bytes!!";
+    static final HttpClient HTTP = HttpClient.newHttpClient();
+    static final JsonMapper JSON = JsonMapper.builder().build();
+
+    public static void main(String[] args) throws Exception {
+        String ana = login("ana", "cafe-com-leite-123").get("accessToken").asString();
+        String bruno = login("bruno", "moto-rapida-456").get("accessToken").asString();
+        String carla = login("carla", "painel-admin-789").get("accessToken").asString();
+        String payload = new String(Base64.getUrlDecoder().decode(ana.split("\\.")[1]), StandardCharsets.UTF_8);
+        System.out.println("payload do token da ana: " + payload);
+
+        mostrar("status sem token", chamar("GET", "/publico/status", null));
+        mostrar("login com senha errada", postLogin("ana", "senha-errada"));
+        mostrar("login de quem não existe", postLogin("zezinho", "qualquer"));
+        mostrar("meus pedidos sem token", chamar("GET", "/pedidos/meus", null));
+        mostrar("meus pedidos (ana)", chamar("GET", "/pedidos/meus", ana));
+        mostrar("concluir entrega (ana)", chamar("POST", "/entregas/7/concluir", ana));
+        mostrar("concluir entrega (bruno)", chamar("POST", "/entregas/7/concluir", bruno));
+        mostrar("relatório (bruno)", chamar("GET", "/admin/relatorio", bruno));
+        mostrar("relatório (carla)", chamar("GET", "/admin/relatorio", carla));
+
+        Instant daquiA10Min = Instant.now().plusSeconds(600);
+        mostrar("outro segredo", chamar("GET", "/admin/relatorio",
+                forjar("um-segredo-diferente-com-mais-de-32-bytes!!", "delivery-api", daquiA10Min)));
+        mostrar("expirado", chamar("GET", "/admin/relatorio",
+                forjar(SEGREDO, "delivery-api", Instant.now().minusSeconds(120))));
+        mostrar("outro emissor", chamar("GET", "/admin/relatorio", forjar(SEGREDO, "outra-api", daquiA10Min)));
+        var semAssinatura = new PlainJWT(claims("delivery-api", daquiA10Min)).serialize();
+        mostrar("alg: none", chamar("GET", "/admin/relatorio", semAssinatura));
+        mostrar("forjado com o segredo certo", chamar("GET", "/admin/relatorio",
+                forjar(SEGREDO, "delivery-api", daquiA10Min)));
+    }
+
+    static JsonNode login(String usuario, String senha) throws Exception {
+        return JSON.readTree(postLogin(usuario, senha).body());
+    }
+
+    static HttpResponse<String> postLogin(String usuario, String senha) throws Exception {
+        String corpo = "{\"usuario\": \"" + usuario + "\", \"senha\": \"" + senha + "\"}";
+        var requisicao = HttpRequest.newBuilder(URI.create("http://localhost:8080/auth/token"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(corpo)).build();
+        return HTTP.send(requisicao, HttpResponse.BodyHandlers.ofString());
+    }
+
+    static HttpResponse<String> chamar(String metodo, String rota, String token) throws Exception {
+        var requisicao = HttpRequest.newBuilder(URI.create("http://localhost:8080" + rota))
+                .method(metodo, HttpRequest.BodyPublishers.noBody());
+        if (token != null) {
+            requisicao.header("Authorization", "Bearer " + token);
+        }
+        return HTTP.send(requisicao.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    static void mostrar(String cenario, HttpResponse<String> resposta) {
+        String corpo = resposta.body();
+        if (corpo.contains("\"type\"")) {
+            corpo = JSON.readTree(corpo).get("type").asString();
+        }
+        System.out.printf("%-28s %d %s%n", cenario, resposta.statusCode(), corpo);
+    }
+
+    /** Um token de ADMIN da "carla", como um atacante o montaria. */
+    static String forjar(String segredo, String emissor, Instant expira) throws Exception {
+        var jwt = new SignedJWT(new JWSHeader(JWSAlgorithm.HS256), claims(emissor, expira));
+        jwt.sign(new MACSigner(segredo.getBytes(StandardCharsets.UTF_8)));
+        return jwt.serialize();
+    }
+
+    static JWTClaimsSet claims(String emissor, Instant expira) {
+        return new JWTClaimsSet.Builder().issuer(emissor).subject("carla").claim("roles", List.of("ADMIN"))
+                .expirationTime(Date.from(expira)).build();
+    }
+}
+```
+
+Saída com a solução de referência:
+
+```text
+payload do token da ana: {"iss":"delivery-api","sub":"ana","exp":1791193902,"iat":1791193002,"roles":["CLIENTE"]}
+status sem token             200 {"status":"ok"}
+login com senha errada       401 https://api.delivery.dev/problemas/credenciais-invalidas
+login de quem não existe     401 https://api.delivery.dev/problemas/credenciais-invalidas
+meus pedidos sem token       401 https://api.delivery.dev/problemas/nao-autenticado
+meus pedidos (ana)           200 {"usuario":"ana","pedidos":["PED-1001","PED-1002"]}
+concluir entrega (ana)       403 https://api.delivery.dev/problemas/acesso-negado
+concluir entrega (bruno)     200 {"concluidaPor":"bruno","entrega":7}
+relatório (bruno)            403 https://api.delivery.dev/problemas/acesso-negado
+relatório (carla)            200 {"pedidosHoje":42}
+outro segredo                401 https://api.delivery.dev/problemas/nao-autenticado
+expirado                     401 https://api.delivery.dev/problemas/nao-autenticado
+outro emissor                401 https://api.delivery.dev/problemas/nao-autenticado
+alg: none                    401 https://api.delivery.dev/problemas/nao-autenticado
+forjado com o segredo certo  200 {"pedidosHoje":42}
+```
+
+Os resultados esperados, cenário a cenário:
+
+| Cenário | Resultado |
+|---|---|
+| login da ana | `200`; `tokenType` `Bearer`; `expiresIn` `900`; claims `iss`, `sub`, `iat`, `exp` e `roles` = `["CLIENTE"]` |
+| senha errada / usuário inexistente | `401` `credenciais-invalidas`, corpos idênticos |
+| login com `{"usuario":""}` | `400` `application/problem+json`, `"title":"Bad Request"` |
+| `GET /publico/status` sem token | `200` |
+| `GET /pedidos/meus` sem token | `401` `nao-autenticado`, `WWW-Authenticate: Bearer …` |
+| `GET /pedidos/meus` com `Bearer abc.def.ghi` | `401` `nao-autenticado`, `WWW-Authenticate` com `error="invalid_token"` |
+| `GET /pedidos/meus` com o token da ana | `200`, pedidos `PED-1001` e `PED-1002`, sem `Set-Cookie` |
+| ana / bruno em `POST /entregas/7/concluir` | `403` `acesso-negado` / `200` |
+| bruno / carla em `GET /admin/relatorio` | `403` `acesso-negado` / `200` |
+| token de ADMIN com outro segredo, expirado, de outro emissor ou `alg: none` | `401` `nao-autenticado` |
+| token de ADMIN forjado com o segredo **certo** | `200` |
+
+O que pode variar: o valor do token, o `iat` e o `exp` (são o horário do login), a ordem dos campos nos JSON dos controllers (eles usam `Map.of`, que não tem ordem garantida) e os textos de `title` e `detail`. O encoder do Spring também coloca um `kid` (identificador da chave) no cabeçalho do token; ele não é exigido. A acentuação da saída pode aparecer trocada num terminal do Windows que não esteja em UTF-8.
+
+A última linha não é um erro: a API confia na assinatura, e é só isso que ela pode fazer. Quem tem o segredo emite tokens de ADMIN para quem quiser.
+
+## Critérios de aceite
+
+- [ ] Todos os cenários da tabela acima dão o resultado indicado, com a API rodando.
+- [ ] Nenhuma resposta da API cria sessão ou manda `Set-Cookie`.
+- [ ] O segredo não aparece em nenhum `.java`.
+- [ ] Você explica, com as suas palavras, por que os `401` e `403` da segurança não passam por um `@RestControllerAdvice`, e por que o token forjado com o segredo certo é aceito.
+
+## Desafios opcionais
+
+- Troque HS256 por **RS256**: gere um par de chaves RSA na subida, assine com a privada (`NimbusJwtEncoder` com um `JWKSource`) e valide com a pública (`NimbusJwtDecoder.withPublicKey(...)`). Exponha a chave pública em `GET /.well-known/jwks.json`. O que muda para uma segunda API que só precisa **validar** tokens?
+- Acrescente o claim `aud` (a quem o token se destina) e recuse, com um `JwtClaimValidator`, tokens emitidos para outra API.
+- Escreva a sua própria suíte com `@SpringBootTest`, `@AutoConfigureMockMvc` e `MockMvcTester`, transformando cada linha da tabela do **Experimente** num teste. Os tokens forjados vêm do mesmo código Nimbus.
+- Suba um **Keycloak** com Docker, apague o seu emissor e o seu login e configure só `spring.security.oauth2.resourceserver.jwt.issuer-uri`. Quanto do seu código sobrevive?
+
+<Dicas>
+<Dica nivel={1}>
+Divida em peças, e suba a aplicação depois de cada uma: a `SecurityFilterChain` (rotas + `oauth2ResourceServer`), uma `SecretKey` compartilhada, um `JwtDecoder` e um `JwtEncoder` (os dois da família `NimbusJwt...` com `withSecretKey(chave)`), o conversor de `roles` para `ROLE_*`, um `AuthenticationManager` para o login e uma classe que implementa `AuthenticationEntryPoint` e `AccessDeniedHandler` ao mesmo tempo. O Spring encontra cada `@Bean` pelo tipo.
+</Dica>
+<Dica nivel={2}>
+- Decoder: `NimbusJwtDecoder.withSecretKey(chave).macAlgorithm(MacAlgorithm.HS256).build()` e depois `decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(propriedades.emissor()))`. Sem essa segunda linha, o emissor não é conferido (o validador padrão confere só o tempo).
+- Papéis: um `JwtGrantedAuthoritiesConverter` com `setAuthoritiesClaimName("roles")` e `setAuthorityPrefix("ROLE_")`, dentro de um `JwtAuthenticationConverter` (`setJwtGrantedAuthoritiesConverter`).
+- Login: `new DaoAuthenticationProvider(usuarios)`, `setPasswordEncoder(codificador)` e `new ProviderManager(provedor)`. No controller, `autenticacao.authenticate(UsernamePasswordAuthenticationToken.unauthenticated(usuario, senha))`, com um `catch (AuthenticationException ...)` que monta o `ProblemDetail` do `401`.
+- Na cadeia: `.oauth2ResourceServer(s -> s.jwt(j -> j.jwtAuthenticationConverter(conversor)).authenticationEntryPoint(respostas).accessDeniedHandler(respostas))`. Registre os mesmos dois também em `.exceptionHandling(...)`, para cobrir as requisições sem token nenhum.
+</Dica>
+<Dica nivel={3}>
+- O `WWW-Authenticate` correto (com `error="invalid_token"` quando é o caso) dá trabalho para montar à mão. Dentro do seu `commence`, chame primeiro um `BearerTokenAuthenticationEntryPoint` do próprio Spring, que define o status e o header, e só depois escreva o corpo.
+- Para escrever o corpo: `resposta.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE)`, `resposta.setCharacterEncoding("UTF-8")` e `json.writeValue(resposta.getOutputStream(), mapaDoProblema)`, com um `LinkedHashMap` para manter a ordem `type`, `title`, `status`, `detail`, `instance`.
+- No emissor: `autenticado.getAuthorities().stream().map(GrantedAuthority::getAuthority).filter(a -> a.startsWith("ROLE_")).map(a -> a.substring(5)).sorted().toList()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="SegurancaConfig">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/delivery/SegurancaConfig.java" />
+</Tab>
+<Tab rotulo="EmissorDeTokens">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/delivery/EmissorDeTokens.java" />
+</Tab>
+<Tab rotulo="AuthController">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/delivery/AuthController.java" />
+</Tab>
+<Tab rotulo="RespostasDeSeguranca">
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/delivery/RespostasDeSeguranca.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **O decoder fixa o algoritmo.** Com `macAlgorithm(HS256)`, um token `alg: none`, ou assinado com outro algoritmo, é recusado antes de qualquer outra verificação. Deixar o próprio token dizer como deve ser validado é a origem de uma família inteira de vulnerabilidades de JWT.
+- **O validador de emissor precisa ser explícito.** O validador padrão confere o tempo (`exp` e `nbf`), não o emissor. Sem `createDefaultWithIssuer`, um token emitido por outro sistema que, por descuido, compartilhasse o segredo seria aceito.
+- **`FACTOR_PASSWORD` fora do token.** Converter todas as autoridades em papéis colocaria no token um "papel" que não existe no sistema. Filtrar por `ROLE_` deixa o contrato do token explícito: `roles` contém papéis de negócio, e nada mais.
+- **Mesma resposta no login.** Toda `AuthenticationException` vira o mesmo `credenciais-invalidas`. O `DaoAuthenticationProvider` também gasta o tempo de um BCrypt quando o usuário não existe, então nem o tempo de resposta denuncia quem está cadastrado.
+- **`/error` público.** Não expõe nada: só recebe encaminhamentos internos do próprio servidor. Sem ele, todo erro do MVC numa rota pública (um `400`, um `405`) chegaria ao cliente como `401`.
+- **Um `BearerTokenAuthenticationEntryPoint` por dentro.** O header `WWW-Authenticate` segue a RFC 6750 sem esforço, e a classe só acrescenta o corpo no formato da API. Uma mesma classe implementa as duas interfaces porque as duas escrevem respostas no mesmo formato.
+- **O último cenário é um alerta.** Um token forjado com o segredo **correto** é aceito. Quem tem o segredo emite tokens de ADMIN; por isso ele vai para um cofre (Vault, AWS Secrets Manager, uma variável de ambiente injetada pelo orquestrador) e não para o repositório. É também o argumento para RS256: as APIs que só validam tokens guardam apenas a chave **pública**, e o vazamento de uma delas não permite emitir nada.
+
+### Alternativas e trade-offs
+
+- **RS256 ou ES256 em vez de HS256.** Com uma chave simétrica, todo serviço que valida também poderia emitir. Com um par de chaves, só o emissor tem a privada, e a pública pode ser distribuída por um endpoint JWKS, o que também facilita trocar a chave (*rotação*) sem parar as APIs. HS256 é aceitável quando emissor e validador são o mesmo serviço, como aqui.
+- **Um provedor de identidade (Keycloak, Auth0, Entra ID, Cognito).** Em produção, poucos times escrevem o próprio `POST /auth/token`: o login, a autenticação multifator, a recuperação de senha e a rotação de chaves ficam num serviço especializado, e a API vira só um Resource Server configurado com `issuer-uri`. Escrever o emissor aqui serve para entender o que esses serviços fazem por você.
+- **Sessão com cookie em vez de JWT.** Para uma aplicação web servida pelo mesmo domínio, uma sessão (no Redis, por exemplo) é mais simples e se revoga na hora. O JWT ganha quando há vários serviços, apps móveis e nenhuma vontade de consultar um armazenamento compartilhado a cada requisição.
+- **Regras de papel com `@PreAuthorize` nos controllers** em vez de `requestMatchers`. Funciona (com `@EnableMethodSecurity`) e deixa a regra ao lado do código, mas espalha a política de acesso; para regras que dependem só da rota, a cadeia centraliza tudo num lugar.
+
+### Avalie sua solução
+
+- Quanto tempo um token roubado continua valendo? O que você mudaria para poder revogá-lo antes disso (pense em validade mais curta, *refresh tokens* e uma lista de tokens revogados), e quanto cada opção custa?
+- Quando a ana for promovida a ADMIN, quando o token dela passa a refletir isso? E quando ela for demitida?
+- Se `GET /admin/relatorio` for chamado com o token da ana, o log registra algo? Deveria? O que entra nesse registro e o que nunca pode entrar (o token, por exemplo)?
+- O que acontece com a sua API se o relógio do servidor estiver cinco minutos adiantado?
+
+</Solucao>

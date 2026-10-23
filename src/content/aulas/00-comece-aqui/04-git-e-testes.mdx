@@ -1,0 +1,209 @@
+---
+titulo: Git essencial e seu primeiro teste automatizado
+descricao: O mínimo de Git para trabalhar em time desde o primeiro dia, o que é um teste automatizado e como ler a saída do Maven quando algo falha.
+modulo: 00-comece-aqui
+ordem: 4
+duracao: 50
+objetivos:
+  - Usar o ciclo status → add → commit → push e criar branches
+  - Ler um teste JUnit e entender o que ele verifica
+  - Rodar testes com Maven e interpretar falhas
+tags: [Git, JUnit, Maven, testes]
+flashcards:
+  - frente: Qual a diferença entre `git add` e `git commit`?
+    verso: "`add` coloca mudanças na staging area (o que vai no próximo commit); `commit` grava um snapshot permanente com mensagem."
+  - frente: Por que trabalhar em branches?
+    verso: Para isolar uma mudança até ela estar pronta e revisada, sem quebrar a branch principal (main) usada pelo time.
+  - frente: O que é o ciclo vermelho → verde → refatorar?
+    verso: Escrever/rodar um teste que falha (vermelho), implementar o mínimo para passar (verde) e melhorar o código com a segurança dos testes (refatorar).
+  - frente: "Em um teste, o que significam Arrange, Act e Assert?"
+    verso: Preparar os dados (arrange), executar a ação testada (act) e verificar o resultado (assert).
+  - frente: Qual a diferença entre falha (failure) e erro (error) no relatório de testes?
+    verso: Failure é uma asserção que não bateu (resultado diferente do esperado). Error é uma exceção inesperada durante o teste.
+---
+
+Duas habilidades separam alguém que "programa" de alguém que **trabalha em um time de backend**: versionar código com Git e provar que o código funciona com testes automatizados. Você vai usar as duas todos os dias, a partir de hoje.
+
+## Git em 10 minutos
+
+O Git registra a **história** do seu código em *commits*: fotografias do projeto em um momento, cada uma com autor, data e mensagem. Com isso você pode voltar no tempo, entender por que algo mudou e trabalhar em paralelo com outras pessoas sem que um sobrescreva o trabalho do outro.
+
+<Figura legenda="As três áreas do Git e os comandos que movem as mudanças entre elas">
+<svg viewBox="0 0 700 190" width="700" role="img" aria-label="Diretório de trabalho → git add → staging → git commit → repositório local → git push → remoto">
+  <defs><marker id="s4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="50" width="150" height="80" rx="12" class="d-box"/>
+  <text x="85" y="85" text-anchor="middle" class="d-title">Diretório</text>
+  <text x="85" y="106" text-anchor="middle" class="d-label">seus arquivos</text>
+  <rect x="190" y="50" width="150" height="80" rx="12" class="d-info"/>
+  <text x="265" y="85" text-anchor="middle" class="d-title">Staging</text>
+  <text x="265" y="106" text-anchor="middle" class="d-label">o próximo commit</text>
+  <rect x="370" y="50" width="150" height="80" rx="12" class="d-accent"/>
+  <text x="445" y="85" text-anchor="middle" class="d-title">Repositório</text>
+  <text x="445" y="106" text-anchor="middle" class="d-label">histórico local</text>
+  <rect x="550" y="50" width="140" height="80" rx="12" class="d-ok"/>
+  <text x="620" y="85" text-anchor="middle" class="d-title">Remoto</text>
+  <text x="620" y="106" text-anchor="middle" class="d-label">GitHub/GitLab</text>
+  <path d="M160 90 H186" class="d-line" marker-end="url(#s4)"/>
+  <path d="M340 90 H366" class="d-line" marker-end="url(#s4)"/>
+  <path d="M520 90 H546" class="d-line" marker-end="url(#s4)"/>
+  <text x="173" y="160" text-anchor="middle" class="d-mono">add</text>
+  <text x="353" y="160" text-anchor="middle" class="d-mono">commit</text>
+  <text x="533" y="160" text-anchor="middle" class="d-mono">push</text>
+  <path d="M620 50 C620 10, 85 10, 85 46" class="d-line" stroke-dasharray="5 5" marker-end="url(#s4)"/>
+  <text x="352" y="26" text-anchor="middle" class="d-mono">pull</text>
+</svg>
+</Figura>
+
+### O ciclo do dia a dia
+
+```bash
+git status                       # o que mudou? (rode o tempo todo)
+git switch -c feat/saudacao      # cria uma branch e muda para ela
+# ... edita arquivos ...
+git add src/main/java/.../Saudacao.java
+git commit -m "feat: implementa saudação com capitalização"
+git push -u origin feat/saudacao # envia a branch para o remoto
+```
+
+Depois do `push`, no GitHub ou GitLab, você abre um **Pull Request** (ou *Merge Request*): um pedido para outra pessoa revisar e juntar sua branch na `main`. Em qualquer empresa, **nenhum código vai para a `main` sem revisão**.
+
+### Boas mensagens de commit
+
+O mercado adota amplamente o padrão **Conventional Commits**:
+
+| Prefixo | Quando usar | Exemplo |
+|---|---|---|
+| `feat:` | Nova funcionalidade | `feat: adiciona cálculo de frete expresso` |
+| `fix:` | Correção de bug | `fix: evita NPE quando o nome é nulo` |
+| `test:` | Só testes | `test: cobre saque acima do limite` |
+| `refactor:` | Mudança interna sem alterar comportamento | `refactor: extrai método capitalizar` |
+| `docs:` | Documentação | `docs: explica como rodar os testes` |
+
+<Callout tipo="dica" titulo="Use Git na própria trilha">
+Crie um repositório seu para os exercícios e faça **um commit por exercício concluído**. No fim da trilha, esse histórico vira parte do seu portfólio — recrutadores técnicos olham o GitHub.
+</Callout>
+
+## O que é um teste automatizado
+
+Um teste automatizado é **código que verifica outro código**. Em vez de rodar o programa e conferir o resultado "no olho", você escreve uma vez o que espera e deixa o computador conferir sempre que quiser — em segundos.
+
+Veja um teste real do exercício 00.01:
+
+```java title="SaudacaoTest.java"
+class SaudacaoTest {
+
+    @Test
+    @DisplayName("cumprimenta a pessoa pelo nome")
+    void cumprimentaPeloNome() {
+        // Arrange (preparar) + Act (executar)
+        String resultado = Saudacao.para("Ana");
+
+        // Assert (verificar)
+        assertThat(resultado).isEqualTo("Olá, Ana!");
+    }
+}
+```
+
+- **`@Test`** marca o método como teste para o **JUnit**, o framework de testes padrão do Java (a trilha usa o JUnit 6).
+- **`@DisplayName`** dá um nome legível, que aparece no relatório.
+- **`assertThat(...).isEqualTo(...)`** vem do **AssertJ**, uma biblioteca de asserções fluentes. Se o valor for diferente, o teste falha e mostra os dois valores.
+
+A estrutura **Arrange → Act → Assert** (preparar, executar, verificar) é o esqueleto de praticamente todo teste bem escrito.
+
+### Testes parametrizados
+
+Quando a mesma regra vale para várias entradas, você não copia o teste. Você o **parametriza**:
+
+```java
+@ParameterizedTest(name = "nome inválido [{0}] vira visitante")
+@NullAndEmptySource
+@ValueSource(strings = {"   ", "\t"})
+void semNome(String nome) {
+    assertThat(Saudacao.para(nome)).isEqualTo("Olá, visitante!");
+}
+```
+
+O JUnit roda esse método **quatro vezes**: com `null`, `""`, `"   "` e `"\t"`.
+
+## Rodando os testes com Maven
+
+Na pasta de um starter:
+
+```bash
+cd java/m00-comece-aqui/starter
+mvn test
+```
+
+Sem implementação nenhuma, a saída termina com algo assim:
+
+```text
+[ERROR] Tests run: 7, Failures: 0, Errors: 7, Skipped: 0
+[ERROR] cumprimentaPeloNome  <<< ERROR!
+java.lang.UnsupportedOperationException: Implemente Saudacao.para
+    at dev.trilhajava.m00.Saudacao.para(Saudacao.java:23)
+[INFO] BUILD FAILURE
+```
+
+Como ler:
+
+- **`Tests run: 7`** — quantos testes rodaram.
+- **`Failures`** — asserções que não bateram (o código rodou, mas o resultado estava errado).
+- **`Errors`** — exceções inesperadas (o código nem chegou ao fim). Aqui, é o `UnsupportedOperationException` do stub.
+- **O *stack trace*** diz **onde** o problema aconteceu: `Saudacao.java:23`. Sempre procure a primeira linha que aponta para o **seu** código.
+
+Para rodar só uma classe de teste, use `-Dtest`:
+
+```bash
+mvn test -Dtest=SaudacaoTest
+```
+
+## Vermelho → verde → refatorar
+
+Todo exercício da trilha segue este ritmo, que vem do **TDD** (*Test-Driven Development*):
+
+1. 🔴 **Vermelho:** rode os testes e veja-os falhar. Isso prova que o teste consegue detectar o problema.
+2. 🟢 **Verde:** escreva o código **mais simples** que faz o teste passar.
+3. 🔵 **Refatorar:** melhore nomes, extraia métodos e remova duplicação — com a garantia de que os testes continuam verdes.
+
+<Callout tipo="entrevista">
+"Você escreve testes?" é pergunta certa em qualquer entrevista. Mais forte do que dizer "sim" é descrever **como**: "uso JUnit e AssertJ, organizo em Arrange-Act-Assert, uso testes parametrizados para variações da mesma regra e rodo tudo no CI a cada push". Você vai conseguir dizer isso com propriedade ao final do módulo 10.
+</Callout>
+
+<Quiz
+  id="00-git-testes"
+  questoes={[
+    {
+      pergunta: 'Você editou três arquivos, mas quer que só dois entrem no próximo commit. O que faz?',
+      opcoes: ['`git commit -a`', '`git add` apenas nos dois arquivos e depois `git commit`', '`git push` dos dois arquivos', 'Apaga o terceiro arquivo'],
+      correta: 1,
+      explicacao: 'A staging area existe exatamente para isso: você escolhe o que vai no commit com `git add` e depois faz o `commit`.',
+    },
+    {
+      pergunta: 'No relatório do Maven: `Tests run: 5, Failures: 2, Errors: 1`. O que isso significa?',
+      opcoes: ['3 testes passaram', '2 asserções falharam e 1 teste lançou exceção inesperada; 2 passaram', '5 testes falharam', 'O build passou com avisos'],
+      correta: 1,
+      explicacao: 'Failures são asserções que não bateram; errors são exceções inesperadas. 5 - 2 - 1 = 2 testes passaram.',
+    },
+    {
+      pergunta: 'Qual mensagem de commit segue Conventional Commits?',
+      opcoes: ['`ajustes`', '`fix: trata nome nulo na saudação`', '`FIX NOME`', '`commit 2`'],
+      correta: 1,
+      explicacao: 'Prefixo do tipo (`fix:`) + descrição curta no imperativo. Mensagens assim tornam o histórico pesquisável e permitem gerar changelogs automaticamente.',
+    },
+    {
+      pergunta: 'Por que ver o teste falhar ANTES de implementar?',
+      opcoes: ['Para ganhar tempo', 'Para ter certeza de que o teste realmente detecta o problema', 'Porque o Maven exige', 'Não é necessário'],
+      correta: 1,
+      explicacao: 'Um teste que nunca falhou pode estar verificando a coisa errada (ou nada). Ver o vermelho primeiro valida o próprio teste.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Git: `status` → `add` → `commit` → `push`, sempre em branches, com revisão via Pull Request.
+- Um teste JUnit segue **Arrange → Act → Assert**. O AssertJ deixa as verificações legíveis.
+- `mvn test -Dtest=Classe` roda os testes de um exercício. *Failures* são resultados errados; *errors* são exceções.
+- Ritmo da trilha: **vermelho → verde → refatorar**.
+
+Agora é com você: o [exercício 00.01](../../../exercicios/00-comece-aqui/01-primeiro-teste-verde/) está esperando o primeiro teste verde.

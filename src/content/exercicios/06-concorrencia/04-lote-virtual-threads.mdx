@@ -1,0 +1,76 @@
+---
+titulo: Emissão de notas em lote com virtual threads
+codigo: "06.04"
+resumo: Emita milhares de notas fiscais chamando um serviço lento, com uma virtual thread por nota, no máximo N chamadas simultâneas (Semaphore) e falhas coletadas sem interromper o lote.
+modulo: 06-concorrencia
+ordem: 4
+dificuldade: dificil
+tempo: 2h
+conceitos: [virtual threads, Semaphore, Future, tratamento de falhas]
+aulas: [06-concorrencia/05-virtual-threads, 06-concorrencia/03-executors]
+java:
+  modulo: m06-concorrencia
+  teste: ProcessadorDeNotasTest
+---
+
+## Contexto
+
+No fechamento do mês, um ERP emite **milhares de notas fiscais** chamando o serviço da secretaria da fazenda (SEFAZ) de cada estado. Cada chamada leva de 50 ms a alguns segundos. Em sequência, o lote de 2 mil notas leva quase duas horas. O serviço externo, porém, **aceita no máximo 200 conexões simultâneas** por certificado: passar disso gera bloqueio temporário.
+
+## Requisitos
+
+`ProcessadorDeNotas.processar(ids, emitirNota, maxSimultaneas)` → `ResultadoLote(sucessos, falhas)`:
+
+- Uma **virtual thread por nota**.
+- **No máximo `maxSimultaneas`** chamadas a `emitirNota` acontecendo ao mesmo tempo.
+- **Sucessos** (`id → número da nota`) e **falhas** (`id → mensagem do erro`), ambos na **ordem dos ids recebidos**.
+- Uma falha não interrompe as outras.
+- `maxSimultaneas < 1` → `IllegalArgumentException`.
+
+## Os testes
+
+- **2.000 emissões de 50 ms**, limite 200: termina em menos de 5 s (em sequência: 100 s) e o **pico de chamadas simultâneas medido** nunca passa de 200 (e passa de 50, o que prova que há paralelismo de verdade).
+- Ids terminados em `3` falham: aparecem em `falhas` com a mensagem original.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ProcessadorDeNotasTest` passam.
+- [ ] Não existe `newFixedThreadPool` limitando a concorrência: o limite vem de um `Semaphore`.
+- [ ] A permissão do semáforo é devolvida em `finally`.
+
+## Desafios opcionais
+
+- **Retry** com backoff exponencial para falhas temporárias (e só para elas).
+- **Rate limit** em vez de limite de concorrência: no máximo 100 chamadas **por segundo**.
+
+<Dicas>
+<Dica nivel={1}>
+Separe duas preocupações: **quantas threads** (uma por tarefa, virtual — barato) e **quantas chamadas simultâneas** ao serviço (o recurso escasso). A segunda é um `Semaphore`.
+</Dica>
+<Dica nivel={2}>
+`try (ExecutorService ex = Executors.newVirtualThreadPerTaskExecutor()) { ... }`: o `close()` espera todas as tarefas. Guarde os `Future<String>` num `LinkedHashMap<id, Future>` para manter a ordem.
+</Dica>
+<Dica nivel={3}>
+Dentro da tarefa: `permissoes.acquire(); try { return emitirNota.apply(id); } finally { permissoes.release(); }`. Depois, para cada future: `get()` em `sucessos`; `ExecutionException` → `falhas.put(id, e.getCause().getMessage())`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m06-concorrencia/solucao/src/main/java/dev/trilhajava/m06/ProcessadorDeNotas.java" />
+
+### Por que assim
+
+- **O limite está no recurso, não nas threads.** 2 mil virtual threads custam poucos megabytes; as que esperam no `acquire` são desmontadas e não ocupam carriers.
+- **`try-with-resources` no executor** garante que todas as tarefas terminaram antes de montar o resultado.
+- **`LinkedHashMap`** preserva a ordem dos ids, o que deixa o relatório previsível (e testável).
+- **`ExecutionException.getCause()`** recupera a exceção original da tarefa, com a mensagem de negócio.
+
+### Avalie sua solução
+
+- O pico medido no teste fica próximo de 200? Muito abaixo pode indicar que algo está serializando as chamadas.
+- Se `emitirNota` lançar exceção, a permissão volta para o semáforo na sua versão?
+
+</Solucao>

@@ -1,0 +1,94 @@
+---
+titulo: Relatório da estação meteorológica
+codigo: "01.03"
+resumo: Processe séries de leituras de temperatura em arrays — mínima, máxima, média, maior sequência de alta — sem alterar a entrada, e gere um relatório formatado.
+modulo: 01-java-essencial
+ordem: 3
+dificuldade: facil
+tempo: 1h
+conceitos: [arrays, laços, métodos, formatação, text blocks]
+aulas: [01-java-essencial/03-lacos, 01-java-essencial/05-arrays-e-strings]
+java:
+  modulo: m01-java-essencial
+  teste: EstacaoMeteorologicaTest
+---
+
+## Contexto
+
+Uma startup de agrotecnologia instala estações meteorológicas em fazendas. Cada estação envia, uma vez por dia, um array com as leituras de temperatura. O agrônomo responsável quer um **resumo automático** para decidir sobre irrigação: extremos, média e, principalmente, **por quantos dias seguidos a temperatura subiu** — um indicador de estresse térmico nas plantas.
+
+## Requisitos
+
+Implemente em `EstacaoMeteorologica` (todos `static`, recebendo `double[] leituras`):
+
+| Método | Retorna |
+|---|---|
+| `minima` / `maxima` | O menor / maior valor |
+| `media` | A média aritmética |
+| `maiorSequenciaDeAlta` | O tamanho da maior sequência de leituras **consecutivas e estritamente crescentes** |
+| `contarAcimaDe(leituras, limite)` | Quantas leituras são **estritamente** maiores que o limite |
+| `formatarRelatorio` | Um texto de 5 linhas, no formato abaixo |
+
+Para a semana `[21.5, 23.0, 24.1, 22.8, 25.3, 26.0, 26.7]`:
+
+```text
+Leituras: 7
+Mínima: 21.5 °C
+Máxima: 26.7 °C
+Média: 24.2 °C
+Maior sequência de alta: 4 leituras
+```
+
+A maior sequência é `22.8 → 25.3 → 26.0 → 26.7` (4 leituras). A sequência inicial `21.5 → 23.0 → 24.1` tem 3.
+
+## Regras
+
+- Array `null` ou vazio: `IllegalArgumentException`.
+- Uma única leitura forma uma sequência de alta de tamanho **1**.
+- Valores iguais **quebram** a sequência (alta é estrita): `[20, 20, 21]` → 2.
+- O relatório usa **ponto** como separador decimal e uma casa (`Locale.US`).
+- **Nenhum método pode alterar o array recebido.** Esse array pertence a quem chamou.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `EstacaoMeteorologicaTest` passam, inclusive `naoAlteraEntrada`.
+- [ ] A validação de array vazio/nulo não está repetida em cada método.
+- [ ] `maiorSequenciaDeAlta` percorre o array **uma única vez**.
+
+## Desafios opcionais
+
+- **Mediana.** Implemente `mediana(double[])`. Você vai precisar ordenar — e o teste `naoAlteraEntrada` vai te lembrar de ordenar uma **cópia**.
+- **Amplitude térmica diária** a partir de um `double[][]` (uma linha por dia, várias leituras por linha).
+
+<Dicas>
+<Dica nivel={1}>
+Mínima, máxima e média são o mesmo padrão: uma variável acumuladora inicializada antes do laço e atualizada a cada elemento. Para a sequência de alta, você precisa de **duas** variáveis: a sequência atual e a maior já vista.
+</Dica>
+<Dica nivel={2}>
+Na sequência de alta, compare cada leitura com a **anterior** — então o laço começa em `i = 1`. Se `leituras[i] > leituras[i - 1]`, a sequência atual cresce; senão, volta a ser 1. Depois de cada passo, atualize a maior.
+</Dica>
+<Dica nivel={3}>
+Para o relatório, um text block com `%d` e `%.1f` e `String.format(Locale.US, textBlock, ...)` resolve tudo de uma vez. Cuidado: o text block **não** pode terminar com quebra de linha, porque o teste espera o texto sem `\n` no final. Feche as aspas triplas na mesma linha do último texto.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m01-java-essencial/solucao/src/main/java/dev/trilhajava/m01/EstacaoMeteorologica.java" />
+
+### Pontos de atenção
+
+- **Inicializar com o primeiro elemento**, e não com `0` ou `Double.MAX_VALUE`. Inicializar a máxima com `0` quebra com temperaturas negativas (o teste `negativas` pega isso). `Double.MIN_VALUE` é uma armadilha famosa: ele é o **menor número positivo**, não o mais negativo!
+- **`Math.min`/`Math.max`** deixam os laços mais curtos que `if (t < menor) menor = t;`. As duas formas são corretas.
+- **Sequência de alta em uma passada**: `atual = leituras[i] > leituras[i - 1] ? atual + 1 : 1`. É o padrão *running count*, que reaparece em muitos problemas de entrevista (maior subarray crescente, maior sequência de dias sem incidentes…).
+- **`exigirLeituras` centraliza a validação.** Cada método público chama uma linha só.
+- **`formatarRelatorio` reutiliza os outros métodos.** Isso percorre o array várias vezes, o que é aceitável para 7 leituras. Para milhões, você faria uma passada única calculando tudo — um bom exemplo de legibilidade versus desempenho.
+
+### Avalie sua solução
+
+- Seu código funciona com `{-3.5, -1.0, -7.2}`?
+- Você chegou a ordenar o array original para achar mínimo e máximo? `Arrays.sort` altera o array recebido — e ordenar custa O(n log n) quando um laço O(n) basta.
+
+</Solucao>

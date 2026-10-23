@@ -1,0 +1,105 @@
+---
+titulo: Conta corrente com cheque especial
+codigo: "02.01"
+resumo: Modele uma conta que protege o próprio saldo — sem setters —, com cheque especial, extrato imutável e transferência atômica entre contas.
+modulo: 02-poo
+ordem: 1
+dificuldade: facil
+tempo: 1,5–2h
+conceitos: [encapsulamento, invariantes, BigDecimal, cópia defensiva]
+aulas: [02-poo/01-classes-e-objetos, 02-poo/02-encapsulamento]
+java:
+  modulo: m02-poo
+  teste: ContaCorrenteTest
+---
+
+## Contexto
+
+Um banco digital está reescrevendo o núcleo de contas. No sistema antigo, a classe `Conta` tinha `setSaldo()` público, e **cinco lugares diferentes** do código calculavam saldo e limite, cada um de um jeito. Resultado: clientes com saldo abaixo do limite permitido e um extrato que, em certos fluxos, "perdia" lançamentos.
+
+Sua missão é escrever a nova `ContaCorrente`: **a única** responsável por suas regras.
+
+## Requisitos
+
+| Operação | Comportamento |
+|---|---|
+| `new ContaCorrente(titular, limiteChequeEspecial)` | Cria a conta com saldo zero |
+| `depositar(valor)` | Aumenta o saldo e registra um `CREDITO` no extrato |
+| `sacar(valor)` | Diminui o saldo (pode usar o cheque especial) e registra um `DEBITO` |
+| `transferirPara(destino, valor)` | Debita desta conta e credita no destino, registrando `TRANSFERENCIA_ENVIADA` e `TRANSFERENCIA_RECEBIDA` |
+| `getSaldo()` | Saldo atual (pode ser negativo) |
+| `getSaldoDisponivel()` | Saldo + limite do cheque especial |
+| `extrato()` | Lista de `Movimentacao` em ordem cronológica, com o saldo após cada uma |
+
+`Movimentacao`, `TipoMovimentacao` e `SaldoInsuficienteException` já estão prontas no starter.
+
+## Regras de negócio
+
+1. Titular é obrigatório (não pode ser nulo nem em branco).
+2. O limite do cheque especial é zero ou positivo.
+3. Valores de depósito, saque e transferência devem ser **maiores que zero**. Caso contrário: `IllegalArgumentException`.
+4. O saldo **nunca** pode ficar abaixo de `-limite`. Um saque que ultrapasse isso lança `SaldoInsuficienteException` e **não altera nada** (nem saldo, nem extrato).
+5. **Transferência é atômica**: se falhar, **nenhuma** das duas contas muda.
+6. Não é possível transferir para a própria conta.
+7. Quem recebe o extrato **não consegue alterá-lo**.
+
+## Exemplo
+
+```text
+Conta de Ana, limite R$ 500,00
+depositar 100,00  → saldo 100,00   disponível 600,00
+sacar 600,00      → saldo -500,00  disponível 0,00
+sacar 0,01        → SaldoInsuficienteException (nada muda)
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ContaCorrenteTest` passam.
+- [ ] A classe **não tem nenhum setter**.
+- [ ] A verificação de limite existe em **um único lugar** (usada por saque e transferência).
+- [ ] Todos os atributos que não mudam são `final`.
+
+## Desafios opcionais
+
+- **Tarifa de cheque especial:** juros de 8% ao mês sobre o saldo negativo, cobrados por um método `cobrarJurosDoMes()`. Pense: essa regra deveria morar na conta ou em outro objeto?
+- **Datas testáveis:** o extrato registra o momento de cada movimentação. Como testar isso sem depender do relógio real? (A solução mostra uma forma.)
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo que **não pode mudar**: titular e limite são `final`. O saldo muda, mas só dentro da classe. Quantos métodos precisam realmente alterar o saldo? Talvez só dois métodos privados: um que credita e um que debita.
+</Dica>
+<Dica nivel={2}>
+Crie `private void debitar(BigDecimal valor, TipoMovimentacao tipo)` que **primeiro** verifica o limite e só **depois** altera o saldo e registra no extrato. `sacar` e `transferirPara` usam esse mesmo método — assim a regra existe uma vez só.
+</Dica>
+<Dica nivel={3}>
+Para a atomicidade da transferência, a ordem resolve: debite a origem **antes** de creditar o destino. Se o débito lançar exceção, a linha do crédito nunca executa. Para o extrato, devolva `List.copyOf(movimentacoes)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/conta/ContaCorrente.java" />
+
+### Decisões de design
+
+- **Dois pontos de mudança de estado.** Só `creditar` e `debitar` (privados) alteram o saldo. Os métodos públicos validam a entrada e delegam. Se amanhã surgir uma regra nova (limite diário de saque, por exemplo), ela entra em um lugar só.
+- **Validar antes de mudar.** Em `debitar`, a checagem vem antes de qualquer alteração. É o que garante que uma exceção nunca deixa a conta "pela metade".
+- **Atomicidade pela ordem.** Em `transferirPara`, o débito vem primeiro. Numa aplicação real com banco de dados, a atomicidade entre duas contas vem da **transação** (`@Transactional`, módulo 09), mas o princípio é o mesmo: nada é confirmado até tudo dar certo.
+- **`List.copyOf`** devolve uma lista imutável: `clear()` lança `UnsupportedOperationException`, que é exatamente o que o teste `imutavel` verifica.
+- **`Clock` injetável.** O construtor de pacote recebe um `Clock`, e o público usa `Clock.systemUTC()`. Nos testes, dá para passar `Clock.fixed(...)` e verificar datas exatas. Essa técnica de trocar a fonte do tempo é padrão em código profissional.
+- **`destino == this`** compara referências de propósito: queremos saber se é **o mesmo objeto**.
+
+### Alternativas
+
+- **`long` em centavos** em vez de `BigDecimal` funcionaria igualmente bem e seria mais rápido. A escolha por `BigDecimal` segue o que você vai encontrar na maioria dos sistemas financeiros em Java.
+- **Record `Dinheiro` (exercício 02.03)** no lugar de `BigDecimal` seria ainda melhor: garante moeda e escala. Depois de fazer o 02.03, volte aqui e refatore.
+
+### Avalie sua solução
+
+- Existe algum caminho em que o saldo muda **antes** da validação?
+- Um saque recusado adiciona algo ao extrato na sua versão?
+- Você usou `==` para comparar `BigDecimal`? Use `compareTo`.
+
+</Solucao>

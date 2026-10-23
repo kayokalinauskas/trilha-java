@@ -1,0 +1,316 @@
+---
+titulo: "Fintech Core — Marco 3: suíte de testes"
+codigo: "10.05"
+resumo: Dê ao Fintech Core a suíte de testes de um projeto profissional — unidade no domínio, Mockito no caso de uso, fatias web e JPA, PostgreSQL real com Testcontainers, a arquitetura verificada com ArchUnit e o relatório de cobertura do JaCoCo.
+modulo: 10-testes
+ordem: 5
+marco: 3
+dificuldade: dificil
+tempo: 8–10h
+conceitos: [projeto integrador, pirâmide de testes, Mockito, WebMvcTest, DataJpaTest, Testcontainers, ArchUnit, JaCoCo]
+aulas: [10-testes/01-por-que-e-como-testar, 10-testes/02-junit-e-assertj, 10-testes/03-mockito, 10-testes/04-testes-de-fatia-no-spring, 10-testes/05-testcontainers, 10-testes/06-tdd-e-arquitetura]
+java:
+  modulo: projeto-integrador
+---
+
+## Contexto
+
+A Fintech Core vai receber um segundo time. Antes disso, o CTO estabeleceu uma regra: **nenhum código entra sem testes, e o build garante a arquitetura**. Até aqui, o projeto não tem uma suíte própria: não há nada que avise, em segundos, que uma regra do domínio quebrou, nada que prove que o SQL funciona no PostgreSQL de produção, e nada que impeça um colega de chamar o repositório direto do controller "só desta vez".
+
+Neste marco você **não acrescenta funcionalidades**. Você escreve a suíte de testes do Fintech Core, em todas as camadas da pirâmide, e liga o relatório de cobertura no build. O código de produção só muda se um teste seu revelar um defeito (e isso acontece: veja a solução).
+
+## O que você vai praticar
+
+- **A pirâmide de testes.** Muitos testes de unidade, rápidos e sem framework, na base; alguns testes de fatia no meio; poucos testes da aplicação inteira no topo. Cada camada pega um tipo diferente de defeito, e cada uma tem o seu custo em segundos. Veja [Por que testar — e o que é um bom teste](../../../aulas/10-testes/01-por-que-e-como-testar/).
+- **JUnit e AssertJ.** `@DisplayName` em português que descreve o comportamento, `@ParameterizedTest` para a mesma regra com vários valores, `isEqualByComparingTo` para `BigDecimal` (30 e 30.00 são o mesmo dinheiro) e `assertThatThrownBy` para exceções. Veja [JUnit 6 e AssertJ a fundo](../../../aulas/10-testes/02-junit-e-assertj/).
+- **Dublês com Mockito.** O caso de uso depende de interfaces (`RepositorioDeContas` e companhia): com `@Mock` no lugar delas, você testa as **decisões** do serviço sem banco, e com `InOrder` verifica a ordem das chamadas. Mocke só as portas que você controla. Veja [Dublês de teste com Mockito](../../../aulas/10-testes/03-mockito/).
+- **Testes de fatia.** `@WebMvcTest` sobe só a camada web (controller, `@RestControllerAdvice`, Jackson, validação), com o serviço substituído por um `@MockitoBean`, e o `MockMvcTester` confere status, headers e JSON. `@DataJpaTest` sobe só JPA e Flyway, e cada teste roda numa transação desfeita no fim. Veja [Testes de fatia no Spring Boot](../../../aulas/10-testes/04-testes-de-fatia-no-spring/).
+- **Testcontainers.** Um PostgreSQL 18 de verdade num container, declarado como bean com `@ServiceConnection`: o Spring lê URL, usuário e senha do container, sem nenhuma propriedade de conexão nos testes. `@EnabledIfDockerAvailable` pula (não falha) os testes quando não há Docker. Veja [Testes de integração com Testcontainers](../../../aulas/10-testes/05-testcontainers/).
+- **ArchUnit e JaCoCo.** O ArchUnit lê o bytecode e transforma as regras de arquitetura em testes que falham no build. O JaCoCo mostra, linha a linha, o que nenhum teste executou: serve para achar código sem teste, não como meta. Veja [TDD e testes de arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/).
+
+## Requisitos
+
+### O que já existe
+
+O seu Fintech Core ao fim do marco 2 (o da solução de referência do marco 2 serve de base, se você preferir partir dele):
+
+- **`dominio`**: `Conta` (`depositar`, `sacar`, `enviar` e `receber`, que devolvem um `Movimento` com o `saldoApos`), `Transferencia` (recusa origem igual ao destino; `exigirMesmoPedido(origem, destino, valor)` compara o pedido com o da chave de idempotência), `Cpf`, as exceções de negócio e as interfaces `RepositorioDeContas`, `RepositorioDeMovimentos` e `RepositorioDeTransferencias`;
+- **`aplicacao`**: `ServicoDeContas` e `ServicoDeTransferencias`, com o `transferir(chave, origem, destino, valor)` que devolve um `Resultado(transferencia, repetida)`, trava as contas com `buscarParaAtualizar` e recebe um `Clock` pelo construtor;
+- **`api`**: `ContaController`, `TransferenciaController` e o `TratadorDeErros` (Problem Details com `type` em `https://fintech.dev/problemas/`);
+- **`infra`**: os adaptadores JPA (`RepositorioDeContasJpa` e os outros) e as migrações Flyway `V1` e `V2`, com `CHECK (saldo >= 0)`, `UNIQUE (cpf, tipo)` e `UNIQUE` na chave de idempotência;
+- no `pom.xml`: Testcontainers (`spring-boot-testcontainers`, `testcontainers-junit-jupiter`, `testcontainers-postgresql`) e ArchUnit (`archunit-junit5`), com escopo de teste.
+
+Se o seu código usar outros nomes, adapte os testes a ele: o que importa são os comportamentos das regras abaixo.
+
+### O que você implementa
+
+Acrescente ao `pom.xml` as duas dependências de teste deste marco:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-webmvc-test</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-jpa-test</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+E escreva, em `src/test/java/dev/trilhajava/fintech`, uma classe de teste por linha:
+
+| Arquivo | Camada da pirâmide | Ferramentas | Regras |
+|---|---|---|---|
+| `dominio/ContaTest.java` | unidade | JUnit, AssertJ | 1 a 5 |
+| `dominio/TransferenciaTest.java` | unidade | JUnit, AssertJ | 6 e 7 |
+| `aplicacao/ServicoDeTransferenciasTest.java` | unidade com dublês | Mockito | 8 a 10 |
+| `api/TransferenciaControllerTest.java` | fatia web | `@WebMvcTest`, `MockMvcTester`, `@MockitoBean` | 11 a 13 |
+| `BancoDeTeste.java` | configuração | Testcontainers, `@ServiceConnection` | 14 |
+| `infra/RepositorioDeContasJpaTest.java` | fatia JPA | `@DataJpaTest`, Testcontainers | 15 a 17 |
+| `AplicacaoNoPostgresTest.java` | aplicação inteira | `@SpringBootTest`, Testcontainers | 18 a 20 |
+| `ArquiteturaTest.java` | arquitetura | ArchUnit | 21 |
+
+Por fim, configure o `jacoco-maven-plugin` para gerar o relatório no `mvn verify` (regra 22).
+
+Os nomes das classes e dos métodos de teste são livres, desde que cada classe termine em `Test` (é o que o Surefire procura). O que está definido são os **cenários** que cada uma precisa cobrir.
+
+## Regras
+
+Cada regra é um cenário que a sua suíte precisa verificar, com os valores de exemplo. Onde aparece "e nada muda", o teste precisa conferir isso também.
+
+**Domínio: unidade, sem Spring** (`ContaTest`, `TransferenciaTest`)
+
+Crie as contas com `new Conta(UUID.randomUUID(), "Ana", new Cpf("52998224725"), TipoConta.CORRENTE, AGORA)`, com `AGORA` fixo (`Instant.parse("2026-09-28T13:00:00Z")`).
+
+1. **Conta nova tem saldo zero com duas casas.** `saldo()` é `0.00` (compare com `isEqualByComparingTo("0")` e confira a escala 2).
+2. **Depósito aumenta o saldo e devolve o movimento.** Depositar `150.5` → saldo `150.50`; o movimento é `DEPOSITO`, com valor `150.50`, `saldoApos` `150.50` e a data/hora `AGORA`.
+3. **Saque maior que o saldo é recusado, e nada muda.** Com saldo `100.00`, sacar `100.01` → `SaldoInsuficienteException`, cujo `saldoDisponivel()` é `100.00`; o saldo continua `100.00`.
+4. **Valores inválidos são recusados no depósito e no saque.** `null`, `0`, `-1` e `0.001` (três casas) → `IllegalArgumentException` nos dois. Um `@ParameterizedTest` com `@NullSource` e `@ValueSource` cobre os quatro.
+5. **Transferência entre contas.** Origem com `80.00` enviando `30.00` para um destino zerado: origem fica com `50.00`, destino com `30.00`; o movimento da origem é `TRANSFERENCIA_ENVIADA`, o do destino, `TRANSFERENCIA_RECEBIDA`, e o movimento enviado guarda o id da transferência.
+6. **Transferência para a própria conta é recusada.** `new Transferencia(id, A, A, BigDecimal.TEN, Instant.EPOCH, "k")` → `TransferenciaInvalidaException`.
+7. **A impressão digital da idempotência reconhece o mesmo pedido.** Para uma transferência de A para B de `30.00` com a chave `"k"`: `exigirMesmoPedido(A, B, 30)` não lança (30 e 30.00 são o mesmo valor); `exigirMesmoPedido(A, B, 31)` e `exigirMesmoPedido(B, A, 30)` lançam `ChaveIdempotenciaReutilizadaException`.
+
+**Caso de uso: Mockito nas portas** (`ServicoDeTransferenciasTest`)
+
+Crie o serviço com `@Mock` para os três repositórios e `Clock.fixed(AGORA, ZoneOffset.UTC)`. Use dois UUIDs fixos: `MENOR = 00000000-0000-0000-0000-000000000001` e `MAIOR = 00000000-0000-0000-0000-000000000002`.
+
+8. **Repetição idempotente não trava nenhuma conta.** Com `buscarPorChave("chave-1")` devolvendo uma transferência anterior, `transferir("chave-1", MAIOR, MENOR, 10)` devolve um resultado com `repetida() == true` e **a mesma** transferência (`isSameAs`), e o repositório de contas e o de movimentos **não recebem nenhuma chamada**.
+9. **As contas são travadas da menor para a maior, mesmo quando a origem é a maior.** Com a origem `MAIOR` (saldo `100.00`) e o destino `MENOR`, transferir `40.00`: `buscarParaAtualizar(MENOR)` acontece **antes** de `buscarParaAtualizar(MAIOR)` (verifique com `InOrder`), a transferência é salva uma vez e dois movimentos são registrados. É o teste que documenta por que A→B e B→A simultâneas não entram em deadlock.
+10. **Saldo insuficiente não grava movimento.** As duas contas com `5.00`, transferir `10.00` de `MENOR` para `MAIOR` → `SaldoInsuficienteException`, e `movimentos.registrar(...)` **nunca** é chamado.
+
+**API: fatia web** (`TransferenciaControllerTest`)
+
+`@WebMvcTest(TransferenciaController.class)`, com o `ServicoDeTransferencias` como `@MockitoBean`. Corpo das requisições: `{"origem": "<A>", "destino": "<B>", "valor": 30.00}`.
+
+11. **Criada: `201` com `Location`; repetida: header `Idempotent-Replayed`.** Com o mock devolvendo primeiro `Resultado(t, false)` e depois `Resultado(t, true)`, dois `POST /transferencias` com `Idempotency-Key: k`: o primeiro é `201`, o `Location` termina em `/transferencias/<id de t>`, **não** tem `Idempotent-Replayed` e o JSON tem `$.valor` = `30.0`; o segundo tem `Idempotent-Replayed: true`.
+12. **Requisição inválida → `400`.** Sem o header `Idempotency-Key` → `400`. Com `"valor": -1` → `400`, com `$.type` = `https://fintech.dev/problemas/dados-invalidos`.
+13. **Exceção de negócio vira Problem Details.** Com o mock lançando `new SaldoInsuficienteException(A, new BigDecimal("5.00"))` → `422`, `Content-Type` compatível com `application/problem+json`, `$.type` = `https://fintech.dev/problemas/saldo-insuficiente` e `$.saldoDisponivel` = `5.0`.
+
+**Persistência: PostgreSQL de verdade** (`BancoDeTeste`, `RepositorioDeContasJpaTest`)
+
+14. **Um PostgreSQL 18 compartilhado.** `BancoDeTeste` é uma `@TestConfiguration(proxyBeanMethods = false)` com um `@Bean @ServiceConnection` que devolve `new PostgreSQLContainer("postgres:18")`, a mesma versão do `compose.yaml`. Os testes que precisam do banco fazem `@Import(BancoDeTeste.class)` e têm `@EnabledIfDockerAvailable`. Nenhum `spring.datasource.url` nos testes.
+
+`RepositorioDeContasJpaTest`: `@DataJpaTest`, `@AutoConfigureTestDatabase(replace = Replace.NONE)` (senão o Spring troca o seu PostgreSQL por um banco em memória) e `@Import({RepositorioDeContasJpa.class, BancoDeTeste.class})`. O Flyway cria o schema.
+
+15. **Salva e busca, com o CPF convertido.** Salvar uma conta com o CPF `52998224725`, `CORRENTE` → `buscar(id)` devolve a conta com o mesmo `Cpf` e saldo `0`; `existe(cpf, CORRENTE)` é `true` e `existe(cpf, POUPANCA)` é `false`.
+16. **Lista por CPF em ordem de abertura, com paginação.** Salve primeiro uma `POUPANCA` aberta às 13h01 e depois uma `CORRENTE` aberta às 13h00, ambas do CPF `11144477735`: `listar(cpf, 0, 10)` devolve **[corrente, poupança]** (a ordem de abertura, não a de inserção); `listar(cpf, 1, 1)` devolve só a poupança; `contar(cpf)` é `2`.
+17. **A constraint `UNIQUE (cpf, tipo)` do banco barra a duplicata.** Duas contas `CORRENTE` com o CPF `39053344705` → a segunda gravação lança `DataIntegrityViolationException`. Esse teste falharia com um banco que não tivesse a constraint: ele protege a migração.
+
+**A aplicação inteira sobre PostgreSQL** (`AplicacaoNoPostgresTest`)
+
+`@SpringBootTest(webEnvironment = RANDOM_PORT)` + `@Import(BancoDeTeste.class)` + `@EnabledIfDockerAvailable`. Faça as requisições HTTP de verdade na porta sorteada (`@LocalServerPort`), com o `HttpClient` do JDK ou o `RestTestClient`. Use CPFs e chaves diferentes em cada teste (os dados não são desfeitos entre testes).
+
+18. **O banco é o PostgreSQL 18, com o schema do Flyway.** Pelo `DataSource`, os metadados da conexão dizem `PostgreSQL`, versão maior `18`, e `select count(*) from flyway_schema_history where success` é maior que zero.
+19. **Fluxo completo.** Ana abre conta e deposita `500.00`; Bruno abre conta. Transferir `120.50` de Ana para Bruno com uma chave nova → `201`; repetir com a **mesma** chave → o **mesmo** `id`. Ana fica com `379.50`, o extrato de Bruno tem só `TRANSFERENCIA_RECEBIDA`, e um saque de `200.00` na conta de Bruno → `422`. E abrir duas vezes a mesma conta (mesmo CPF, `CORRENTE`) → `201` e depois `409`.
+20. **Concorrência com os locks do PostgreSQL.** Conta com `100.00`, 20 transferências **simultâneas** de `10.00` (cada uma com a sua chave), todas liberadas ao mesmo tempo por um `CountDownLatch`: exatamente **10** respostas `201`, **10** respostas `422`, e o saldo final é `0`.
+
+**Arquitetura e cobertura** (`ArquiteturaTest`, `pom.xml`)
+
+21. **As regras de arquitetura do projeto, com ArchUnit**, analisando só o código de produção (`@AnalyzeClasses(packages = "dev.trilhajava.fintech", importOptions = ImportOption.DoNotIncludeTests.class)`):
+    - **camadas**: `api` não é acessada por nenhuma camada; `aplicacao` só por `api` e `infra`; `infra` por nenhuma; `dominio` por `api`, `aplicacao` e `infra`;
+    - **domínio sem Spring**: nenhuma classe de `dominio` depende de `org.springframework..` (anotações do Jakarta Persistence são permitidas);
+    - **sem injeção em campo** (`GeneralCodingRules.NO_CLASSES_SHOULD_USE_FIELD_INJECTION`);
+    - **controllers só em `api`**: toda classe com `@RestController` fica em `dev.trilhajava.fintech.api..`;
+    - **`@Transactional` fora da `api`**: nenhum método de classe de `api` tem `@Transactional`.
+
+    Uma regra só vale se você já a viu falhar: quebre cada uma de propósito uma vez (um `@Autowired` num campo, um `import org.springframework...` em `Conta`) e confira que o teste fica vermelho, depois desfaça.
+22. **Relatório de cobertura no `mvn verify`.** O `jacoco-maven-plugin` com dois `execution`: `prepare-agent` (instrumenta os testes) e `report` na fase `verify`. Depois do `mvn verify`, o relatório está em `target/site/jacoco/index.html`. Não há percentual mínimo obrigatório: use o relatório para achar o código que **nenhum** teste executa.
+
+**Para a suíte toda**
+
+23. **Tempo controlado, sem espera.** Nenhum teste chama `Instant.now()`, `LocalDateTime.now()` ou `Thread.sleep`: os instantes são fixos (`AGORA`) e o serviço recebe um `Clock.fixed`. A concorrência da regra 20 se sincroniza com `CountDownLatch`, não com pausas.
+24. **Cada teste diz o que verifica.** Um `@DisplayName` em português por teste, descrevendo o comportamento (`"saque maior que o saldo: SaldoInsuficienteException, e nada muda"`), não o método (`"testSacar"`).
+
+## Passo a passo sugerido
+
+Suba a pirâmide de baixo para cima. Depois de cada passo, rode só a classe nova (veja **Experimente**) e, antes de seguir, quebre de propósito a regra de produção que ela protege para ver o teste ficar vermelho.
+
+1. **O domínio (regras 1 a 7).** Não precisa de nenhuma dependência nova. `ContaTest` roda em milissegundos. Para conferir que ele protege algo, troque `saldo.compareTo(quantia) < 0` por `<= 0` em `Conta` e veja a regra 3 falhar.
+2. **O caso de uso (regras 8 a 10).** `@ExtendWith(MockitoExtension.class)`, os três `@Mock` e o serviço criado num `@BeforeEach`. Experimente inverter a ordem dos locks no serviço: a regra 9 fica vermelha com uma mensagem do `InOrder` dizendo qual chamada veio fora de ordem.
+3. **A fatia web (regras 11 a 13).** Acrescente `spring-boot-starter-webmvc-test`. Repare no log que só a camada web sobe (nada de banco) e que o `TratadorDeErros` entra sozinho na fatia.
+4. **O banco de teste e a fatia JPA (regras 14 a 17).** Acrescente `spring-boot-starter-data-jpa-test`, escreva o `BancoDeTeste` e rode o `RepositorioDeContasJpaTest` com o Docker ligado. Na primeira vez, o download da imagem `postgres:18` demora; nas seguintes, o container sobe em poucos segundos.
+5. **A aplicação inteira (regras 18 a 20).** Um teste por regra. Se algum SQL seu só funcionava no H2 do marco 2, é aqui que ele aparece.
+6. **A arquitetura (regra 21).** Escreva uma regra de cada vez, e quebre cada uma de propósito.
+7. **O JaCoCo (regra 22).** Rode `mvn verify`, abra o relatório e procure as linhas vermelhas em `dominio` e `aplicacao`.
+8. **Revise a suíte (regras 23 e 24).** Procure `now()` e `sleep` nos testes; leia só os `@DisplayName` em sequência, como uma especificação.
+
+## Experimente
+
+Na pasta do seu projeto (`java/projeto-integrador/starter`):
+
+```bash
+mvn test "-Dtest=ContaTest"                  # uma classe
+mvn test "-Dtest=ContaTest,TransferenciaTest,ServicoDeTransferenciasTest"   # a base da pirâmide
+mvn verify                                   # a suíte inteira + target/site/jacoco/index.html
+```
+
+<Callout tipo="atencao" titulo="Enquanto o projeto ainda tiver os testes de aceitação dos marcos">
+Se o seu projeto ainda roda os testes de aceitação dos marcos (as classes `Marco1…` a `Marco6…`), deixe-os de fora para rodar só a sua suíte: `mvn verify "-Dtest=!Marco*"`. E não chame a sua configuração de banco de `PostgresDeTeste`: esse nome já existe entre eles, e duas classes com o mesmo nome no mesmo pacote não compilam.
+</Callout>
+
+No IntelliJ, o ▶ verde ao lado de uma classe ou de um método de teste roda só ele; com **Run with Coverage**, a cobertura aparece colorida no próprio editor.
+
+O que você deve ver (na suíte de referência, numa máquina comum com Docker):
+
+| Cenário | Resultado |
+|---|---|
+| `ContaTest` + `TransferenciaTest` + `ServicoDeTransferenciasTest` | 13 execuções (os 4 valores da regra 4 contam como 4), todas verdes, em menos de 1 segundo cada classe; nenhum log do Spring |
+| `TransferenciaControllerTest` | 3 testes verdes; sobe um contexto do Spring só com a camada web: segundos, sem banco nem Docker |
+| `RepositorioDeContasJpaTest` | 3 testes verdes; na primeira vez, espera o download da imagem `postgres:18`; depois, cerca de 10 segundos (container + Flyway + Hibernate) |
+| `RepositorioDeContasJpaTest` **sem Docker** | 3 testes **pulados** (skipped), não falhos, por causa do `@EnabledIfDockerAvailable` |
+| `AplicacaoNoPostgresTest` | 4 testes verdes: PostgreSQL 18, fluxo completo, duplicata `409`, 10 × `201` e 10 × `422` na concorrência |
+| `ArquiteturaTest` com um `@Autowired` num campo de propósito | vermelho, apontando a classe e o campo; sem ele, verde |
+| `mvn verify` | `BUILD SUCCESS` e `target/site/jacoco/index.html` gerado |
+| relatório do JaCoCo, pacotes `dominio` e `aplicacao` | quase tudo verde; ficam vermelhos os caminhos que nenhuma regra provoca, como o `buscar` de `ServicoDeTransferencias` (nenhuma regra faz `GET /transferencias/{id}`) e, no `TratadorDeErros`, os erros que nenhuma regra provoca (`conta-nao-encontrada`, `transferencia-invalida`) |
+
+Os tempos variam com a máquina; o que importa é a **proporção**: a base da pirâmide em milissegundos; as fatias e os testes com banco, em segundos, porque sobem o Spring (e um container). Por isso a base é larga e o topo, estreito.
+
+## Critérios de aceite
+
+- [ ] Cada uma das regras 1 a 21 tem pelo menos um teste que a verifica, e o `mvn verify` termina com `BUILD SUCCESS` com o Docker ligado.
+- [ ] Sem Docker, os testes que precisam do PostgreSQL aparecem como **pulados**, e os demais continuam verdes.
+- [ ] Os testes de domínio e do caso de uso rodam sem subir o Spring.
+- [ ] Ao introduzir de propósito cada um destes defeitos, pelo menos um teste fica vermelho: `<= 0` no lugar de `< 0` na verificação de saldo; a ordem dos locks invertida; o `Idempotent-Replayed` removido do controller; a constraint `UNIQUE (cpf, tipo)` removida da migração; um `@Autowired` num campo.
+- [ ] `target/site/jacoco/index.html` é gerado no `mvn verify`, e você sabe apontar nele uma parte do código que a sua suíte não cobre e dizer se isso é um risco.
+
+## Desafios opcionais
+
+- **Mutação com o PIT** no pacote `dominio` (`mvn test-compile org.pitest:pitest-maven:mutationCoverage`): mate os mutantes sobreviventes de `Conta`.
+- **Uma meta mínima no JaCoCo** só para o domínio: o goal `check` com uma `rule` para o pacote `dev.trilhajava.fintech.dominio` e `LINE` `COVEREDRATIO` mínimo de `0.90`. Discuta com você mesmo por que não aplicar a mesma meta ao projeto inteiro.
+- **Testes lentos separados**: marque os testes com Testcontainers com `@Tag("integracao")` e configure o `maven-failsafe-plugin` para rodá-los no `verify`, deixando o `mvn test` só com os rápidos.
+- **Teste de contrato do OpenAPI**: o `/v3/api-docs` gerado bate com um arquivo versionado em `src/test/resources`?
+- **Mais uma regra de arquitetura**: sem ciclos entre os pacotes (`slices().matching("..fintech.(*)..").should().beFreeOfCycles()`).
+
+<Dicas>
+<Dica nivel={1}>
+Cada camada com a ferramenta certa: regras de negócio sem Spring (`new Conta(...)` e pronto); decisões do caso de uso com mocks só das **interfaces** que o serviço recebe no construtor; contrato HTTP com a fatia web; SQL e constraints no PostgreSQL de verdade. Se um teste de domínio precisa do Spring, ele está na camada errada. Comece pelo `ContaTest`, que não precisa de nada novo no `pom.xml`.
+</Dica>
+<Dica nivel={2}>
+- Fatia web: `@WebMvcTest(TransferenciaController.class)` + `@Autowired MockMvcTester mvc` + `@MockitoBean ServicoDeTransferencias servico`. Para o mock devolver valores diferentes em chamadas seguidas: `given(...).willReturn(primeiro, segundo)`.
+- Fatia JPA: `@DataJpaTest`, `@AutoConfigureTestDatabase(replace = Replace.NONE)` e `@Import({RepositorioDeContasJpa.class, BancoDeTeste.class})`. O `@DataJpaTest` não cria os seus adaptadores (só os repositórios Spring Data): por isso o `@Import` do `RepositorioDeContasJpa`.
+- Com `BancoDeTeste` importado do **mesmo jeito** em todos os testes, o cache de contexto do Spring reaproveita o mesmo contexto, e o mesmo container, entre as classes.
+</Dica>
+<Dica nivel={3}>
+Ordem dos locks com Mockito:
+
+```java
+given(transferencias.buscarPorChave("chave-2")).willReturn(Optional.empty());
+given(contas.buscarParaAtualizar(MENOR)).willReturn(Optional.of(conta(MENOR, "0.00")));
+given(contas.buscarParaAtualizar(MAIOR)).willReturn(Optional.of(conta(MAIOR, "100.00")));
+
+servico.transferir("chave-2", MAIOR, MENOR, new BigDecimal("40.00"));   // origem é a MAIOR
+
+InOrder ordem = inOrder(contas);
+ordem.verify(contas).buscarParaAtualizar(MENOR);
+ordem.verify(contas).buscarParaAtualizar(MAIOR);
+```
+
+Na concorrência (regra 20): um `Executors.newFixedThreadPool(20)`, cada tarefa faz `largada.await()` antes de transferir, e o `largada.countDown()` libera todas juntas. Guarde os `Future` e some os status no fim.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A suíte de referência
+
+A solução completa está em `java/projeto-integrador/solucao-marco-3`: o código do marco 2, a suíte em `src/test/java` e o JaCoCo no `pom.xml`. Na referência, a configuração do banco se chama `PostgresDeTeste`, e o teste da aplicação inteira e o de arquitetura são os testes de aceitação do marco 3 (`Marco3PostgresTest` e `Marco3ArquiteturaTest`), que rodam no build da solução.
+
+<Tabs>
+<Tab rotulo="Domínio">
+<CodigoJava caminho="projeto-integrador/solucao-marco-3/src/test/java/dev/trilhajava/fintech/dominio/ContaTest.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-3/src/test/java/dev/trilhajava/fintech/dominio/TransferenciaTest.java" />
+</Tab>
+<Tab rotulo="Caso de uso">
+<CodigoJava caminho="projeto-integrador/solucao-marco-3/src/test/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferenciasTest.java" />
+</Tab>
+<Tab rotulo="Fatia web">
+<CodigoJava caminho="projeto-integrador/solucao-marco-3/src/test/java/dev/trilhajava/fintech/api/TransferenciaControllerTest.java" />
+</Tab>
+<Tab rotulo="Fatia JPA">
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/PostgresDeTeste.java" titulo="PostgresDeTeste.java (o BancoDeTeste da regra 14)" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-3/src/test/java/dev/trilhajava/fintech/infra/RepositorioDeContasJpaTest.java" />
+</Tab>
+<Tab rotulo="Aplicação no PostgreSQL">
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/Marco3PostgresTest.java" titulo="Marco3PostgresTest.java (regras 18 a 20)" />
+</Tab>
+<Tab rotulo="Arquitetura e JaCoCo">
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/Marco3ArquiteturaTest.java" titulo="Marco3ArquiteturaTest.java (regra 21)" />
+
+```xml
+<!-- pom.xml: relatório de cobertura em target/site/jacoco/index.html (mvn verify) -->
+<plugin>
+  <groupId>org.jacoco</groupId>
+  <artifactId>jacoco-maven-plugin</artifactId>
+  <version>0.8.15</version>
+  <executions>
+    <execution>
+      <goals>
+        <goal>prepare-agent</goal>
+      </goals>
+    </execution>
+    <execution>
+      <id>relatorio</id>
+      <phase>verify</phase>
+      <goals>
+        <goal>report</goal>
+      </goals>
+    </execution>
+  </executions>
+</plugin>
+```
+</Tab>
+</Tabs>
+
+O teste da aplicação inteira da referência usa dois apoios dos testes de aceitação: a meta-anotação `@TesteDeAceitacao` (um `@SpringBootTest` com porta aleatória e as propriedades comuns) e o `ApiDeTeste` (um cliente HTTP pequeno sobre o `HttpClient` do JDK, com `abrirConta`, `abrirContaComSaldo` e leitura do JSON). Na sua suíte, você escreve o equivalente, do tamanho que precisar.
+
+### O que a suíte encontrou
+
+Escrever o teste da fatia web revelou um defeito real, que os testes de ponta a ponta não pegavam: com o header `Idempotency-Key` validado por `@NotBlank`, o Spring passou a validar o método inteiro e a reportar os erros do corpo como `HandlerMethodValidationException`, e o `TratadorDeErros` devolvia esses `400` **sem** o formato Problem Details da API. O teste de ponta a ponta só olhava o status `400`; a regra 12 olha também o `$.type`. A correção (sobrescrever `handleHandlerMethodValidationException` no `TratadorDeErros`) está na solução dos marcos 2 e 3. Cada camada da pirâmide pega um tipo diferente de defeito.
+
+### Por que assim
+
+- **Cada camada com a ferramenta certa.** Regras em milissegundos (unidade), contrato HTTP sem banco (fatia web), SQL e constraints no banco de produção (fatia JPA com Testcontainers), e poucos testes da aplicação inteira para o que só aparece com tudo junto: locks do PostgreSQL, Flyway, a transação de verdade.
+- **Mocks só nas portas.** O caso de uso é testado com mocks das interfaces `RepositorioDeContas` e companhia; o adaptador JPA é testado contra o PostgreSQL. Ninguém mocka o `EntityManager` nem o `JpaRepository`: um mock deles só repetiria o que você acha que o Hibernate faz.
+- **Tempo fixo.** `Clock.fixed` e `Instant` constantes deixam os testes repetíveis: o mesmo resultado hoje, amanhã e no CI às 23h59 do último dia do mês.
+- **Um teste que documenta uma decisão.** A regra 9 não testa um resultado, testa uma **ordem**. Quem ler `ordemDosLocks` entende por que o serviço compara os UUIDs, e quem "simplificar" o serviço descobre na hora.
+- **Arquitetura no build.** As camadas que você vem seguindo desde o marco 1 viram regra verificada, e não combinado de time.
+- **Cobertura sem meta global.** O relatório aponta o que ninguém testou; uma meta de 80% no projeto inteiro costuma produzir testes sem asserção, só para bater o número.
+
+### Alternativas e trade-offs
+
+- **H2 em vez de Testcontainers**: mais rápido e sem Docker, mas não é o PostgreSQL. `SELECT ... FOR UPDATE`, tipos, constraints e mensagens de erro se comportam diferente, e o teste de concorrência (regra 20) perde o sentido. Vale para um teste de fatia muito simples, não para o que protege dinheiro.
+- **`@SpringBootTest` para tudo**: um só tipo de teste é mais simples de escrever, mas cada classe sobe o contexto inteiro, a suíte fica lenta, e quando falha você não sabe se foi a regra, o JSON ou o SQL.
+- **`MockMvc` clássico (`andExpect`) em vez de `MockMvcTester`**: funciona igual; o `MockMvcTester` usa asserções do AssertJ, as mesmas do resto da suíte.
+- **Container singleton estático em vez de `@ServiceConnection` num `@TestConfiguration`**: sobe um container por JVM mesmo com contextos diferentes, ao custo de gerenciar o ciclo de vida à mão (`@DynamicPropertySource`).
+
+### Avalie sua suíte
+
+- Quanto tempo leva `mvn test` só com os testes de unidade? E a suíte inteira? Qual camada é a mais cara, e ela se paga?
+- Na regra 10, o serviço grava a transferência **antes** de debitar a origem. Por que isso não deixa uma transferência órfã no banco quando falta saldo? E qual teste da sua suíte provaria isso (o de Mockito consegue)?
+- Troque o saldo inicial das contas da regra 9 para que a transferência falhe por saldo: o teste ainda prova a ordem dos locks? Por quê?
+- Se um colega introduzir um N+1 no extrato, algum teste percebe? (Pense nas estatísticas do Hibernate do exercício 09.02.)
+- Remova o `@AutoConfigureTestDatabase(replace = Replace.NONE)` do teste JPA: o que acontece, e o que isso diz sobre o que o teste está verificando?
+
+</Solucao>

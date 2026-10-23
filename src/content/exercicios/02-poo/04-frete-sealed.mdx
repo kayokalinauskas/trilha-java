@@ -1,0 +1,126 @@
+---
+titulo: Frete com sealed types e pattern matching
+codigo: "02.04"
+resumo: Modele as modalidades de entrega como uma hierarquia sealed de records e calcule frete e descrições com switch exaustivo, record patterns e guardas.
+modulo: 02-poo
+ordem: 4
+dificuldade: medio
+tempo: 2h
+conceitos: [sealed, record, pattern matching, switch, LocalDate]
+aulas: [02-poo/06-sealed-e-pattern-matching, 02-poo/05-records-e-imutabilidade]
+java:
+  modulo: m02-poo
+  teste: CalculadoraFreteTest
+---
+
+## Contexto
+
+Um e-commerce de médio porte oferece quatro modalidades de entrega. Cada uma tem **dados próprios** (retirada precisa da loja; agendada precisa da data) e as **regras de preço mudam toda campanha**. O código atual é uma classe `Entrega` com todos os campos opcionais (`loja`, `data`, `mesmoDia`…) e um `if` por `tipo`, e já houve incidente de entrega agendada sem data.
+
+A proposta é modelar cada modalidade como um **record** dentro de uma **hierarquia sealed** e centralizar as regras em uma `CalculadoraFrete`.
+
+## O modelo (declarado no starter)
+
+```java
+sealed interface Entrega permits Retirada, EntregaPadrao, EntregaExpressa, EntregaAgendada { }
+
+record Retirada(String loja) implements Entrega { }
+record EntregaPadrao(Cep cep, double pesoKg) implements Entrega { }
+record EntregaExpressa(Cep cep, double pesoKg, boolean mesmoDia) implements Entrega { }
+record EntregaAgendada(Cep cep, double pesoKg, LocalDate data) implements Entrega { }
+record Cep(String digitos) { String formatado(); }
+```
+
+Seu trabalho: as **validações** nos construtores compactos e a **`CalculadoraFrete`**.
+
+## Regras de preço
+
+| Modalidade | Regra |
+|---|---|
+| Retirada | Grátis |
+| Padrão | R$ 15,00 até 1 kg + **R$ 2,50 por kg adicional** (fração conta como kg inteiro). **Grátis** se o pedido for ≥ R$ 199,00 |
+| Expressa | (Preço da padrão, **sem** frete grátis) × 1,8. **+ R$ 20,00** se for no mesmo dia |
+| Agendada | R$ 25,00 + o mesmo adicional por kg. Data com **pelo menos 2 dias** de antecedência e **nunca num domingo** |
+
+Exemplos (hoje = segunda, 28/09/2026):
+
+| Entrega | Pedido | Frete |
+|---|---|---|
+| Padrão, 2,3 kg | R$ 100 | 15 + 2 × 2,50 = **20,00** |
+| Padrão, 5 kg | R$ 199 | **0,00** |
+| Expressa, 2,3 kg | R$ 500 | 20 × 1,8 = **36,00** |
+| Expressa mesmo dia, 2,3 kg | R$ 100 | 36 + 20 = **56,00** |
+| Agendada, 3,5 kg, quinta | R$ 50 | 25 + 3 × 2,50 = **32,50** |
+| Agendada, amanhã | — | `IllegalArgumentException` ("antecedência") |
+
+## Validações
+
+- CEP: aceita `01310-100` ou `01310100` (com espaços nas pontas); guarda só os 8 dígitos. Dois `Cep` com os mesmos dígitos são iguais.
+- Peso: maior que 0 e no máximo 30 kg.
+- Loja de retirada: obrigatória.
+- Data do agendamento: obrigatória. A antecedência é validada no cálculo (depende de "hoje").
+- Valor do pedido: não negativo.
+
+## Descrições para o cliente
+
+```text
+Retirada na loja Paulista
+Entrega padrão para 01310-100
+Entrega expressa no mesmo dia para 01310-100
+Entrega expressa para 01310-100
+Entrega agendada para 01/10/2026 em 01310-100
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `CalculadoraFreteTest` passam.
+- [ ] `calcular` e `descrever` usam `switch` **sem `default`**.
+- [ ] `descrever` usa **record patterns** (desestruturação).
+- [ ] A validação de peso **não está repetida** nos três records.
+
+## Desafios opcionais
+
+- Adicione `EntregaPorDrone` ao `permits` e observe o compilador apontar cada `switch` que precisa ser atualizado. Esse é o ponto do exercício.
+- Implemente `prazoEmDias(Entrega, LocalDate hoje)` usando dias úteis.
+
+<Dicas>
+<Dica nivel={1}>
+Onde colocar uma validação comum a três records? Interfaces podem ter métodos `static`. Um `Entrega.validarPeso(pesoKg)` chamado em cada construtor compacto elimina a repetição.
+</Dica>
+<Dica nivel={2}>
+O frete grátis da entrega padrão é um caso especial do **mesmo tipo**. Um `case EntregaPadrao p when valorPedido.compareTo(LIMITE) >= 0 -> ZERO;` antes do `case EntregaPadrao p -> ...` expressa isso direto no `switch`. Para o adicional por peso: `Math.ceil(Math.max(0, peso - 1))`.
+</Dica>
+<Dica nivel={3}>
+Casos com várias instruções usam bloco e `yield`: `case EntregaAgendada a -> { validarAgendamento(a.data(), hoje); yield BASE.add(...); }`. Para o domingo: `data.getDayOfWeek() == DayOfWeek.SUNDAY`. Para formatar a data: `DateTimeFormatter.ofPattern("dd/MM/yyyy")`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### O modelo
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/frete/Entrega.java" />
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/frete/EntregaAgendada.java" />
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/frete/Cep.java" />
+
+### A calculadora
+
+<CodigoJava caminho="m02-poo/solucao/src/main/java/dev/trilhajava/m02/frete/CalculadoraFrete.java" />
+
+### Por que assim
+
+- **Estados impossíveis ficam impossíveis.** Não existe "agendada sem data" nem "retirada com CEP": cada record tem exatamente os dados de que precisa. Compare com a classe única cheia de campos opcionais do sistema antigo.
+- **Regras concentradas.** Toda a política de frete cabe em uma tela. Quando o comercial mudar a campanha, é aqui que se mexe — e em nenhum outro lugar.
+- **O compilador como revisor.** Sem `default`, adicionar uma modalidade quebra a compilação exatamente nos lugares que precisam de uma decisão de negócio.
+- **`when` para o frete grátis.** A regra especial fica visível como um caso do `switch`, em vez de escondida num `if` dentro do bloco.
+- **No Java 22+,** os componentes não usados em `descrever` podem virar `_`: `case EntregaPadrao(Cep cep, _) -> ...`. A solução usa nomes para compilar também no Java 21.
+
+### Avalie sua solução
+
+- Seus switches têm `default`? Remova e confira se o compilador aceita.
+- Você repetiu a fórmula do adicional por kg nas três modalidades ou extraiu um método?
+- `new Cep("01310100").equals(new Cep("01310-100"))` é `true` na sua versão?
+
+</Solucao>

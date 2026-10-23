@@ -1,0 +1,12 @@
+# Fica ao lado do Dockerfile e tem precedência sobre o .dockerignore da raiz do contexto.
+# Só o jar entra no contexto do build; o resto só deixa o build lento (ou vaza segredo).
+.git
+.idea
+.vscode
+*.iml
+.env
+*.log
+src/
+target/classes/
+target/test-classes/
+target/surefire-reports/

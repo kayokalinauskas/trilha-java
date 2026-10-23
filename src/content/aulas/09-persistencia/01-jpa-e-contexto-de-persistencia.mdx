@@ -1,0 +1,175 @@
+---
+titulo: JPA, entidades e o contexto de persistência
+descricao: O que um ORM faz (e o que ele esconde), como mapear entidades, o ciclo de vida transient/managed/detached/removed, dirty checking, flush e o cache de primeiro nível — a base para entender todo comportamento "mágico" do Hibernate.
+modulo: 09-persistencia
+ordem: 1
+duracao: 55
+objetivos:
+  - Explicar o que JPA, Hibernate e Spring Data são e como se relacionam
+  - Mapear entidades com identificadores, colunas, enums e value objects
+  - Descrever o ciclo de vida de uma entidade e o papel do contexto de persistência
+  - Prever quando o SQL é executado (dirty checking e flush)
+tags: [JPA, Hibernate, ORM, entidades, persistence context]
+flashcards:
+  - frente: Qual a diferença entre JPA, Hibernate e Spring Data JPA?
+    verso: JPA (Jakarta Persistence) é a especificação; Hibernate é a implementação mais usada; Spring Data JPA é uma camada em cima que gera repositórios e consultas a partir de interfaces.
+  - frente: Quais os estados de uma entidade no JPA?
+    verso: Transient (new, não gerenciada), managed (no contexto de persistência — mudanças viram UPDATE), detached (já foi gerenciada, o contexto fechou) e removed (marcada para DELETE).
+  - frente: O que é dirty checking?
+    verso: No flush, o Hibernate compara as entidades gerenciadas com o estado carregado e gera UPDATE para o que mudou — sem você chamar save().
+  - frente: O que é o cache de primeiro nível?
+    verso: O próprio contexto de persistência. Dentro de uma transação, buscar a mesma entidade pelo id duas vezes devolve a mesma instância e não repete o SELECT.
+  - frente: Por que usar EnumType.STRING e não ORDINAL?
+    verso: ORDINAL grava a posição (0, 1, 2); reordenar ou inserir um valor no enum corrompe silenciosamente os dados existentes. STRING grava o nome.
+---
+
+No módulo 07 você escreveu SQL e JDBC na mão: cada consulta, cada `ResultSet` convertido em objeto, cada `UPDATE` montado campo a campo. Um **ORM** (*Object-Relational Mapper*) automatiza essa tradução entre objetos Java e tabelas. É produtivo — e perigoso para quem não sabe o que ele faz por baixo. Esta aula é sobre o "por baixo".
+
+## JPA, Hibernate e Spring Data
+
+| Camada | O que é | Você usa para |
+|---|---|---|
+| **Jakarta Persistence (JPA)** | a especificação (`jakarta.persistence.*`) | anotações (`@Entity`, `@Id`…), `EntityManager`, JPQL |
+| **Hibernate ORM** | a implementação (versão 7 no Boot 4) | o motor: gera SQL, gerencia cache, faz dirty checking |
+| **Spring Data JPA** | camada de produtividade | repositórios por interface, consultas derivadas do nome, paginação |
+
+Com o `spring-boot-starter-data-jpa`, o Boot configura o pool de conexões (HikariCP), o Hibernate e o `EntityManager`, e cria implementações para as suas interfaces de repositório.
+
+## Mapeando uma entidade
+
+```java
+@Entity
+@Table(name = "conta")
+public class Conta {
+
+    @Id
+    private UUID id;                                   // chave primária
+
+    @Column(nullable = false, length = 120)
+    private String titular;
+
+    @Convert(converter = CpfConverter.class)           // value object ↔ coluna texto
+    @Column(nullable = false, length = 11)
+    private Cpf cpf;
+
+    @Enumerated(EnumType.STRING)                       // grava "CORRENTE", não 0
+    @Column(nullable = false, length = 10)
+    private TipoConta tipo;
+
+    @Column(nullable = false, precision = 15, scale = 2)
+    private BigDecimal saldo;
+
+    private Instant criadaEm;                          // → criada_em (a estratégia do Spring converte o nome)
+
+    @Version
+    private long versao;                               // lock otimista (aula 6)
+
+    protected Conta() { }                              // o JPA exige um construtor sem argumentos
+
+    public Conta(UUID id, String titular, Cpf cpf, TipoConta tipo, Instant criadaEm) { ... }
+}
+```
+
+Algumas decisões que importam:
+
+- **Identificadores**: `IDENTITY` (a coluna gera o número; simples) ou `SEQUENCE` (permite *batch insert*; preferido no PostgreSQL para alto volume), ou **UUID** gerado pela aplicação (não revela volume nem permite adivinhar `id + 1`; ótimo em APIs públicas e sistemas distribuídos — o UUID v7, ordenado pelo tempo, reduz a fragmentação do índice).
+- **`EnumType.STRING` sempre**: `ORDINAL` grava a posição, e alguém que reordena o enum corrompe os dados.
+- **Construtor `protected` sem argumentos** para o Hibernate, e um construtor público com o que é obrigatório para você: a entidade nasce válida.
+- **Sem setters públicos** para tudo: métodos de negócio (`depositar`, `sacar`) mantêm as regras dentro da entidade.
+- **Records não podem ser entidades** (precisam de estado mutável e proxy), mas funcionam como **embeddables** e como **projeções** de consulta.
+
+<Callout tipo="dica" titulo="ddl-auto: validate, e quem cria o schema é o Flyway">
+Em projetos reais, `spring.jpa.hibernate.ddl-auto` fica em `validate` (ou `none`): o schema é criado e evoluído por migrações versionadas (aula 6), e o Hibernate apenas **confere** se as entidades batem com as tabelas, falhando na subida se não baterem. `create-drop` e `update` servem para protótipos, nunca para produção.
+</Callout>
+
+## O contexto de persistência
+
+O conceito mais importante do JPA é o **contexto de persistência** (*persistence context*): um mapa das entidades que o `EntityManager` está **gerenciando** naquela unidade de trabalho — no Spring, em geral, **uma transação**.
+
+<Figura legenda="O ciclo de vida de uma entidade">
+<svg viewBox="0 0 680 210" width="680" role="img" aria-label="Transient vira managed com persist ou quando é carregada; managed vira detached quando o contexto fecha e volta com merge; managed vira removed com remove">
+  <defs><marker id="cv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="80" width="130" height="50" rx="10" class="d-box"/><text x="75" y="102" text-anchor="middle" class="d-mono">transient</text><text x="75" y="120" text-anchor="middle" class="d-label">new Conta(...)</text>
+  <rect x="270" y="80" width="140" height="50" rx="10" class="d-accent"/><text x="340" y="102" text-anchor="middle" class="d-mono">managed</text><text x="340" y="120" text-anchor="middle" class="d-label">mudanças → UPDATE</text>
+  <rect x="540" y="20" width="130" height="50" rx="10" class="d-info"/><text x="605" y="42" text-anchor="middle" class="d-mono">detached</text><text x="605" y="60" text-anchor="middle" class="d-label">contexto fechou</text>
+  <rect x="540" y="140" width="130" height="50" rx="10" class="d-box"/><text x="605" y="162" text-anchor="middle" class="d-mono">removed</text><text x="605" y="180" text-anchor="middle" class="d-label">DELETE no flush</text>
+  <path d="M140 105 H266" class="d-line" marker-end="url(#cv)"/><text x="203" y="96" text-anchor="middle" class="d-label">persist / save</text>
+  <path d="M410 95 L536 50" class="d-line" marker-end="url(#cv)"/><text x="470" y="62" text-anchor="middle" class="d-label">fim da transação</text>
+  <path d="M540 60 L414 110" class="d-line" marker-end="url(#cv)"/><text x="500" y="100" text-anchor="middle" class="d-label">merge</text>
+  <path d="M410 115 L536 160" class="d-line" marker-end="url(#cv)"/><text x="465" y="158" text-anchor="middle" class="d-label">remove</text>
+  <text x="340" y="160" text-anchor="middle" class="d-label">find / consultas também</text><text x="340" y="175" text-anchor="middle" class="d-label">devolvem entidades managed</text>
+</svg>
+</Figura>
+
+### Dirty checking: o UPDATE que você não escreveu
+
+```java
+@Transactional
+public Conta depositar(UUID id, BigDecimal valor) {
+    Conta conta = contas.findById(id).orElseThrow();   // SELECT — a conta fica "managed"
+    conta.depositar(valor);                            // só muda o objeto em memória
+    return conta;                                      // nenhum save()!
+}                                                      // commit → flush → UPDATE conta SET saldo = ...
+```
+
+No **flush** (antes do commit, ou antes de uma consulta que dependa das mudanças), o Hibernate compara cada entidade gerenciada com o estado que carregou e gera `UPDATE` para o que mudou. Chamar `save()` numa entidade já gerenciada não é errado, mas é redundante.
+
+### Cache de primeiro nível
+
+Dentro da mesma transação, `findById(42)` duas vezes devolve **a mesma instância**, e o segundo `SELECT` não acontece. É também por isso que o Hibernate garante uma única representação de cada linha por contexto.
+
+<Callout tipo="atencao" titulo="Consultas não passam pelo cache de primeiro nível">
+`findById` consulta o contexto primeiro; uma consulta JPQL (`findByChaveIdempotencia`) sempre vai ao banco. É isso que permite ao marco 2 do projeto integrador **conferir de novo** a chave de idempotência depois de obter o lock: a segunda consulta enxerga o que outra transação acabou de gravar.
+</Callout>
+
+### Detached e o `LazyInitializationException`
+
+Quando a transação termina, o contexto fecha e as entidades ficam **detached**: mudanças nelas não são mais salvas, e acessar uma associação LAZY ainda não carregada lança `LazyInitializationException`. A solução **não** é ligar `open-in-view` nem mudar tudo para EAGER — é carregar o que você precisa dentro da transação, com a consulta certa (aula 4).
+
+<Callout tipo="erro" titulo="spring.jpa.open-in-view=true (o padrão!)">
+Com *open-in-view*, o Spring mantém o contexto aberto durante toda a requisição HTTP, inclusive na serialização do JSON. Parece conveniente, mas esconde consultas N+1 disparadas pela camada web, segura conexões do pool por mais tempo e faz o comportamento depender de onde o código roda. O Boot inclusive loga um aviso. Desligue: `spring.jpa.open-in-view=false`.
+</Callout>
+
+## `equals` e `hashCode` em entidades
+
+Entidades gerenciadas pelo Hibernate podem ser *proxies* e ganham id só depois do `persist` (com `IDENTITY`). Regras práticas:
+
+- se o id é **gerado pela aplicação** (UUID no construtor), `equals`/`hashCode` pelo id funcionam bem;
+- se o id é **gerado pelo banco**, use uma chave natural imutável (CPF, código) ou `hashCode` constante por classe com `equals` pelo id não nulo;
+- **nunca** inclua associações em `equals`/`hashCode`/`toString` (e cuidado com o `@Data` do Lombok): isso dispara carregamentos e laços infinitos.
+
+<Callout tipo="entrevista">
+"O que é o contexto de persistência?" separa quem usa JPA de quem entende JPA. Responda com os **estados** (transient, managed, detached, removed), o **dirty checking** (UPDATE sem `save`), o **flush** e o **cache de primeiro nível**, e conecte com problemas reais: `LazyInitializationException`, `open-in-view` e por que `ddl-auto=update` não vai para produção.
+</Callout>
+
+<Quiz
+  id="09-jpa"
+  questoes={[
+    {
+      pergunta: 'Dentro de um método @Transactional, você busca uma conta com findById, altera o saldo e não chama save(). O que acontece no commit?',
+      opcoes: ['Nada, a alteração se perde', 'O Hibernate gera o UPDATE pelo dirty checking', 'Lança exceção por falta de save', 'Só atualiza se a entidade tiver @Version'],
+      correta: 1,
+      explicacao: 'A entidade está managed; no flush, as mudanças viram UPDATE.',
+    },
+    {
+      pergunta: 'O enum Status tinha ATIVO, INATIVO e alguém inseriu PENDENTE no início. Os dados antigos gravados com EnumType.ORDINAL:',
+      opcoes: ['Continuam corretos', 'Passam a significar outros status', 'São migrados automaticamente', 'Geram erro de validação'],
+      correta: 1,
+      explicacao: 'ORDINAL grava a posição; 0 que era ATIVO vira PENDENTE. Use EnumType.STRING.',
+    },
+    {
+      pergunta: 'Qual configuração de ddl-auto é adequada em produção, com Flyway?',
+      opcoes: ['create-drop', 'update', 'validate', 'create'],
+      correta: 2,
+      explicacao: 'O schema é das migrações; o Hibernate só confere o mapeamento.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **JPA** é a especificação, **Hibernate** a implementação, **Spring Data** a camada de repositórios.
+- Entidades: construtor protegido + construtor válido, `EnumType.STRING`, ids pensados (IDENTITY, SEQUENCE ou UUID), regras em métodos de negócio.
+- O **contexto de persistência** gerencia entidades: **dirty checking** gera UPDATE, o **flush** decide quando o SQL sai, e o **cache de primeiro nível** evita SELECTs repetidos.
+- **Detached** + LAZY = `LazyInitializationException`: carregue o necessário dentro da transação e desligue o `open-in-view`.
+- `ddl-auto=validate`: o schema pertence às migrações.

@@ -1,0 +1,148 @@
+---
+titulo: Análises com window functions e CTEs
+codigo: "07.03"
+resumo: Responda perguntas analíticas sem uma linha de Java — melhor cliente por cidade, faturamento acumulado, variação mês a mês e dias sem venda — com RANK, SUM OVER, LAG e CTE recursiva.
+modulo: 07-sql
+ordem: 3
+dificuldade: dificil
+tempo: 2–3h
+conceitos: [window functions, RANK, SUM OVER, LAG, CTE, CTE recursiva]
+aulas: [07-sql/04-agregacoes-e-janelas]
+java:
+  modulo: m07-sql
+  teste: AnalisesAvancadasTest
+---
+
+## Contexto
+
+Depois dos relatórios do exercício 07.02, a diretoria da loja de cafés quer um painel analítico. O primeiro rascunho do time carregava **todos** os pedidos para a memória do Java e calculava tudo com streams — funcionava com mil pedidos e derrubava a aplicação com um milhão. Sua missão: mover os cálculos para onde os dados estão.
+
+## A base e onde escrever
+
+A mesma base do 07.02 (`cliente`, `produto`, `pedido`, `item_pedido`). As consultas ficam em `java/m07-sql/starter/src/main/resources/sql/0703/`. Em todas, só entram pedidos com `status = 'PAGO'`, e o valor de um item é `quantidade × preco_unitario`.
+
+## Requisitos
+
+| Arquivo | Pergunta | Colunas | Ordem |
+|---|---|---|---|
+| `q1-melhor-cliente-por-cidade.sql` | Qual cliente mais gastou em **cada cidade**? (empates: mostre todos) | `cidade`, `nome`, `total` | cidade |
+| `q2-acumulado-diario.sql` | Faturamento de cada dia com venda e o **acumulado** até aquele dia | `data`, `faturamento_dia`, `acumulado` | data |
+| `q3-variacao-mensal.sql` | Faturamento por mês (`AAAA-MM`) e a **variação** em relação ao mês anterior | `mes`, `faturamento`, `variacao` | mês |
+| `q4-dias-sem-venda.sql` | Quais dias entre **01/03/2026 e 07/03/2026** não tiveram nenhuma venda paga? | `dia` | dia |
+
+## Resultados esperados
+
+**q1**
+
+| cidade | nome | total |
+|---|---|---|
+| Curitiba | Elis | 360 |
+| Recife | Carla | 310 |
+| São Paulo | Bruno | 360 |
+
+**q2**
+
+| data | faturamento_dia | acumulado |
+|---|---|---|
+| 2026-01-05 | 55 | 55 |
+| 2026-01-07 | 360 | 415 |
+| 2026-01-20 | 40 | 455 |
+| 2026-02-02 | 90 | 545 |
+| 2026-02-15 | 205 | 750 |
+| 2026-03-01 | 80 | 830 |
+| 2026-03-03 | 25 | 855 |
+| 2026-03-05 | 360 | 1215 |
+
+**q3**
+
+| mes | faturamento | variacao |
+|---|---|---|
+| 2026-01 | 455 | `NULL` |
+| 2026-02 | 295 | -160 |
+| 2026-03 | 465 | 170 |
+
+**q4:** 2026-03-02, 2026-03-04, 2026-03-06 e 2026-03-07. Repare que 03/03 **não** aparece: houve um pedido pendente e um pago nesse dia.
+
+## Regras
+
+- **Sem `LIMIT 1` por cidade** nem subconsulta correlacionada na q1: use uma window function.
+- Na q3, o primeiro mês não tem anterior, e a variação deve ser `NULL` (não `0`: "não sei" é diferente de "não mudou").
+- Na q4, gere o calendário com **CTE recursiva**. `generate_series` existe no PostgreSQL, mas não no banco dos testes; e a CTE recursiva é portátil e cai em entrevista.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `AnalisesAvancadasTest` passam.
+- [ ] Cada consulta usa CTEs com nomes que explicam as etapas.
+- [ ] Você sabe explicar por que a window function da q1 não pode ir direto no `WHERE`.
+
+## Desafios opcionais
+
+- q1 com `ROW_NUMBER` em vez de `RANK`: o que muda quando dois clientes empatam?
+- Média móvel de 3 dias do faturamento diário (`ROWS BETWEEN 2 PRECEDING AND CURRENT ROW`).
+- "Dias desde o pedido anterior" por cliente, com `LAG(data) OVER (PARTITION BY cliente_id ORDER BY data)`.
+- Reescreva a q4 com `generate_series` e rode num PostgreSQL de verdade.
+
+<Dicas>
+<Dica nivel={1}>
+Pense em etapas e dê um nome a cada uma com `WITH`. Na q1: (1) total por cliente, (2) posição de cada cliente **dentro da sua cidade**, (3) só os primeiros. Na q3: (1) faturamento por mês, (2) cada mês ao lado do anterior.
+</Dica>
+<Dica nivel={2}>
+- q1: `RANK() OVER (PARTITION BY cidade ORDER BY total DESC)`, filtrado **numa etapa seguinte** (a window function é calculada depois do `WHERE`).
+- q2: agrupe por data e aplique a janela sobre o resultado agrupado: `SUM(SUM(...)) OVER (ORDER BY p.data)`. Ou faça o agrupamento numa CTE e a janela na consulta de fora.
+- q3: `TO_CHAR(p.data, 'YYYY-MM')` gera o mês; `LAG(faturamento) OVER (ORDER BY mes)` traz o anterior.
+</Dica>
+<Dica nivel={3}>
+Calendário da q4:
+
+```sql
+WITH RECURSIVE deslocamento (n) AS (
+    SELECT 0
+    UNION ALL
+    SELECT n + 1 FROM deslocamento WHERE n < 6
+), calendario (dia) AS (
+    SELECT DATE '2026-03-01' + n FROM deslocamento
+)
+SELECT ... FROM calendario c WHERE NOT EXISTS (...)
+```
+
+Somar um inteiro a uma data avança dias, tanto no PostgreSQL quanto no H2.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="q1 ranking">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0703/q1-melhor-cliente-por-cidade.sql" />
+</Tab>
+<Tab rotulo="q2 acumulado">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0703/q2-acumulado-diario.sql" />
+</Tab>
+<Tab rotulo="q3 LAG">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0703/q3-variacao-mensal.sql" />
+</Tab>
+<Tab rotulo="q4 calendário">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0703/q4-dias-sem-venda.sql" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **q1: `RANK` e não `ROW_NUMBER`.** O enunciado pede todos os empatados. Com `ROW_NUMBER`, um deles sumiria de forma arbitrária, e o resultado mudaria de uma execução para outra.
+- **q1: por que não `MAX`?** `MAX(total)` por cidade diz **quanto** foi o maior total, mas não **quem**. Para trazer o nome, você teria de juntar de volta com a tabela, e aí os empates dão trabalho. A janela resolve de uma vez.
+- **q2: janela sobre agregação.** O `GROUP BY` roda primeiro; depois a window function percorre as linhas já agrupadas. Por isso `SUM(SUM(x)) OVER (...)` é válido: o `SUM` de dentro é do grupo, o de fora é da janela.
+- **q3: `NULL` honesto.** `COALESCE(LAG(...), 0)` faria janeiro parecer "estável", quando na verdade não há mês anterior para comparar.
+- **q4: gerar o que não existe.** Uma tabela de fatos só tem os dias **com** evento. Para achar ausências, é preciso um conjunto completo (o calendário) e um anti-join contra os fatos.
+
+### Performance: SQL × Java
+
+As quatro consultas devolvem poucas linhas, independentemente do tamanho da base. O rascunho em Java trafegava todos os pedidos pela rede e os segurava na memória. **Agregue no banco e traga o resultado**, e use o Java para regras de negócio que o SQL expressa mal.
+
+### Avalie sua solução
+
+- Se a Ana tivesse gastado 360, empatando com o Bruno em São Paulo, sua q1 mostraria os dois?
+- Sua q3 continuaria correta se um mês inteiro ficasse sem vendas? (Não continuaria: o `LAG` compararia com o último mês **com** venda. Como você resolveria? Dica: o calendário da q4.)
+
+</Solucao>

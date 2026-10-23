@@ -1,0 +1,315 @@
+---
+titulo: Um cliente de câmbio que sobrevive ao provedor
+codigo: "13.04"
+resumo: Construa o cliente de um provedor de cotações instável com as defesas em camadas — timeouts de conexão e leitura, retry com backoff só para falhas transitórias (retry nativo do Spring Framework 7), circuit breaker do Resilience4j que ignora erros do cliente, e fallback para o último valor recente. Você o põe à prova contra um provedor falso que responde 503, 404, devagar e trava no meio do corpo.
+modulo: 13-arquitetura
+ordem: 4
+dificuldade: dificil
+tempo: 3h
+conceitos: [resiliência, timeout, RetryTemplate, circuit breaker, Resilience4j, fallback, RestClient, Clock]
+aulas: [13-arquitetura/06-resiliencia]
+java:
+  modulo: m13-arquitetura
+  arquivos:
+    - src/main/java/dev/trilhajava/m13/cambio/ClienteDeCambio.java
+---
+
+## Contexto
+
+A mesa de câmbio de uma corretora consulta a cotação do dólar a cada operação. O provedor é barato e instável: responde 503 durante os deploys dele, às vezes demora 30 segundos, e uma vez ficou fora por uma tarde inteira. Na última queda, a corretora inteira parou, porque as threads ficaram presas esperando o provedor.
+
+O novo cliente tem uma meta clara: **o provedor pode falhar; a corretora, não**.
+
+## O que você vai praticar
+
+- **Timeouts em toda chamada.** Sem timeout, uma chamada lenta segura uma thread pelo tempo que o provedor quiser. O de **conexão** limita a abertura da conexão; o de **leitura**, a espera pela resposta, inclusive pelo corpo. Veja [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/#camada-1-timeout-em-toda-chamada).
+- **Retry com critério.** Repetir só o que é **transitório** (pode dar certo na próxima: 503, timeout, conexão recusada), com espera crescente entre as tentativas (*backoff* exponencial). O Spring Framework 7 tem retry nativo: `RetryTemplate` e `RetryPolicy`, no pacote `org.springframework.core.retry`. Veja [a camada 2](../../../aulas/13-arquitetura/06-resiliencia/#camada-2-retry-com-critério).
+- **Circuit breaker.** Um disjuntor que observa as últimas chamadas e, com falhas demais, **abre**: para de chamar o provedor por um tempo e falha na hora. Depois desse tempo, fica **meio-aberto** e deixa uma chamada de teste passar; se ela der certo, **fecha**. Aqui, com o `CircuitBreaker` do Resilience4j. Veja [a camada 3](../../../aulas/13-arquitetura/06-resiliencia/#camada-3-circuit-breaker).
+- **Fallback.** O que devolver quando tudo falhou: aqui, o último valor conhecido, se for recente, marcado como desatualizado. É uma decisão de negócio. Veja [a camada 4](../../../aulas/13-arquitetura/06-resiliencia/#camada-4-bulkhead-e-fallback).
+- **Traduzir as falhas do `RestClient`.** Cada falha chega como uma exceção diferente, e você decide quais são transitórias. Um detalhe que pega muita gente está na regra 4.
+- **O relógio injetado.** O circuito e a validade do último valor usam um `java.time.Clock`. Com um relógio que você avança à mão, "30 segundos depois" acontece num instante.
+
+## Requisitos
+
+### O contrato do provedor
+
+```http
+GET {urlBase}/cotacoes/USD
+200 {"moeda": "USD", "valor": "5.43"}
+404 moeda desconhecida
+5xx indisponível
+```
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m13.cambio` (não precisa mudar):
+
+- `Cotacao(String moeda, BigDecimal valor, Instant obtidaEm, boolean desatualizada)`, com `comoDesatualizada()` (visível no pacote), que devolve uma cópia com `desatualizada = true` e o mesmo `obtidaEm`.
+- `ConfiguracaoDoCliente(timeoutDeConexao, timeoutDeLeitura, maxRetries, atrasoInicial, janelaDoCircuito, percentualDeFalhas, tempoAberto, validadeDoUltimoValor)`. `padrao()` traz valores de produção: 1 s, 2 s, 2 repetições, 200 ms, janela de 10, 50%, 30 s aberto, 15 min de validade.
+- `MoedaDesconhecidaException(String moeda)` e `CambioIndisponivelException(String moeda, Throwable causa)`.
+- No `pom.xml`: Spring Web (o `RestClient`), o retry do Spring Framework 7 e `resilience4j-circuitbreaker`.
+
+### O que você implementa
+
+`ClienteDeCambio`, já criado e vazio. Ele não é um bean do Spring: quem usa o cria com `new`.
+
+```java
+public ClienteDeCambio(String urlBase, ConfiguracaoDoCliente config, Clock relogio)
+public Cotacao cotacao(String moeda)          // regras 1 a 9
+public boolean circuitoAberto()               // true quando o circuito está OPEN (regra 7)
+```
+
+| Situação | Comportamento |
+|---|---|
+| `200` | a cotação, com `obtidaEm` = agora (do `Clock`) e `desatualizada = false`; vira o último valor da moeda |
+| `5xx`, timeout (conexão ou leitura), conexão recusada ou cortada | falha **transitória**: repetir até `maxRetries` vezes, com espera `atrasoInicial` dobrando |
+| `404` | `MoedaDesconhecidaException` na hora, **sem repetir** e **sem contar** como falha no circuito |
+| falhou depois das repetições, ou circuito aberto | **fallback**: o último valor, se tiver no máximo `validadeDoUltimoValor`; senão, `CambioIndisponivelException` |
+
+## Regras
+
+Nos exemplos, a configuração é a do **Experimente**: conexão 500 ms, leitura 300 ms, 2 repetições, atraso inicial 20 ms, janela de 4 chamadas, 50%, 30 s aberto, 10 min de validade.
+
+**Uma chamada**
+
+1. **Sucesso.** `200` → `Cotacao(moeda, valor, relogio.instant(), false)`, guardada como o último valor daquela moeda. O valor é `BigDecimal`, lido do JSON (`"5.43"`). Exemplo: 1 chamada ao provedor, `5.43`.
+2. **Repetir o transitório.** `5xx` → nova tentativa, até `maxRetries` repetições **depois** da primeira, com espera de `atrasoInicial` antes da 1ª repetição e o dobro a cada nova (20 ms, 40 ms). Exemplos: `503, 503, 200` → `5.50` com 3 chamadas; `503` sempre, sem valor anterior → `CambioIndisponivelException` depois de 3 chamadas.
+3. **Não repetir erro de quem chama.** `404` → `MoedaDesconhecidaException` com 1 chamada só.
+4. **Timeout é transitório, em qualquer fase.** Uma resposta que demora mais que o timeout de leitura é cortada e repetida, seja a demora **antes dos cabeçalhos** (o provedor não responde) ou **no meio do corpo** (o provedor manda o começo do JSON e trava). Exemplos: 1,5 s até os cabeçalhos e depois `200` → `5.44`, 2 chamadas, cerca de 330 ms; corpo travado por 1,5 s e depois `200` → `5.45`, 2 chamadas, cerca de 330 ms. Atenção: com o `RestClient`, as duas demoras chegam como exceções **diferentes**. Antes da resposta, é uma `ResourceAccessException`. Durante a leitura do corpo, o erro acontece dentro da conversão do JSON e chega como uma `RestClientException` genérica, com a `IOException` lá no fundo da cadeia de causas (`RestClientException` → `HttpMessageNotReadableException` → `JacksonIOException` → `IOException`). Tratar só `ResourceAccessException` deixa o segundo caso escapar sem retry nem fallback.
+5. **JSON inválido não é transitório.** Uma resposta `200` com corpo que não é JSON válido não é repetida (repetir não conserta o provedor) e não cai no fallback: a exceção do `RestClient` chega a quem chamou, porque é uma quebra de contrato que alguém precisa ver, e não instabilidade.
+
+**Circuito e fallback**
+
+6. **O circuito conta chamadas do cliente.** O retry fica **dentro** do circuito: uma chamada a `cotacao` com as suas repetições conta **uma** vez na janela. A janela tem as últimas `janelaDoCircuito` chamadas e é também o mínimo para decidir: com menos chamadas que isso, o circuito não abre.
+7. **Abrir, meio-abrir e fechar.** Com `percentualDeFalhas`% ou mais de falhas na janela, o circuito abre. Aberto, **não chama o provedor** (0 chamadas). Depois de `tempoAberto` (medido pelo `Clock`), ele deixa **uma** chamada de teste passar: se der certo, fecha; se falhar, abre de novo. Exemplo: uma chamada boa e três com `503` (3 de 4 = 75%) → aberto na 4ª; a 5ª não chega ao provedor.
+8. **`404` não conta.** Seis `404` seguidos não abrem o circuito: uma moeda digitada errada é erro de quem chama, não do provedor.
+9. **Fallback recente.** Quando a chamada falha (depois das repetições) ou o circuito está aberto, o cliente devolve o último valor da moeda com `desatualizada = true` e o `obtidaEm` **original**, se ele tiver no máximo `validadeDoUltimoValor`; senão, `CambioIndisponivelException`, com a falha original como causa. Exemplos: valor obtido há 5 min → `5.43 (desatualizada)`; há 11 min → `CambioIndisponivelException`. `MoedaDesconhecidaException` nunca cai no fallback.
+
+## Passo a passo sugerido
+
+1. **Uma chamada, sem defesas (regras 1 e 3).** Um método privado `buscar(moeda)` com o `RestClient`, que faz **uma** chamada e traduz as respostas: `404` → `MoedaDesconhecidaException`; `5xx` → uma exceção sua de falha transitória.
+2. **Timeouts (regra 4).** Configure o `RestClient` com uma fábrica de requisições que tenha os dois timeouts. Traduza para a sua falha transitória **as duas** formas de timeout. Rode o programa: as duas linhas de timeout precisam mostrar 2 chamadas e menos de 1 segundo.
+3. **Retry (regra 2).** Envolva `buscar` num `RetryTemplate` que só repete a sua falha transitória.
+4. **Circuito (regras 6 a 8).** Envolva o retry num `CircuitBreaker` que ignora `MoedaDesconhecidaException` e usa o seu `Clock`.
+5. **Fallback (regra 9).** Guarde a última cotação de cada moeda e trate a falha transitória e o circuito aberto.
+
+## Experimente
+
+O programa sobe um provedor falso com o `HttpServer` que vem no JDK, programa as respostas cenário a cenário e imprime o resultado, quantas chamadas chegaram ao provedor, o estado do circuito e o tempo. Os primeiros cenários usam um cliente novo cada um; os últimos, um cliente só, até o circuito abrir e fechar. O relógio é manual: o programa o avança para envelhecer o último valor e para passar do tempo aberto.
+
+Salve-o em `src/test/java/dev/trilhajava/m13/cambio/ExperimenteCambio.java` (no mesmo pacote do cliente) e rode pelo ▶ do IntelliJ, ou no terminal, na pasta do starter:
+
+```bash
+mvn -q test-compile exec:java "-Dexec.mainClass=dev.trilhajava.m13.cambio.ExperimenteCambio" "-Dexec.classpathScope=test"
+```
+
+```java
+package dev.trilhajava.m13.cambio;
+
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class ExperimenteCambio {
+
+    /** Um relógio que só anda quando o programa manda: o circuito e a validade usam ele. */
+    static final class RelogioManual extends Clock {
+        private volatile Instant agora = Instant.parse("2026-10-06T12:00:00Z");
+
+        void avancar(Duration quanto) { agora = agora.plus(quanto); }
+        @Override public Instant instant() { return agora; }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zona) { return this; }
+    }
+
+    /** O que o provedor falso responde: status, valor, atraso antes dos cabeçalhos e atraso no meio do corpo. */
+    record Resposta(int status, String valor, long atrasoMs, long travaNoCorpoMs) {
+        static Resposta ok(String valor) { return new Resposta(200, valor, 0, 0); }
+        static Resposta erro(int status) { return new Resposta(status, null, 0, 0); }
+    }
+
+    static final ConcurrentLinkedDeque<Resposta> roteiro = new ConcurrentLinkedDeque<>();
+    static volatile Resposta padrao = Resposta.ok("5.43");
+    static final AtomicInteger chamadas = new AtomicInteger();
+
+    /** Timeouts curtos, 2 repetições, circuito com janela de 4 chamadas e 50% de falhas, 30 s aberto. */
+    static final ConfiguracaoDoCliente CONFIG = new ConfiguracaoDoCliente(Duration.ofMillis(500),
+            Duration.ofMillis(300), 2, Duration.ofMillis(20), 4, 50f, Duration.ofSeconds(30), Duration.ofMinutes(10));
+
+    public static void main(String[] args) throws Exception {
+        HttpServer provedor = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        provedor.setExecutor(Executors.newCachedThreadPool());
+        provedor.createContext("/cotacoes/", troca -> {
+            chamadas.incrementAndGet();
+            Resposta r = roteiro.isEmpty() ? padrao : roteiro.poll();
+            String json = r.status() == 200 ? "{\"moeda\": \"USD\", \"valor\": \"" + r.valor() + "\"}" : "{}";
+            byte[] corpo = json.getBytes(StandardCharsets.UTF_8);
+            try (OutputStream saida = troca.getResponseBody()) {
+                Thread.sleep(r.atrasoMs());
+                troca.getResponseHeaders().add("Content-Type", "application/json");
+                troca.sendResponseHeaders(r.status(), corpo.length);
+                if (r.travaNoCorpoMs() > 0) {   // manda um pedaço do corpo e trava
+                    saida.write(corpo, 0, 5);
+                    saida.flush();
+                    Thread.sleep(r.travaNoCorpoMs());
+                    saida.write(corpo, 5, corpo.length - 5);
+                } else {
+                    saida.write(corpo);
+                }
+            } catch (InterruptedException | IOException e) {
+                troca.close();   // o cliente desistiu antes do fim: normal nos cenários de timeout
+            }
+        });
+        provedor.start();
+        String url = "http://localhost:" + provedor.getAddress().getPort();
+
+        var relogio = new RelogioManual();
+        cenario("200", new ClienteDeCambio(url, CONFIG, relogio), "USD");
+        roteiro.addAll(List.of(Resposta.erro(503), Resposta.erro(503), Resposta.ok("5.50")));
+        cenario("503, 503, 200", new ClienteDeCambio(url, CONFIG, relogio), "USD");
+        padrao = Resposta.erro(404);
+        cenario("404", new ClienteDeCambio(url, CONFIG, relogio), "XYZ");
+        padrao = Resposta.ok("5.43");
+        roteiro.addAll(List.of(new Resposta(200, "9.99", 1_500, 0), Resposta.ok("5.44")));
+        cenario("lento (1,5 s até os cabeçalhos)", new ClienteDeCambio(url, CONFIG, relogio), "USD");
+        roteiro.addAll(List.of(new Resposta(200, "9.99", 0, 1_500), Resposta.ok("5.45")));
+        cenario("corpo travado por 1,5 s", new ClienteDeCambio(url, CONFIG, relogio), "USD");
+
+        System.out.println("-- um cliente só, até o circuito abrir e fechar");
+        var cliente = new ClienteDeCambio(url, CONFIG, relogio);
+        cenario("200", cliente, "USD");
+        padrao = Resposta.erro(503);
+        relogio.avancar(Duration.ofMinutes(5));
+        for (int i = 1; i <= 4; i++) {
+            cenario("503 sempre (" + i + "ª chamada)", cliente, "USD");
+        }
+        cenario("503 sempre, circuito aberto", cliente, "USD");
+        relogio.avancar(Duration.ofMinutes(6));
+        cenario("último valor com 11 min", cliente, "USD");
+        padrao = Resposta.ok("5.60");
+        relogio.avancar(Duration.ofSeconds(31));
+        cenario("provedor de volta, +31 s", cliente, "USD");
+
+        provedor.stop(0);
+    }
+
+    static void cenario(String nome, ClienteDeCambio cliente, String moeda) {
+        chamadas.set(0);
+        long inicio = System.nanoTime();
+        String resultado;
+        try {
+            Cotacao c = cliente.cotacao(moeda);
+            resultado = c.valor() + (c.desatualizada() ? " (desatualizada)" : "");
+        } catch (RuntimeException e) {
+            resultado = e.getClass().getSimpleName();
+        }
+        long ms = (System.nanoTime() - inicio) / 1_000_000;
+        System.out.printf("%-34s %-27s chamadas=%d circuito=%-7s %5d ms%n", nome, resultado, chamadas.get(),
+                cliente.circuitoAberto() ? "ABERTO" : "fechado", ms);
+    }
+}
+```
+
+A saída esperada:
+
+```text
+200                                5.43                        chamadas=1 circuito=fechado   303 ms
+503, 503, 200                      5.50                        chamadas=3 circuito=fechado    83 ms
+404                                MoedaDesconhecidaException  chamadas=1 circuito=fechado    17 ms
+lento (1,5 s até os cabeçalhos)    5.44                        chamadas=2 circuito=fechado   329 ms
+corpo travado por 1,5 s            5.45                        chamadas=2 circuito=fechado   356 ms
+-- um cliente só, até o circuito abrir e fechar
+200                                5.43                        chamadas=1 circuito=fechado    28 ms
+503 sempre (1ª chamada)            5.43 (desatualizada)        chamadas=3 circuito=fechado    77 ms
+503 sempre (2ª chamada)            5.43 (desatualizada)        chamadas=3 circuito=fechado    69 ms
+503 sempre (3ª chamada)            5.43 (desatualizada)        chamadas=3 circuito=ABERTO     73 ms
+503 sempre (4ª chamada)            5.43 (desatualizada)        chamadas=0 circuito=ABERTO      0 ms
+503 sempre, circuito aberto        5.43 (desatualizada)        chamadas=0 circuito=ABERTO      0 ms
+último valor com 11 min            CambioIndisponivelException chamadas=3 circuito=ABERTO     70 ms
+provedor de volta, +31 s           5.60                        chamadas=1 circuito=fechado     2 ms
+```
+
+Os tempos variam de máquina para máquina (a primeira linha inclui o aquecimento da JVM); o resto não deve variar. Linha a linha, o que conferir:
+
+- **`503, 503, 200`**: 3 chamadas e o valor da terceira (regra 2). Cerca de 60 ms são as esperas de 20 ms e 40 ms.
+- **`404`**: 1 chamada e `MoedaDesconhecidaException` (regra 3). Se aparecer `CambioIndisponivelException`, o seu cliente está repetindo o `404`.
+- **As duas linhas de timeout**: 2 chamadas e bem menos de 1,5 s (regra 4). Se a linha do corpo travado mostrar `RestClientException` (ou `HttpMessageNotReadableException`), o cliente está tratando só a `ResourceAccessException`. Se mostrar cerca de 1.500 ms, o timeout de leitura não está configurado.
+- **O circuito abre na 3ª chamada com `503`**: a janela é das 4 últimas chamadas do cliente, e a primeira (`200`) ainda está nela: 3 falhas em 4 = 75% (regras 6 e 7). A partir daí, 0 chamadas ao provedor, mas o fallback continua respondendo (regra 9).
+- **`último valor com 11 min`**: o relógio andou 6 minutos, bem mais que os 30 s de circuito aberto. Por isso a chamada de teste do meio-aberto passou (3 chamadas, com o retry), falhou, e o circuito abriu de novo. O último valor já tem 11 minutos, além da validade de 10: `CambioIndisponivelException`.
+- **`provedor de volta, +31 s`**: passou o tempo aberto, a chamada de teste deu certo, e o circuito fechou.
+
+Para a regra 8, acrescente ao programa um cliente novo que recebe seis `404` seguidos (`padrao = Resposta.erro(404)` e um laço): o circuito precisa continuar `fechado`.
+
+## Critérios de aceite
+
+- [ ] O programa do **Experimente** dá a mesma saída (menos os tempos).
+- [ ] Uma resposta mais lenta que o timeout de leitura, antes dos cabeçalhos ou no meio do corpo, não prende a chamada: ela é cortada e repetida.
+- [ ] Com o circuito aberto, o provedor não recebe nenhuma chamada.
+- [ ] Seis `404` seguidos não abrem o circuito.
+- [ ] Em todas as situações do contrato do provedor, quem usa o cliente só vê três desfechos: uma `Cotacao` (atual ou desatualizada), `MoedaDesconhecidaException` ou `CambioIndisponivelException`.
+
+## Desafios opcionais
+
+- Adicione `@ConcurrencyLimit` (Spring 7) ou um `Bulkhead` do Resilience4j e veja, com 20 threads chamando um provedor lento, o que acontece com as que passam do limite.
+- Exponha as métricas do circuito no Micrometer (`TaggedCircuitBreakerMetrics`).
+- Refaça com anotações (`@Retryable` do Spring 7 e `@CircuitBreaker` do `resilience4j-spring-boot4`) e descubra, com um teste, em que ordem os dois aspectos são aplicados.
+- Escreva a sua própria suíte com JUnit: o mesmo `HttpServer` num `@BeforeEach`, o relógio manual e um teste por linha da saída.
+
+<Dicas>
+<Dica nivel={1}>
+Monte as camadas de dentro para fora: primeiro uma função `buscar(moeda)` que faz **uma** chamada HTTP e traduz as respostas em exceções (404 → `MoedaDesconhecida`, 5xx e timeout → uma falha transitória sua). Depois envolva com o retry, depois com o circuito, e por último trate o fallback.
+</Dica>
+<Dica nivel={2}>
+- Timeouts: `HttpClient.newBuilder().connectTimeout(...)` no `JdkClientHttpRequestFactory`, e `setReadTimeout(...)` na fábrica. Depois, `RestClient.builder().baseUrl(urlBase).requestFactory(fabrica).build()`.
+- Retry: `new RetryTemplate(RetryPolicy.builder().includes(SuaFalhaTransitoria.class).maxRetries(n).delay(d).multiplier(2).build())` e `retry.invoke(() -> buscar(moeda))`.
+- Status: `.retrieve().onStatus(status -> status.value() == 404, (req, res) -> { throw ... })`, e outro `onStatus` para `HttpStatusCode::is5xxServerError`.
+</Dica>
+<Dica nivel={3}>
+- Timeouts e conexões cortadas: capture `RestClientException` e procure uma `IOException` na cadeia de causas (`for (Throwable c = e; c != null; c = c.getCause())`). Se achar, é transitório; se não (JSON inválido, por exemplo), relance. A `ResourceAccessException` já traz a `IOException` como causa direta.
+- `CircuitBreakerConfig.custom().slidingWindow(janela, janela, SlidingWindowType.COUNT_BASED).failureRateThreshold(p).waitDurationInOpenState(t).permittedNumberOfCallsInHalfOpenState(1).ignoreExceptions(MoedaDesconhecidaException.class).clock(relogio)`.
+- O retry fica **dentro** do circuito: `circuito.executeSupplier(() -> retry.invoke(() -> buscar(moeda)))`.
+- Circuito aberto lança `CallNotPermittedException`: trate como falha, e caia no fallback.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/cambio/ClienteDeCambio.java" />
+
+### Por que assim
+
+- **Cada camada com uma responsabilidade.** Timeout transforma "lento" em "falhou". Retry resolve o 503 de um deploy. O circuito para de insistir quando o provedor está fora de verdade. O fallback decide o que o negócio aceita.
+- **A exceção transitória é interna.** `FalhaTransitoria` existe para o retry e o circuito saberem o que fazer. Quem usa o cliente vê só uma cotação (atual ou desatualizada), `MoedaDesconhecida` ou `CambioIndisponivel`.
+- **"Transitório" é decidido pela causa, não pelo tipo da exceção.** O `RestClient` embrulha a mesma `IOException` em exceções diferentes conforme a fase em que ela aconteceu. Procurar a `IOException` na cadeia de causas cobre as duas fases e continua recusando o que não é de rede, como um JSON malformado.
+- **404 fora da conta.** Uma moeda digitada errada é erro de quem chama. Se contasse, dez erros de digitação abririam o circuito para toda a mesa de câmbio.
+- **Retry dentro do circuito.** A janela do circuito conta "chamadas do cliente", cada uma já com as suas repetições. Com o circuito aberto, nem a primeira tentativa acontece.
+- **O relógio é injetado.** Validade do último valor e tempo aberto do circuito ficam verificáveis sem `sleep`: o programa avança 31 segundos num instante.
+
+### Uma correção nesta solução
+
+A primeira versão desta solução capturava só `ResourceAccessException`. O cenário "corpo travado" mostrou o furo: quando o timeout de leitura vence **durante a leitura do corpo**, o `JdkClientHttpRequestFactory` corta o fluxo, o Jackson recebe uma `IOException` no meio do JSON, e o `RestClient` lança `RestClientException: Error while extracting response for type [...]`. Essa exceção escapava do retry, do fallback e do tratamento de falha transitória, e chegava crua a quem chamou. A suíte da solução (`ClienteDeCambioTest`, em `java/m13-arquitetura/solucao/src/test/java`, 12 testes) ganhou um teste para esse caso.
+
+### Sobre o fallback
+
+Devolver um valor desatualizado é uma **decisão de negócio**. Para mostrar uma estimativa na tela, 10 minutos de atraso é aceitável. Para **fechar** uma operação de câmbio, provavelmente não: o `desatualizada = true` existe para quem chama poder recusar. Em entrevista, dizer quem decide o fallback (o produto) vale mais do que o código.
+
+### Avalie sua solução
+
+- O cliente é usado por 200 threads ao mesmo tempo e o provedor fica lento (mas abaixo do timeout). O que ainda pode dar errado? (Pense em bulkhead.)
+- Qual o pior caso de tempo de uma chamada com os valores de `padrao()`? (Timeout de leitura × tentativas + esperas.) Ele é aceitável para uma tela?
+- E um `429 Too Many Requests` do provedor: deveria ser repetido? Com que espera? O que o header `Retry-After` muda?
+
+</Solucao>

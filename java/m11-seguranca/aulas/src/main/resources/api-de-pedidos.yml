@@ -1,0 +1,12 @@
+# Aula 11.07: configuração da API de pedidos (Resource Server).
+# Carregada com spring.config.name=api-de-pedidos, para não misturar com as outras aulas do módulo.
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # O Spring busca {issuer-uri}/.well-known/openid-configuration, acha o jwks_uri
+          # e passa a exigir iss igual a este valor em todo token.
+          issuer-uri: ${EMISSOR:http://localhost:9000}
+          # O token precisa ter sido emitido PARA esta API.
+          audiences: api-pedidos

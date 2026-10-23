@@ -1,0 +1,55 @@
+---
+import Icon from '../Icon.astro';
+
+interface Props {
+  tipo?: 'dica' | 'atencao' | 'entrevista' | 'novidade' | 'info' | 'erro';
+  titulo?: string;
+}
+
+const config = {
+  dica: { icon: 'bulb', titulo: 'Dica', cor: 'var(--ok)', fundo: 'var(--ok-soft)' },
+  atencao: { icon: 'alert', titulo: 'Atenção', cor: 'var(--warn)', fundo: 'var(--warn-soft)' },
+  erro: { icon: 'alert', titulo: 'Armadilha comum', cor: 'var(--danger)', fundo: 'var(--danger-soft)' },
+  entrevista: { icon: 'mic', titulo: 'Como isso cai na entrevista', cor: 'var(--violet)', fundo: 'var(--violet-soft)' },
+  novidade: { icon: 'sparkles', titulo: 'Java moderno', cor: 'var(--accent)', fundo: 'var(--accent-soft)' },
+  info: { icon: 'info', titulo: 'Para saber mais', cor: 'var(--info)', fundo: 'var(--info-soft)' },
+} as const;
+
+const { tipo = 'info', titulo } = Astro.props;
+const c = config[tipo];
+---
+
+<aside class="callout" style={`--c:${c.cor};--f:${c.fundo}`} aria-label={titulo ?? c.titulo}>
+  <p class="callout-title"><Icon name={c.icon} size={17} />{titulo ?? c.titulo}</p>
+  <div class="callout-body"><slot /></div>
+</aside>
+
+<style>
+  .callout {
+    margin-block: 1.6em;
+    padding: 14px 18px 16px;
+    border-radius: var(--radius);
+    background: var(--f);
+    border: 1px solid color-mix(in srgb, var(--c) 28%, transparent);
+    border-left: 3px solid var(--c);
+  }
+  .callout-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 6px;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--c);
+  }
+  .callout-body {
+    color: var(--text-2);
+    font-size: 0.97rem;
+  }
+  .callout-body > :global(* + *) {
+    margin-top: 0.7em;
+  }
+  .callout-body :global(.expressive-code) {
+    margin-block: 0.8em 0;
+  }
+</style>

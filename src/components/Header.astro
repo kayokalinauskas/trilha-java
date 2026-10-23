@@ -1,0 +1,255 @@
+---
+import Icon from './Icon.astro';
+import { url } from '../lib/url';
+
+const links = [
+  { href: url(''), label: 'Trilha', icon: 'map' as const, match: /^\/?$|\/modulos\/|\/aulas\// },
+  { href: url('exercicios'), label: 'Exercícios', icon: 'code' as const, match: /\/exercicios\// },
+  { href: url('projetos'), label: 'Projetos', icon: 'briefcase' as const, match: /\/projetos\// },
+  { href: url('entrevista'), label: 'Entrevista', icon: 'mic' as const, match: /\/entrevista\// },
+  { href: url('flashcards'), label: 'Flashcards', icon: 'cards' as const, match: /\/flashcards\// },
+  { href: url('painel'), label: 'Painel', icon: 'gauge' as const, match: /\/painel\// },
+];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const path = Astro.url.pathname.slice(base.length) || '/';
+---
+
+<header class="site-header">
+  <div class="bar">
+    <a class="brand" href={url('')} aria-label="Trilha Java Backend — início">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="30" height="30">
+          <rect width="32" height="32" rx="9" fill="var(--accent)"></rect>
+          <path d="M9 13h11v5a5 5 0 0 1-5 5h-1a5 5 0 0 1-5-5Z" fill="none" stroke="var(--accent-ink)" stroke-width="2.2" stroke-linejoin="round"></path>
+          <path d="M20 14.5h1.5a2.5 2.5 0 0 1 0 5H20" fill="none" stroke="var(--accent-ink)" stroke-width="2.2"></path>
+          <path d="M12.5 7.5c0 1.5 1.5 1.5 1.5 3M16.5 7.5c0 1.5 1.5 1.5 1.5 3" fill="none" stroke="var(--accent-ink)" stroke-width="1.8" stroke-linecap="round"></path>
+        </svg>
+      </span>
+      <span class="brand-text">Trilha<strong>Java</strong></span>
+    </a>
+
+    <nav class="nav" aria-label="Principal">
+      <ul>
+        {
+          links.map((l) => (
+            <li>
+              <a href={l.href} aria-current={l.match.test(path) ? 'page' : undefined}>
+                <Icon name={l.icon} size={16} />
+                {l.label}
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </nav>
+
+    <div class="actions">
+      <button class="search-trigger" type="button" data-abrir-busca aria-label="Buscar (Ctrl+K)">
+        <Icon name="search" size={16} />
+        <span class="search-label">Buscar aulas, exercícios…</span>
+        <kbd class="search-kbd">Ctrl K</kbd>
+      </button>
+      <button class="icon-btn" type="button" id="alternar-tema" aria-label="Alternar tema claro/escuro">
+        <Icon name="sun" class="i-sun" />
+        <Icon name="moon" class="i-moon" />
+      </button>
+      <button class="icon-btn menu-btn" type="button" id="abrir-menu" aria-label="Abrir menu" aria-expanded="false" aria-controls="menu-mobile">
+        <Icon name="menu" />
+      </button>
+    </div>
+  </div>
+
+  <div class="mobile-menu" id="menu-mobile" hidden>
+    <nav aria-label="Principal (mobile)">
+      <ul>
+        {
+          links.map((l) => (
+            <li>
+              <a href={l.href} aria-current={l.match.test(path) ? 'page' : undefined}>
+                <Icon name={l.icon} size={18} />
+                {l.label}
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<script>
+  const html = document.documentElement;
+  document.getElementById('alternar-tema')?.addEventListener('click', () => {
+    const novo = html.dataset.theme === 'dark' ? 'light' : 'dark';
+    html.dataset.theme = novo;
+    try {
+      localStorage.setItem('trilha-java:tema', novo);
+    } catch {}
+  });
+
+  const botao = document.getElementById('abrir-menu');
+  const menu = document.getElementById('menu-mobile');
+  botao?.addEventListener('click', () => {
+    const aberto = botao.getAttribute('aria-expanded') === 'true';
+    botao.setAttribute('aria-expanded', String(!aberto));
+    menu!.hidden = aberto;
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && menu && !menu.hidden) {
+      menu.hidden = true;
+      botao?.setAttribute('aria-expanded', 'false');
+      botao?.focus();
+    }
+  });
+</script>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(1.4) blur(14px);
+    -webkit-backdrop-filter: saturate(1.4) blur(14px);
+    border-bottom: 1px solid var(--border);
+    view-transition-name: site-header;
+  }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    height: var(--header-h);
+    max-width: var(--page-max);
+    margin-inline: auto;
+    padding-inline: var(--gutter);
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    text-decoration: none;
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    letter-spacing: -0.02em;
+    flex-shrink: 0;
+  }
+  .brand-text strong {
+    color: var(--accent);
+    font-weight: 800;
+  }
+  .logo svg {
+    transition: transform 0.3s var(--ease);
+  }
+  .brand:hover .logo svg {
+    transform: rotate(-8deg) scale(1.05);
+  }
+  .nav {
+    margin-left: 12px;
+  }
+  .nav ul,
+  .mobile-menu ul {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    gap: 2px;
+  }
+  .nav a {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    text-decoration: none;
+    font-size: 0.92rem;
+    font-weight: 550;
+    color: var(--text-2);
+    transition: background 0.15s, color 0.15s;
+  }
+  .nav a:hover {
+    color: var(--text);
+    background: var(--surface-2);
+  }
+  .nav a[aria-current='page'] {
+    color: var(--text);
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+  .nav a[aria-current='page'] :global(.icon) {
+    color: var(--accent);
+  }
+  .actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .search-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    height: 40px;
+    padding: 0 10px 0 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-3);
+    font-size: 0.88rem;
+    min-width: 250px;
+    transition: border-color 0.15s;
+  }
+  .search-trigger:hover {
+    border-color: var(--border-strong);
+    color: var(--text-2);
+  }
+  .search-kbd {
+    margin-left: auto;
+  }
+  :global([data-theme='dark'] .i-sun),
+  :global([data-theme='light'] .i-moon) {
+    display: none;
+  }
+  .menu-btn {
+    display: none;
+  }
+  .mobile-menu {
+    border-top: 1px solid var(--border);
+    padding: 8px var(--gutter) 16px;
+  }
+  .mobile-menu ul {
+    flex-direction: column;
+  }
+  .mobile-menu a {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px;
+    border-radius: 12px;
+    text-decoration: none;
+    font-weight: 550;
+  }
+  .mobile-menu a[aria-current='page'] {
+    background: var(--surface-2);
+    color: var(--accent);
+  }
+
+  @media (max-width: 1100px) {
+    .search-label,
+    .search-kbd {
+      display: none;
+    }
+    .search-trigger {
+      min-width: 0;
+      width: 40px;
+      padding: 0;
+      justify-content: center;
+    }
+  }
+  @media (max-width: 860px) {
+    .nav {
+      display: none;
+    }
+    .menu-btn {
+      display: inline-grid;
+    }
+  }
+</style>

@@ -1,0 +1,97 @@
+---
+titulo: "Grafos: rotas de entrega e ordem de build"
+codigo: "05.05"
+resumo: Calcule rotas com menos trechos (BFS), conte regiões desconectadas (DFS) e ordene módulos por dependência com o algoritmo de Kahn, detectando ciclos.
+modulo: 05-algoritmos
+ordem: 5
+dificuldade: dificil
+tempo: 2,5–3h
+conceitos: [grafos, BFS, DFS, ordenação topológica, PriorityQueue]
+aulas: [05-algoritmos/06-grafos-e-intervalos]
+java:
+  modulo: m05-algoritmos
+  teste: GrafosTest
+---
+
+## Contexto
+
+**Parte 1 — logística.** Uma transportadora tem centros de distribuição ligados por trechos rodoviários (de mão dupla). Cada trecho implica uma troca de caminhão, então o que importa é o **menor número de trechos**, não a distância. O time também quer saber quantas **regiões desconectadas** existem na malha (centros sem rota entre si).
+
+**Parte 2 — build.** A plataforma de CI precisa compilar os módulos de um monorepo **na ordem das dependências**, com uma ordem **determinística** (para builds reproduzíveis) e com erro claro se alguém criar uma **dependência circular**.
+
+## Requisitos
+
+### `RedeDeEntregas(List<List<String>> trechos)`
+
+| Método | Retorna |
+|---|---|
+| `menorNumeroDeTrechos(origem, destino)` | Número de trechos; `0` se origem == destino; `-1` se inalcançável ou centro desconhecido |
+| `caminhoMaisCurto(origem, destino)` | Lista de centros da origem ao destino; vazia se não houver |
+| `regioesDesconectadas()` | Número de componentes conexos |
+
+### `OrdemDeBuild.ordenar(Map<String, List<String>> dependencias)`
+
+- Mapa **módulo → dependências dele**. Devolve uma lista em que cada módulo vem depois de todas as suas dependências.
+- Entre os módulos **prontos ao mesmo tempo**, ordem **alfabética**.
+- Dependência citada mas não declarada como chave também entra na ordem.
+- Ciclo: `CicloDeDependenciaException` (pronta) com os módulos envolvidos.
+
+## Exemplos
+
+```text
+Trechos: SP–Campinas, Campinas–Ribeirão, SP–Santos, Ribeirão–Franca, BH–Contagem
+menorNumeroDeTrechos(Santos, Franca) → 4
+caminhoMaisCurto(Santos, Ribeirão)   → [Santos, SP, Campinas, Ribeirão]
+regioesDesconectadas()               → 2
+
+{app: [dominio, infra], infra: [dominio], dominio: [], cli: [app], docs: []}
+→ [docs, dominio, infra, app, cli]
+```
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `GrafosTest` passam.
+- [ ] BFS e DFS são **iterativas** (sem risco de `StackOverflowError` em malhas grandes).
+- [ ] Complexidade O(V + E) na BFS/DFS e O((V + E) log V) na ordenação.
+
+## Desafios opcionais
+
+- Trechos com distância em km e `menorDistancia(origem, destino)` com **Dijkstra**.
+- Em `OrdemDeBuild`, agrupe em "ondas" de módulos que podem compilar **em paralelo**.
+
+<Dicas>
+<Dica nivel={1}>
+Monte uma lista de adjacência `Map<String, List<String>>`, adicionando as duas direções de cada trecho. BFS usa uma fila; DFS usa uma pilha. Para o build, calcule quantas dependências faltam para cada módulo (grau de entrada).
+</Dica>
+<Dica nivel={2}>
+BFS: um `Map<String, String> veioDe` serve de "visitados" e de trilha para reconstruir o caminho. Marque ao **enfileirar**. Kahn: um mapa `liberaQuem` (dependência → dependentes) e uma `PriorityQueue` com os módulos de grau zero.
+</Dica>
+<Dica nivel={3}>
+Reconstrução: `for (no = destino; no != null; no = veioDe.get(no)) caminho.add(no);` e depois `Collections.reverse`. Ciclo: se `ordem.size() < total de módulos`, os que não entraram são os presos; use um `TreeSet` para a mensagem sair ordenada.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### Rede de entregas (BFS e DFS)
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/RedeDeEntregas.java" />
+
+### Ordem de build (Kahn)
+
+<CodigoJava caminho="m05-algoritmos/solucao/src/main/java/dev/trilhajava/m05/OrdemDeBuild.java" />
+
+### Pontos-chave
+
+- **`menorNumeroDeTrechos` reaproveita `caminhoMaisCurto`**: uma BFS só, duas perguntas.
+- **Marcar ao enfileirar** evita que um centro entre várias vezes na fila.
+- **`Set.add` devolve `false` se já existia**: em `regioesDesconectadas`, uma chamada verifica e marca.
+- **`PriorityQueue` dá determinismo** ao build: a mesma entrada sempre produz a mesma ordem.
+- **Ciclo detectado sem DFS extra**: quem nunca chega a grau zero está preso em um ciclo ou depende de um.
+
+### Avalie sua solução
+
+- `menorNumeroDeTrechos("SP", "Marte")` devolve `-1` sem exceção?
+- A mensagem do ciclo lista `a`, `b` e `c` — e não `d`?
+
+</Solucao>

@@ -1,0 +1,538 @@
+---
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import { getAulas, getExercicios, getModulos, pad2 } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const [modulos, aulas, exercicios] = await Promise.all([getModulos(), getAulas(), getExercicios()]);
+
+/** Módulos que compõem a prontidão para vagas Júnior (os demais completam o Pleno). */
+const TRILHA_JR = new Set([
+  '00-comece-aqui', '01-java-essencial', '02-poo', '03-colecoes-generics-excecoes', '04-java-moderno',
+  '05-algoritmos', '07-sql', '08-spring-boot', '09-persistencia', '10-testes', '14-devops',
+]);
+
+const dados = {
+  modulos: modulos.map((m) => ({
+    id: m.id,
+    rotulo: `${pad2(m.data.numero)} · ${m.data.titulo}`,
+    horas: m.data.horas,
+    disponivel: m.data.status === 'disponivel',
+    jr: TRILHA_JR.has(m.id),
+    url: url(`modulos/${m.id}`),
+    aulas: aulas.filter((a) => a.data.modulo.id === m.id).map((a) => a.id),
+    exercicios: exercicios.filter((e) => e.data.modulo.id === m.id).map((e) => e.id),
+  })),
+  aulas: aulas.map((a) => ({ id: a.id, titulo: a.data.titulo, url: url(`aulas/${a.id}`), cartoes: a.data.flashcards.length })),
+  exercicios: exercicios.map((e) => ({ id: e.id, titulo: `${e.data.codigo} · ${e.data.titulo}`, url: url(`exercicios/${e.id}`) })),
+  links: { flashcards: url('flashcards'), entrevista: url('entrevista') },
+};
+---
+
+<Base title="Painel" description="Seu progresso na trilha, prontidão para vagas Júnior e Pleno, sequência de estudos e backup.">
+  <section class="head">
+    <div class="container head-row">
+      <div>
+        <p class="eyebrow">Seu painel</p>
+        <h1>Onde você está na trilha</h1>
+        <p class="lead">Tudo aqui é calculado a partir do progresso salvo neste navegador.</p>
+      </div>
+      <div class="streak card">
+        <Icon name="flame" size={26} />
+        <div>
+          <strong data-streak>0</strong>
+          <span>dia(s) seguidos estudando</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="container grid">
+    <section class="card bloco prontidao" aria-labelledby="pront-t">
+      <h2 id="pront-t"><Icon name="gauge" size={18} /> Prontidão para vagas</h2>
+      <div class="gauges">
+        <div class="gauge" data-gauge="jr" style="--p:0">
+          <svg viewBox="0 0 120 120" aria-hidden="true">
+            <circle cx="60" cy="60" r="52" class="g-bg"></circle>
+            <circle cx="60" cy="60" r="52" class="g-fg lvl-jr"></circle>
+          </svg>
+          <div class="g-txt"><strong data-valor>0%</strong><span>Júnior</span></div>
+        </div>
+        <div class="gauge" data-gauge="pleno" style="--p:0">
+          <svg viewBox="0 0 120 120" aria-hidden="true">
+            <circle cx="60" cy="60" r="52" class="g-bg"></circle>
+            <circle cx="60" cy="60" r="52" class="g-fg lvl-pleno"></circle>
+          </svg>
+          <div class="g-txt"><strong data-valor>0%</strong><span>Pleno</span></div>
+        </div>
+      </div>
+      <p class="muted nota">
+        Ponderado pelas horas de cada módulo: aulas contam 1, exercícios contam 2, e exercícios feitos <em>sem</em> abrir a solução contam
+        um pouco mais. Módulos ainda não publicados contam como zero — a métrica é honesta de propósito.
+      </p>
+    </section>
+
+    <section class="card bloco proximo" aria-labelledby="prox-t">
+      <h2 id="prox-t"><Icon name="arrow-right" size={18} /> Próximos passos</h2>
+      <ul class="passos" data-passos></ul>
+    </section>
+
+    <section class="card bloco numeros" aria-labelledby="num-t">
+      <h2 id="num-t"><Icon name="layers" size={18} /> Em números</h2>
+      <dl class="nums">
+        <div><dt>Aulas concluídas</dt><dd data-n="aulas">0</dd></div>
+        <div><dt>Exercícios concluídos</dt><dd data-n="exercicios">0</dd></div>
+        <div><dt>… sem ver a solução</dt><dd data-n="autonomos">0</dd></div>
+        <div><dt>Acerto médio nos quizzes</dt><dd data-n="quiz">—</dd></div>
+        <div><dt>Flashcards para hoje</dt><dd data-n="cartoes">0</dd></div>
+        <div><dt>Perguntas de entrevista treinadas</dt><dd data-n="entrevista">0</dd></div>
+      </dl>
+    </section>
+
+    <section class="card bloco atividade" aria-labelledby="ativ-t">
+      <h2 id="ativ-t"><Icon name="clock" size={18} /> Atividade nas últimas 16 semanas</h2>
+      <div class="heat" data-heat role="img" aria-label="Mapa de calor de atividade diária"></div>
+      <p class="legenda muted">Menos <span class="h0"></span><span class="h1"></span><span class="h2"></span><span class="h3"></span><span class="h4"></span> Mais</p>
+    </section>
+
+    <section class="card bloco modulos" aria-labelledby="mod-t">
+      <h2 id="mod-t"><Icon name="map" size={18} /> Progresso por módulo</h2>
+      <ul class="mods" data-mods></ul>
+    </section>
+
+    <section class="card bloco backup" aria-labelledby="bk-t">
+      <h2 id="bk-t"><Icon name="download" size={18} /> Backup do progresso</h2>
+      <p class="muted">
+        Seu progresso fica só neste navegador. Exporte um arquivo para guardar ou levar para outro computador.
+      </p>
+      <div class="row">
+        <button type="button" class="btn btn-primary btn-sm" id="exportar"><Icon name="download" size={15} /> Exportar</button>
+        <label class="btn btn-sm" for="importar-arquivo"><Icon name="upload" size={15} /> Importar</label>
+        <input type="file" id="importar-arquivo" accept="application/json,.json" class="sr-only" />
+        <button type="button" class="btn btn-ghost btn-sm perigo" id="zerar"><Icon name="trash" size={15} /> Zerar progresso</button>
+      </div>
+    </section>
+  </div>
+
+  <dialog class="confirmar" id="confirmar-zerar" aria-labelledby="cz-t">
+    <div class="cz">
+      <h2 id="cz-t">Zerar todo o progresso?</h2>
+      <p class="muted">Aulas, exercícios, flashcards e autoavaliações deste navegador serão apagados. Considere exportar um backup antes.</p>
+      <div class="row fim">
+        <button type="button" class="btn btn-ghost" data-cancelar>Cancelar</button>
+        <button type="button" class="btn btn-primary" data-confirmar>Zerar</button>
+      </div>
+    </div>
+  </dialog>
+</Base>
+
+<script type="application/json" id="dados-painel" set:html={JSON.stringify(dados)} />
+
+<script>
+  import { aoMudar, exportar, hoje, importar, ler, sequenciaDias, toast, zerar } from '../lib/progresso';
+
+  type Mod = { id: string; rotulo: string; horas: number; disponivel: boolean; jr: boolean; url: string; aulas: string[]; exercicios: string[] };
+  const D = JSON.parse(document.getElementById('dados-painel')!.textContent || '{}') as {
+    modulos: Mod[];
+    aulas: { id: string; titulo: string; url: string; cartoes: number }[];
+    exercicios: { id: string; titulo: string; url: string }[];
+    links: { flashcards: string; entrevista: string };
+  };
+
+  const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+
+  function progressoModulo(m: Mod, p = ler()) {
+    const pesoTotal = m.aulas.length + m.exercicios.length * 2;
+    if (!m.disponivel || pesoTotal === 0) return 0;
+    let feito = 0;
+    for (const a of m.aulas) if (p.aulas[a]) feito += 1;
+    for (const e of m.exercicios) {
+      const s = p.exercicios[e];
+      if (s?.status === 'concluido') feito += s.viuSolucao ? 1.6 : 2;
+    }
+    return Math.min(1, feito / pesoTotal);
+  }
+
+  function render() {
+    const p = ler();
+    const d = hoje();
+
+    // streak
+    document.querySelector('[data-streak]')!.textContent = String(sequenciaDias(p));
+
+    // prontidão
+    const calcular = (filtro: (m: Mod) => boolean) => {
+      const mods = D.modulos.filter(filtro);
+      const total = mods.reduce((s, m) => s + m.horas, 0);
+      return total ? mods.reduce((s, m) => s + m.horas * progressoModulo(m, p), 0) / total : 0;
+    };
+    const pront = { jr: calcular((m) => m.jr), pleno: calcular(() => true) };
+    for (const [chave, valor] of Object.entries(pront)) {
+      const g = document.querySelector<HTMLElement>(`[data-gauge="${chave}"]`)!;
+      g.style.setProperty('--p', String(Math.round(valor * 100)));
+      g.querySelector('[data-valor]')!.textContent = `${Math.round(valor * 100)}%`;
+    }
+
+    // números
+    const exs = Object.values(p.exercicios).filter((e) => e.status === 'concluido');
+    const quizzes = Object.values(p.quizzes);
+    const media = quizzes.length ? quizzes.reduce((s, q) => s + q.acertos / q.total, 0) / quizzes.length : null;
+    const cartoesHoje = Object.values(p.flashcards).filter((c) => c.proxima <= d).length;
+    const set = (k: string, v: string | number) => (document.querySelector(`[data-n="${k}"]`)!.textContent = String(v));
+    set('aulas', `${Object.keys(p.aulas).length} / ${D.aulas.length}`);
+    set('exercicios', `${exs.length} / ${D.exercicios.length}`);
+    set('autonomos', exs.filter((e) => !e.viuSolucao).length);
+    set('quiz', media === null ? '—' : `${Math.round(media * 100)}%`);
+    set('cartoes', cartoesHoje);
+    set('entrevista', Object.keys(p.entrevista).length);
+
+    // próximos passos
+    const passos: string[] = [];
+    const proximaAula = D.aulas.find((a) => !p.aulas[a.id]);
+    const exFazendo = D.exercicios.find((e) => p.exercicios[e.id]?.status === 'fazendo');
+    const exPendente = D.exercicios.find((e) => !p.exercicios[e.id] && D.modulos.some((m) => m.exercicios.includes(e.id) && m.aulas.every((a) => p.aulas[a])));
+    if (exFazendo) passos.push(`<a href="${exFazendo.url}"><b>Termine</b> ${esc(exFazendo.titulo)}</a>`);
+    if (proximaAula) passos.push(`<a href="${proximaAula.url}"><b>Próxima aula:</b> ${esc(proximaAula.titulo)}</a>`);
+    if (exPendente && exPendente !== exFazendo) passos.push(`<a href="${exPendente.url}"><b>Pratique:</b> ${esc(exPendente.titulo)}</a>`);
+    if (cartoesHoje) passos.push(`<a href="${D.links.flashcards}"><b>Revise</b> ${cartoesHoje} flashcard(s) de hoje</a>`);
+    const revisar = Object.values(p.entrevista).filter((r) => r.nota < 2).length;
+    if (revisar) passos.push(`<a href="${D.links.entrevista}"><b>Treine de novo</b> ${revisar} pergunta(s) de entrevista</a>`);
+    if (!passos.length) passos.push('<span>Você está em dia com tudo o que já foi publicado. Treine no simulador de entrevista enquanto os próximos módulos chegam!</span>');
+    document.querySelector('[data-passos]')!.innerHTML = passos.map((x) => `<li>${x}</li>`).join('');
+
+    // módulos
+    document.querySelector('[data-mods]')!.innerHTML = D.modulos
+      .map((m) => {
+        const pct = Math.round(progressoModulo(m, p) * 100);
+        return `<li class="${m.disponivel ? '' : 'breve'}"><a href="${m.url}"><span class="mr">${esc(m.rotulo)}</span>
+          <span class="progress"><span style="--value:${pct}"></span></span><span class="mp">${m.disponivel ? pct + '%' : 'em breve'}</span></a></li>`;
+      })
+      .join('');
+
+    // heatmap: 16 semanas terminando no sábado desta semana
+    const heat = document.querySelector<HTMLElement>('[data-heat]')!;
+    const fim = new Date();
+    fim.setDate(fim.getDate() + (6 - fim.getDay()));
+    const inicio = new Date(fim);
+    inicio.setDate(fim.getDate() - 16 * 7 + 1);
+    const celulas: string[] = [];
+    for (let dia = new Date(inicio); dia <= fim; dia.setDate(dia.getDate() + 1)) {
+      const chave = hoje(dia);
+      const n = p.atividade[chave] ?? 0;
+      const nivel = n === 0 ? 0 : n < 3 ? 1 : n < 6 ? 2 : n < 10 ? 3 : 4;
+      const futuro = chave > d;
+      celulas.push(`<span class="h${nivel}${futuro ? ' fut' : ''}" title="${chave.split('-').reverse().join('/')}: ${n} atividade(s)"></span>`);
+    }
+    heat.innerHTML = celulas.join('');
+  }
+
+  render();
+  aoMudar(render);
+
+  document.getElementById('exportar')!.addEventListener('click', () => {
+    exportar();
+    toast('Arquivo de backup baixado.');
+  });
+  document.getElementById('importar-arquivo')!.addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    const arquivo = input.files?.[0];
+    if (!arquivo) return;
+    toast((await importar(arquivo)) ? 'Progresso importado com sucesso!' : 'Arquivo inválido: não parece um backup da trilha.');
+    input.value = '';
+  });
+  const dlg = document.getElementById('confirmar-zerar') as HTMLDialogElement;
+  document.getElementById('zerar')!.addEventListener('click', () => dlg.showModal());
+  dlg.querySelector('[data-cancelar]')!.addEventListener('click', () => dlg.close());
+  dlg.querySelector('[data-confirmar]')!.addEventListener('click', () => {
+    zerar();
+    dlg.close();
+    toast('Progresso zerado.');
+  });
+</script>
+
+<style>
+  .head {
+    padding-block: 40px 28px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 260px at 90% 0%, var(--accent-soft), transparent 70%);
+  }
+  .head-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .streak {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 20px;
+    color: var(--accent);
+  }
+  .streak strong {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 2rem;
+    line-height: 1;
+    color: var(--text);
+  }
+  .streak span {
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 16px;
+    padding-top: 28px;
+  }
+  .bloco {
+    padding: 22px;
+  }
+  .bloco h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.05rem;
+    margin-bottom: 16px;
+  }
+  .bloco h2 :global(.icon) {
+    color: var(--accent);
+  }
+  .prontidao {
+    grid-column: span 3;
+  }
+  .proximo {
+    grid-column: span 3;
+  }
+  .numeros {
+    grid-column: span 2;
+  }
+  .atividade {
+    grid-column: span 4;
+  }
+  .modulos {
+    grid-column: span 4;
+  }
+  .backup {
+    grid-column: span 2;
+  }
+  .gauges {
+    display: flex;
+    justify-content: space-around;
+    gap: 16px;
+  }
+  .gauge {
+    position: relative;
+    width: 140px;
+    height: 140px;
+  }
+  .gauge svg {
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+  }
+  .g-bg,
+  .g-fg {
+    fill: none;
+    stroke-width: 10;
+  }
+  .g-bg {
+    stroke: var(--surface-3);
+  }
+  .g-fg {
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-dasharray: 326.7;
+    stroke-dashoffset: calc(326.7 - 326.7 * var(--p) / 100);
+    transition: stroke-dashoffset 0.8s var(--ease);
+  }
+  .g-txt {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-content: center;
+    text-align: center;
+  }
+  .g-txt strong {
+    font-family: var(--font-display);
+    font-size: 1.8rem;
+    line-height: 1;
+  }
+  .g-txt span {
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .nota {
+    margin-top: 16px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+  .passos {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+  }
+  .passos :global(li a),
+  .passos :global(li span) {
+    display: block;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--bg-soft);
+    text-decoration: none;
+    font-size: 0.92rem;
+    color: var(--text-2);
+  }
+  .passos :global(li a:hover) {
+    border-color: var(--accent);
+  }
+  .passos :global(b) {
+    color: var(--accent);
+  }
+  .nums {
+    display: grid;
+    gap: 10px;
+  }
+  .nums div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  .nums dt {
+    color: var(--text-3);
+  }
+  .nums dd {
+    margin: 0;
+    font-weight: 700;
+    font-family: var(--font-mono);
+  }
+  .heat {
+    display: grid;
+    grid-auto-flow: column;
+    grid-template-rows: repeat(7, 1fr);
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .heat :global(span),
+  .legenda span {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+    background: var(--surface-3);
+  }
+  .heat :global(.h1),
+  .legenda .h1 {
+    background: color-mix(in srgb, var(--accent) 30%, var(--surface-3));
+  }
+  .heat :global(.h2),
+  .legenda .h2 {
+    background: color-mix(in srgb, var(--accent) 55%, var(--surface-3));
+  }
+  .heat :global(.h3),
+  .legenda .h3 {
+    background: color-mix(in srgb, var(--accent) 80%, var(--surface-3));
+  }
+  .heat :global(.h4),
+  .legenda .h4 {
+    background: var(--accent);
+  }
+  .heat :global(.fut) {
+    opacity: 0.25;
+  }
+  .legenda {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 10px;
+    font-size: 0.75rem;
+  }
+  .mods {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+  .mods :global(a) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 140px 64px;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-size: 0.88rem;
+  }
+  .mods :global(a:hover) {
+    background: var(--surface-2);
+  }
+  .mods :global(.mr) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mods :global(.mp) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-3);
+  }
+  .mods :global(.breve) {
+    opacity: 0.55;
+  }
+  .backup .muted {
+    font-size: 0.88rem;
+    margin-bottom: 14px;
+  }
+  .perigo:hover {
+    color: var(--danger);
+  }
+  .confirmar {
+    width: min(440px, calc(100vw - 32px));
+    padding: 0;
+    border-radius: var(--radius-l);
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    margin: auto;
+  }
+  .confirmar::backdrop {
+    background: rgb(10 8 6 / 0.6);
+  }
+  .cz {
+    padding: 24px;
+    display: grid;
+    gap: 12px;
+  }
+  .cz h2 {
+    font-size: 1.2rem;
+  }
+  .fim {
+    justify-content: flex-end;
+  }
+  @media (max-width: 1000px) {
+    .grid > * {
+      grid-column: span 6 !important;
+    }
+  }
+  @media (max-width: 560px) {
+    .mods :global(a) {
+      grid-template-columns: minmax(0, 1fr) 70px 48px;
+    }
+    .gauge {
+      width: 120px;
+      height: 120px;
+    }
+  }
+</style>

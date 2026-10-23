@@ -1,0 +1,278 @@
+---
+titulo: "MongoDB: modelar documentos, indexar e saber quando não usar"
+descricao: O modelo de documento, embutir × referenciar, schema flexível para um catálogo com atributos variáveis, índices compostos e multikey com a regra ESR, aggregation pipeline, transações multidocumento e seu custo, MongoDB × PostgreSQL (e o JSONB) e o Spring Data MongoDB.
+modulo: 15-system-design
+ordem: 3
+duracao: 60
+objetivos:
+  - Decidir entre embutir e referenciar a partir dos padrões de acesso
+  - Modelar um catálogo com atributos variáveis e indexá-lo seguindo a regra ESR
+  - Escrever consultas e agregações com MongoTemplate, Query, Criteria e update atômico
+  - Justificar a escolha entre MongoDB e PostgreSQL (com JSONB) para um caso concreto
+tags: [MongoDB, NoSQL, documento, índices, ESR, aggregation, Spring Data MongoDB, JSONB]
+flashcards:
+  - frente: Qual a regra geral para embutir × referenciar no MongoDB?
+    verso: Embuta o que é lido junto, pertence ao documento pai e tem tamanho limitado (os itens de um pedido). Referencie o que cresce sem limite, é compartilhado ou muda de forma independente (as avaliações de um produto, o cliente de um pedido).
+  - frente: O que diz a regra ESR para índices compostos?
+    verso: Ordene os campos do índice como Igualdade, depois Ordenação (sort), depois Faixa (range). Assim o índice filtra pelo exato, entrega os documentos já ordenados e só então aplica a faixa.
+  - frente: O que é um índice multikey?
+    verso: Um índice sobre um campo que contém um array. O MongoDB cria uma entrada de índice para cada elemento, permitindo buscar documentos por qualquer valor do array.
+  - frente: O MongoDB tem transações?
+    verso: Sim. Transações multidocumento existem desde o 4.0 (replica sets) e o 4.2 (clusters shardados). Têm custo de desempenho e limite de duração; um bom modelo de documento faz a maioria das operações caber num documento só, onde a escrita já é atômica.
+  - frente: Quando o JSONB do PostgreSQL é uma alternativa ao MongoDB?
+    verso: Quando a maior parte do modelo é relacional (pedidos, pagamentos, transações ACID) e só uma parte tem atributos variáveis. Uma coluna JSONB com índice GIN resolve o schema flexível sem um segundo banco.
+---
+
+O catálogo da loja vende tênis, geladeiras e livros. O tênis tem tamanho e cor; a geladeira, voltagem e capacidade em litros; o livro, autor e número de páginas. Numa tabela relacional, isso vira dezenas de colunas quase sempre vazias, ou um modelo entidade-atributo-valor que ninguém consegue consultar.
+
+O **MongoDB** guarda **documentos**: cada produto é um objeto JSON (armazenado em BSON) com os campos que fazem sentido para ele. É uma ferramenta excelente para esse tipo de problema, e uma péssima escolha quando o problema é relacional. Esta aula mostra as duas coisas.
+
+## O modelo de documento
+
+```js
+// coleção produtos
+{
+  _id: ObjectId("..."),
+  sku: "TEN-001-42-AZ",
+  nome: "Tênis de corrida",
+  categoria: "tenis",
+  preco: NumberDecimal("399.90"),
+  estoque: 12,
+  atributos: [
+    { nome: "tamanho", valor: "42" },
+    { nome: "cor", valor: "azul" }
+  ],
+  imagens: ["tenis-001-a.webp", "tenis-001-b.webp"]
+}
+```
+
+Três diferenças para o relacional:
+
+- **Sem schema obrigatório.** Dois documentos da mesma coleção podem ter campos diferentes. (Dá para exigir campos com *schema validation*, e em produção você deveria.)
+- **Estruturas aninhadas.** Arrays e subdocumentos são parte do documento, não tabelas separadas.
+- **A escrita num documento é atômica.** Tudo o que está dentro de um documento muda junto, sem transação explícita. Isso guia a modelagem.
+
+## Embutir × referenciar
+
+A pergunta central do modelo de documento não é "quais são as entidades?", e sim **"como os dados são lidos?"**.
+
+<Figura legenda="Embutir o que é lido junto e limitado; referenciar o que cresce sem limite ou é compartilhado">
+<svg viewBox="0 0 680 250" width="680" role="img" aria-label="À esquerda, um pedido com itens e endereço embutidos. À direita, um produto que referencia avaliações em outra coleção">
+  <defs><marker id="m1503" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="165" y="24" text-anchor="middle" class="d-title">Embutir</text>
+  <rect x="20" y="36" width="290" height="160" rx="10" class="d-box"/><text x="165" y="58" text-anchor="middle" class="d-mono">pedido</text>
+  <rect x="40" y="72" width="250" height="34" rx="6" class="d-ok"/><text x="165" y="94" text-anchor="middle" class="d-mono">itens: [ ... ]</text>
+  <rect x="40" y="116" width="250" height="34" rx="6" class="d-ok"/><text x="165" y="138" text-anchor="middle" class="d-mono">enderecoDeEntrega: ...</text>
+  <text x="165" y="180" text-anchor="middle" class="d-label">lidos sempre juntos, poucos itens</text>
+  <text x="515" y="24" text-anchor="middle" class="d-title">Referenciar</text>
+  <rect x="370" y="36" width="130" height="70" rx="10" class="d-box"/><text x="435" y="66" text-anchor="middle" class="d-mono">produto</text><text x="435" y="88" text-anchor="middle" class="d-label">_id: 7</text>
+  <rect x="540" y="36" width="130" height="160" rx="10" class="d-violet"/><text x="605" y="58" text-anchor="middle" class="d-mono">avaliacoes</text>
+  <text x="605" y="88" text-anchor="middle" class="d-label">produtoId: 7</text>
+  <text x="605" y="112" text-anchor="middle" class="d-label">produtoId: 7</text>
+  <text x="605" y="136" text-anchor="middle" class="d-label">... milhares</text>
+  <path d="M537 100 L503 80" class="d-line" marker-end="url(#m1503)"/>
+  <text x="515" y="225" text-anchor="middle" class="d-label">cresce sem limite: coleção própria</text>
+  <text x="180" y="225" text-anchor="middle" class="d-label">muda junto: um documento, atômico</text>
+</svg>
+</Figura>
+
+Regras práticas:
+
+| Embuta quando | Referencie quando |
+|---|---|
+| os dados são lidos **juntos** na maioria das consultas | os dados são lidos **separadamente** |
+| a relação é "um para poucos" (itens de um pedido, endereços de um cliente) | a relação é "um para muitos sem limite" (avaliações, logs, movimentos) |
+| o filho não faz sentido sem o pai | o filho é **compartilhado** (o mesmo cliente em muitos pedidos) |
+| precisam mudar juntos, atomicamente | mudam de forma independente e com frequência |
+
+Dois limites concretos: um documento tem no máximo **16 MB**, e arrays que crescem sem parar deixam cada leitura e escrita mais cara muito antes disso. Duplicar um pouco (o nome do produto dentro do item do pedido, como ele era **no momento da compra**) é normal e, muitas vezes, é o dado correto.
+
+## Atributos variáveis e índices
+
+Indexar `tamanho`, `cor`, `voltagem` e cada novo atributo separadamente não escala. O **padrão de atributos** transforma os campos variáveis num array de pares nome-valor, como no documento acima, e um único índice serve a todos:
+
+```js
+db.produtos.createIndex({ "atributos.nome": 1, "atributos.valor": 1 })
+
+db.produtos.find({
+  categoria: "tenis",
+  atributos: { $elemMatch: { nome: "tamanho", valor: "42" } }
+})
+```
+
+Como `atributos` é um array, esse é um índice **multikey**: uma entrada para cada elemento. (Aqui os dois campos do índice vêm do **mesmo** array, o que é permitido; o que um índice composto não aceita é, no mesmo documento, dois campos indexados que sejam arrays diferentes.) O `$elemMatch` garante que nome **e** valor casem no **mesmo** elemento; sem ele, bastaria um elemento com nome "tamanho" e **outro** elemento qualquer com valor "42", e um tênis de tamanho 40 poderia passar no filtro.
+
+Para índices compostos, a regra **ESR** orienta a ordem dos campos:
+
+1. **E**quality: campos comparados por igualdade (`categoria: "tenis"`);
+2. **S**ort: campos de ordenação (`preco`);
+3. **R**ange: campos de faixa (`avaliacao: { $gte: 4 }`).
+
+```js
+// consulta: tênis com avaliação >= 4, ordenados por preço
+db.produtos.createIndex({ categoria: 1, preco: 1, avaliacao: 1 })
+```
+
+Com a faixa antes da ordenação, o banco teria de ordenar em memória. Confira sempre com `explain("executionStats")`: procure `IXSCAN` em vez de `COLLSCAN` e compare documentos examinados com documentos devolvidos, como fez com o `EXPLAIN` no módulo 7.
+
+## Aggregation pipeline
+
+Para relatórios e filtros de busca, o **aggregation pipeline** encadeia estágios, cada um transformando os documentos do anterior. A página de busca precisa, numa consulta só, da contagem por marca, das faixas de preço e da primeira página de resultados:
+
+```js
+db.produtos.aggregate([
+  { $match: { categoria: "tenis", ativo: true } },          // primeiro: usa índice e reduz o volume
+  { $facet: {
+      porMarca: [
+        { $group: { _id: "$marca", total: { $sum: 1 } } },
+        { $sort: { total: -1 } }
+      ],
+      faixasDePreco: [
+        { $bucket: { groupBy: "$preco", boundaries: [0, 200, 500, 1000], default: "1000 ou mais" } }
+      ],
+      pagina: [ { $sort: { preco: 1 } }, { $limit: 20 } ]
+  } }
+])
+```
+
+`$match` no início é a regra de ouro: filtra antes de agrupar. `$group` agrega (como `GROUP BY`), `$facet` roda vários sub-pipelines sobre a mesma entrada, e `$lookup` faz uma junção com outra coleção, útil de vez em quando, sinal de modelo errado se for usado em toda consulta.
+
+## Transações multidocumento
+
+O MongoDB tem transações ACID multidocumento desde a versão **4.0** (em replica sets) e a **4.2** (em clusters shardados). Elas funcionam, mas:
+
+- custam mais que escritas num documento só (coordenação, locks, mais idas à rede);
+- têm limite de duração (por padrão, 60 segundos) e exigem replica set (ou cluster shardado), inclusive no ambiente local; um replica set de um nó só basta, e é o que o `MongoDBContainer` do Testcontainers sobe;
+- no Spring, exigem declarar um `MongoTransactionManager` para o `@Transactional` valer.
+
+Se quase toda operação precisa de transação entre coleções, o modelo está relacional, e talvez o banco devesse ser também.
+
+<Callout tipo="erro" titulo="Ler, calcular e gravar o estoque">
+Ler o produto, subtrair 1 em Java e gravar o documento inteiro de volta perde vendas concorrentes (o mesmo *lost update* do módulo 9). Use um **update atômico com condição**: o filtro exige estoque suficiente e o `$inc` subtrai, numa operação só, no servidor.
+</Callout>
+
+## Spring Data MongoDB
+
+Um mapeamento típico no **MongoDB 8**, com o padrão de atributos e o preço como `Decimal128` campo a campo (o exercício 15.02 usa um `Map` de atributos e a propriedade global para o `BigDecimal`, e discute as duas escolhas):
+
+```java
+@Document(collection = "produtos")
+public record Produto(
+        @Id String id,
+        @Indexed(unique = true) String sku,
+        String nome,
+        String categoria,
+        @Field(targetType = FieldType.DECIMAL128) BigDecimal preco,   // decimal exato, não double
+        int estoque,
+        List<Atributo> atributos) {
+
+    public record Atributo(String nome, String valor) { }
+}
+
+@Repository
+public class CatalogoMongo {
+
+    private final MongoTemplate mongo;
+
+    public CatalogoMongo(MongoTemplate mongo) {
+        this.mongo = mongo;
+    }
+
+    public List<Produto> buscar(String categoria, String atributo, String valor) {
+        Query consulta = Query.query(Criteria.where("categoria").is(categoria)
+                        .and("atributos").elemMatch(Criteria.where("nome").is(atributo).and("valor").is(valor)))
+                .with(Sort.by("preco"))
+                .limit(20);
+        return mongo.find(consulta, Produto.class);
+    }
+
+    public boolean reservar(String sku, int quantidade) {
+        UpdateResult resultado = mongo.updateFirst(
+                Query.query(Criteria.where("sku").is(sku).and("estoque").gte(quantidade)),
+                new Update().inc("estoque", -quantidade),
+                Produto.class);
+        return resultado.getModifiedCount() == 1;   // 0 = sem estoque suficiente
+    }
+}
+```
+
+Atenção ao `@Indexed`: desde o Spring Data MongoDB 3.0, a criação automática de índices vem **desligada**. Ou você a liga (`spring.data.mongodb.auto-index-creation=true`), ou cria os índices explicitamente (com `mongo.indexOps(Produto.class)` na inicialização, ou num script de migração). Sem isso, o `unique` do `sku` não existe no banco.
+
+`MongoRepository` também existe (métodos derivados do nome, como no Spring Data JPA), mas `MongoTemplate` com `Query` e `Criteria` dá controle sobre filtros dinâmicos, projeções e updates atômicos.
+
+## MongoDB × PostgreSQL
+
+| Critério | Tende a MongoDB | Tende a PostgreSQL |
+|---|---|---|
+| Forma dos dados | documentos autocontidos, atributos variáveis | entidades relacionadas, muitas junções |
+| Consistência | atomicidade por documento basta | transações entre várias entidades são a regra (dinheiro) |
+| Consultas | por chave e por poucos campos conhecidos | relatórios ad hoc, junções, SQL |
+| Escala | sharding nativo | réplicas de leitura; sharding com extensões ou na aplicação |
+
+<Callout tipo="dica" titulo="Considere o JSONB antes de um segundo banco">
+Se a Fintech Core precisa de atributos variáveis só no cadastro de produtos financeiros, uma coluna `JSONB` no PostgreSQL com índice GIN resolve sem operar outro banco:
+
+```sql
+ALTER TABLE produto ADD COLUMN atributos JSONB NOT NULL DEFAULT '{}';
+CREATE INDEX idx_produto_atributos ON produto USING GIN (atributos);
+SELECT * FROM produto WHERE atributos @> '{"indexador": "CDI"}';
+```
+
+Um banco a mais é mais backup, monitoramento, atualização e conhecimento no time.
+</Callout>
+
+<Callout tipo="entrevista">
+"SQL ou NoSQL?" Evite a resposta de torcida. Parta dos **padrões de acesso** e da **consistência** exigida:
+
+- dados autocontidos e lidos juntos, com atributos variáveis: documento;
+- dinheiro, estoque e relações entre muitas entidades: relacional com transações;
+- mostre que conhece o meio-termo (JSONB) e o custo operacional de mais um banco;
+- no MongoDB, fale de embutir × referenciar, índices com **ESR** e update atômico com `$inc`.
+</Callout>
+
+<Quiz
+  id="15-mongodb"
+  questoes={[
+    {
+      pergunta: 'Um produto pode ter milhares de avaliações, lidas de forma paginada. Como modelar?',
+      opcoes: ['Embutir todas as avaliações no documento do produto', 'Coleção própria de avaliações, com referência ao produto', 'Um array de ids de avaliações no produto, sem limite', 'Uma avaliação por campo'],
+      correta: 1,
+      explicacao: 'Crescem sem limite e são lidas separadamente: referencie. Embutir aproximaria o documento do limite de 16 MB e encareceria cada escrita.',
+    },
+    {
+      pergunta: 'Consulta: categoria igual a "tenis", avaliação maior ou igual a 4, ordenado por preço. Qual índice segue a regra ESR?',
+      opcoes: ['categoria, avaliacao, preco', 'categoria, preco, avaliacao', 'preco, categoria, avaliacao', 'avaliacao, preco, categoria'],
+      correta: 1,
+      explicacao: 'Igualdade (categoria), depois ordenação (preco), depois faixa (avaliacao).',
+    },
+    {
+      pergunta: 'Como reservar estoque no MongoDB sem perder vendas concorrentes?',
+      opcoes: ['Ler, subtrair em Java e salvar o documento', 'updateFirst com filtro estoque >= quantidade e $inc negativo', 'Uma transação multidocumento sempre', 'Um lock no Redis'],
+      correta: 1,
+      explicacao: 'A escrita num documento é atômica: filtro e decremento acontecem juntos no servidor.',
+    },
+    {
+      pergunta: 'Qual afirmação sobre transações no MongoDB está correta?',
+      opcoes: ['Não existem', 'Existem desde o 4.0, com custo; um bom modelo de documento faz a maioria das escritas caber num documento só', 'São tão baratas quanto escritas simples', 'Só existem em clusters shardados'],
+      correta: 1,
+      explicacao: 'Existem (4.0 em replica sets, 4.2 em shards), mas custam mais e têm limite de duração.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Documento = objeto com campos variáveis e estruturas aninhadas; a escrita num documento é **atômica**.
+- Modele pelos **padrões de acesso**: embuta o que é lido junto e limitado; referencie o que cresce sem limite ou é compartilhado.
+- **Padrão de atributos** + índice **multikey** para catálogos; `$elemMatch` para casar nome e valor no mesmo elemento.
+- Índices compostos na ordem **ESR**; confira com `explain`.
+- Aggregation: `$match` primeiro, `$group`, `$facet`, `$lookup` com moderação.
+- Transações multidocumento existem (4.0+), com custo. Estoque: update atômico com filtro e `$inc`.
+- Relacional para dinheiro e muitas relações; considere **JSONB** antes de um segundo banco.
+
+## Referências
+
+- Documentação do MongoDB — *Data Modeling*, *Indexes* (*The ESR Rule*), *Aggregation*, *Transactions*
+- Documentação do Spring Data MongoDB — *MongoTemplate*, *Query and Criteria*, *Transactions*
+- Documentação do PostgreSQL — *JSON Types* e *GIN Indexes*
+- Martin Kleppmann — *Designing Data-Intensive Applications*, capítulo 2

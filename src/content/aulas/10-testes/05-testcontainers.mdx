@@ -1,0 +1,697 @@
+---
+titulo: Testes de integração com Testcontainers
+descricao: "Por que um teste verde no H2 não garante nada sobre o PostgreSQL, e como testar contra o banco de verdade: Testcontainers 2 com Docker, @ServiceConnection do Spring Boot 4.1, Flyway no container, ciclo de vida e reaproveitamento de containers, isolamento de dados, tempo de execução, os erros mais comuns e o CI."
+modulo: 10-testes
+ordem: 5
+duracao: 100
+objetivos:
+  - Demonstrar com um teste real quatro diferenças entre o H2 em modo PostgreSQL e o PostgreSQL (upsert, transação abortada, ordenação, jsonb)
+  - Explicar o que acontece quando um teste pede um container, incluindo o papel do Docker, do Ryuk e da porta sorteada
+  - Configurar um PostgreSQL de teste com @TestConfiguration e @ServiceConnection, com as migrations do Flyway aplicadas no container
+  - Escolher o ciclo de vida do container (por classe, por contexto do Spring ou um por JVM) e medir o efeito no tempo da suíte
+  - Isolar os dados entre testes limpando tabelas, fazendo rollback ou usando dados únicos, e dizer quando cada estratégia falha
+  - Diagnosticar os erros típicos (Docker desligado, @ServiceConnection esquecido, porta fixa, imagem baixando) pelas mensagens reais
+tags: [Testcontainers, Docker, PostgreSQL, integração, ServiceConnection, Flyway]
+flashcards:
+  - frente: Dê dois exemplos concretos de SQL que se comportam diferente no H2 (modo PostgreSQL) e no PostgreSQL.
+    verso: "INSERT ... ON CONFLICT DO UPDATE (upsert) dá erro de sintaxe no H2. E, depois de um erro dentro de uma transação, o PostgreSQL aborta a transação inteira (SQLState 25P02), enquanto o H2 aceita os comandos seguintes. Outros: ORDER BY em texto (collation) e a posição dos NULLs."
+  - frente: O que o Testcontainers faz, passo a passo, quando um teste pede um PostgreSQL?
+    verso: Conecta-se ao Docker, sobe o Ryuk, baixa a imagem se ela não estiver em cache, cria o container com uma porta do host sorteada ligada à 5432, espera o banco aceitar conexões e expõe a URL JDBC. No fim, para e remove o container.
+  - frente: O que é o Ryuk?
+    verso: Um container auxiliar do Testcontainers que vigia a JVM dos testes. Quando ela termina, mesmo que tenha sido interrompida, o Ryuk remove os containers, redes e volumes que ela criou.
+  - frente: O que o @ServiceConnection faz?
+    verso: Lê do container a URL, o usuário e a senha e registra os ConnectionDetails do Spring Boot. Assim, o DataSource (e o Flyway) usam o container sem nenhuma spring.datasource.* escrita à mão e sem @DynamicPropertySource.
+  - frente: Container como bean de uma @TestConfiguration ou @Container num campo static? Qual a diferença de ciclo de vida?
+    verso: O bean vive enquanto o contexto do Spring vive, e o cache de contexto o reaproveita entre as classes com a mesma configuração. O campo static com @Container vive uma classe de teste, e a extensão do JUnit o para no fim dela.
+  - frente: Por que o rollback automático (@Transactional no teste) não isola um teste com várias threads?
+    verso: A transação do teste pertence à thread do teste. O que outras threads (ou uma requisição HTTP com RANDOM_PORT) gravam roda em outras transações, é confirmado e não é desfeito. Nesses casos, limpe as tabelas ou use dados únicos.
+  - frente: "Os testes passam localmente e o log mostra 'Syntax error in SQL statement \"TRUNCATE [*]item_carrinho\"'. O que aconteceu?"
+    verso: O @ServiceConnection foi esquecido e havia H2 no classpath de teste. O Spring Boot criou um H2 embutido em silêncio, e o container subiu sem ninguém usá-lo.
+---
+
+A loja estava tranquila até a primeira sexta-feira de promoção. Uma cliente clicou duas vezes em "adicionar ao carrinho" no mesmo pacote de café, e a segunda requisição voltou com **erro 500**. O log dizia `current transaction is aborted, commands ignored until end of transaction block`. O código do carrinho tinha testes, e todos passavam. O problema é que eles rodavam num **H2 em memória**, e o H2 não é o PostgreSQL da produção: no H2, o código funcionava; no PostgreSQL, nunca tinha funcionado.
+
+Essa história é comum. Bancos em memória são rápidos e não pedem instalação, mas imitam só uma parte do banco real. Tudo o que é específico do PostgreSQL, justamente o que um backend maduro usa (upsert, `jsonb`, `FOR UPDATE SKIP LOCKED`, índices parciais, a forma como erros afetam a transação), ou não existe no H2 ou se comporta de outro jeito. Uma suíte verde no H2 prova que o código funciona **no H2**.
+
+Nesta aula você vai reproduzir exatamente esse bug: escrever um teste que passa no H2, ver o mesmo teste falhar num PostgreSQL 18 de verdade e depois corrigir o código. O PostgreSQL vai subir num **container Docker descartável**, criado e destruído pelo **Testcontainers 2** durante os testes, conectado ao Spring Boot 4.1 com uma anotação. Depois vamos tratar do que aparece quando isso vira rotina: ciclo de vida dos containers, isolamento de dados, tempo da suíte, erros comuns e CI.
+
+## A intuição: ensaiar no palco de verdade
+
+Uma companhia de teatro ensaia na sala de ensaio durante semanas. O piso é de madeira lisa, as portas são fitas no chão e a escada é um caixote. Tudo funciona. Na estreia, no teatro de verdade, a atriz descobre que o palco é inclinado, que a porta real abre para o outro lado e que a escada tem um degrau a mais. Ninguém errou o texto; o cenário do ensaio simplesmente não era o cenário da peça.
+
+Por isso toda companhia faz um **ensaio geral** no palco de verdade antes da estreia. O H2 é a sala de ensaio: ótimo para decorar o texto, ou seja, para testar a lógica pura. O Testcontainers é o ensaio geral: o mesmo PostgreSQL 18 da produção, montado para o teste e desmontado depois dele. E, como montar o palco custa alguns segundos, você vai aprender a montá-lo uma vez e ensaiar várias cenas nele.
+
+<Figura legenda="O teste pede um PostgreSQL; o Testcontainers pede ao Docker um container com porta sorteada, o Spring se conecta a ele pelo @ServiceConnection e o Ryuk remove tudo quando a JVM termina">
+<svg viewBox="0 0 720 360" width="720" role="img" aria-labelledby="tc-titulo tc-desc">
+  <title id="tc-titulo">Como um teste com Testcontainers chega ao PostgreSQL</title>
+  <desc id="tc-desc">À esquerda, a JVM dos testes contém o teste JUnit, o Testcontainers e o contexto do Spring com o DataSource. O Testcontainers fala com o Docker, que cria dois containers: o Ryuk, que vigia a JVM, e o postgres:18, que escuta na porta 5432 dentro do container e é publicado numa porta sorteada do host, como 51143. O DataSource do Spring se conecta a localhost na porta sorteada, com os dados que o @ServiceConnection leu do container. Quando a JVM termina, o Ryuk remove o container do PostgreSQL.</desc>
+  <defs><marker id="mk-tc05" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="300" height="330" rx="12" class="d-box"/>
+  <text x="160" y="36" text-anchor="middle" class="d-title">JVM dos testes (mvn test)</text>
+  <rect x="40" y="56" width="240" height="54" rx="10" class="d-info"/>
+  <text x="160" y="80" text-anchor="middle" class="d-title">Teste JUnit</text>
+  <text x="160" y="99" text-anchor="middle" class="d-label">@SpringBootTest @Import(...)</text>
+  <path d="M160 110 L160 142" class="d-line" marker-end="url(#mk-tc05)"/>
+  <rect x="40" y="144" width="240" height="54" rx="10" class="d-accent"/>
+  <text x="160" y="168" text-anchor="middle" class="d-title">Testcontainers</text>
+  <text x="160" y="187" text-anchor="middle" class="d-label">new PostgreSQLContainer("postgres:18")</text>
+  <rect x="40" y="244" width="240" height="72" rx="10" class="d-violet"/>
+  <text x="160" y="268" text-anchor="middle" class="d-title">Spring: DataSource</text>
+  <text x="160" y="287" text-anchor="middle" class="d-label">@ServiceConnection leu</text>
+  <text x="160" y="304" text-anchor="middle" class="d-mono">localhost:51143</text>
+  <path d="M160 198 L160 242" class="d-line" marker-end="url(#mk-tc05)"/>
+  <text x="170" y="226" class="d-label">URL, usuário, senha</text>
+  <rect x="400" y="10" width="310" height="330" rx="12" class="d-box"/>
+  <text x="555" y="36" text-anchor="middle" class="d-title">Docker</text>
+  <path d="M280 171 L398 171" class="d-line" marker-end="url(#mk-tc05)"/>
+  <text x="339" y="162" text-anchor="middle" class="d-label">cria</text>
+  <rect x="430" y="56" width="250" height="70" rx="10" class="d-info"/>
+  <text x="555" y="82" text-anchor="middle" class="d-title">Ryuk</text>
+  <text x="555" y="102" text-anchor="middle" class="d-label">vigia a JVM; quando ela</text>
+  <text x="555" y="118" text-anchor="middle" class="d-label">termina, remove os containers</text>
+  <rect x="430" y="196" width="250" height="120" rx="10" class="d-ok"/>
+  <text x="555" y="222" text-anchor="middle" class="d-title">postgres:18</text>
+  <text x="555" y="244" text-anchor="middle" class="d-label">dentro do container: 5432</text>
+  <text x="555" y="264" text-anchor="middle" class="d-label">no host: porta sorteada</text>
+  <text x="555" y="288" text-anchor="middle" class="d-mono">51143 → 5432</text>
+  <text x="555" y="306" text-anchor="middle" class="d-label">Flyway aplica V1 aqui</text>
+  <path d="M280 280 L428 270" class="d-line" marker-end="url(#mk-tc05)"/>
+  <text x="352" y="300" text-anchor="middle" class="d-label">JDBC</text>
+  <path d="M555 126 L555 194" class="d-line" marker-end="url(#mk-tc05)"/>
+  <text x="565" y="164" class="d-label">remove no fim</text>
+</svg>
+</Figura>
+
+Três ideias da figura voltam a aparecer a aula toda:
+
+- **O banco não é instalado na sua máquina.** Ele roda dentro de um container, a partir de uma imagem (`postgres:18`) que o Docker baixa uma vez e guarda em cache.
+- **A porta é sorteada.** Dentro do container o PostgreSQL escuta na 5432 de sempre, mas no seu computador ele aparece numa porta livre qualquer. Por isso nenhum teste pode ter `localhost:5432` escrito à mão; quem sabe a porta é o container, e o `@ServiceConnection` a repassa ao Spring.
+- **Ninguém precisa lembrar de apagar nada.** O Ryuk remove os containers quando a JVM dos testes termina, mesmo que você interrompa o Maven no meio.
+
+## Vocabulário
+
+| Termo | O que é | Nesta aula |
+|---|---|---|
+| **Imagem** | O "molde" de um container, identificado por nome e tag | `postgres:18`: sempre com tag fixa, a mesma da produção |
+| **Container** | Um processo isolado criado a partir de uma imagem, descartável | Um PostgreSQL novo, vazio, só para os testes |
+| **Testcontainers** | Biblioteca Java que cria, espera e remove containers a partir do código de teste | Versão 2.0.5, que vem do BOM do Spring Boot 4.1 |
+| **Ryuk** | Container auxiliar que remove os containers de teste quando a JVM termina | `testcontainers/ryuk:0.14.0` aparece no `docker ps` |
+| **Porta mapeada** | A porta do host ligada a uma porta do container | `getMappedPort(5432)` devolve, por exemplo, 51143 |
+| **`@Testcontainers` / `@Container`** | Extensão do JUnit que inicia e para os containers declarados em campos | Estilo "container no campo", sem ou com Spring |
+| **`@ServiceConnection`** | Anotação do Spring Boot que transforma um container em configuração de conexão | Dispensa `spring.datasource.url`, usuário e senha |
+| **Cache de contexto** | O Spring reaproveita o contexto já montado entre classes com a mesma configuração (aula 4) | Um único container para várias classes de teste |
+
+## Por que o H2 engana
+
+Antes de qualquer Spring, vale ver as diferenças com os próprios olhos. O teste abaixo abre duas conexões JDBC, uma com o H2 em modo PostgreSQL (`MODE=PostgreSQL`, o modo "mais parecido" que ele oferece) e outra com um PostgreSQL 18 num container, e roda o **mesmo SQL** nos dois. Cada `@Test` é uma diferença, e as asserções registram o comportamento de cada banco. Todos esses testes passam: eles não dizem que o código está certo, dizem **onde os dois bancos discordam**.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/H2NaoEPostgresTest.java" destacar="26-27, 31-32, 39-40, 66-67, 78-84, 92-93, 101-102" />
+
+O que as asserções mostram, resumido numa tabela. As quatro primeiras linhas vêm do teste acima; as demais vieram de uma rodada exploratória com o mesmo H2 2.4.240 e o `postgres:18`:
+
+| SQL | PostgreSQL 18 | H2 2.4 em `MODE=PostgreSQL` |
+|---|---|---|
+| `INSERT ... ON CONFLICT (sku) DO UPDATE ...` | soma: estoque 10 + 5 = 15 | `Syntax error in SQL statement` |
+| Um `INSERT` duplicado e, na mesma transação, um `UPDATE` | o `UPDATE` falha: `current transaction is aborted` (SQLState 25P02) | o `UPDATE` funciona e altera 1 linha |
+| `ORDER BY nome` com `café`, `Filtro`, `açúcar` | `açúcar, café, Filtro` (collation `en_US.utf8`) | `Filtro, açúcar, café` (maiúsculas antes) |
+| `ORDER BY estoque` com um `NULL` | o `NULL` vai para o **fim** | o `NULL` vem **primeiro** |
+| `CAST('{"origem": "app"}' AS jsonb) ->> 'origem'` | `app` | `Syntax error` no operador `->>` |
+| `CREATE INDEX ... WHERE estoque = 0` (índice parcial) | criado | `Syntax error` |
+| `CREATE UNIQUE INDEX ... (lower(email))` | aceito; na rodada, recusou criar porque a tabela já tinha `Ana@x.com` e `ana@x.com` | `Syntax error` |
+| `INSERT ... RETURNING id` | devolve o id | `Syntax error` |
+| `CAST('2026-09-10 12:00:00-03' AS timestamptz)` | ok | `Unknown data type: "TIMESTAMPTZ"` |
+| `SELECT CAST(10 AS numeric) / 3` | `3.3333333333333333` | um número com centenas de casas decimais |
+
+Repare que há dois tipos de diferença, e o segundo é o mais perigoso:
+
+1. **O H2 recusa o SQL** (upsert, `jsonb`, índices parciais, `RETURNING`). É honesto, mas empurra o time a escrever SQL "que roda nos dois", abrindo mão dos recursos do banco, ou a manter duas migrations, que divergem.
+2. **O H2 aceita o SQL e responde outra coisa** (transação abortada, ordenação, `NULL`s, arredondamento). Esse produz testes verdes e produção vermelha, como na história do começo.
+
+O `FOR UPDATE SKIP LOCKED` do [exercício 10.03](../../../exercicios/10-testes/03-fila-com-testcontainers/) o H2 até aceita, mas o que importa ali é a trava entre conexões concorrentes, e isso só se testa no banco de verdade.
+
+## O código que vamos testar
+
+O carrinho de compras da loja fica numa tabela só. A chave primária é o par `(carrinho_id, sku)`: cada produto aparece uma vez por carrinho, e adicionar de novo **soma** a quantidade. A migration do Flyway mora num diretório próprio, `db/aulas-containers`:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/resources/db/aulas-containers/V1__cria_item_carrinho.sql" />
+
+Ela usa `TIMESTAMP WITH TIME ZONE` em vez de `TIMESTAMPTZ` só porque vamos rodá-la também no H2. A aplicação é um `@SpringBootApplication` que lê `aulas-containers.properties`, com uma única linha: `spring.flyway.locations=classpath:db/aulas-containers`. Não há `spring.datasource.url`: em produção ela viria do ambiente; nos testes, virá do container.
+
+A **primeira versão** do repositório, a que o time testou no H2, tenta inserir e, se o produto já está no carrinho, soma com um `UPDATE`:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/containers/ItensDoCarrinhoV1.java" destacar="25, 27-28, 33-37" />
+
+O raciocínio parece sólido: a chave primária garante que não haverá duas linhas; o `INSERT` falha com `DuplicateKeyException` (a tradução do Spring para o SQLState 23505) e o `catch` trata o caso. O `@Transactional` está ali porque, na aplicação real, esse método roda dentro da transação do serviço de checkout. Guarde esse detalhe: ele é a causa do bug.
+
+## Mão na massa
+
+Tudo o que aparece nesta aula existe em `java/m10-testes/aulas`, pacote `dev.trilhajava.m10.aulas.containers`, e roda no CI. Para executar um teste, entre na pasta do módulo:
+
+```bash
+cd java/m10-testes/aulas
+mvn test -Dtest=H2NaoEPostgresTest    # uma classe
+mvn test                               # o módulo inteiro (as aulas 3 e 5)
+```
+
+### Passo 0: Docker e dependências
+
+**Docker rodando** é o único pré-requisito: Docker Desktop (Windows e macOS), Docker Engine (Linux), Rancher Desktop, OrbStack ou Podman. Confira no terminal:
+
+```bash
+docker version --format '{{.Server.Version}}'
+```
+
+```text
+28.5.1
+```
+
+Se aparecer um erro de conexão, o Docker não está ligado; resolva isso antes de continuar (a seção "Quando dá errado" mostra o que o Testcontainers diz nesse caso).
+
+A aplicação usa `spring-boot-starter-jdbc`, `spring-boot-starter-flyway`, `flyway-database-postgresql` e o driver `postgresql`. Para os testes, entram as dependências abaixo, todas **sem versão**, porque o BOM do Spring Boot 4.1 (importado no `spring-parent`) já define Testcontainers 2.0.5 e H2:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-testcontainers</artifactId>   <!-- @ServiceConnection -->
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>testcontainers-junit-jupiter</artifactId> <!-- @Testcontainers, @Container -->
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>testcontainers-postgresql</artifactId>    <!-- PostgreSQLContainer -->
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>com.h2database</groupId>
+  <artifactId>h2</artifactId>                           <!-- só para a comparação desta aula -->
+  <scope>test</scope>
+</dependency>
+```
+
+<Callout tipo="novidade" titulo="Testcontainers 2: o que mudou">
+A versão 2 (2025) mudou três coisas que quebram código e tutoriais antigos. Os **artefatos** ganharam o prefixo `testcontainers-` (`testcontainers-postgresql`, e não `postgresql`; `testcontainers-junit-jupiter`, e não `junit-jupiter`). As **classes** dos módulos foram para pacotes próprios: `org.testcontainers.postgresql.PostgreSQLContainer`, e não mais `org.testcontainers.containers.PostgreSQLContainer`. E os **genéricos** sumiram: `new PostgreSQLContainer("postgres:18")`, sem o `<?>` de antes. O suporte ao JUnit 4 também foi removido. Se um exemplo da internet não compila, confira esses três pontos primeiro.
+</Callout>
+
+No Spring Boot 4, o Flyway também tem starter próprio (`spring-boot-starter-flyway`); só o `flyway-core` no classpath não liga mais a migração automática. E o suporte ao PostgreSQL no Flyway fica num artefato separado, `flyway-database-postgresql`.
+
+### Passo 1: o primeiro container, sem Spring
+
+**O que vamos fazer e por quê.** Começamos pelo Testcontainers puro, para enxergar o que ele faz sem a "mágica" do Spring. O `H2NaoEPostgresTest`, que você já leu, usa só JUnit, Testcontainers e JDBC. Rode:
+
+```bash
+mvn test -Dtest=H2NaoEPostgresTest
+```
+
+Saída (resumida; os horários e identificadores mudam a cada execução):
+
+```text
+[INFO] Running H2 no modo PostgreSQL não é PostgreSQL
+INFO org.testcontainers.DockerClientFactory -- Testcontainers version: 2.0.5
+INFO o.t.dockerclient.DockerClientProviderStrategy -- Found Docker environment with local Npipe socket (npipe:////./pipe/docker_engine)
+INFO tc.testcontainers/ryuk:0.14.0 -- Creating container for image: testcontainers/ryuk:0.14.0
+INFO tc.testcontainers/ryuk:0.14.0 -- Container testcontainers/ryuk:0.14.0 started in PT0.8804177S
+INFO org.testcontainers.utility.RyukResourceReaper -- Ryuk started - will monitor and terminate Testcontainers containers on JVM exit
+INFO tc.postgres:18 -- Creating container for image: postgres:18
+INFO tc.postgres:18 -- Container postgres:18 is starting: 46bef1257e7b…
+INFO tc.postgres:18 -- Container postgres:18 started in PT1.3350776S
+INFO tc.postgres:18 -- Container is started (JDBC URL: jdbc:postgresql://localhost:64542/test?loggerLevel=OFF)
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.120 s -- in H2 no modo PostgreSQL não é PostgreSQL
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- `Found Docker environment with local Npipe socket`: o Testcontainers achou o Docker (no Windows, por um *named pipe*; no Linux e no macOS, pelo socket `/var/run/docker.sock`; com `DOCKER_HOST` definida, pelo endereço dela).
+- `ryuk ... started`: antes do seu container, sobe o Ryuk, que fica conectado à JVM e remove tudo quando ela cai.
+- `Creating container for image: postgres:18`: a imagem já estava em cache, então nada foi baixado.
+- `started in PT1.3350776S`: o `PostgreSQLContainer` observa o log do banco e só libera o teste quando o PostgreSQL aceita conexões.
+- `JDBC URL: jdbc:postgresql://localhost:64542/test`: a porta **64542** foi sorteada; na próxima execução será outra. Banco, usuário e senha são `test`, e o teste lê tudo com `getJdbcUrl()`, `getUsername()` e `getPassword()`.
+
+E no código: `@Testcontainers` liga a extensão ao JUnit 6, que inicia e para os campos `@Container`. O campo é **`static`**: um container para a classe inteira. Sem `static`, seria um container **por método**, seis PostgreSQLs em vez de um. `@EnabledIfDockerAvailable` faz a classe ser **pulada** sem Docker (voltamos a isso na seção de erros). O resto é JDBC puro, como no módulo 07.
+
+Enquanto o teste roda, abra outro terminal e peça ao Docker a lista de containers. Foi isto que apareceu numa execução:
+
+```bash
+docker ps --format "{{.Image}}  {{.Ports}}  {{.Names}}"
+```
+
+```text
+postgres:18  0.0.0.0:51143->5432/tcp, [::]:51143->5432/tcp  dreamy_carson
+testcontainers/ryuk:0.14.0  0.0.0.0:51127->8080/tcp, [::]:51127->8080/tcp  testcontainers-ryuk-f9c2d8f8-…
+```
+
+A coluna do meio é a porta mapeada: `51143->5432` quer dizer "a porta 51143 do seu computador leva à 5432 do container". Rode `docker ps` de novo alguns segundos depois do fim do Maven: os dois containers terão sumido.
+
+### Passo 2: o teste do carrinho no H2 (passa)
+
+**O que vamos fazer e por quê.** Agora reproduzimos a história do começo. Este é o teste que o time tinha: a aplicação inteira com `@SpringBootTest`, mas com a `spring.datasource.url` apontando para um H2 em memória. O Flyway roda a migration no H2 e o teste adiciona o mesmo café duas vezes.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/CarrinhoV1NoH2Test.java" semImports />
+
+```bash
+mvn test -Dtest=CarrinhoV1NoH2Test
+```
+
+```text
+[INFO] Running Carrinho V1 no H2
+WARN o.f.c.internal.database.base.Database : Using H2 2.4.240 which is newer than the version Flyway has been verified with. The latest verified version of H2 is 2.3.232.
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.944 s -- in Carrinho V1 no H2
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Verde. O primeiro `adicionar` inseriu 2 cafés; o segundo tentou inserir, recebeu `DuplicateKeyException`, caiu no `catch` e somou 1. O aviso do Flyway é inofensivo aqui, mas é um bom lembrete: nem o Flyway garante que o H2 se comporte como você espera.
+
+### Passo 3: o mesmo teste no PostgreSQL (falha)
+
+**O que vamos fazer e por quê.** Trocamos só o banco. Em vez da `spring.datasource.url`, a classe importa `PostgresDeTeste`, uma configuração que declara um PostgreSQL 18 num container (você a escreve no passo 4; por enquanto, confie que ela entrega um banco). O corpo do teste é idêntico ao do passo 2: adicionar 2, adicionar 1, esperar 3.
+
+Resultado, copiado de uma execução real:
+
+```text
+[INFO] Running Carrinho V1 no PostgreSQL
+[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 10.80 s <<< FAILURE! -- in Carrinho V1 no PostgreSQL
+[ERROR] dev.trilhajava.m10.aulas.containers.CarrinhoV1NoPostgresTest.segundoAdicionarQuebra -- Time elapsed: 2.167 s <<< ERROR!
+org.springframework.jdbc.UncategorizedSQLException:
+PreparedStatementCallback; uncategorized SQLException for SQL [UPDATE item_carrinho
+   SET quantidade = quantidade + ?, atualizado_em = CURRENT_TIMESTAMP
+ WHERE carrinho_id = ? AND sku = ?]; SQL state [25P02]; error code [0]; ERROR: current transaction is aborted, commands ignored until end of transaction block
+	at dev.trilhajava.m10.aulas.containers.CarrinhoV1NoPostgresTest.segundoAdicionarQuebra(CarrinhoV1NoPostgresTest.java:33)
+Caused by: org.postgresql.util.PSQLException: ERROR: current transaction is aborted, commands ignored until end of transaction block
+…
+Caused by: org.postgresql.util.PSQLException:
+ERROR: duplicate key value violates unique constraint "item_carrinho_pkey"
+  Detalhe: Key (carrinho_id, sku)=(f560957b-8e01-48c4-be0e-d8755459fea9, CAFE-1KG) already exists.
+…
+[INFO] BUILD FAILURE
+```
+
+**Como ler de baixo para cima.** A última causa (`Caused by`) é a primeira coisa que aconteceu: o `INSERT` bateu na chave primária `item_carrinho_pkey`. Até aqui, nada de novo; o H2 também reclamou. A diferença está na causa de cima: o `UPDATE` do `catch` foi **recusado** com SQLState **25P02**. No PostgreSQL, qualquer erro dentro de uma transação a coloca em estado abortado, e a partir daí todo comando é ignorado até um `ROLLBACK`. O `catch` do Java capturou a exceção, mas o banco não "esqueceu" o erro. (O `Detalhe:` em português vem do driver JDBC, que usa o idioma da JVM.)
+
+Repare no tipo da exceção: `UncategorizedSQLException`. O Spring traduz vários SQLStates para exceções específicas (`DuplicateKeyException`, `DataIntegrityViolationException`), mas não tem categoria para 25P02; uma exceção "sem categoria" no log costuma ser comportamento específico do banco.
+
+O teste falhando não fica no projeto: o `CarrinhoV1NoPostgresTest` guardado no repositório **documenta** o bug com `assertThatThrownBy(...).hasMessageContaining("current transaction is aborted")`, e passa enquanto a V1 existir.
+
+### Passo 4: o container como bean e o upsert
+
+**O que vamos fazer e por quê.** Duas mudanças: a correção do código e a configuração de teste definitiva.
+
+A correção é o **upsert** do PostgreSQL: um único `INSERT ... ON CONFLICT DO UPDATE`, atômico, sem exceção no meio e sem `catch`.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/containers/ItensDoCarrinho.java" destacar="24-34" />
+
+`ON CONFLICT (carrinho_id, sku)` diz qual restrição de unicidade tratar; `EXCLUDED.quantidade` é o valor que **seria** inserido; `item_carrinho.quantidade` é o valor que já está na tabela. O próprio banco resolve a corrida entre duas requisições simultâneas: uma insere, a outra espera a trava da linha e soma. Esse código **não roda no H2**, como o passo 1 mostrou, e é exatamente por isso que ele precisa de um teste no PostgreSQL.
+
+Agora a configuração de teste. Em vez de declarar o container dentro de cada classe, ele vira um **bean** numa `@TestConfiguration` reutilizável:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/PostgresDeTeste.java" destacar="17, 19-23" />
+
+**O que cada anotação faz.**
+
+- `@TestConfiguration(proxyBeanMethods = false)`: configuração só de teste, que a varredura de componentes **não** encontra; entra apenas onde houver `@Import(PostgresDeTeste.class)`. O `proxyBeanMethods = false` dispensa um proxy que só serviria se um `@Bean` chamasse outro.
+- `@Bean PostgreSQLContainer postgres()`: o Spring **inicia** o container antes de qualquer bean que dependa do banco e o **para** quando o contexto fecha.
+- `@ServiceConnection`: o Spring Boot lê do container a URL JDBC, o usuário e a senha e registra um `JdbcConnectionDetails`, que o `DataSource` e o Flyway usam no lugar de qualquer `spring.datasource.*`. Por isso a porta sorteada nunca aparece no código.
+- `"postgres:18"`: **a mesma versão da produção**, com tag fixa. Com `latest`, os testes um dia passariam a validar um banco que você não usa.
+
+A suíte principal importa essa configuração e limpa a tabela antes de cada teste:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ItensDoCarrinhoTest.java" destacar="25-27, 42-45, 49-57" />
+
+```bash
+mvn test -Dtest=ItensDoCarrinhoTest
+```
+
+```text
+[INFO] Running Itens do carrinho no PostgreSQL
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.050 s -- in Itens do carrinho no PostgreSQL
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- O Spring encontrou a `LojaApplication`, importou `PostgresDeTeste`, iniciou o container, criou o `DataSource` com os dados do `@ServiceConnection` e rodou o **Flyway contra o container**. O teste `bancoDeVerdade` prova as duas coisas: o banco é PostgreSQL 18, e a `flyway_schema_history` registra a `V1` com a descrição `cria item carrinho` (tirada do nome do arquivo).
+- Ou seja, a **migration da produção** roda a cada rodada de testes: um erro num `V7__...sql` quebra o build na sua máquina, e não no deploy.
+- `somaAsQuantidades`, o teste que falhava na V1, agora passa. `quantidadeZero` mostra o `CHECK` do banco virando `DataIntegrityViolationException`, com o nome gerado pelo PostgreSQL (`item_carrinho_quantidade_check`) na mensagem.
+- `concorrencia` libera 8 threads juntas (`CountDownLatch`), cada uma adicionando 25 cafés, e exige exatamente 200. O que está sendo testado é o controle de concorrência **do banco**, e isso só faz sentido no banco real.
+- Os 9 segundos são quase todos de preparação (container, contexto, Flyway); o passo 7 mede isso.
+
+<Callout tipo="dica" titulo="Quer ver os logs do Testcontainers dentro do Spring?">
+O `pom.xml` pai desta trilha deixa o log dos testes em `WARN` para a saída ficar limpa, e isso esconde as linhas de `Creating container` e `started in`. Para vê-las numa rodada, acrescente `-Dlogging.level.tc=INFO` ao comando. Os containers registram o log com o nome `tc.<imagem>`, como `tc.postgres:18`.
+</Callout>
+
+### Passo 5: isolamento dos dados entre testes
+
+**O que vamos fazer e por quê.** Com um banco compartilhado, o que um teste grava fica lá para o próximo. Se `somaAsQuantidades` rodar depois de um teste que deixou 5 cafés no mesmo carrinho, vai encontrar 8, não 3. Testes que dependem da ordem são a fonte clássica de "no CI falha, na minha máquina passa". Há três estratégias, e o projeto usa as três.
+
+**Estratégia 1: limpar antes de cada teste.** É o `TRUNCATE item_carrinho` no `@BeforeEach` do `ItensDoCarrinhoTest`. Limpe **antes**, não depois: se um teste falhar no meio, o próximo ainda começa do zero e você pode inspecionar o banco. Com chaves estrangeiras, use `TRUNCATE a, b, c` num comando só. Funciona em qualquer situação, inclusive com várias threads.
+
+**Estratégia 2: rollback no fim de cada teste.** Com `@Transactional` na classe de teste, o Spring abre uma transação antes de cada teste e a **desfaz** no fim. Nada precisa ser limpo:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ItensDoCarrinhoComRollbackTest.java" semImports />
+
+```bash
+mvn test -Dtest=ItensDoCarrinhoComRollbackTest
+```
+
+```text
+[INFO] Running Itens do carrinho, isolados por rollback
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 6.958 s -- in Itens do carrinho, isolados por rollback
+[INFO] BUILD SUCCESS
+```
+
+O primeiro teste grava dois produtos; o segundo, forçado a rodar depois, encontra o carrinho vazio. É o que o `@DataJpaTest` da [aula 4](../04-testes-de-fatia-no-spring/) faz por padrão. Os limites:
+
+- **Só vale para a thread do teste.** As 8 threads do teste de concorrência gravariam em outras transações, confirmadas e nunca desfeitas.
+- **Não vale para HTTP real.** Com `webEnvironment = RANDOM_PORT`, a requisição roda noutra thread do servidor, com transação própria.
+- **Muda o comportamento transacional.** O código roda dentro da transação do teste, que nunca chega ao `COMMIT`: restrições `DEFERRABLE` nunca são checadas, e `now()` devolve o mesmo instante em todas as chamadas (o checkpoint mostra por que isso importa).
+
+**Estratégia 3: dados únicos por teste.** Cada teste cria o próprio carrinho com `UUID.randomUUID()` e só consulta esse carrinho. Não há o que limpar, e os testes podem até rodar em paralelo. O cuidado é com consultas globais: um `SELECT count(*) FROM item_carrinho` enxerga os dados de todos os testes.
+
+| Estratégia | Custo | Funciona com threads e HTTP? | Quando usar |
+|---|---|---|---|
+| Limpar (`TRUNCATE`) no `@BeforeEach` | um comando por teste | sim | padrão para testes de integração com `@SpringBootTest` |
+| Rollback (`@Transactional` no teste) | zero | **não** | repositórios e consultas, `@DataJpaTest` |
+| Dados únicos (UUID, CPF gerado) | nenhum, mas exige disciplina nas consultas | sim | testes de aceitação e suítes paralelas |
+
+### Passo 6: três outras formas de declarar o container
+
+**O que vamos fazer e por quê.** A `@TestConfiguration` com `@ServiceConnection` é a forma recomendada no Spring Boot 4.1, mas você vai encontrar as outras em projetos existentes, e cada uma tem um ciclo de vida diferente.
+
+**Container no campo, com `@ServiceConnection`.** É o estilo do passo 1 levado para o Spring: a extensão `@Testcontainers` inicia o container e o `@ServiceConnection` no campo o conecta ao contexto.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ContainerNoCampoTest.java" destacar="21-23, 27-29" />
+
+Aqui quem manda no ciclo de vida é o **JUnit**: o container nasce antes da classe e morre depois dela. É explícito, mas cada classe paga o próprio container, e o Spring guarda no cache um contexto cujo `DataSource` aponta para um container já parado. Se outra classe tiver exatamente a mesma configuração, ela herda esse contexto e os erros de conexão parecem aleatórios. Por isso a recomendação é deixar o Spring gerenciar o container como bean.
+
+**`@DynamicPropertySource`, o jeito anterior.** Antes do `@ServiceConnection` (Spring Boot 3.1), copiava-se cada dado do container para as propriedades:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ContainerComPropriedadesTest.java" destacar="27-35" />
+
+Os `postgres::getJdbcUrl` são *suppliers*, avaliados só quando o Spring precisa da propriedade, porque a porta só existe depois do `start()`. O estilo ainda serve para serviços que o Spring Boot não conhece.
+
+**Um container por JVM, com `@ImportTestcontainers`.** Quando classes diferentes precisam de contextos diferentes (uma com `@MockitoBean`, outra com uma propriedade a mais), cada contexto novo criaria outro container. Para ter **um único** PostgreSQL na JVM, declare-o como campo de uma interface (campos de interface são `static final`):
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ContainersDaJvm.java" semImports />
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/ContainerDaJvmTest.java" semImports />
+
+`@ImportTestcontainers` faz o Spring Boot iniciar os containers da interface e aplicar os `@ServiceConnection` deles. Como o objeto é um só, todas as classes que usarem a interface recebem o mesmo banco, qualquer que seja o contexto, e o isolamento de dados fica ainda mais importante.
+
+### Passo 7: ciclo de vida e tempo da suíte
+
+**O que vamos fazer e por quê.** Rodar o módulo inteiro e **medir**: quantos containers subiram e quanto cada classe custou. Os tempos por classe estão na saída do Surefire; o `-Dlogging.level.tc=INFO` mostra cada container.
+
+```bash
+mvn test -Dlogging.level.tc=INFO
+```
+
+Saída de uma execução real (sem as linhas da aula 3 e com os horários cortados):
+
+```text
+INFO tc.testcontainers/ryuk:0.14.0 -- Container testcontainers/ryuk:0.14.0 started in PT2.1958471S
+INFO tc.postgres:18 : Container postgres:18 started in PT1.6629032S
+[INFO] Tests run: 1, … Time elapsed: 13.85 s -- in Checkpoint: atualizado_em
+[INFO] Tests run: 1, … Time elapsed: 3.553 s -- in Carrinho V1 no H2
+[INFO] Tests run: 1, … Time elapsed: 0.318 s -- in Carrinho V1 no PostgreSQL
+INFO tc.postgres:18 : Container postgres:18 started in PT2.0255619S
+[INFO] Tests run: 1, … Time elapsed: 4.495 s -- in Container com @DynamicPropertySource
+INFO tc.postgres:18 : Container postgres:18 started in PT2.0686817S
+[INFO] Tests run: 1, … Time elapsed: 9.636 s -- in Container singleton, um por JVM
+INFO tc.postgres:18 : Container postgres:18 started in PT2.9427056S
+[INFO] Tests run: 1, … Time elapsed: 4.829 s -- in Container declarado no campo da classe de teste
+INFO tc.postgres:18 : Container postgres:18 started in PT1.9450824S
+[INFO] Tests run: 6, … Time elapsed: 2.964 s -- in H2 no modo PostgreSQL não é PostgreSQL
+[INFO] Tests run: 2, … Time elapsed: 0.122 s -- in Itens do carrinho, isolados por rollback
+[INFO] Tests run: 6, … Time elapsed: 0.489 s -- in Itens do carrinho no PostgreSQL
+[INFO] Tests run: 33, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+[INFO] Total time:  01:09 min
+```
+
+**Como ler.**
+
+- **Cinco PostgreSQLs** e um Ryuk subiram; cada container levou de 1,6 a 2,9 s para ficar pronto, fora contexto e Flyway.
+- A primeira classe com `@Import(PostgresDeTeste.class)` (o checkpoint) pagou tudo: 13,85 s, com a JVM ainda "fria". As outras três com **a mesma configuração** levaram 0,3 s, 0,1 s e 0,5 s: reaproveitaram o contexto do cache e, com ele, o container. Nenhum `started in` aparece antes delas.
+- As três classes do passo 6 e o `H2NaoEPostgresTest` subiram um container **cada uma**. Aqui é de propósito, para demonstrar os estilos; num projeto real, seriam uns 8 segundos jogados fora.
+
+A regra: **o custo de um teste de integração é o contexto + o container, não o teste**. Duzentas classes com a mesma configuração pagam o container uma vez; duzentas com pequenas variações (`@MockitoBean` diferente, `@TestPropertySource`, `@DirtiesContext`) pagam duzentas. Os ciclos de vida, do mais curto ao mais longo:
+
+| Declaração | Vive por | Quem para | Use para |
+|---|---|---|---|
+| `@Container` em campo de instância | um método de teste | extensão do JUnit | quase nunca (caro demais) |
+| `@Container static` | uma classe de teste | extensão do JUnit | testes sem Spring, como o do passo 1 |
+| `@Bean` + `@ServiceConnection` numa `@TestConfiguration` | um contexto do Spring (compartilhado pelo cache) | o Spring, ao fechar o contexto | **o padrão** em projetos Spring Boot |
+| Campo de interface + `@ImportTestcontainers` | a JVM inteira | no fim da execução (o Ryuk garante) | suítes com muitos contextos diferentes |
+| `.withReuse(true)` | várias execuções do Maven | ninguém (você apaga à mão) | só desenvolvimento local |
+
+A última linha é o **reuso**: com `.withReuse(true)` no container e `testcontainers.reuse.enable=true` no arquivo `.testcontainers.properties` da sua pasta de usuário, o container sobrevive ao fim do Maven e é reencontrado na execução seguinte. Cuidados: o banco **não** volta vazio, o container fica rodando até um `docker rm -f`, e o recurso fica desligado no CI. Nenhum teste desta trilha usa reuso.
+
+Outras alavancas de tempo: padronizar a configuração para aproveitar o cache de contexto (aula 4), evitar `@DirtiesContext` e usar testes de fatia quando não precisar da aplicação inteira.
+
+## Quando dá errado: as mensagens mais comuns
+
+### Docker desligado
+
+Com o Docker parado, o Testcontainers percorre as estratégias de conexão (variável `DOCKER_HOST`, socket, *named pipe*, Docker Desktop) e, se nenhuma responde, desiste. Ao apontar o `DOCKER_HOST` para um endereço onde nada escuta, a primeira linha abaixo apareceu de verdade:
+
+```text
+WARN org.testcontainers.dockerclient.DockerClientProviderStrategy -- DOCKER_HOST tcp://127.0.0.1:1 is not listening
+```
+
+Nessa máquina o Docker continuava ligado, e o Testcontainers o achou pela estratégia seguinte (o *named pipe*). Com o Docker realmente desligado, todas falham e a execução termina com uma mensagem como esta (**ilustrativa**: não foi reproduzida aqui, para não derrubar o Docker de outros serviços):
+
+```text
+java.lang.IllegalStateException: Could not find a valid Docker environment. Please see logs and check configuration
+```
+
+**Como corrigir:** ligue o Docker e confira com `docker version`. No Linux, veja a permissão no socket (grupo `docker`); com Podman ou Colima, exporte o `DOCKER_HOST` que a ferramenta indicar.
+
+**E o `@EnabledIfDockerAvailable`?** Com ele, sem Docker, a classe é **pulada** em vez de falhar. É conveniente para rodar só os testes unitários numa máquina sem Docker, por isso a trilha o usa. O outro lado: num CI sem Docker, a suíte fica verde **sem testar nada** de integração. Se adotar a anotação, confira no CI que o número de testes pulados é zero.
+
+### `@ServiceConnection` esquecido
+
+Para gerar esta, a anotação foi removida da `PostgresDeTeste`. Sem H2 no classpath, a mensagem é direta:
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Failed to configure a DataSource: 'url' attribute is not specified and no embedded datasource could be configured.
+
+Reason: Failed to determine a suitable driver class
+```
+
+**Como ler:** o container até subiu (é um bean), mas ninguém contou ao Spring como chegar nele. O Spring procurou uma `spring.datasource.url`, não achou, procurou um banco embutido, não achou, e desistiu.
+
+Agora a versão traiçoeira, com o **H2 no classpath de teste** (como neste módulo):
+
+```text
+[ERROR] Tests run: 6, Failures: 0, Errors: 6, Skipped: 0, Time elapsed: 12.90 s <<< FAILURE! -- in Itens do carrinho no PostgreSQL
+[ERROR] dev.trilhajava.m10.aulas.containers.ItensDoCarrinhoTest.somaAsQuantidades -- Time elapsed: 2.263 s <<< ERROR!
+…
+Caused by: org.h2.jdbc.JdbcSQLSyntaxErrorException:
+Syntax error in SQL statement "TRUNCATE [*]item_carrinho"; expected "TABLE"; SQL statement:
+```
+
+**Como ler:** a pista é o pacote `org.h2` num teste que deveria usar PostgreSQL. Sem conexão configurada, o Spring Boot criou **em silêncio** um H2 embutido, rodou o Flyway nele e os testes quebraram no primeiro SQL que o H2 não entende. Com SQL comum, teriam passado, e você acharia que testa no PostgreSQL. **Como corrigir:** recoloque o `@ServiceConnection`, e tenha um teste como o `bancoDeVerdade`, que confere o nome e a versão do banco.
+
+### Porta fixa no teste
+
+Um erro muito comum de quem está começando: copiar a URL de desenvolvimento para o teste. Com `spring.datasource.url=jdbc:postgresql://localhost:5432/test` e nenhum banco nessa porta:
+
+```text
+Caused by: org.flywaydb.core.internal.exception.sqlExceptions.FlywaySqlUnableToConnectToDbException: Unable to obtain connection from database: Connection to localhost:5432 refused. Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.
+```
+
+O Flyway aparece porque é o primeiro a abrir uma conexão. **Como corrigir:** apague a URL fixa e deixe o `@ServiceConnection` fornecer a porta sorteada. O contrário é pior: se houver um PostgreSQL instalado escutando na 5432, o teste conecta **nele**, apaga tabelas no `TRUNCATE` e passa, enquanto no CI falha.
+
+### Imagem baixando (a primeira execução "travada")
+
+Na primeira vez que uma imagem é usada numa máquina, o Docker precisa baixá-la. Com uma tag ainda não baixada (`postgres:18-alpine`), o log mostrou:
+
+```text
+INFO tc.postgres:18-alpine -- Pulling docker image: postgres:18-alpine. Please be patient; this may take some time but only needs to be done once.
+INFO tc.postgres:18-alpine -- Pulling image layers:  8 pending,  1 downloaded,  0 extracted, (0 bytes/? MB)
+…
+INFO tc.postgres:18-alpine -- Pull complete. 9 layers, pulled in 46s (downloaded 112 MB at 2 MB/s)
+INFO tc.postgres:18-alpine -- Container postgres:18-alpine started in PT2.7529854S
+```
+
+Quase 48 segundos de download para 2,7 de subida; na segunda execução, a imagem já está em cache. Se o primeiro `mvn test` parecer travado, é quase sempre isso (e, com o log em `WARN`, você nem vê essas linhas). Evite a surpresa com `docker pull postgres:18`. Em redes que bloqueiam o Docker Hub, a propriedade `hub.image.name.prefix` do Testcontainers aponta para um registro interno.
+
+## No CI
+
+O GitHub Actions desta trilha já roda os testes com Testcontainers, sem nenhuma configuração especial: os *runners* `ubuntu-latest` vêm com Docker instalado e ligado. O trecho relevante do `.github/workflows/ci.yml` do projeto:
+
+```yaml
+jobs:
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Soluções de referência passam em todos os testes
+        run: mvn -B -f java/pom.xml verify
+```
+
+O `mvn verify` roda estes testes e os do exercício 10.03, que sobem PostgreSQLs de verdade a cada push. Cuidados: use runners **Linux** (os de Windows e macOS do GitHub não oferecem Docker com containers Linux de forma prática); lembre que cada build começa com o cache de imagens vazio e paga o `docker pull`; deixe o **reuso desligado**, para cada build começar com bancos vazios. Em GitLab CI e Jenkins, o job precisa de acesso a um Docker (*Docker-in-Docker* ou o socket do host).
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="H2 imitando o PostgreSQL" depois="O PostgreSQL da produção, num container">
+```java
+// application-test.properties:
+// spring.datasource.url=jdbc:h2:mem:loja;MODE=PostgreSQL
+
+@SpringBootTest(properties =
+    "spring.datasource.url=jdbc:h2:mem:loja;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE")
+class CarrinhoV1NoH2Test {
+    // verde no H2...
+    // ...e erro 500 na primeira sexta-feira
+    // de promoção
+}
+```
+
+```java
+@TestConfiguration(proxyBeanMethods = false)
+public class PostgresDeTeste {
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer postgres() {
+        return new PostgreSQLContainer("postgres:18");
+    }
+}
+
+@SpringBootTest
+@Import(PostgresDeTeste.class)
+class ItensDoCarrinhoTest { /* ... */ }
+```
+</Comparar>
+
+À esquerda, o teste valida um banco que não existe em produção, e o time acaba escrevendo SQL para agradar o H2. À direita, a mesma versão do banco, as mesmas migrations e nenhuma URL escrita à mão. As regras de bolso:
+
+- **Tag fixa, igual à da produção.** `postgres:18`, nunca `latest`. Atualizou o banco em produção? Atualize a tag no mesmo pull request.
+- **Uma configuração compartilhada.** Todas as classes importam a mesma `@TestConfiguration` do mesmo jeito. Variações (`@MockitoBean`, propriedades, `@DirtiesContext`) criam contextos novos e, com eles, containers novos.
+- **Limpe antes, não depois.** E prefira dados únicos quando o teste puder rodar em paralelo.
+- **Confira que o banco é o certo.** Um teste que verifica o nome e a versão do banco pega o `@ServiceConnection` esquecido na hora.
+- **Não suba container para testar regra de negócio.** Frete, prazo de reembolso, validação de CPF: isso é teste unitário, com objetos reais e fakes, em milissegundos (aulas 2 e 3). Testcontainers é para a **fronteira** com o banco: SQL, migrations, mapeamentos, transações, concorrência.
+- **Não teste o PostgreSQL.** Um `INSERT` seguido de `SELECT` que devolve a linha testa o banco, não o seu código. Priorize as consultas com regra (filtros, ordenação, upsert, travas) e os fluxos críticos.
+
+<Callout tipo="atencao" titulo="Além do banco">
+O Testcontainers tem módulos para Kafka, RabbitMQ, Redis, MongoDB, LocalStack (AWS) e muitos outros, e o `@ServiceConnection` conhece a maioria. Nos módulos 12 (mensageria) e 15 (cache), os testes seguem o padrão desta aula: uma `@TestConfiguration` com o container como bean.
+</Callout>
+
+## Checkpoint: o upsert também renova a data
+
+O upsert do `ItensDoCarrinho` faz duas coisas no `DO UPDATE`: soma a quantidade e atualiza `atualizado_em = now()`. Nenhum teste da suíte confere a segunda parte. Se alguém apagar essa linha, a loja perde a informação que usa para limpar carrinhos abandonados, e nada fica vermelho.
+
+**O desafio:** crie a classe `MeuTesteDeAtualizadoEmTest` no pacote de testes `dev.trilhajava.m10.aulas.containers`, com um teste que:
+
+1. adiciona um café a um carrinho **novo** e lê o `atualizado_em` direto da tabela;
+2. adiciona mais um café ao mesmo carrinho e lê o `atualizado_em` de novo;
+3. confere que o segundo instante é **posterior** ao primeiro e que a quantidade virou 2.
+
+Use a `PostgresDeTeste` de modo que a sua classe **não** suba um container novo, e não use `TRUNCATE`. Rode com `mvn test -Dtest=MeuTesteDeAtualizadoEmTest`, depois apague temporariamente a linha `atualizado_em = now()` do upsert e veja o teste falhar (desfaça em seguida).
+
+<Dicas>
+<Dica nivel={1}>
+Para aproveitar o container já existente, a sua classe precisa ter **exatamente** a mesma configuração das outras: `@SpringBootTest` e `@Import(PostgresDeTeste.class)`, sem propriedades extras. E, sem `TRUNCATE`, o isolamento vem da estratégia 3 do passo 5.
+</Dica>
+<Dica nivel={2}>
+`UUID.randomUUID()` dá um carrinho que nenhum outro teste usa. Para ler a coluna, injete o `JdbcClient` e consulte `SELECT atualizado_em FROM item_carrinho WHERE carrinho_id = :c AND sku = :s`, pedindo o resultado como `OffsetDateTime.class`.
+</Dica>
+<Dica nivel={3}>
+Um método auxiliar deixa o teste legível:
+
+```java
+private OffsetDateTime atualizadoEm(UUID carrinhoId, String sku) {
+    return jdbc.sql("SELECT atualizado_em FROM item_carrinho WHERE carrinho_id = :c AND sku = :s")
+            .param("c", carrinhoId)
+            .param("s", sku)
+            .query(OffsetDateTime.class)
+            .single();
+}
+```
+
+A asserção principal é `assertThat(segundaVez).isAfter(primeiraVez)`.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/containers/AtualizadoEmTest.java" semImports />
+
+**Por que assim.** A classe tem a mesma configuração do `ItensDoCarrinhoTest`, então o Spring reaproveita o contexto e o container: na medição do passo 7, as classes nessa situação levaram menos de meio segundo. O carrinho com `UUID.randomUUID()` dispensa a limpeza, e as consultas filtram por ele, então dados de outros testes não atrapalham.
+
+**Por que a data muda.** No PostgreSQL, `now()` devolve o instante do **início da transação**. Cada chamada a `adicionar` roda na sua própria transação (não há `@Transactional` no teste nem no repositório), então as duas chamadas têm instantes diferentes, com precisão de microssegundos. Se o teste fosse `@Transactional`, as duas chamadas estariam na mesma transação, `now()` devolveria o mesmo valor e o teste falharia mesmo com o código certo. É um exemplo concreto do terceiro limite do rollback no passo 5: ele muda o comportamento transacional do código testado.
+
+**Alternativa.** Acrescentar `atualizadoEm` ao `record ItemDoCarrinho` só se a aplicação precisar do dado; consultar a tabela direto num teste de integração é legítimo.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+"Como você faz testes de integração com banco?" e "por que não H2?" são perguntas clássicas. Uma resposta com substância: uso Testcontainers com a **mesma versão** do banco de produção, declarado como bean numa `@TestConfiguration` com `@ServiceConnection`, importada por todas as classes do mesmo jeito para o cache de contexto do Spring reaproveitar um único container. As migrations do Flyway rodam no container, então o schema testado é o da produção. Não uso H2 porque ele esconde diferenças reais: não tem upsert com `ON CONFLICT`, nem `jsonb`, nem índice parcial, ordena texto e `NULL`s de outro jeito e, principalmente, não aborta a transação depois de um erro como o PostgreSQL faz. Isolo os dados limpando as tabelas antes de cada teste ou com dados únicos; rollback só em testes de repositório, porque não funciona com threads nem com HTTP. Bônus: citar o Ryuk, as portas sorteadas e o cuidado de não subir container para testar regra de negócio mostra experiência prática.
+</Callout>
+
+<Quiz
+  id="10-testcontainers"
+  questoes={[
+    {
+      pergunta: 'O repositório faz INSERT e, se receber DuplicateKeyException, faz UPDATE, tudo dentro de @Transactional. O teste passa no H2. O que acontece no PostgreSQL?',
+      opcoes: ['Funciona igual', 'O UPDATE falha com "current transaction is aborted": no PostgreSQL, um erro invalida o resto da transação', 'O INSERT não lança exceção no PostgreSQL', 'O PostgreSQL faz o upsert sozinho'],
+      correta: 1,
+      explicacao: 'Depois de qualquer erro, a transação fica abortada (SQLState 25P02) até um ROLLBACK. O H2 aceita os comandos seguintes. A correção é um upsert atômico: `INSERT ... ON CONFLICT DO UPDATE`.',
+    },
+    {
+      pergunta: 'Qual a função do @ServiceConnection no bean PostgreSQLContainer?',
+      opcoes: ['Iniciar o Docker', 'Ler URL, usuário e senha do container e configurar o DataSource e o Flyway, sem spring.datasource.* manual', 'Baixar a imagem do PostgreSQL', 'Rodar as migrations'],
+      correta: 1,
+      explicacao: 'Ele registra os `ConnectionDetails` a partir do container. Quem inicia o container é o Spring (por ser um bean), e quem roda as migrations é o Flyway.',
+    },
+    {
+      pergunta: 'Três classes de teste importam @Import(PostgresDeTeste.class) do mesmo jeito; uma quarta importa a mesma configuração, mas acrescenta @TestPropertySource. Quantos containers PostgreSQL sobem?',
+      opcoes: ['Um', 'Dois: um para o contexto compartilhado pelas três e outro para o contexto diferente da quarta', 'Quatro, um por classe', 'Nenhum, o Spring reaproveita o banco local'],
+      correta: 1,
+      explicacao: 'O container vive com o contexto do Spring. As três primeiras compartilham o contexto do cache; a propriedade extra muda a chave do cache e cria outro contexto, com outro container.',
+    },
+    {
+      pergunta: 'Um teste dispara 8 threads que gravam no banco. Qual estratégia de isolamento NÃO funciona para ele?',
+      opcoes: ['TRUNCATE no @BeforeEach', 'Dados únicos por teste (UUID)', '@Transactional no teste, com rollback automático', 'Nenhuma funciona'],
+      correta: 2,
+      explicacao: 'A transação do teste pertence à thread do teste. As outras threads gravam em transações próprias, que são confirmadas e não são desfeitas no fim.',
+    },
+    {
+      pergunta: 'Os testes quebram com "org.h2.jdbc.JdbcSQLSyntaxErrorException", mas a configuração declara um PostgreSQLContainer. Qual a causa mais provável?',
+      opcoes: ['O Docker está desligado', 'O @ServiceConnection foi esquecido e, com H2 no classpath, o Spring Boot criou um H2 embutido', 'A imagem postgres:18 não existe', 'O Flyway não suporta PostgreSQL 18'],
+      correta: 1,
+      explicacao: 'Sem conexão configurada, o Spring Boot usa um banco embutido se encontrar um no classpath. O container sobe, mas ninguém o usa. Um teste que confere o nome do banco pega isso na hora.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **H2 não é PostgreSQL.** Ou ele recusa o SQL (upsert, `jsonb`, índice parcial, `RETURNING`) ou, pior, aceita e responde diferente (transação abortada, ordenação de texto, posição dos `NULL`s). Teste a camada de dados contra o banco real.
+- **Testcontainers** conversa com o Docker, sobe o Ryuk, baixa a imagem se preciso, cria o container com **porta sorteada**, espera o banco ficar pronto e remove tudo no fim.
+- No Spring Boot 4.1, o padrão é o container como **`@Bean` com `@ServiceConnection`** numa **`@TestConfiguration`** importada por todas as classes do mesmo jeito. Nenhuma `spring.datasource.*` escrita à mão; o **Flyway** aplica as migrations da produção no container.
+- **Testcontainers 2:** artefatos `testcontainers-postgresql` e `testcontainers-junit-jupiter`, classe `org.testcontainers.postgresql.PostgreSQLContainer`, sem genéricos.
+- **Ciclo de vida:** `@Container static` vive uma classe; o bean vive um contexto (compartilhado pelo cache); `@ImportTestcontainers` com campo de interface vive a JVM; `withReuse` atravessa execuções e é só para uso local.
+- **Tempo:** o custo está no contexto e no container, não no teste. Meça com os tempos do Surefire e `-Dlogging.level.tc=INFO`.
+- **Isolamento:** `TRUNCATE` antes de cada teste (funciona sempre), rollback com `@Transactional` (não funciona com threads e HTTP) ou dados únicos.
+- **Erros típicos:** Docker desligado (`Could not find a valid Docker environment`), `@ServiceConnection` esquecido (`Failed to configure a DataSource`, ou um H2 silencioso), porta fixa (`Connection to localhost:5432 refused`) e a primeira execução baixando a imagem.
+- **No CI**, os runners `ubuntu-latest` do GitHub Actions já têm Docker.
+
+## Próximo passo
+
+No [exercício 10.03, Fila de tarefas no PostgreSQL com Testcontainers](../../../exercicios/10-testes/03-fila-com-testcontainers/), você monta a `@TestConfiguration` com `@ServiceConnection` e implementa uma fila de tarefas sobre o PostgreSQL com `FOR UPDATE SKIP LOCKED`, `jsonb` e índice parcial: tudo o que o H2 não sabe fazer. O teste final coloca 8 trabalhadores concorrentes consumindo 200 tarefas, e cada uma precisa ser processada exatamente uma vez. Na aula seguinte, [TDD e testes de arquitetura](../06-tdd-e-arquitetura/), a suíte que você construiu no módulo passa a guiar o design do código.

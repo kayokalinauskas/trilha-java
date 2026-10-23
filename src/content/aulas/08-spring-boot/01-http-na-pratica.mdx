@@ -1,0 +1,200 @@
+---
+titulo: HTTP na prática
+descricao: O protocolo que toda API usa — requisição e resposta, métodos e suas garantias (seguro, idempotente), status codes que comunicam de verdade, headers essenciais e como investigar tudo com curl.
+modulo: 08-spring-boot
+ordem: 1
+duracao: 50
+objetivos:
+  - Descrever a estrutura de uma requisição e de uma resposta HTTP
+  - Escolher o método certo sabendo o que é seguro e idempotente
+  - Responder com o status code que comunica o resultado
+  - Usar curl para investigar uma API
+tags: [HTTP, REST, status codes, curl]
+flashcards:
+  - frente: O que significa um método HTTP ser idempotente?
+    verso: Repetir a mesma requisição várias vezes deixa o servidor no mesmo estado que uma vez só. GET, PUT e DELETE são; POST não é.
+  - frente: Qual a diferença entre 401 e 403?
+    verso: 401 Unauthorized = não sei quem você é (falta ou é inválida a autenticação). 403 Forbidden = sei quem você é, mas você não pode fazer isso.
+  - frente: Quando usar 400 e quando usar 422?
+    verso: 400 para requisição malformada ou dados que não passam na validação de formato; 422 para dados bem formados que violam uma regra de negócio (ex. saldo insuficiente).
+  - frente: O que o header Location indica numa resposta 201?
+    verso: A URI do recurso recém-criado, para o cliente consultá-lo depois.
+  - frente: O que é um método "seguro" em HTTP?
+    verso: Um método que não altera o estado do servidor (GET, HEAD, OPTIONS). Pode ser repetido, cacheado e pré-carregado sem efeitos colaterais.
+---
+
+Toda API REST que você vai escrever — e toda API que você vai consumir — conversa por **HTTP**. Frameworks escondem muito dos detalhes, mas as perguntas de entrevista e os bugs de produção moram exatamente neles: "por que esse `POST` criou dois pedidos?", "por que o cliente recebe 200 com uma mensagem de erro?", "por que o navegador não cacheia?".
+
+## Uma conversa em texto
+
+HTTP é um protocolo de **requisição e resposta**. O cliente envia uma mensagem; o servidor devolve outra. No HTTP/1.1, as mensagens são texto puro; o HTTP/2 e o HTTP/3 mudam o transporte (binário, multiplexado, sobre QUIC no caso do 3), mas **a semântica é a mesma**: métodos, status, headers e corpo.
+
+```http
+POST /contas/7f3c.../depositos HTTP/1.1
+Host: api.fintech.dev
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+
+{"valor": 150.50}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{"id": "7f3c...", "saldo": 150.50}
+```
+
+<Figura legenda="Anatomia de uma troca HTTP: linha inicial, headers, linha em branco e corpo">
+<svg viewBox="0 0 680 230" width="680" role="img" aria-label="Requisição com método, caminho, headers e corpo; resposta com status, headers e corpo">
+  <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="160" y="20" text-anchor="middle" class="d-title">Requisição</text>
+  <rect x="20" y="30" width="280" height="36" rx="8" class="d-accent"/><text x="160" y="53" text-anchor="middle" class="d-mono">POST /contas/7f3c/depositos</text>
+  <rect x="20" y="72" width="280" height="64" rx="8" class="d-box"/><text x="160" y="96" text-anchor="middle" class="d-mono">Content-Type: application/json</text><text x="160" y="120" text-anchor="middle" class="d-mono">Authorization: Bearer …</text>
+  <rect x="20" y="142" width="280" height="36" rx="8" class="d-info"/><text x="160" y="165" text-anchor="middle" class="d-mono">{'{"valor": 150.50}'}</text>
+  <text x="520" y="20" text-anchor="middle" class="d-title">Resposta</text>
+  <rect x="380" y="30" width="280" height="36" rx="8" class="d-ok"/><text x="520" y="53" text-anchor="middle" class="d-mono">200 OK</text>
+  <rect x="380" y="72" width="280" height="64" rx="8" class="d-box"/><text x="520" y="96" text-anchor="middle" class="d-mono">Content-Type: application/json</text><text x="520" y="120" text-anchor="middle" class="d-mono">Cache-Control: no-store</text>
+  <rect x="380" y="142" width="280" height="36" rx="8" class="d-info"/><text x="520" y="165" text-anchor="middle" class="d-mono">{'{"saldo": 150.50}'}</text>
+  <path d="M300 90 H376" class="d-line" marker-end="url(#h1)"/>
+  <text x="160" y="205" text-anchor="middle" class="d-label">linha inicial · headers · corpo</text>
+  <text x="520" y="205" text-anchor="middle" class="d-label">status · headers · corpo</text>
+</svg>
+</Figura>
+
+HTTP é **sem estado** (*stateless*): cada requisição carrega tudo o que o servidor precisa para atendê-la (inclusive a autenticação). É isso que permite colocar dez instâncias da sua aplicação atrás de um balanceador de carga e qualquer uma responder.
+
+## Métodos: o verbo diz a intenção
+
+| Método | Uso típico | Seguro | Idempotente | Corpo |
+|---|---|---|---|---|
+| `GET` | ler um recurso ou uma coleção | ✅ | ✅ | não |
+| `POST` | criar, ou disparar uma ação | ❌ | ❌ | sim |
+| `PUT` | substituir o recurso inteiro | ❌ | ✅ | sim |
+| `PATCH` | alterar parte do recurso | ❌ | depende | sim |
+| `DELETE` | remover | ❌ | ✅ | raro |
+| `HEAD` / `OPTIONS` | metadados / capacidades (CORS) | ✅ | ✅ | não |
+
+- **Seguro**: não altera o estado do servidor. Por isso navegadores, *crawlers* e caches podem repetir um `GET` à vontade. Um `GET /contas/7/apagar` é um bug esperando para acontecer.
+- **Idempotente**: repetir dá o mesmo **estado final**. `DELETE /contas/7` duas vezes: a conta continua apagada (a segunda resposta pode ser 404, mas o estado é o mesmo). `PUT` com o mesmo corpo também.
+
+<Callout tipo="atencao" titulo="Redes falham — e o cliente repete">
+Um celular envia `POST /transferencias`, o servidor processa, mas a resposta se perde no túnel do metrô. O app tenta de novo. Sem cuidado, são **duas** transferências. Como `POST` não é idempotente, APIs sérias aceitam um header `Idempotency-Key`: o servidor guarda a chave e, se ela chegar de novo, devolve a resposta original sem reprocessar. Você implementa isso no marco 2 do projeto integrador.
+</Callout>
+
+## Status codes: a primeira coisa que o cliente lê
+
+O código de status diz **o que aconteceu** antes de qualquer um olhar o corpo. Monitoramento, retries, caches e SDKs tomam decisões com base nele.
+
+| Faixa | Significado | Os que você mais vai usar |
+|---|---|---|
+| **2xx** | sucesso | `200 OK`, `201 Created` (+ `Location`), `202 Accepted` (processamento assíncrono), `204 No Content` |
+| **3xx** | redirecionamento | `301`/`308` (permanente), `304 Not Modified` (cache) |
+| **4xx** | erro **do cliente** — não adianta repetir igual | `400`, `401`, `403`, `404`, `405`, `409`, `415`, `422`, `429` |
+| **5xx** | erro **do servidor** — pode adiantar tentar de novo | `500`, `502`, `503` (+ `Retry-After`), `504` |
+
+Os que mais geram dúvida:
+
+- **400 Bad Request**: JSON malformado, campo obrigatório ausente, formato inválido.
+- **401 Unauthorized** × **403 Forbidden**: 401 é "não sei quem você é"; 403 é "sei quem você é, mas não pode". (O nome "Unauthorized" é um erro histórico da especificação: deveria ser "Unauthenticated".)
+- **404 Not Found**: o recurso não existe — ou você não deve saber que existe (veja o módulo 11).
+- **409 Conflict**: conflita com o estado atual (CPF já cadastrado, versão desatualizada).
+- **422 Unprocessable Content**: a requisição está bem formada, mas viola uma regra de negócio (saldo insuficiente, check-out antes do check-in).
+- **429 Too Many Requests**: limite de requisições excedido; mande `Retry-After`.
+
+<Comparar antes="200 para tudo" depois="Status que comunica">
+```http
+HTTP/1.1 200 OK
+
+{"sucesso": false,
+ "erro": "Conta não encontrada"}
+```
+
+```http
+HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{"type": ".../conta-nao-encontrada",
+ "title": "Conta não encontrada",
+ "status": 404}
+```
+</Comparar>
+
+Com "200 para tudo", o balanceador acha que está tudo bem, o dashboard de erros fica verde e cada cliente precisa inspecionar o corpo para saber se deu certo. O formato de erro à direita (Problem Details) é o assunto da aula 5.
+
+## Headers que você precisa conhecer
+
+| Header | Para quê |
+|---|---|
+| `Content-Type` | formato do corpo **enviado** (`application/json`, `application/problem+json`) |
+| `Accept` | formatos que o cliente **aceita** receber |
+| `Authorization` | credenciais (`Bearer <token>`) |
+| `Location` | onde está o recurso criado (201) ou para onde ir (3xx) |
+| `Cache-Control`, `ETag`, `If-None-Match` | cache e requisições condicionais (`304`) |
+| `Idempotency-Key` | tornar um `POST` seguro para repetição |
+| `Retry-After` | quanto esperar antes de tentar de novo (`429`, `503`) |
+| `X-Request-Id` / `traceparent` | correlacionar logs entre serviços (módulo 14) |
+
+## curl: o estetoscópio do backend
+
+Antes do Postman ou do Insomnia, aprenda o `curl`. Ele está em todo servidor e em todo pipeline de CI.
+
+```bash
+# -i mostra status e headers da resposta
+curl -i http://localhost:8080/pacientes/1
+
+# POST com JSON
+curl -i -X POST http://localhost:8080/pacientes \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Ana", "cpf": "52998224725", "nascimento": "1990-05-10"}'
+
+# -v mostra também a requisição enviada (ótimo para depurar headers)
+curl -v http://localhost:8080/pacientes?nome=ana
+```
+
+<Callout tipo="dica" titulo="No Windows">
+No PowerShell, `curl` pode ser um apelido de `Invoke-WebRequest`. Use `curl.exe` para chamar o curl de verdade — e aspas duplas escapadas no JSON (`-d "{\"nome\": \"Ana\"}"`). No IntelliJ, arquivos `.http` são uma alternativa excelente, versionada junto com o código.
+</Callout>
+
+<Callout tipo="entrevista">
+"Qual a diferença entre PUT e PATCH?" e "o que é idempotência?" caem em quase toda entrevista de backend. Responda com um exemplo concreto: `PUT /pacientes/7` substitui o paciente inteiro, e repeti-lo não muda nada; um `POST /transferencias` repetido pode transferir duas vezes — por isso existe `Idempotency-Key`. Citar 401 × 403 e 400 × 422 com exemplos mostra maturidade.
+</Callout>
+
+<Quiz
+  id="08-http"
+  questoes={[
+    {
+      pergunta: 'Um cliente chamou `DELETE /pedidos/10` duas vezes por causa de um timeout. O que isso revela sobre DELETE?',
+      opcoes: ['Que é inseguro e não deve ser usado', 'Que é idempotente: o estado final é o mesmo, o pedido continua apagado', 'Que a segunda chamada apaga outro pedido', 'Que DELETE não pode retornar 404'],
+      correta: 1,
+      explicacao: 'A segunda resposta pode ser 404, mas o estado do servidor é o mesmo — a definição de idempotência.',
+    },
+    {
+      pergunta: 'O usuário está autenticado, mas tenta acessar o painel de administração. Qual status?',
+      opcoes: ['401', '403', '404', '400'],
+      correta: 1,
+      explicacao: 'O servidor sabe quem ele é (autenticado), mas ele não tem permissão: 403 Forbidden.',
+    },
+    {
+      pergunta: 'Um saque de R$ 500 numa conta com R$ 100, com JSON perfeitamente válido. O status mais adequado é:',
+      opcoes: ['400 Bad Request', '422 Unprocessable Content', '500 Internal Server Error', '200 OK com erro no corpo'],
+      correta: 1,
+      explicacao: 'A requisição está bem formada; ela viola uma regra de negócio.',
+    },
+    {
+      pergunta: 'Qual header acompanha um 201 Created indicando o novo recurso?',
+      opcoes: ['Content-Location', 'Location', 'Link', 'X-Created'],
+      correta: 1,
+      explicacao: 'Location aponta para a URI do recurso criado.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- HTTP é texto (semântica) sobre transportes diferentes; é **sem estado**.
+- Métodos têm garantias: `GET` é **seguro**; `GET`, `PUT` e `DELETE` são **idempotentes**; `POST` não é — use `Idempotency-Key` quando repetir for perigoso.
+- O status code é o contrato mais importante da resposta: 201 + `Location`, 204, 400 × 422, 401 × 403, 404, 409, 429, 5xx.
+- Aprenda `curl -i` e `curl -v`: você vai precisar deles em produção.

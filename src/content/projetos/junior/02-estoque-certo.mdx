@@ -1,0 +1,1282 @@
+---
+titulo: Estoque Certo — gestão de estoque e compras para pequeno varejo
+resumo: API de estoque para uma rede pequena de lojas com vários depósitos, em que o saldo nasce de movimentações imutáveis, nunca fica negativo nem com duas vendas simultâneas, e alimenta compras, importação de catálogo por CSV e relatórios em SQL.
+nivel: junior
+ordem: 2
+dominio: Varejo · estoque
+horas: 86
+stack: [Java 25, Spring Boot 4, Spring Security 7, Spring Data JPA, PostgreSQL 18, Flyway, JUnit 6, Testcontainers 2, Docker Compose, GitHub Actions]
+competencias:
+  - Modelagem de livro-razão — o saldo é derivado de movimentações imutáveis, com conciliação que prova que as contas fecham
+  - Concorrência tratada e testada — vinte vendas simultâneas do último item não deixam o saldo negativo, e a escolha do lock está num ADR
+  - Dinheiro com BigDecimal do começo ao fim, incluindo custo médio ponderado com arredondamento documentado
+  - SQL de relatório de verdade (curva ABC com funções de janela, giro, estoque parado) com índices justificados por EXPLAIN
+  - Importação de 10 mil linhas de CSV com validação linha a linha, relatório de erros e reprocessamento seguro
+  - API REST paginada, documentada em OpenAPI, com erros em Problem Details e autorização por papel
+  - Projeto que sobe com um comando, CI verde com Testcontainers e README que um avaliador entende em cinco minutos
+modulos: [02-poo, 03-colecoes-generics-excecoes, 04-java-moderno, 06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 14-devops]
+marcos:
+  - { id: fundacao, titulo: Fundação do repositório, resumo: "Projeto criado no Spring Initializr, PostgreSQL no Docker Compose, CI verde e README inicial." }
+  - { id: catalogo, titulo: "Catálogo: produtos, categorias, fornecedores e depósitos", resumo: "CRUD paginado com SKU, EAN-13 e CNPJ validados, preços em BigDecimal e erros em Problem Details." }
+  - { id: seguranca, titulo: Autenticação, papéis e auditoria, resumo: "Login com JWT, papéis GERENTE, ESTOQUISTA e CONSULTA, e trilha de auditoria das alterações." }
+  - { id: movimentacoes, titulo: Movimentações e saldo derivado, resumo: "Entradas, saídas e ajustes imutáveis, saldo por depósito, custo médio ponderado e extrato do produto." }
+  - { id: concorrencia, titulo: Concorrência e transferências, resumo: "Lock por produto, teste com vinte vendas simultâneas, transferências entre depósitos e conciliação." }
+  - { id: compras, titulo: Pedidos de compra e recebimento, resumo: "Ciclo de vida do pedido, recebimento parcial e total gerando entradas, tudo em uma transação." }
+  - { id: importacao, titulo: Importação e exportação de catálogo em CSV, resumo: "Arquivo de 10 mil linhas validado linha a linha, relatório de erros, simulação e reprocessamento idempotente." }
+  - { id: relatorios, titulo: Relatórios SQL e alertas de estoque mínimo, resumo: "Valor do estoque, curva ABC, giro, produtos parados e alertas, com índices justificados." }
+  - { id: entrega, titulo: Entrega, resumo: "Deploy, README final, coleção de requisições, vídeo de demonstração e release v1.0.0." }
+---
+
+## Visão geral
+
+Loja pequena perde dinheiro com estoque de dois jeitos: falta o produto que vende e sobra o que não vende. O problema raramente é falta de sistema; é um sistema em que ninguém confia. A tela diz 12, a prateleira tem 7, e ninguém sabe quando nem por que a diferença apareceu.
+
+Você vai construir o **Estoque Certo**, a API de estoque e compras de uma rede pequena de lojas. O princípio é o de um livro contábil: **o saldo não é um número que se edita, é a soma de lançamentos que nunca se apagam**. Assim, toda diferença tem data, autor e motivo.
+
+O que será construído:
+
+- Cadastro de **produtos** (SKU único, EAN-13 com dígito verificador conferido, unidade, preços em `BigDecimal`), **categorias**, **fornecedores** (CNPJ validado, inclusive o alfanumérico) e **depósitos**.
+- **Movimentações imutáveis** (entrada, venda, perda, ajuste de inventário, transferência) das quais o saldo é **derivado**. O saldo nunca fica negativo, nem com duas vendas do último item no mesmo milissegundo.
+- **Custo médio ponderado** recalculado a cada entrada.
+- **Estoque mínimo** com alertas abertos e resolvidos automaticamente.
+- **Pedidos de compra** com ciclo de vida e recebimento parcial que gera as entradas.
+- **Importação de catálogo** por CSV (10 mil linhas, relatório de erros, simulação, reprocessamento seguro) e **exportação**.
+- **Relatórios em SQL**: valor do estoque, curva ABC, giro e produtos parados.
+- **JWT** com três papéis, **auditoria**, OpenAPI, Testcontainers, Docker Compose, CI e deploy.
+
+**Pitch de uma frase:** "Fiz uma API de estoque em que o saldo é derivado de movimentações imutáveis, com lock por produto testado com vinte vendas simultâneas, custo médio em `BigDecimal` e curva ABC em SQL."
+
+**Por que chama atenção num portfólio Júnior.** A maioria dos portfólios tem um CRUD em que o estoque é uma coluna `quantidade` que o `PUT` sobrescreve. Este projeto mostra que você sabe **por que** isso é errado (sem histórico, sem autor, perdendo atualizações em concorrência) e sabe fazer o certo: livro-razão, transação, lock, `CHECK` no banco, SQL além do `SELECT *` e um teste que prova, com threads e PostgreSQL de verdade, que o saldo não fica negativo. São os assuntos que um entrevistador de backend gosta de puxar.
+
+## Contexto de negócio
+
+A **Casa Aurora Utilidades** é uma rede familiar com duas lojas (Centro e Bairro Novo) e um depósito central que abastece as duas. Vende cerca de 3.500 itens: utilidades domésticas, ferragens, material elétrico e alguns produtos a granel (parafuso por quilo, fio por metro). Hoje há uma planilha por loja, atualizada no fim do dia. A dona, Rosa, relata: saldo que não bate com a prateleira, compras "no olho", transferências lançadas duas vezes ou nenhuma, entregas parciais esquecidas e cadastro um a um quando o fornecedor manda 800 itens numa planilha.
+
+O ponto de venda (PDV) é outro sistema, de terceiros, que chama a API a cada venda. Aqui ele é **simulado** por um script e pela coleção de requisições.
+
+### Atores
+
+| Ator | Papel | O que faz |
+|---|---|---|
+| Gerente | `GERENTE` | Tudo o que o estoquista faz, mais cadastros, preços, usuários, pedidos de compra, ajustes de valor alto, importação, relatórios e auditoria |
+| Estoquista | `ESTOQUISTA` | Entradas avulsas, perdas, contagens (ajustes até R$ 500,00), transferências e recebimentos |
+| Consulta (vendedores, contador) | `CONSULTA` | Só leitura: catálogo, saldos, extratos, alertas e relatórios |
+| PDV (simulado) | `ESTOQUISTA` (usuário técnico) | Saídas por venda, com chave de idempotência |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **SKU** | Código interno do produto (`PAR-SXT-6MM`), único sem diferenciar caixa |
+| **EAN-13** | Código de barras de 13 dígitos; o último é verificador. Opcional (granel não tem) |
+| **Depósito** | Qualquer local com estoque; lojas também são depósitos (`LOJA-CENTRO`, `LOJA-BAIRRO`, `CD-CENTRAL`) |
+| **Movimentação** | Lançamento imutável que altera o saldo de um produto num depósito |
+| **Saldo** | Quantidade de um produto num depósito: a soma das movimentações do par |
+| **Custo médio ponderado** | Custo unitário pela média das entradas ponderada pelas quantidades; valora estoque e saídas |
+| **Custo de referência** | Último custo informado no cadastro; sugere o preço do pedido de compra |
+| **Curva ABC** | Classificação pelo valor consumido: A concentra 80% do valor, B os próximos 15%, C o resto |
+| **Giro** | Quantas vezes o estoque médio se renovou no período |
+| **Conciliação** | Conferência de que o saldo guardado bate com a soma das movimentações |
+
+## Escopo
+
+**Dentro:** API REST em `/api/v1` com paginação e filtros; cadastros; movimentações, ajuste por contagem e transferência; saldo, extrato e custo médio global por produto; estoque mínimo (mesmo valor para cada depósito) e alertas; pedidos de compra; importação e exportação CSV; relatórios e conciliação; JWT, papéis e auditoria; OpenAPI, Docker Compose, CI e deploy.
+
+**Fora (vira "Para ir além"):** interface web; vendas, caixa e nota fiscal (são do PDV e do ERP); lotes e validade; mínimo diferente por depósito; reserva de estoque; envio real do pedido ao fornecedor (aqui, "enviar" é uma mudança de estado); multiempresa; conversão de unidades (caixa com 12 → unidade).
+
+## Requisitos funcionais
+
+As regras (RN) têm numeração contínua. Os exemplos usam os depósitos `LOJA-CENTRO`, `LOJA-BAIRRO` e `CD-CENTRAL` e datas de outubro de 2026.
+
+### RF-01 · Depósitos
+
+- **RN-01 — Código único.** De 3 a 20 caracteres (letras, dígitos, hífen), normalizado para maiúsculas: `loja-centro` vira `LOJA-CENTRO`; `LJ` → `400`; repetido → `409 CODIGO_DUPLICADO`.
+- **RN-02 — Inativar só sem saldo.** Com qualquer saldo diferente de zero → `409 DEPOSITO_COM_SALDO`. Depósito inativo não recebe movimentação (`422 DEPOSITO_INATIVO`), mas continua nos relatórios de períodos passados.
+- **RN-03 — Código imutável.** O `PATCH` aceita só `nome` e `ativo`; mandar `codigo` → `400`.
+
+**Critérios de aceite**
+
+- Dado `LOJA-CENTRO` existente, quando um gerente cria `Loja-Centro`, então recebe `409 CODIGO_DUPLICADO`.
+- Dado `CD-CENTRAL` com todos os saldos zero, quando é inativado, então uma entrada nele recebe `422 DEPOSITO_INATIVO`.
+- Dado um `ESTOQUISTA`, quando tenta criar um depósito, então recebe `403`.
+
+### RF-02 · Categorias e fornecedores
+
+- **RN-04 — Categoria única sem diferenciar caixa.** 2 a 60 caracteres; `Ferragens` e `ferragens` são a mesma → `409 CATEGORIA_DUPLICADA`. Garanta com índice único em `lower(nome)`, não só com uma checagem no Java.
+- **RN-05 — CNPJ validado, inclusive o alfanumérico.** 14 posições: as 12 primeiras são dígitos ou letras maiúsculas (formato alfanumérico, para inscrições novas a partir de julho de 2026) e as 2 últimas, dígitos verificadores. Aceite com ou sem máscara; grave sem máscara, em maiúsculas. Cada caractere vale seu código ASCII menos 48 (`'0'` = 0, `'A'` = 17); o 1º verificador usa os pesos 5,4,3,2,9,8,7,6,5,4,3,2 e o 2º, 6,5,4,3,2,9,8,7,6,5,4,3,2; resto da divisão por 11 menor que 2 dá 0, senão 11 menos o resto. Exemplos: `11.222.333/0001-81` válido; `11.222.333/0001-82` → `400`; `12.ABC.345/01DE-35` válido; `00000000000000` → `400`; 13 caracteres → `400`.
+- **RN-06 — CNPJ único e prazo.** Repetido → `409 CNPJ_DUPLICADO`. `prazoEntregaDias` de 1 a 120; razão social de 3 a 150 caracteres; e-mail opcional, mas válido se vier.
+- **RN-07 — Inativar, não apagar.** Fornecedor não tem `DELETE`; inativo não recebe pedido novo (`422 FORNECEDOR_INATIVO`). Categoria sem produtos pode ser apagada (`204`); com produtos → `409 CATEGORIA_EM_USO`.
+
+**Critérios de aceite**
+
+- Quando um gerente cadastra o CNPJ `12.ABC.345/01DE-35`, então recebe `201` e o CNPJ volta como `12ABC34501DE35`.
+- Dado o CNPJ `11222333000181` cadastrado, quando alguém cadastra `11.222.333/0001-81`, então recebe `409 CNPJ_DUPLICADO`.
+- Dada a categoria `Elétrica` com 1 produto, quando é apagada, então a resposta é `409 CATEGORIA_EM_USO`.
+
+### RF-03 · Produtos
+
+- **RN-08 — SKU.** 3 a 30 caracteres (letras, dígitos, hífen), normalizado para maiúsculas e sem espaços nas pontas, único (`409 SKU_DUPLICADO`) e imutável. `  par-sxt-6mm ` vira `PAR-SXT-6MM`; `PAR SXT` → `400`.
+- **RN-09 — EAN-13.** Opcional; se vier, 13 dígitos e o último confere: some os 12 primeiros multiplicando os de posição ímpar (contando da esquerda) por 1 e os de posição par por 3; o verificador é `(10 − soma % 10) % 10`. `7891000315507` e `7891234567895` válidos; `7891234567890` → `400` (esperado 5); 12 dígitos ou uma letra → `400`. Único entre os que têm EAN (`409 EAN_DUPLICADO`). Sem regex: percorra os caracteres.
+- **RN-10 — Unidade e fração.** `UN`, `CX`, `KG`, `L`, `M`. Em `UN` e `CX`, toda quantidade (mínimo, movimentação, pedido) é inteira; em `KG`, `L` e `M`, até 3 casas. 2,5 `KG` vale; 2,5 `UN` → `400`; 0,0005 `KG` → `400`.
+- **RN-11 — Preços em `BigDecimal`.** `precoVenda` maior que zero, `custoReferencia` ≥ 0, no máximo 2 casas e R$ 9.999.999,99. `12.999` → `400` (a API não arredonda em silêncio). `NUMERIC(12,2)` no banco; nunca `double`, nem no DTO.
+- **RN-12 — Margem calculada.** A resposta traz `custoMedio` (só leitura) e `margemPercentual = (precoVenda − custoMedio) / precoVenda × 100`, 2 casas, `HALF_EVEN`; `null` se o custo médio for zero. Preço abaixo do custo é permitido, com `"avisos": ["MARGEM_NEGATIVA"]`.
+- **RN-13 — Versão no `PUT`.** O produto tem `@Version`; o `PUT` exige `versao` e, se ela não for a atual, responde `409 CONFLITO_DE_VERSAO` com a versão atual. Dois gerentes editando a versão 3: o primeiro salva (vira 4), o segundo recebe `409` em vez de apagar a alteração do primeiro.
+- **RN-14 — Inativar, não apagar.** Produto com movimentação só é inativado, e só com saldo zero em todos os depósitos (`409 PRODUTO_COM_SALDO`). Inativo não recebe movimentação nem entra em pedido novo (`422 PRODUTO_INATIVO`). Sem movimentações, pode ser apagado (`204`).
+- **RN-15 — Busca paginada.** Filtros `q` (contém, sem diferenciar caixa, em nome, SKU ou EAN), `categoriaId`, `fornecedorId`, `ativo` (padrão `true`), `abaixoDoMinimo`. Página padrão 0, tamanho 20, **máximo 100** (`size=101` → `400`, não corte silencioso). Ordenação só por `nome`, `sku`, `precoVenda`, `criadoEm`; outra → `400`. Padrão `nome,asc`.
+
+**Critérios de aceite**
+
+- Quando um gerente cadastra `sku = "par-sxt-6mm"`, `unidade = "KG"`, `precoVenda = 39.90`, então recebe `201` com `Location`, `sku = "PAR-SXT-6MM"`, `custoMedio = 0.0000` e `margemPercentual = null`.
+- Dado um produto com EAN `7891000315507`, quando outro é cadastrado com o mesmo EAN, então recebe `409 EAN_DUPLICADO`.
+- Dado o produto na versão 3, quando chegam dois `PUT` com `versao: 3`, então o primeiro recebe `200` com `versao: 4` e o segundo `409 CONFLITO_DE_VERSAO`.
+- Dados 45 produtos ativos, quando alguém pede `page=2&size=20`, então recebe 5 itens, `totalElementos = 45`, `totalPaginas = 3`.
+
+### RF-04 · Movimentações e saldo
+
+Toda alteração de saldo é uma linha nova em `movimentacao`; a tabela `saldo_estoque` é uma **projeção** atualizada na mesma transação (ADR-001).
+
+| Tipo | Sinal | Quem registra | Custo unitário gravado |
+|---|---|---|---|
+| `ENTRADA` | + | `ESTOQUISTA`, `GERENTE` ou o recebimento de pedido | Informado (obrigatório) |
+| `SAIDA_VENDA`, `SAIDA_PERDA` | − | `ESTOQUISTA` (PDV), `GERENTE` | Custo médio do momento |
+| `AJUSTE` | ± | contagem (RF-05) | Custo médio do momento |
+| `TRANSFERENCIA_SAIDA` / `_ENTRADA` | − / + | transferência (RF-06) | Custo médio do momento |
+
+- **RN-16 — Imutável de verdade.** Não há `PUT`, `PATCH` nem `DELETE`, e um *trigger* no PostgreSQL rejeita `UPDATE` e `DELETE` em `movimentacao`. Erro se corrige com nova movimentação que referencia a original em `corrigeMovimentacaoId`. Exemplo: lançaram 50 em vez de 5; uma contagem gera `AJUSTE` de −45 apontando para a entrada errada, e o extrato mostra as duas.
+- **RN-17 — O saldo nunca fica negativo.** Saída maior que o saldo **do depósito** → `409 ESTOQUE_INSUFICIENTE` com `saldoDisponivel` e `quantidadeSolicitada`, sem gravar nada. Saldo 3 na loja e 200 no CD, venda de 4 na loja → `409`. Vale em três camadas: domínio, lock (RN-27) e `CHECK (quantidade >= 0)` em `saldo_estoque`.
+- **RN-18 — Quantidade positiva na requisição.** O sinal vem do tipo; zero ou negativo → `400`; casas conforme RN-10; máximo 1.000.000.
+- **RN-19 — Custo médio ponderado.** Só entradas mudam o custo. Com `S` = saldo **total** do produto (todos os depósitos), `C` = custo atual, `q` e `c` = quantidade e custo da entrada: `novoCusto = (S × C + q × c) / (S + q)`, com 4 casas e `HALF_EVEN`; se `S` for zero, `novoCusto = c`.
+
+  | Evento | Saldo total antes | Custo antes | Custo depois | Saldo total depois |
+  |---|---|---|---|---|
+  | Entrada 10 un a R$ 5,00 | 0 | 0,0000 | 5,0000 | 10 |
+  | Entrada 30 un a R$ 6,00 | 10 | 5,0000 | (50 + 180) / 40 = **5,7500** | 40 |
+  | Venda 15 un | 40 | 5,7500 | 5,7500 | 25 |
+  | Entrada 5 un a R$ 7,10 | 25 | 5,7500 | (143,75 + 35,50) / 30 = **5,9750** | 30 |
+  | Transferência de 10 do CD para a loja | 30 | 5,9750 | 5,9750 | 30 |
+
+  Borda: entrada com custo zero (brinde) é permitida e puxa o custo para baixo; mostre no teste.
+- **RN-20 — Valor.** Cada movimentação guarda `custoUnitario` (4 casas) e expõe `valorTotal = |quantidade| × custoUnitario`, 2 casas: venda de 15 a 5,7500 → `86.25`.
+- **RN-21 — Extrato.** Cada movimentação guarda `saldoApos` (saldo do depósito depois dela). `GET /produtos/{id}/extrato?depositoId=&de=&ate=` lista em ordem cronológica, paginado (padrão 50, máximo 200). O `saldoApos` da última linha é o saldo atual.
+- **RN-22 — Idempotência nas vendas.** `POST /movimentacoes` aceita `Idempotency-Key` (UUID, obrigatório para `SAIDA_VENDA`). Mesma chave e mesmo conteúdo → `200` com a movimentação original, sem gravar outra; mesma chave com conteúdo diferente → `409 IDEMPOTENCIA_CONFLITO`. Chaves valem 7 dias. Garanta com índice único, não com "consultar antes de inserir".
+- **RN-23 — Data do servidor.** `criadoEm` vem de um `Clock` injetado (`TIMESTAMPTZ`); o cliente não informa data, porque um lançamento retroativo quebraria o `saldoApos` das linhas seguintes.
+
+**Critérios de aceite**
+
+- Dado `PAR-SXT-6MM` sem movimentações, quando entram 10 a `5.00` e 30 a `6.00` na `LOJA-CENTRO`, então o saldo é 40 e o `custoMedio` é `5.7500`.
+- Dado saldo 3, quando o PDV vende 4, então recebe `409` com `saldoDisponivel: 3` e o número de movimentações não muda.
+- Dada uma venda com `Idempotency-Key` gravada, quando a requisição idêntica é repetida, então a resposta é `200` com o mesmo `id` e o saldo cai uma vez só.
+- Quando alguém executa `UPDATE movimentacao SET quantidade = 1` direto no banco, então o PostgreSQL recusa.
+
+### RF-05 · Ajuste por contagem
+
+- **RN-24 — Pela quantidade contada.** `POST /ajustes` recebe `produtoId`, `depositoId`, `quantidadeContada` (≥ 0) e `motivo` (10 a 200 caracteres). A diferença `contada − saldo` é calculada **sob o lock** (RN-27). Diferença zero → `200` com `"ajustado": false`, sem movimentação; senão `201` com o `AJUSTE`. Saldo 12, contados 9 → `AJUSTE` de −3.
+- **RN-25 — Limite por papel.** Valor do ajuste = `|diferença| × custoMedio`. Acima de **R$ 500,00**, só `GERENTE`; o estoquista recebe `403 AJUSTE_EXIGE_GERENTE` com o valor. Exatamente R$ 500,00 é aceito.
+
+**Critérios de aceite**
+
+- Dado saldo 12, quando um estoquista informa contagem 9 com motivo, então recebe `201` e o saldo vira 9.
+- Dado saldo 100 e custo `9.0000`, quando um estoquista informa 40 (R$ 540,00), então recebe `403` e o saldo continua 100.
+- Dado saldo 7, quando alguém informa 7, então recebe `200` com `ajustado: false`.
+
+### RF-06 · Transferência
+
+- **RN-26 — Atômica.** `POST /transferencias` (`produtoId`, `origemId`, `destinoId`, `quantidade`) grava, na **mesma transação**, `TRANSFERENCIA_SAIDA` e `TRANSFERENCIA_ENTRADA` com o mesmo `transferenciaId` e o custo médio atual. Origem igual ao destino → `400`; depósito inativo → `422`; saldo insuficiente na origem → `409`. Custo médio e saldo total não mudam.
+
+**Critérios de aceite**
+
+- Dado CD 200 e loja 5, quando 50 são transferidos, então os saldos ficam 150 e 55, com duas movimentações e o mesmo `transferenciaId`.
+- Dado CD 10, quando alguém transfere 11, então recebe `409` e nenhuma das duas movimentações existe.
+
+### RF-07 · Concorrência no saldo
+
+- **RN-27 — O produto é o cadeado.** Toda operação que altera saldo ou custo de um produto trava **primeiro** a linha do produto (`@Lock(PESSIMISTIC_WRITE)`, um `SELECT ... FOR UPDATE`) e só então lê, valida e grava. Produtos diferentes não se bloqueiam. Operações com vários produtos (recebimento) travam em **ordem crescente de id**, para não haver deadlock.
+- **RN-28 — Espera limitada.** Nenhuma requisição espera lock mais de 3 s (`lock_timeout` do PostgreSQL); se esperar, `503 TENTE_NOVAMENTE` com `Retry-After: 1`, sem gravar nada.
+
+**Critérios de aceite**
+
+- Dado saldo 10, quando 20 vendas de 1 unidade (chaves distintas) chegam ao mesmo tempo, então exatamente 10 recebem `201`, 10 recebem `409`, o saldo final é 0 e há 10 movimentações `SAIDA_VENDA`.
+- Dado 100 no CD e 100 na loja, quando 10 transferências CD → loja e 10 loja → CD, de 5 cada, rodam juntas, então todas terminam em até 10 s, o total continua 200 e a conciliação não aponta divergência.
+- Dado saldo 20 a `2.0000`, quando 20 entradas simultâneas de 1 a `4.00` chegam, então o custo final é `3.0000` (nenhuma atualização perdida).
+
+### RF-08 · Estoque mínimo e alertas
+
+- **RN-29 — Abertura.** Com `estoqueMinimo` maior que zero, quando uma movimentação faz o saldo de um depósito **cruzar** o mínimo para baixo, abre-se um alerta com saldo, mínimo e `quantidadeSugerida = 2 × mínimo − saldo` (arredondada para cima em `UN`/`CX`). Mínimo 10, saldo 12, venda de 5 → alerta com saldo 7 e sugestão 13. Uma segunda venda não abre outro: no máximo um alerta aberto por produto e depósito (índice único parcial).
+- **RN-30 — Resolução.** Saldo de volta a ≥ mínimo resolve o alerta na mesma transação. Mudar o `estoqueMinimo` reavalia os alertas na hora.
+- **RN-31 — Consulta.** `GET /alertas?status=ABERTO|RESOLVIDO&depositoId=`, paginado, mais antigos primeiro.
+
+**Critérios de aceite**
+
+- Dado mínimo 10 e saldo 12 na `LOJA-BAIRRO`, quando 5 são vendidos, então há 1 alerta aberto com `saldo = 7` e `quantidadeSugerida = 13`.
+- Dado esse alerta, quando chega uma transferência de 20, então ele fica `RESOLVIDO`.
+
+### RF-09 · Pedidos de compra
+
+<Figura legenda="Ciclo de vida do pedido de compra: só essas transições existem; qualquer outra responde 409 TRANSICAO_INVALIDA">
+<svg viewBox="0 0 880 250" width="880" role="img" aria-labelledby="ec-pedido-titulo ec-pedido-desc">
+  <title id="ec-pedido-titulo">Estados do pedido de compra</title>
+  <desc id="ec-pedido-desc">Seis estados. Rascunho vai para Enviado pela ação enviar. Enviado vai para Recebido parcial quando chega parte, ou direto para Recebido quando chega tudo. Recebido parcial pode receber de novo e ficar parcial, ir para Recebido quando chega o restante, ou para Encerrado quando o gerente desiste do restante. Rascunho e Enviado podem ir para Cancelado. Recebido, Encerrado e Cancelado são estados finais.</desc>
+  <defs><marker id="ec-mk-pedido" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="70" width="140" height="48" rx="10" class="d-box"/>
+  <text x="80" y="99" text-anchor="middle" class="d-mono">RASCUNHO</text>
+  <rect x="220" y="70" width="140" height="48" rx="10" class="d-info"/>
+  <text x="290" y="99" text-anchor="middle" class="d-mono">ENVIADO</text>
+  <rect x="440" y="70" width="190" height="48" rx="10" class="d-accent"/>
+  <text x="535" y="99" text-anchor="middle" class="d-mono">RECEBIDO_PARCIAL</text>
+  <rect x="720" y="70" width="150" height="48" rx="10" class="d-ok"/>
+  <text x="795" y="99" text-anchor="middle" class="d-mono">RECEBIDO</text>
+  <rect x="140" y="190" width="150" height="48" rx="10" class="d-violet"/>
+  <text x="215" y="219" text-anchor="middle" class="d-mono">CANCELADO</text>
+  <rect x="460" y="190" width="150" height="48" rx="10" class="d-violet"/>
+  <text x="535" y="219" text-anchor="middle" class="d-mono">ENCERRADO</text>
+  <path d="M150 94 L218 94" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="184" y="86" text-anchor="middle" class="d-label">enviar</text>
+  <path d="M360 94 L438 94" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="399" y="86" text-anchor="middle" class="d-label">receber parte</text>
+  <path d="M630 94 L718 94" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="674" y="86" text-anchor="middle" class="d-label">receber resto</text>
+  <path d="M290 70 C 330 10, 740 10, 795 68" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="540" y="30" text-anchor="middle" class="d-label">receber tudo de uma vez</text>
+  <path d="M600 118 C 640 160, 580 160, 560 120" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="660" y="160" class="d-label">receber mais uma parte</text>
+  <path d="M80 118 L175 188" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <path d="M290 118 L240 188" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="300" y="160" class="d-label">cancelar</text>
+  <text x="60" y="160" class="d-label">cancelar</text>
+  <path d="M510 118 L510 188" class="d-line" marker-end="url(#ec-mk-pedido)"/>
+  <text x="440" y="160" class="d-label">encerrar</text>
+</svg>
+</Figura>
+
+- **RN-32 — Rascunho.** O pedido nasce `RASCUNHO`, com número `PC-2026-000123` (único), fornecedor e depósito de destino ativos e de 1 a 200 itens (produto ativo, quantidade conforme RN-10, custo com 2 casas; se omitido, o `custoReferencia`). Produto repetido no pedido → `400`. `valorTotal` = soma de `quantidade × custoUnitario`. Itens só mudam em `RASCUNHO`.
+- **RN-33 — Transições.** Só as da figura. `enviar` exige ao menos 1 item e grava `previsaoEntrega = envio + prazoEntregaDias`. `cancelar` (motivo de 10 a 200 caracteres) só em `RASCUNHO` e `ENVIADO`; `encerrar` (com motivo) só em `RECEBIDO_PARCIAL`. Outra → `409 TRANSICAO_INVALIDA` com `estadoAtual` e `acao`. Cancelar um `RECEBIDO_PARCIAL` → `409` (a mercadoria já entrou; o certo é encerrar).
+- **RN-34 — Recebimento gera entradas, tudo ou nada.** `POST /pedidos-compra/{id}/recebimentos` recebe `notaFiscal` e os itens (`produtoId`, `quantidade`, `custoUnitario` opcional se a nota veio com outro preço). Cada item gera uma `ENTRADA` no destino (recalculando o custo médio) vinculada ao item, e soma em `quantidadeRecebida`. Tudo recebido → `RECEBIDO`; senão `RECEBIDO_PARCIAL`. Erro em qualquer item desfaz o recebimento inteiro.
+- **RN-35 — Não receber além do pedido.** Recebido acumulado acima do pedido → `422 RECEBIMENTO_EXCEDE_PEDIDO` com o pendente; produto fora do pedido → `422 ITEM_FORA_DO_PEDIDO`. Pedido de 100, recebe 60 (pendente 40); depois 50 → `422`; depois 40 → `RECEBIDO`.
+- **RN-36 — Nota fiscal única.** Fornecedor + número da nota é único (`409 NOTA_FISCAL_DUPLICADA`): o clique duplo do estoquista não duplica estoque.
+
+**Critérios de aceite**
+
+- Dado um pedido `ENVIADO` com A (100 a `3.00`) e B (20 a `10.00`), quando chegam A = 60 e B = 20 com a nota `4471`, então o pedido fica `RECEBIDO_PARCIAL` com 2 entradas e A com `quantidadeRecebida = 60`.
+- Dado esse pedido, quando alguém recebe A = 50, então a resposta é `422` e nenhuma entrada é gravada.
+- Quando a nota `4471` do mesmo fornecedor é repetida, então a resposta é `409 NOTA_FISCAL_DUPLICADA`.
+- Dado um pedido `RECEBIDO_PARCIAL` encerrado com motivo, quando chega novo recebimento, então a resposta é `409 TRANSICAO_INVALIDA`.
+
+### RF-10 · Importação e exportação CSV
+
+```text
+sku;ean;nome;unidade;categoria;custo_referencia;preco_venda;estoque_minimo;fornecedor_cnpj
+PAR-SXT-6MM;;Parafuso sextavado 6 mm (granel);KG;Ferragens;18,40;39,90;5;11222333000181
+LAMP-LED-9W;7891000315507;Lâmpada LED 9 W bivolt;UN;Elétrica;6,20;14,90;30;
+FIO-FLEX-2-5;;"Fio flexível 2,5 mm² azul; rolo fracionado";M;Elétrica;1,85;3,99;100;12ABC34501DE35
+```
+
+- **RN-37 — Estrutura.** UTF-8 (com ou sem BOM), separador `;`, LF ou CRLF, cabeçalho exatamente igual ao modelo (sem diferenciar caixa). Campo com `;` entre aspas, aspas internas dobradas (RFC 4180). Decimal com vírgula, sem milhar (`1.234,56` é erro). Linhas em branco são ignoradas mas contam na numeração. Cabeçalho diferente → `400 CABECALHO_INVALIDO`, dizendo a coluna esperada.
+- **RN-38 — Limites.** Até 5 MB e 10.000 linhas de dados; acima → `413 ARQUIVO_GRANDE_DEMAIS` antes de processar qualquer linha. Vazio ou só cabeçalho → `400`.
+- **RN-39 — Validação linha a linha.** Mesmas regras do cadastro (RN-08 a RN-11), mais: SKU repetido no arquivo é erro nas repetições ("SKU já aparece na linha 12"); EAN de **outro** SKU é erro; `fornecedor_cnpj`, se preenchido, precisa existir; categoria inexistente é criada. Todos os erros da linha são relatados, e uma linha com erro não impede as outras.
+- **RN-40 — Relatório.** `totalLinhas`, `criados`, `atualizados`, `inalterados`, `comErro`, `categoriasCriadas`, `duracaoMs` e `erros` (`linha`, `coluna`, `valor`, `mensagem`), limitado aos primeiros 1.000 (`errosOmitidos` conta o resto).
+- **RN-41 — Idempotente por SKU.** Cada linha é um *upsert*: SKU novo cria, existente atualiza o que mudou ou fica `inalterados`. A importação nunca mexe em saldo nem em custo médio.
+- **RN-42 — Simulação.** `?simular=true` valida e devolve o relatório sem gravar nada (nem categorias).
+- **RN-43 — Desempenho e falha no meio.** 10.000 linhas válidas em até 15 s no Docker Compose. Grave em lotes de 500 por transação; se o processo cair, reimportar termina o trabalho sem duplicar (RN-41). Cada importação é registrada (usuário, arquivo, SHA-256, totais, duração) e auditada.
+- **RN-44 — Exportação.** `GET /produtos/exportacao` devolve `text/csv` com `Content-Disposition: attachment; filename="produtos-2026-10-05.csv"`, com os filtros da busca, sem paginação, em *streaming*. Importar o arquivo exportado dá `inalterados = totalLinhas`.
+
+**Critérios de aceite**
+
+- Dado um arquivo com 3 linhas novas válidas e 1 com EAN `7891234567890`, quando um gerente importa, então recebe `criados = 3`, `comErro = 1` e um erro na coluna `ean`.
+- Quando o mesmo arquivo é importado de novo, então `criados = 0`, `atualizados = 0`, `inalterados = 3`.
+- Dado um arquivo de 10.001 linhas, então a resposta é `413` e nada é criado.
+- Dado `?simular=true` com 50 linhas novas, então o relatório diz `criados = 50` e a busca continua sem elas.
+
+### RF-11 · Relatórios
+
+Consultas SQL nativas (não laços em Java), para `GERENTE` e `CONSULTA`, período padrão dos últimos 90 dias e máximo de 366 (`400` acima, ou com `de` depois de `ate`), `depositoId` opcional.
+
+- **RN-45 — Valor do estoque.** Por depósito e total: produtos com saldo e soma de `saldo × custoMedio`, 2 casas. 30 un a 5,9750 + 12 kg a 20,0000 → R$ 419,25.
+- **RN-46 — Curva ABC.** Valor consumido = soma de `valorTotal` das `SAIDA_VENDA` no período. Ordene por valor decrescente (empate: SKU) e use o percentual acumulado **antes** do produto: menor que 80% → A; menor que 95% → B; senão C. Produtos ativos sem venda entram como C. Use `SUM(...) OVER (ORDER BY ...)`.
+
+  | Produto | Valor | Acumulado antes | Classe |
+  |---|---|---|---|
+  | P1 | 6.000,00 | 0% | A |
+  | P2 | 1.500,00 | 60% | A |
+  | P3 | 1.200,00 | 75% | A |
+  | P4 | 800,00 | 87% | B |
+  | P5 | 500,00 | 95% | C |
+
+  Bordas: um único produto com 100% é A; período sem vendas → todos C, sem divisão por zero.
+- **RN-47 — Giro.** Por produto: `saidas` (quantidade vendida no período), `saldoInicial` (soma das movimentações antes de `de`), `saldoFinal`, `estoqueMedio = (inicial + final) / 2`, `giro = saidas / estoqueMedio` (2 casas) e `coberturaDias = saldoFinal / (saidas / dias)` (1 casa). 30 dias, inicial 40, final 20, vendas 90 → giro 3,00, cobertura 6,7 dias. Estoque médio zero → `giro = null`; sem vendas → `coberturaDias = null`. Só é possível porque o saldo é derivado.
+- **RN-48 — Parados.** `GET /relatorios/parados?dias=60` (1 a 365): produtos com saldo e **nenhuma venda** nos últimos N dias, com `diasParado` (desde a última venda, ou a primeira entrada), saldo e `valorParado`, por valor decrescente. Última venda em 01/08/2026, consulta em 05/10/2026 → 65 dias: entra com `dias=60`, não com `dias=90`.
+
+**Critérios de aceite**
+
+- Dadas vendas de R$ 6.000, 1.500, 1.200, 800 e 500, quando alguém pede a curva ABC, então as classes são A, A, A, B, C.
+- Dado um produto com saldo 50 e última venda há 100 dias, quando alguém pede `parados?dias=90`, então ele aparece com `diasParado = 100`.
+
+### RF-12 · Autenticação, usuários e papéis
+
+- **RN-49 — JWT.** `POST /auth/login` devolve JWT HS256, emissor `estoque-certo`, validade de 60 minutos, `sub` = id do usuário e claim `papel`. O segredo vem de `JWT_SEGREDO` (mínimo de 32 bytes); sem ela, a aplicação não sobe.
+- **RN-50 — Sem enumeração e com bloqueio.** E-mail inexistente e senha errada → mesmo `401 CREDENCIAIS_INVALIDAS`. Após 5 falhas seguidas **para o mesmo e-mail informado**, exista a conta ou não, bloqueio de 15 minutos (`429 TENTATIVAS_EXCEDIDAS` com `Retry-After`): se só e-mails cadastrados fossem bloqueados, o `429` revelaria quem tem conta. Um login certo zera o contador. BCrypt; senha de 15 caracteres (code points, o mínimo da NIST SP 800-63B rev. 4 para senha como único fator) a 72 bytes em UTF-8.
+- **RN-51 — Primeiro gerente.** Com o banco vazio, a aplicação cria um `GERENTE` a partir de `ADMIN_EMAIL` e `ADMIN_SENHA`. Só gerente cria usuários e troca papéis; ninguém rebaixa ou desativa o último gerente ativo (`409 ULTIMO_GERENTE`).
+- **RN-52 — Permissões no servidor.** Matriz da tabela de endpoints. Token ausente, expirado ou adulterado → `401`; papel sem permissão → `403`; usuário desativado com token válido → `401` (o filtro confere `ativo`).
+
+**Critérios de aceite**
+
+- Dado um usuário `CONSULTA`, quando tenta registrar uma entrada, então recebe `403`.
+- Quando alguém faz login com e-mail inexistente, então recebe `401` com o mesmo `detail` de uma senha errada.
+- Dadas 5 senhas erradas, quando a 6ª tentativa (mesmo certa) chega 1 minuto depois, então a resposta é `429` com `Retry-After` perto de 840.
+
+### RF-13 · Auditoria e conciliação
+
+- **RN-53 — Quem fez o quê.** Toda movimentação guarda `criadoPor`. A tabela `auditoria` registra criação e alteração de produto (antes e depois, em JSONB), usuários, transições de pedido, importações e inativações, **na mesma transação** da operação. Preço de 14.90 para 15.90 → `PRODUTO_ALTERADO` com `{"precoVenda": {"antes": "14.90", "depois": "15.90"}}`.
+- **RN-54 — Consulta.** `GET /auditoria?entidade=&entidadeId=&usuarioId=&de=&ate=`, só gerente, paginada, mais recentes primeiro, sem senhas ou hashes.
+- **RN-55 — Conciliação.** `GET /estoque/conciliacao` (gerente) compara `saldo_estoque` com a soma das movimentações e devolve só as divergências. Num sistema correto, a lista é vazia.
+
+**Critérios de aceite**
+
+- Dada uma alteração de preço feita por `rosa@casaaurora.test`, quando a auditoria do produto é consultada, então há 1 registro com usuário, antes, depois e instante.
+- Depois da suíte de testes de movimentação, a conciliação devolve lista vazia.
+
+## Requisitos não funcionais
+
+| Id | Requisito | Meta | Como verificar |
+|---|---|---|---|
+| RNF-01 | Busca de produtos | p95 ≤ 200 ms com 50 mil produtos, `size=20` | Massa de dados + `hey` ou `k6`; resultado no README |
+| RNF-02 | Movimentação | p95 ≤ 150 ms sem contenção | 1.000 requisições em produtos variados |
+| RNF-03 | Concorrência | 0 saldo negativo e 0 divergência com 20 vendas simultâneas | Teste de integração (RF-07) no CI |
+| RNF-04 | Importação | 10.000 linhas em ≤ 15 s | Teste com arquivo gerado; `duracaoMs` |
+| RNF-05 | Relatórios | ABC e giro em ≤ 1 s com 500 mil movimentações | Massa com `generate_series` + `EXPLAIN (ANALYZE, BUFFERS)` em `docs/` |
+| RNF-06 | Subida | `docker compose up --build` pronto em ≤ 3 min numa máquina limpa | Seguir o README do zero |
+| RNF-07 | Qualidade | CI verde em todo PR; cobertura ≥ 80% em domínio e aplicação (JaCoCo) | Badge e relatório como artefato do CI |
+| RNF-08 | Segurança | BCrypt; nenhum segredo no repositório; erros sem stack trace | `git log -p`; teste do corpo do `500` |
+| RNF-09 | Observabilidade | Logs estruturados (`logging.structured.format.console=ecs`), health com liveness e readiness, id de correlação por requisição | Conferir log e `/actuator/health` |
+| RNF-10 | Documentação | OpenAPI com todos os endpoints, exemplos e erros | Swagger UI |
+| RNF-11 | Dinheiro | Nenhum `double`/`float` em valores ou quantidades | Busca no código; ADR-003 |
+| RNF-12 | Esquema | Só migrations Flyway; `ddl-auto=validate` | Subir com banco vazio |
+
+## Modelo de dados
+
+<Figura legenda="Modelo entidade-relacionamento: o saldo_estoque é uma projeção das movimentações, e o pedido de compra se liga às entradas pelo item">
+<svg viewBox="0 0 880 640" width="880" role="img" aria-labelledby="ec-er-titulo ec-er-desc">
+  <title id="ec-er-titulo">Diagrama ER do Estoque Certo</title>
+  <desc id="ec-er-desc">No alto, categoria e fornecedor apontam para produto, que tem sku e ean únicos, preços, custo médio, estoque mínimo e versão. Deposito e produto compõem a chave de saldo_estoque, que tem quantidade com check maior ou igual a zero. Movimentacao referencia produto, deposito e o usuario que a criou, e opcionalmente um item de pedido. Fornecedor tem pedidos de compra; cada pedido tem itens e recebimentos. O recebimento de um item gera uma movimentacao de entrada.</desc>
+  <defs><marker id="ec-mk-er" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="250" height="84" rx="8" class="d-box"/>
+  <text x="22" y="32" class="d-title">categoria</text>
+  <text x="22" y="56" class="d-mono">id PK</text>
+  <text x="22" y="76" class="d-mono">nome UNIQUE(lower)</text>
+  <rect x="315" y="10" width="250" height="300" rx="8" class="d-accent"/>
+  <text x="327" y="32" class="d-title">produto</text>
+  <text x="327" y="56" class="d-mono">id PK</text>
+  <text x="327" y="76" class="d-mono">sku UNIQUE</text>
+  <text x="327" y="96" class="d-mono">ean UNIQUE (nulo ok)</text>
+  <text x="327" y="116" class="d-mono">nome, unidade</text>
+  <text x="327" y="136" class="d-mono">categoria_id FK</text>
+  <text x="327" y="156" class="d-mono">fornecedor_id FK (nulo ok)</text>
+  <text x="327" y="176" class="d-mono">preco_venda NUMERIC(12,2)</text>
+  <text x="327" y="196" class="d-mono">custo_referencia (12,2)</text>
+  <text x="327" y="216" class="d-mono">custo_medio NUMERIC(14,4)</text>
+  <text x="327" y="236" class="d-mono">estoque_minimo (14,3)</text>
+  <text x="327" y="256" class="d-mono">ativo, versao</text>
+  <text x="327" y="276" class="d-mono">criado_em, atualizado_em</text>
+  <text x="327" y="298" class="d-label">a linha é o cadeado (RN-27)</text>
+  <rect x="620" y="10" width="250" height="124" rx="8" class="d-box"/>
+  <text x="632" y="32" class="d-title">fornecedor</text>
+  <text x="632" y="56" class="d-mono">id PK</text>
+  <text x="632" y="76" class="d-mono">cnpj CHAR(14) UNIQUE</text>
+  <text x="632" y="96" class="d-mono">razao_social, email</text>
+  <text x="632" y="116" class="d-mono">prazo_entrega_dias, ativo</text>
+  <rect x="10" y="140" width="250" height="104" rx="8" class="d-box"/>
+  <text x="22" y="162" class="d-title">deposito</text>
+  <text x="22" y="186" class="d-mono">id PK</text>
+  <text x="22" y="206" class="d-mono">codigo UNIQUE</text>
+  <text x="22" y="226" class="d-mono">nome, ativo</text>
+  <rect x="620" y="170" width="250" height="144" rx="8" class="d-box"/>
+  <text x="632" y="192" class="d-title">pedido_compra</text>
+  <text x="632" y="216" class="d-mono">id PK, numero UNIQUE</text>
+  <text x="632" y="236" class="d-mono">fornecedor_id FK</text>
+  <text x="632" y="256" class="d-mono">deposito_id FK (destino)</text>
+  <text x="632" y="276" class="d-mono">status CHECK, versao</text>
+  <text x="632" y="296" class="d-mono">enviado_em, previsao</text>
+  <rect x="10" y="350" width="250" height="124" rx="8" class="d-ok"/>
+  <text x="22" y="372" class="d-title">saldo_estoque</text>
+  <text x="22" y="396" class="d-mono">produto_id PK, FK</text>
+  <text x="22" y="416" class="d-mono">deposito_id PK, FK</text>
+  <text x="22" y="436" class="d-mono">quantidade CHECK (≥ 0)</text>
+  <text x="22" y="458" class="d-label">projeção: soma das movimentações</text>
+  <rect x="315" y="350" width="250" height="280" rx="8" class="d-info"/>
+  <text x="327" y="372" class="d-title">movimentacao (imutável)</text>
+  <text x="327" y="396" class="d-mono">id PK</text>
+  <text x="327" y="416" class="d-mono">produto_id, deposito_id FK</text>
+  <text x="327" y="436" class="d-mono">tipo CHECK</text>
+  <text x="327" y="456" class="d-mono">quantidade (±) CHECK ≠ 0</text>
+  <text x="327" y="476" class="d-mono">custo_unitario (14,4)</text>
+  <text x="327" y="496" class="d-mono">saldo_apos</text>
+  <text x="327" y="516" class="d-mono">transferencia_id (nulo ok)</text>
+  <text x="327" y="536" class="d-mono">pedido_item_id FK (nulo ok)</text>
+  <text x="327" y="556" class="d-mono">corrige_movimentacao_id</text>
+  <text x="327" y="576" class="d-mono">chave_idempotencia UNIQUE</text>
+  <text x="327" y="596" class="d-mono">criado_por FK, criado_em</text>
+  <text x="327" y="618" class="d-label">trigger bloqueia UPDATE e DELETE</text>
+  <rect x="620" y="350" width="250" height="124" rx="8" class="d-box"/>
+  <text x="632" y="372" class="d-title">pedido_item</text>
+  <text x="632" y="396" class="d-mono">id PK, pedido_id FK</text>
+  <text x="632" y="416" class="d-mono">produto_id FK</text>
+  <text x="632" y="436" class="d-mono">quantidade, recebida</text>
+  <text x="632" y="456" class="d-mono">custo_unitario (12,2)</text>
+  <rect x="620" y="510" width="250" height="104" rx="8" class="d-box"/>
+  <text x="632" y="532" class="d-title">recebimento</text>
+  <text x="632" y="556" class="d-mono">id PK, pedido_id FK</text>
+  <text x="632" y="576" class="d-mono">nota_fiscal</text>
+  <text x="632" y="596" class="d-mono">recebido_por, recebido_em</text>
+  <rect x="10" y="510" width="250" height="104" rx="8" class="d-violet"/>
+  <text x="22" y="532" class="d-title">usuario</text>
+  <text x="22" y="556" class="d-mono">id PK, email UNIQUE</text>
+  <text x="22" y="576" class="d-mono">senha_hash, papel CHECK</text>
+  <text x="22" y="596" class="d-mono">ativo, falhas, bloqueado_ate</text>
+  <path d="M260 52 L313 52" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="266" y="44" class="d-label">1:N</text>
+  <path d="M620 52 L567 52" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="578" y="44" class="d-label">1:N</text>
+  <path d="M745 134 L745 168" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="752" y="156" class="d-label">1:N</text>
+  <path d="M745 314 L745 348" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="752" y="336" class="d-label">1:N</text>
+  <path d="M870 290 L876 290 L876 560 L872 560" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <path d="M440 310 L440 348" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="448" y="336" class="d-label">1:N</text>
+  <path d="M135 244 L135 348" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="142" y="300" class="d-label">1:N</text>
+  <path d="M315 280 L200 280 L200 348" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <path d="M260 230 L290 230 L290 400 L313 400" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <path d="M620 440 L567 440" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="572" y="432" class="d-label">gera</text>
+  <path d="M260 560 L313 560" class="d-line" marker-end="url(#ec-mk-er)"/>
+  <text x="266" y="552" class="d-label">criou</text>
+</svg>
+</Figura>
+
+Tabelas de apoio, fora do diagrama: `alerta_estoque` (produto, depósito, saldo, mínimo, sugerida, `criado_em`, `resolvido_em`), `auditoria` (usuário, ação, entidade, `entidade_id`, `detalhes JSONB`, `ocorrido_em`) e `importacao` (usuário, arquivo, `hash_sha256`, totais, `duracao_ms`).
+
+### Restrições que o banco garante
+
+O Java valida primeiro (para dar boas mensagens), mas o banco tem a última palavra: duas requisições simultâneas passam juntas pela validação do Java.
+
+| Tabela | Restrição | Regra |
+|---|---|---|
+| `produto` | `UNIQUE (sku)`; único parcial em `ean WHERE ean IS NOT NULL`; `CHECK` de preços e de unidade | RN-08 a RN-11 |
+| `categoria` | Único em `lower(nome)` | RN-04 |
+| `saldo_estoque` | PK `(produto_id, deposito_id)`; `CHECK (quantidade >= 0)` | RN-17 |
+| `movimentacao` | `CHECK (quantidade <> 0)`; `CHECK` de sinal por tipo; `UNIQUE (chave_idempotencia)`; trigger `BEFORE UPDATE OR DELETE` | RN-16, RN-18, RN-22 |
+| `alerta_estoque` | Único em `(produto_id, deposito_id) WHERE resolvido_em IS NULL` | RN-29 |
+| `pedido_item` | `UNIQUE (pedido_id, produto_id)`; `CHECK (quantidade_recebida <= quantidade)` | RN-32, RN-35 |
+| `recebimento` | `UNIQUE (fornecedor_id, nota_fiscal)` (fornecedor desnormalizado) | RN-36 |
+
+### Índices
+
+Todo índice precisa de uma consulta que o justifique, com o `EXPLAIN` guardado.
+
+| Índice | Consulta |
+|---|---|
+| `movimentacao (produto_id, deposito_id, criado_em)` | Extrato e saldo numa data (giro) |
+| `movimentacao (tipo, criado_em) INCLUDE (produto_id, quantidade, custo_unitario)` | Curva ABC e giro (vendas num período) |
+| `pg_trgm` com GIN em `produto.nome`, ou B-tree em `lower(nome) text_pattern_ops` | Busca `q` (RNF-01); o B-tree só atende "começa com" |
+| `produto (categoria_id)`, `produto (fornecedor_id)` | Filtros; o PostgreSQL **não** indexa FK sozinho |
+| `alerta_estoque (resolvido_em, criado_em)` | Alertas abertos, mais antigos primeiro |
+| `auditoria (entidade, entidade_id, ocorrido_em DESC)` | Auditoria de um produto |
+
+### Migrations
+
+| Migration | Marco | Cria |
+|---|---|---|
+| `V1__catalogo.sql` | 2 | `deposito`, `categoria`, `fornecedor`, `produto` |
+| `V2__usuarios_e_auditoria.sql` | 3 | `usuario`, `auditoria` |
+| `V3__estoque.sql` | 4 | `saldo_estoque`, `movimentacao`, trigger, índice do extrato |
+| `V4__compras.sql` | 6 | `pedido_compra`, `pedido_item`, `recebimento`, sequência do número; FK `movimentacao.pedido_item_id` |
+| `V5__importacao.sql` | 7 | `importacao` |
+| `V6__alertas_e_relatorios.sql` | 8 | `alerta_estoque`, índices de relatório |
+| `db/dev/R__dados_de_exemplo.sql` | 2+ | 3 depósitos, 40 produtos, usuários de teste; só no perfil `dev` (via `spring.flyway.locations`) |
+
+Nunca edite uma migration já aplicada. Para os `INSERT` em lote da importação, use `SEQUENCE` com `allocationSize` maior que 1: com `IDENTITY`, o Hibernate desliga o lote.
+
+## Contrato da API
+
+Base `/api/v1`, JSON UTF-8. Instantes em ISO-8601 com fuso (`2026-10-05T14:03:22Z`); filtros de período aceitam datas, no fuso `America/Sao_Paulo`. Dinheiro e quantidades são números JSON lidos como `BigDecimal`.
+
+### Endpoints
+
+**G** = `GERENTE`, **E** = `ESTOQUISTA`, **C** = `CONSULTA`, **—** = público.
+
+| Método | Caminho | Quem | O que faz | Respostas |
+|---|---|---|---|---|
+| POST | `/auth/login` | — | Devolve o JWT | 200, 400, 401, 429 |
+| GET, POST, PATCH | `/usuarios`, `/usuarios/{id}` | G | Lista, cria, muda papel ou `ativo` | 200, 201, 400, 404, 409 |
+| GET | `/depositos`, `/categorias`, `/fornecedores` | G E C | Listas (fornecedores paginados) | 200 |
+| POST, PUT/PATCH, DELETE | `/depositos`, `/categorias`, `/fornecedores` e `/{id}` | G | Mantém os cadastros (DELETE só em categoria) | 201, 200, 204, 400, 404, 409 |
+| GET | `/produtos`, `/produtos/{id}` | G E C | Busca (RN-15) e detalhe | 200, 400, 404 |
+| POST, PUT, DELETE | `/produtos`, `/produtos/{id}` | G | Cria, atualiza com `versao`, apaga sem movimentações | 201, 200, 204, 400, 404, 409 |
+| POST | `/produtos/{id}/inativacao` | G | Inativa | 200, 404, 409 |
+| GET | `/produtos/{id}/saldos`, `/produtos/{id}/extrato` | G E C | Saldo por depósito; kardex | 200, 400, 404 |
+| POST | `/produtos/importacoes` | G | CSV `multipart/form-data` (campo `arquivo`, `?simular=`) | 200, 400, 413 |
+| GET | `/produtos/exportacao` | G C | CSV | 200 |
+| GET | `/estoque` | G E C | Saldos com filtros | 200 |
+| GET | `/estoque/conciliacao` | G | Divergências | 200 |
+| POST | `/movimentacoes` | G E | Entrada, venda, perda (`Idempotency-Key`) | 201, 200, 400, 404, 409, 422, 503 |
+| GET | `/movimentacoes`, `/movimentacoes/{id}` | G E C | Lista com filtros; detalhe | 200, 400, 404 |
+| POST | `/ajustes` | G E | Ajuste por contagem | 201, 200, 400, 403, 409, 422, 503 |
+| POST | `/transferencias` | G E | Transferência | 201, 400, 409, 422, 503 |
+| GET | `/alertas` | G E C | Alertas | 200 |
+| GET | `/pedidos-compra`, `/pedidos-compra/{id}` | G E C | Lista e detalhe | 200, 404 |
+| POST, PUT | `/pedidos-compra`, `/pedidos-compra/{id}` | G | Cria e altera rascunho | 201, 200, 400, 404, 409, 422 |
+| POST | `/pedidos-compra/{id}/envio`, `/cancelamento`, `/encerramento` | G | Transições | 200, 400, 404, 409 |
+| POST | `/pedidos-compra/{id}/recebimentos` | G E | Recebe mercadoria | 201, 400, 404, 409, 422, 503 |
+| GET | `/relatorios/valor-estoque`, `/curva-abc`, `/giro`, `/parados` | G C | RN-45 a RN-48 | 200, 400 |
+| GET | `/auditoria` | G | RN-54 | 200, 400 |
+
+Fora de `/api/v1`: `/actuator/health` (público), `/v3/api-docs` e `/swagger-ui.html` (públicos em `dev`; no deploy, decida e registre).
+
+### Exemplos
+
+**Login** — `POST /api/v1/auth/login` com `{ "email": "rosa@casaaurora.test", "senha": "correta-cavalo-bateria" }`:
+
+```json
+{ "accessToken": "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJlc3RvcXVlLWNlcnRvIn0.assinatura", "tipo": "Bearer", "expiraEmSegundos": 3600 }
+```
+
+**Criar produto**
+
+```http
+POST /api/v1/produtos
+Authorization: Bearer eyJ...
+Content-Type: application/json
+
+{
+  "sku": "lamp-led-9w",
+  "ean": "7891000315507",
+  "nome": "Lâmpada LED 9 W bivolt",
+  "unidade": "UN",
+  "categoriaId": 2,
+  "fornecedorId": 1,
+  "precoVenda": 14.90,
+  "custoReferencia": 6.20,
+  "estoqueMinimo": 30
+}
+```
+
+```json
+HTTP/1.1 201 Created
+Location: /api/v1/produtos/57
+
+{
+  "id": 57,
+  "sku": "LAMP-LED-9W",
+  "ean": "7891000315507",
+  "nome": "Lâmpada LED 9 W bivolt",
+  "unidade": "UN",
+  "categoria": { "id": 2, "nome": "Elétrica" },
+  "fornecedor": { "id": 1, "razaoSocial": "Distribuidora Luz Norte Ltda" },
+  "precoVenda": 14.90,
+  "custoReferencia": 6.20,
+  "custoMedio": 0.0000,
+  "margemPercentual": null,
+  "estoqueMinimo": 30,
+  "ativo": true,
+  "versao": 0,
+  "avisos": [],
+  "criadoEm": "2026-10-05T13:10:44Z"
+}
+```
+
+A busca devolve `{ "conteudo": [...], "pagina": 0, "tamanho": 20, "totalElementos": 45, "totalPaginas": 3 }`.
+
+**Registrar venda com idempotência**
+
+```http
+POST /api/v1/movimentacoes
+Idempotency-Key: 5d0c2f7e-8b1a-4c43-9f0e-2a61c9d3b7aa
+Content-Type: application/json
+
+{ "tipo": "SAIDA_VENDA", "produtoId": 57, "depositoId": 1, "quantidade": 3, "documento": "PDV-LOJA-CENTRO-000981" }
+```
+
+```json
+HTTP/1.1 201 Created
+Location: /api/v1/movimentacoes/10433
+
+{
+  "id": 10433,
+  "tipo": "SAIDA_VENDA",
+  "produto": { "id": 57, "sku": "LAMP-LED-9W" },
+  "deposito": { "id": 1, "codigo": "LOJA-CENTRO" },
+  "quantidade": -3,
+  "custoUnitario": 6.1500,
+  "valorTotal": 18.45,
+  "saldoApos": 27,
+  "documento": "PDV-LOJA-CENTRO-000981",
+  "transferenciaId": null,
+  "corrigeMovimentacaoId": null,
+  "criadoPor": { "id": 7, "email": "pdv.centro@casaaurora.test" },
+  "criadoEm": "2026-10-05T14:03:22Z"
+}
+```
+
+A repetição idêntica devolve `200 OK` com o mesmo corpo. Uma `ENTRADA` usa o mesmo endpoint e exige `custoUnitario`.
+
+**Transferência** — `POST /api/v1/transferencias` com `{ "produtoId": 57, "origemId": 3, "destinoId": 1, "quantidade": 50 }`:
+
+```json
+{
+  "transferenciaId": "0b6f3e0a-2c55-4c1e-a4f4-1f7a8b1e9c21",
+  "produto": { "id": 57, "sku": "LAMP-LED-9W" },
+  "quantidade": 50,
+  "custoUnitario": 6.1500,
+  "saida":   { "movimentacaoId": 10434, "deposito": "CD-CENTRAL",  "saldoApos": 150 },
+  "entrada": { "movimentacaoId": 10435, "deposito": "LOJA-CENTRO", "saldoApos": 77 }
+}
+```
+
+**Recebimento de pedido**
+
+```http
+POST /api/v1/pedidos-compra/123/recebimentos
+Content-Type: application/json
+
+{
+  "notaFiscal": "4471",
+  "itens": [
+    { "produtoId": 57, "quantidade": 60 },
+    { "produtoId": 61, "quantidade": 20, "custoUnitario": 9.80 }
+  ]
+}
+```
+
+```json
+HTTP/1.1 201 Created
+
+{
+  "recebimentoId": 88,
+  "pedido": { "id": 123, "numero": "PC-2026-000123", "status": "RECEBIDO_PARCIAL" },
+  "notaFiscal": "4471",
+  "itens": [
+    { "produtoId": 57, "quantidadeRecebida": 60, "pedido": 100, "pendente": 40, "movimentacaoId": 10436 },
+    { "produtoId": 61, "quantidadeRecebida": 20, "pedido": 20, "pendente": 0, "movimentacaoId": 10437 }
+  ],
+  "recebidoEm": "2026-10-06T09:41:17Z"
+}
+```
+
+**Relatório de importação**
+
+```json
+{
+  "importacaoId": 14,
+  "simulacao": false,
+  "totalLinhas": 802,
+  "criados": 761,
+  "atualizados": 28,
+  "inalterados": 9,
+  "comErro": 4,
+  "categoriasCriadas": ["Jardinagem"],
+  "duracaoMs": 1873,
+  "erros": [
+    { "linha": 17, "coluna": "ean", "valor": "7891234567890", "mensagem": "dígito verificador inválido (esperado 5)" },
+    { "linha": 233, "coluna": "preco_venda", "valor": "12,999", "mensagem": "no máximo 2 casas decimais" },
+    { "linha": 233, "coluna": "unidade", "valor": "PC", "mensagem": "unidade deve ser UN, CX, KG, L ou M" },
+    { "linha": 540, "coluna": "sku", "valor": "LAMP-LED-9W", "mensagem": "SKU já aparece na linha 12" }
+  ],
+  "errosOmitidos": 0
+}
+```
+
+### Formato de erro (Problem Details, RFC 9457)
+
+`application/problem+json` com o `ProblemDetail` do Spring e duas extensões: `codigo` (estável) e, em validação, `erros`.
+
+```json
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://estoque-certo.dev/problemas/estoque-insuficiente",
+  "title": "Estoque insuficiente",
+  "status": 409,
+  "detail": "Saldo de LAMP-LED-9W em LOJA-CENTRO é 3; a saída pedia 4.",
+  "instance": "/api/v1/movimentacoes",
+  "codigo": "ESTOQUE_INSUFICIENTE",
+  "saldoDisponivel": 3,
+  "quantidadeSolicitada": 4
+}
+```
+
+Em `400 VALIDACAO`, `erros` traz itens como `{ "campo": "ean", "mensagem": "dígito verificador inválido (esperado 5)" }`.
+
+| HTTP | `codigo` | Quando |
+|---|---|---|
+| 400 | `VALIDACAO` | Campo inválido no corpo |
+| 400 | `REQUISICAO_INVALIDA` | JSON malformado, parâmetro inválido, `size` acima de 100, ordenação proibida, período inválido |
+| 400 | `CABECALHO_INVALIDO` | CSV com cabeçalho errado |
+| 401 | `NAO_AUTENTICADO` | Token ausente, expirado, adulterado, ou usuário desativado |
+| 401 | `CREDENCIAIS_INVALIDAS` | Login errado (mesma mensagem para e-mail e senha) |
+| 403 | `ACESSO_NEGADO`, `AJUSTE_EXIGE_GERENTE` | Papel sem permissão; ajuste acima de R$ 500,00 |
+| 404 | `NAO_ENCONTRADO` | Recurso inexistente |
+| 409 | `SKU_DUPLICADO`, `EAN_DUPLICADO`, `CNPJ_DUPLICADO`, `CODIGO_DUPLICADO`, `CATEGORIA_DUPLICADA`, `EMAIL_DUPLICADO` | Unicidade (inclusive a detectada pelo banco) |
+| 409 | `ESTOQUE_INSUFICIENTE` | Saída maior que o saldo |
+| 409 | `CONFLITO_DE_VERSAO`, `TRANSICAO_INVALIDA` | Versão desatualizada; ação proibida no estado do pedido |
+| 409 | `PRODUTO_COM_SALDO`, `DEPOSITO_COM_SALDO`, `CATEGORIA_EM_USO`, `ULTIMO_GERENTE` | Operação que deixaria dados inconsistentes |
+| 409 | `IDEMPOTENCIA_CONFLITO`, `NOTA_FISCAL_DUPLICADA` | Repetição com conteúdo diferente; nota já recebida |
+| 413 | `ARQUIVO_GRANDE_DEMAIS` | CSV acima de 5 MB ou 10.000 linhas |
+| 422 | `PRODUTO_INATIVO`, `DEPOSITO_INATIVO`, `FORNECEDOR_INATIVO` | Referência a cadastro inativo |
+| 422 | `RECEBIMENTO_EXCEDE_PEDIDO`, `ITEM_FORA_DO_PEDIDO` | Recebimento incoerente |
+| 429 | `TENTATIVAS_EXCEDIDAS` | Login bloqueado (`Retry-After`) |
+| 503 | `TENTE_NOVAMENTE` | Espera por lock acima de 3 s (`Retry-After: 1`) |
+| 500 | `ERRO_INTERNO` | Erro imprevisto; sem stack trace, com o id de correlação |
+
+Por que `409` em `ESTOQUE_INSUFICIENTE`: a requisição é válida, mas conflita com o **estado atual** do saldo; os `422` ficam para referências a cadastros que a tornam inválida. Registre a escolha num ADR; o que importa é ser consistente.
+
+## Arquitetura
+
+<Figura legenda="Containers e camadas: um monólito bem dividido, com o PostgreSQL como fonte da verdade e tudo subindo com o Docker Compose">
+<svg viewBox="0 0 880 470" width="880" role="img" aria-labelledby="ec-arq-titulo ec-arq-desc">
+  <title id="ec-arq-titulo">Arquitetura do Estoque Certo</title>
+  <desc id="ec-arq-desc">À esquerda, os clientes: PDV simulado por script, Swagger UI e arquivo .http. Eles chamam, por HTTPS com JWT, a aplicação Spring Boot, que tem cinco camadas de cima para baixo: api com controllers e Problem Details; seguranca com o filtro JWT e a matriz de papéis; aplicacao com os casos de uso transacionais; dominio com Produto, Movimentacao, CustoMedio, Ean13 e as regras; e infra com repositórios JPA, SQL dos relatórios e leitor de CSV. A infra fala com o PostgreSQL 18, à direita, onde o Flyway aplica as migrations. Uma moldura tracejada indica que a aplicação e o banco sobem juntos no Docker Compose. Embaixo, o GitHub Actions roda mvn verify com Testcontainers, gera a imagem Docker e faz o deploy.</desc>
+  <defs><marker id="ec-mk-arq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="170" height="60" rx="10" class="d-box"/>
+  <text x="95" y="66" text-anchor="middle" class="d-title">PDV simulado</text>
+  <text x="95" y="86" text-anchor="middle" class="d-label">script de vendas</text>
+  <rect x="10" y="120" width="170" height="60" rx="10" class="d-box"/>
+  <text x="95" y="146" text-anchor="middle" class="d-title">Swagger UI</text>
+  <text x="95" y="166" text-anchor="middle" class="d-label">/swagger-ui.html</text>
+  <rect x="10" y="200" width="170" height="60" rx="10" class="d-box"/>
+  <text x="95" y="226" text-anchor="middle" class="d-title">Arquivo .http</text>
+  <text x="95" y="246" text-anchor="middle" class="d-label">demonstração</text>
+  <path d="M180 70 L238 150" class="d-line" marker-end="url(#ec-mk-arq)"/>
+  <path d="M180 150 L238 150" class="d-line" marker-end="url(#ec-mk-arq)"/>
+  <path d="M180 230 L238 150" class="d-line" marker-end="url(#ec-mk-arq)"/>
+  <text x="200" y="118" class="d-label">JWT</text>
+  <rect x="222" y="14" width="646" height="318" rx="14" class="d-line" stroke-dasharray="6 5"/>
+  <text x="236" y="34" class="d-label">docker compose up --build</text>
+  <rect x="240" y="44" width="380" height="276" rx="12" class="d-accent"/>
+  <text x="430" y="66" text-anchor="middle" class="d-title">Aplicação Spring Boot 4 (Java 25)</text>
+  <rect x="256" y="78" width="348" height="38" rx="8" class="d-box"/>
+  <text x="268" y="102" class="d-mono">api</text>
+  <text x="340" y="102" class="d-label">controllers, DTOs, ProblemDetail</text>
+  <rect x="256" y="122" width="348" height="38" rx="8" class="d-box"/>
+  <text x="268" y="146" class="d-mono">seguranca</text>
+  <text x="360" y="146" class="d-label">filtro JWT, papéis, login</text>
+  <rect x="256" y="166" width="348" height="38" rx="8" class="d-box"/>
+  <text x="268" y="190" class="d-mono">aplicacao</text>
+  <text x="360" y="190" class="d-label">casos de uso, @Transactional, locks</text>
+  <rect x="256" y="210" width="348" height="38" rx="8" class="d-ok"/>
+  <text x="268" y="234" class="d-mono">dominio</text>
+  <text x="344" y="234" class="d-label">Produto, Movimentacao, CustoMedio, Ean13</text>
+  <rect x="256" y="254" width="348" height="54" rx="8" class="d-box"/>
+  <text x="268" y="276" class="d-mono">infra</text>
+  <text x="330" y="276" class="d-label">repositórios JPA, SQL de relatórios,</text>
+  <text x="330" y="296" class="d-label">leitor/escritor CSV, auditoria</text>
+  <path d="M604 280 L678 200" class="d-line" marker-end="url(#ec-mk-arq)"/>
+  <text x="600" y="232" class="d-label">JDBC</text>
+  <rect x="680" y="120" width="170" height="150" rx="12" class="d-info"/>
+  <text x="765" y="148" text-anchor="middle" class="d-title">PostgreSQL 18</text>
+  <text x="765" y="174" text-anchor="middle" class="d-label">fonte da verdade</text>
+  <text x="765" y="198" text-anchor="middle" class="d-label">CHECK, UNIQUE, trigger</text>
+  <text x="765" y="222" text-anchor="middle" class="d-label">migrations Flyway</text>
+  <text x="765" y="246" text-anchor="middle" class="d-label">volume persistente</text>
+  <rect x="10" y="370" width="250" height="80" rx="10" class="d-violet"/>
+  <text x="135" y="398" text-anchor="middle" class="d-title">GitHub Actions</text>
+  <text x="135" y="420" text-anchor="middle" class="d-label">mvn verify + Testcontainers</text>
+  <text x="135" y="438" text-anchor="middle" class="d-label">JaCoCo, build da imagem</text>
+  <rect x="320" y="370" width="230" height="80" rx="10" class="d-box"/>
+  <text x="435" y="398" text-anchor="middle" class="d-title">Imagem Docker</text>
+  <text x="435" y="420" text-anchor="middle" class="d-label">multi-stage, temurin 25 JRE</text>
+  <text x="435" y="438" text-anchor="middle" class="d-label">usuário não root</text>
+  <rect x="610" y="370" width="260" height="80" rx="10" class="d-ok"/>
+  <text x="740" y="398" text-anchor="middle" class="d-title">Deploy</text>
+  <text x="740" y="420" text-anchor="middle" class="d-label">plataforma com plano gratuito</text>
+  <text x="740" y="438" text-anchor="middle" class="d-label">ou de baixo custo + Postgres</text>
+  <path d="M260 410 L318 410" class="d-line" marker-end="url(#ec-mk-arq)"/>
+  <path d="M550 410 L608 410" class="d-line" marker-end="url(#ec-mk-arq)"/>
+</svg>
+</Figura>
+
+**Um monólito, bem dividido.** Para três depósitos e milhares de produtos, microsserviços só trariam custo, e a consistência transacional é o requisito principal. O que conta é a divisão interna: a regra mora no domínio, testável sem Spring; o caso de uso abre a transação, pega o lock, chama o domínio e grava.
+
+```text
+src/main/java/dev/<seu-usuario>/estoquecerto/
+  compartilhado/   # TratadorDeErros (ProblemDetail), paginação, Clock
+  seguranca/       # SecurityConfig, login, JWT, bloqueio, usuário
+  catalogo/        # produto, categoria, fornecedor, deposito, Ean13, Cnpj
+    api/ aplicacao/ dominio/ infra/
+  estoque/         # movimentação, saldo, custo médio, ajuste, transferência, alerta, conciliação
+  compras/         # pedido, item, recebimento, máquina de estados
+  importacao/      # leitor e escritor CSV, relatório
+  relatorios/      # SQL nativo e DTOs
+  auditoria/
+src/main/resources/db/migration/   db/dev/
+docs/adr/
+```
+
+### Decisões para registrar em ADRs
+
+Um arquivo por decisão em `docs/adr/` (contexto, opções, decisão, consequências). As recomendações são uma base; se escolher diferente, diga por quê.
+
+**ADR-001 — Saldo guardado ou calculado?** (A) `SUM` das movimentações a cada consulta: nunca dessincroniza, mas fica lento e não há linha para travar. (B) Projeção `saldo_estoque` atualizada na mesma transação, com `CHECK (quantidade >= 0)`. *Recomendação:* B. A movimentação continua sendo a fonte da verdade (a projeção se reconstrói com um `INSERT ... SELECT SUM`), e a conciliação prova que bate.
+
+**ADR-002 — Como impedir saldo negativo com vendas simultâneas?** Duas transações leem saldo 1, as duas validam, as duas gravam: o saldo vira −1 (ou, com o `CHECK`, a segunda recebe um `500`).
+
+<Figura legenda="Com o lock na linha do produto, a segunda venda espera a primeira terminar e lê o saldo já atualizado">
+<svg viewBox="0 0 880 300" width="880" role="img" aria-labelledby="ec-lock-titulo ec-lock-desc">
+  <title id="ec-lock-titulo">Duas vendas simultâneas do último item com lock pessimista</title>
+  <desc id="ec-lock-desc">Linha do tempo com duas transações. A transação 1 pega o lock do produto, lê saldo 1, grava a venda, saldo 0, e faz commit, liberando o lock. A transação 2 pede o mesmo lock logo depois, fica esperando enquanto a transação 1 trabalha, recebe o lock depois do commit, lê saldo 0 e responde 409 estoque insuficiente sem gravar nada.</desc>
+  <defs><marker id="ec-mk-lock" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="10" y="90" class="d-title">Venda 1</text>
+  <text x="10" y="210" class="d-title">Venda 2</text>
+  <path d="M100 150 L860 150" class="d-line" marker-end="url(#ec-mk-lock)"/>
+  <text x="852" y="170" text-anchor="end" class="d-label">tempo</text>
+  <rect x="110" y="60" width="150" height="48" rx="8" class="d-accent"/>
+  <text x="185" y="80" text-anchor="middle" class="d-mono">FOR UPDATE</text>
+  <text x="185" y="98" text-anchor="middle" class="d-label">pega o lock</text>
+  <rect x="270" y="60" width="140" height="48" rx="8" class="d-box"/>
+  <text x="340" y="80" text-anchor="middle" class="d-mono">saldo = 1</text>
+  <text x="340" y="98" text-anchor="middle" class="d-label">1 ≥ 1, ok</text>
+  <rect x="420" y="60" width="160" height="48" rx="8" class="d-box"/>
+  <text x="500" y="80" text-anchor="middle" class="d-mono">INSERT, saldo 0</text>
+  <text x="500" y="98" text-anchor="middle" class="d-label">movimentação e projeção</text>
+  <rect x="590" y="60" width="110" height="48" rx="8" class="d-ok"/>
+  <text x="645" y="80" text-anchor="middle" class="d-mono">COMMIT</text>
+  <text x="645" y="98" text-anchor="middle" class="d-label">201</text>
+  <rect x="140" y="180" width="150" height="48" rx="8" class="d-accent"/>
+  <text x="215" y="200" text-anchor="middle" class="d-mono">FOR UPDATE</text>
+  <text x="215" y="218" text-anchor="middle" class="d-label">pede o lock</text>
+  <rect x="300" y="180" width="400" height="48" rx="8" class="d-box" stroke-dasharray="5 4"/>
+  <text x="500" y="209" text-anchor="middle" class="d-label">esperando (no máximo 3 s, RN-28)</text>
+  <rect x="710" y="180" width="160" height="48" rx="8" class="d-violet"/>
+  <text x="790" y="200" text-anchor="middle" class="d-mono">saldo = 0</text>
+  <text x="790" y="218" text-anchor="middle" class="d-label">409, nada gravado</text>
+  <path d="M700 108 L760 178" class="d-line" marker-end="url(#ec-mk-lock)"/>
+  <text x="742" y="132" class="d-label">libera</text>
+  <text x="440" y="270" text-anchor="middle" class="d-label">Sem o lock, as duas leriam saldo 1 e as duas gravariam: o clássico lost update.</text>
+</svg>
+</Figura>
+
+- *A — Lock pessimista* na linha do produto (`@Lock(LockModeType.PESSIMISTIC_WRITE)`). A segunda transação espera. Simples, sem retentativas, bom quando o **mesmo produto é disputado** (o mais vendido da loja). Custo: transações curtas e locks em ordem.
+- *B — Lock otimista* com `@Version`: quem chega depois recebe `OptimisticLockException` e tenta de novo (até 3 vezes). Ótimo com conflito raro; com o produto disputado, vira fila de retentativas. A retentativa precisa envolver a transação inteira, **fora** do método `@Transactional` (por exemplo, com o `@Retryable` nativo do Spring Framework 7 num bean que chama o serviço transacional).
+- *C — `UPDATE` condicional* (`... SET quantidade = quantidade - :q WHERE ... AND quantidade >= :q`, conferindo as linhas afetadas): eficiente para a venda, mas não protege o custo médio, que depende do saldo total.
+- *Recomendação:* A, travando o **produto** (não só `saldo_estoque`), porque o custo médio lê o saldo de todos os depósitos. Use B nos cadastros (RN-13), onde conflito é raro. O projeto mostra os dois mecanismos, cada um onde faz sentido.
+
+**ADR-003 — Dinheiro e arredondamento.** Preços `NUMERIC(12,2)`, custos `NUMERIC(14,4)`, quantidades `NUMERIC(14,3)`, tudo `BigDecimal`; `HALF_EVEN`; nunca `new BigDecimal(double)`; `compareTo`, não `equals`. Mostre um exemplo em que 2 casas no custo médio acumulam erro. Centavos em `long` não servem para custo fracionário de granel (R$ 0,0185 por metro).
+
+**ADR-004 — Onde vive a regra.** Regras puras em classes de domínio sem Spring (custo médio, transições do pedido com `enum` e `switch`), casos de uso finos. Hexagonal completa não é necessária num Júnior; regra testável sem subir o contexto, sim.
+
+**ADR-005 — Auditoria.** `@CreatedBy`/`@CreatedDate` (Spring Data JPA Auditing, com `AuditorAware`) para autoria, e tabela `auditoria` gravada explicitamente para eventos de negócio com antes e depois. Hibernate Envers versiona entidades inteiras: compare e justifique.
+
+**ADR-006 — JWT ou sessão.** JWT sem estado com o Resource Server do Spring Security (`NimbusJwtDecoder`) é o padrão para API consumida por PDV. Limite: não se revoga antes de expirar, daí os 60 minutos e a checagem de `ativo`.
+
+## Plano de execução
+
+O plano segue **fatias verticais**: cada marco termina com algo que funciona de ponta a ponta (HTTP → regra → banco → teste), num PR com CI verde. O **começo** (marco 1) prepara repositório, esqueleto, banco no Docker e CI antes de qualquer regra. O **meio** (marcos 2 a 8) segue as dependências: catálogo, segurança (toda movimentação precisa de autor), livro-razão, concorrência, compras, importação e relatórios. O **fim** (marco 9) transforma código em portfólio. Use uma branch e um PR por marco, mesmo sozinho: o histórico é parte do que o avaliador vê.
+
+<Marco id="fundacao" numero={1} titulo="Fundação do repositório" horas={8}>
+
+**Objetivo:** repositório público com esqueleto que compila, sobe com o banco no Docker e passa no CI.
+
+**Tarefas**
+
+1. Repositório `estoque-certo` com licença MIT, `.gitignore` e `main` protegida (PR e CI obrigatórios).
+2. Spring Initializr: Maven, Java 25, Spring Boot 4.x, com Web, Validation, Data JPA, PostgreSQL Driver, Flyway, Actuator e Testcontainers.
+3. `compose.yaml` com `postgres:18` (volume, `healthcheck` com `pg_isready`) e a aplicação (`depends_on` com `condition: service_healthy`); `.env` fora do Git, `.env.example` dentro.
+4. `Dockerfile` multi-stage (JDK 25 para build, `eclipse-temurin:25-jre` para rodar, usuário não root).
+5. `application.yml` com `ddl-auto=validate`, `open-in-view=false`, datasource por variáveis de ambiente, logs estruturados e perfil `dev`.
+6. Teste de contexto com Testcontainers e `@ServiceConnection`.
+7. Workflow de CI: checkout, `setup-java` (Temurin 25, cache Maven), `mvn -B verify`.
+8. README inicial (duas frases, como rodar, badge) e `docs/adr/0000-registro-de-decisoes.md`.
+
+**Entregáveis:** `pom.xml`, `compose.yaml`, `Dockerfile`, `.env.example`, workflow, README, primeiro PR mergeado.
+
+**Definição de pronto**
+
+- Numa pasta recém-clonada, `docker compose up --build` sobe tudo e `curl localhost:8080/actuator/health` responde `{"status":"UP"}`.
+- `mvn verify` passa local e no GitHub Actions; o badge está verde.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **H2 "só para começar".** Trigger, `CHECK` e índice parcial não se comportam igual. Testcontainers desde o primeiro teste.
+- **`depends_on` sem `healthcheck`.** A aplicação sobe antes de o PostgreSQL aceitar conexões e morre.
+- **`open-in-view` ligado (o padrão).** Esconde consultas preguiçosas fora da transação e N+1.
+</Callout>
+
+**Aulas de apoio:** [Git e testes](../../../aulas/00-comece-aqui/04-git-e-testes/) · [Git no time](../../../aulas/14-devops/01-git-no-time/) · [Maven e Gradle](../../../aulas/14-devops/02-maven-e-gradle/) · [Docker](../../../aulas/14-devops/03-docker/) · [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/) · [Spring Boot e Spring MVC](../../../aulas/08-spring-boot/04-spring-boot-e-spring-mvc/) · [Testcontainers](../../../aulas/10-testes/05-testcontainers/) · [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/)
+
+</Marco>
+
+<Marco id="catalogo" numero={2} titulo="Catálogo: produtos, categorias, fornecedores e depósitos" horas={12}>
+
+**Objetivo:** cadastros de ponta a ponta (RF-01 a RF-03), com formatos validados, unicidade garantida pelo banco, paginação e Problem Details. Ainda sem autenticação.
+
+**Tarefas**
+
+1. `V1__catalogo.sql` com tabelas, restrições e índices.
+2. Records `Sku`, `Ean13` e `Cnpj` validados no construtor compacto, com testes unitários dos exemplos de RN-05, RN-08 e RN-09.
+3. Entidades, repositórios Spring Data, casos de uso e controllers com DTOs (records) e Bean Validation (`@Digits(integer = 10, fraction = 2)` nos preços).
+4. `@RestControllerAdvice` produzindo `ProblemDetail` com `codigo`; `DataIntegrityViolationException` vira `409` pelo **nome da constraint** violada.
+5. Busca paginada (RN-15) e `PUT` com `versao` (RN-13).
+6. Dados de exemplo do perfil `dev` e springdoc-openapi com Swagger UI.
+
+**Entregáveis:** CRUD dos quatro cadastros; testes unitários, de fatia (`@WebMvcTest`) e de integração; ADR-003.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-01 a RF-03 passam como testes.
+- Duas requisições simultâneas com o mesmo SKU dão um `201` e um `409`.
+- `size=101` e `sort=senha` respondem `400` em Problem Details.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **`BigDecimal` vindo de `double`.** `new BigDecimal(0.1)` vira `0.1000000000000000055511...`. Use `new BigDecimal("0.1")` ou `BigDecimal.valueOf`.
+- **Unicidade só com `existsBySku`.** Falha com duas requisições ao mesmo tempo; a consulta serve para a mensagem, quem garante é o `UNIQUE`.
+- **Entidade JPA no controller.** Acopla a API ao banco e vaza campos. Use records.
+</Callout>
+
+**Aulas de apoio:** [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/) · [Arrays e strings](../../../aulas/01-java-essencial/05-arrays-e-strings/) · [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/) · [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/) · [DDL e constraints](../../../aulas/07-sql/02-ddl-e-constraints/) · [JPA e contexto de persistência](../../../aulas/09-persistencia/01-jpa-e-contexto-de-persistencia/) · [Spring Data JPA](../../../aulas/09-persistencia/03-spring-data-jpa/) · [Testes de fatia no Spring](../../../aulas/10-testes/04-testes-de-fatia-no-spring/) · [OpenAPI](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/)
+
+</Marco>
+
+<Marco id="seguranca" numero={3} titulo="Autenticação, papéis e auditoria" horas={10}>
+
+**Objetivo:** nada sem token, cada papel só faz o que a matriz permite, alterações registradas com autor (RF-12 e RN-53/RN-54).
+
+**Tarefas**
+
+1. `V2__usuarios_e_auditoria.sql`; usuários com BCrypt e o primeiro gerente por variáveis de ambiente.
+2. Login emitindo JWT com `NimbusJwtEncoder`; `SecurityFilterChain` com `oauth2ResourceServer`, `NimbusJwtDecoder` validando algoritmo e emissor, claim `papel` convertido em autoridade (`JwtGrantedAuthoritiesConverter` com `setAuthoritiesClaimName("papel")` e prefixo `ROLE_`), sessão `STATELESS`.
+3. Matriz de permissões com `authorizeHttpRequests`; `401` e `403` em Problem Details.
+4. Bloqueio após 5 falhas com `Clock` injetado.
+5. Auditoria na mesma transação e `@CreatedBy` com `AuditorAware`; utilitário de teste que gera token por papel.
+
+**Entregáveis:** login, matriz aplicada, auditoria de cadastros, ADR-005 e ADR-006.
+
+**Definição de pronto**
+
+- Um teste parametrizado percorre a matriz: para cada endpoint e papel, o status esperado (`2xx`, `401` ou `403`).
+- Alterar um preço gera 1 registro de auditoria; um `PUT` com `409` não gera nenhum.
+- Sem `JWT_SEGREDO`, a aplicação não sobe.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **Segredo no `application.yml`.** Fica no histórico do Git para sempre. Só variável de ambiente.
+- **Aceitar qualquer algoritmo.** Um token com `alg: none` tem de dar `401`.
+- **Auditoria fora da transação.** Deixa rastro de operação que falhou, ou perde o de uma que deu certo.
+</Callout>
+
+**Aulas de apoio:** [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/) · [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/) · [JWT e Resource Server](../../../aulas/11-seguranca/03-jwt-e-resource-server/) · [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/) · [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/)
+
+</Marco>
+
+<Marco id="movimentacoes" numero={4} titulo="Movimentações e saldo derivado" horas={14}>
+
+**Objetivo:** o livro-razão funcionando (RF-04 e RF-05): movimentações imutáveis, saldo como projeção, custo médio correto e extrato. É o marco mais importante; não economize testes.
+
+**Tarefas**
+
+1. `V3__estoque.sql` com os `CHECK` de sinal, `UNIQUE (chave_idempotencia)`, índice do extrato e o trigger (função `plpgsql` com `RAISE EXCEPTION` em `BEFORE UPDATE OR DELETE`).
+2. `enum TipoMovimentacao` que sabe o sinal e se muda o custo; classe `CustoMedio` pura, testada com a tabela de RN-19 inteira.
+3. Caso de uso `RegistrarMovimentacao`: busca o produto **com lock**, valida, confere saldo, grava a movimentação com `saldoApos`, atualiza `saldo_estoque` e o custo médio, numa transação.
+4. `Idempotency-Key` (RN-22): compare um hash do conteúdo; trate a violação do `UNIQUE` numa repetição simultânea devolvendo a original.
+5. `POST /ajustes` (RN-24, RN-25), saldos, listagem de movimentações e extrato.
+6. ADR-001.
+
+**Entregáveis:** endpoints de movimentação, ajuste, saldo e extrato; testes unitários e de integração de RF-04 e RF-05.
+
+**Definição de pronto**
+
+- A sequência de RN-19, via API, termina com custo `5.9750` e saldo total 30.
+- `UPDATE` e `DELETE` em `movimentacao` falham no banco (teste com `JdbcTemplate`).
+- A venda repetida com a mesma chave responde `200` e o saldo cai uma vez.
+- O `saldoApos` da última linha do extrato é igual ao saldo.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **Saldo "setado".** Se em algum lugar o saldo for atribuído em vez de derivado de um lançamento, o projeto perdeu a tese.
+- **`@Transactional` em método `private` ou chamado de dentro da classe.** O proxy não intercepta e não há transação.
+- **`equals` em `BigDecimal`.** `5.75` e `5.7500` são diferentes no `equals`; use `compareTo` e `isEqualByComparingTo`.
+- **Custo médio com o saldo de um depósito.** A fórmula usa o saldo total do produto.
+</Callout>
+
+**Aulas de apoio:** [Modelagem](../../../aulas/07-sql/01-modelagem/) · [Sealed e pattern matching](../../../aulas/02-poo/06-sealed-e-pattern-matching/) · [Exceções](../../../aulas/03-colecoes-generics-excecoes/05-excecoes/) · [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/) · [JUnit e AssertJ](../../../aulas/10-testes/02-junit-e-assertj/) · [Testcontainers](../../../aulas/10-testes/05-testcontainers/)
+
+</Marco>
+
+<Marco id="concorrencia" numero={5} titulo="Concorrência e transferências" horas={10}>
+
+**Objetivo:** provar, com um teste que qualquer pessoa roda, que o saldo não fica negativo com vendas simultâneas (RF-07); transferências atômicas (RF-06) e conciliação (RN-55).
+
+**Tarefas**
+
+1. Escreva primeiro o teste que **falha**: 20 threads (`ExecutorService` + `CountDownLatch` para largarem juntas) vendendo 1 unidade de um saldo 10, contra o Testcontainers. Rode **sem** lock e guarde a saída para o README.
+2. Implemente o lock de RN-27 e rode o teste 20 vezes seguidas.
+3. `lock_timeout` de 3 s (por exemplo, em `spring.datasource.hikari.connection-init-sql`) e o erro traduzido para `503`.
+4. Transferências, conciliação e os outros dois testes de RF-07 (cruzadas e entradas simultâneas), terminando com a conciliação.
+5. ADR-002 com o antes e o depois.
+
+**Entregáveis:** transferências, conciliação, três testes de concorrência, ADR-002, seção "Concorrência" no README.
+
+**Definição de pronto**
+
+- O teste das 20 vendas passa 20 vezes seguidas, local e no CI: 10 `201`, 10 `409`, saldo 0, conciliação vazia.
+- As transferências cruzadas terminam em menos de 10 s, sem `deadlock detected` no log.
+- As entradas simultâneas terminam com custo `3.0000`.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **`synchronized` no serviço.** Não vale com duas instâncias da aplicação; o lock tem de estar no banco.
+- **Teste que passa porque as threads não concorrem.** Sem o `CountDownLatch`, elas rodam quase em sequência. Confira que o teste **falha** sem o lock.
+- **Lock pego tarde.** Ler, validar e só então travar é igual a não travar.
+- **Pool menor que o número de threads.** Com 20 threads e o pool padrão de 10 do Hikari, metade espera conexão, não lock. Saiba qual espera você mede.
+</Callout>
+
+**Aulas de apoio:** [Threads e memória](../../../aulas/06-concorrencia/01-threads-e-memoria/) · [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/) · [Executors](../../../aulas/06-concorrencia/03-executors/) · [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/) · [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/)
+
+</Marco>
+
+<Marco id="compras" numero={6} titulo="Pedidos de compra e recebimento" horas={10}>
+
+**Objetivo:** ciclo de vida do pedido (RF-09), com recebimento parcial e total que gera entradas, tudo ou nada.
+
+**Tarefas**
+
+1. `V4__compras.sql` (sequência do número, `CHECK` de status, unicidade da nota, FK em `movimentacao`).
+2. Máquina de estados no domínio: `enum StatusPedido` e um método por ação que lança `TransicaoInvalidaException`; teste parametrizado com as 24 combinações de 6 estados × 4 ações.
+3. Rascunho e edição (RN-32).
+4. Recebimento: trava os produtos em ordem de id e gera cada `ENTRADA` pelo **mesmo** caso de uso do marco 4 (reuso, não cópia).
+5. Detalhe do pedido sem N+1 (`JOIN FETCH` ou `@EntityGraph`).
+
+**Entregáveis:** endpoints de pedido, diagrama de estados no README, testes de transição e recebimento.
+
+**Definição de pronto**
+
+- As 24 combinações passam, com exatamente as transições da figura permitidas.
+- 100 recebidos em 60 + 40 terminam `RECEBIDO` com duas entradas e o custo médio conferido pela fórmula.
+- Um recebimento com um item válido e um excedente não grava **nenhuma** entrada.
+- O detalhe de um pedido de 50 itens executa um número fixo de consultas (anotado no README).
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **Status como `String`.** `"RECEBIDO_PARCAL"` passa despercebido; `enum` no Java e `CHECK` no banco.
+- **Copiar a lógica de entrada.** Saldo e custo vão divergir na primeira correção feita num lugar só.
+- **Travar na ordem dos itens.** Dois recebimentos com os mesmos produtos em ordens diferentes geram deadlock.
+</Callout>
+
+**Aulas de apoio:** [Sealed e pattern matching](../../../aulas/02-poo/06-sealed-e-pattern-matching/) · [Relacionamentos](../../../aulas/09-persistencia/02-relacionamentos/) · [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/) · [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/)
+
+</Marco>
+
+<Marco id="importacao" numero={7} titulo="Importação e exportação de catálogo em CSV" horas={8}>
+
+**Objetivo:** importar o arquivo do fornecedor com segurança (RF-10): validação linha a linha, relatório, simulação, reprocessamento e desempenho medido.
+
+**Tarefas**
+
+1. `V5__importacao.sql`.
+2. Leitor de CSV próprio (tratando aspas) ou Apache Commons CSV, com testes para BOM, CRLF, aspas dobradas, linha em branco e cabeçalho errado.
+3. Validação reaproveitando `Sku`, `Ean13` e `Cnpj`, acumulando todos os erros da linha; SKU repetido no arquivo com um `Map` de SKU para linha.
+4. Lotes de 500 por transação, *upsert* por SKU, existentes carregados com **uma** consulta por lote (`WHERE sku IN (...)`), `hibernate.jdbc.batch_size` configurado e `flush()`/`clear()` entre lotes.
+5. Simulação, limites (`spring.servlet.multipart.max-file-size` e contagem de linhas), exportação em streaming e teste de ida e volta.
+6. Teste com 10.000 linhas geradas, conferindo `duracaoMs` ≤ 15.000.
+
+**Entregáveis:** importação, exportação, `docs/exemplos/catalogo-exemplo.csv` com linhas certas e erradas, testes.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-10 passam como testes.
+- 10.000 linhas em até 15 s no CI (tempo anotado no README).
+- Exportar e reimportar dá `inalterados = totalLinhas`.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **`split(";")` ingênuo.** Quebra num campo entre aspas com `;` dentro.
+- **Uma transação para tudo, ou uma por linha.** A primeira segura locks e memória; a segunda leva minutos.
+- **`IDENTITY` e lote.** O Hibernate desliga o lote; use `SEQUENCE`.
+- **Arquivo inteiro numa `String`.** Leia em fluxo e pare ao passar do limite.
+</Callout>
+
+**Aulas de apoio:** [List, Set e Map](../../../aulas/03-colecoes-generics-excecoes/01-list-set-map/) · [Complexidade](../../../aulas/03-colecoes-generics-excecoes/02-complexidade/) · [Streams](../../../aulas/04-java-moderno/02-streams/) · [Collectors](../../../aulas/04-java-moderno/03-collectors/) · [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/)
+
+</Marco>
+
+<Marco id="relatorios" numero={8} titulo="Relatórios SQL e alertas de estoque mínimo" horas={8}>
+
+**Objetivo:** transformar o livro-razão em informação de gestão (RF-08 e RF-11), com SQL e índices justificados.
+
+**Tarefas**
+
+1. `V6__alertas_e_relatorios.sql`.
+2. Alertas dentro do caso de uso de movimentação, comparando saldo antes e depois; reavaliação ao mudar o mínimo.
+3. Relatórios com SQL nativo (`JdbcClient` ou `@Query(nativeQuery = true)` com projeções em records).
+4. `docs/massa/gerar-massa.sql` com `generate_series`: 5.000 produtos, 3 depósitos, 500 mil movimentações em 12 meses, com saldos coerentes (entradas antes das saídas).
+5. `EXPLAIN (ANALYZE, BUFFERS)` de cada relatório sem e com índices, guardado em `docs/explain/`, com o que mudou no README.
+6. Testes com os exemplos de RN-46, RN-47 e RN-48 montados à mão.
+
+**Entregáveis:** alertas, relatórios, script de massa, `docs/explain/`, seção "Relatórios e desempenho" no README.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-08 e RF-11 passam como testes.
+- Com a massa, curva ABC e giro de 90 dias respondem em até 1 s (medido e anotado).
+- Todo índice criado aparece usado em algum `EXPLAIN` guardado.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **Relatório em Java.** Carregar 500 mil linhas para somar num `stream()`; agregue no banco.
+- **Divisão inteira.** Em SQL, `1 / 3` com inteiros dá `0`; converta para `NUMERIC` e use `NULLIF` no total.
+- **Empate sem desempate.** Sem `ORDER BY valor DESC, sku`, a classe ABC muda entre execuções.
+- **Fuso no período.** Converta `de` e `ate` para instantes em `America/Sao_Paulo` antes de consultar `TIMESTAMPTZ`.
+</Callout>
+
+**Aulas de apoio:** [Consultas e joins](../../../aulas/07-sql/03-consultas-e-joins/) · [Agregações e janelas](../../../aulas/07-sql/04-agregacoes-e-janelas/) · [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/) · [Spring Data JPA](../../../aulas/09-persistencia/03-spring-data-jpa/) · [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/)
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Entrega" horas={6}>
+
+**Objetivo:** no ar, documentado, demonstrável em três minutos e com uma versão fechada.
+
+**Tarefas**
+
+1. Deploy da imagem numa plataforma com plano gratuito ou de baixo custo (Render, Railway, Fly.io, Koyeb ou similar) e um PostgreSQL gerenciado gratuito (Neon, Supabase ou o da plataforma). Confira as condições atuais; segredos só nas variáveis da plataforma.
+2. Perfil `prod`: decisão sobre o Swagger UI registrada, sem dados de exemplo automáticos, usuário de demonstração `CONSULTA` publicado no README.
+3. README final, `docs/demo.http` e `docs/pdv-simulado.sh` (abaixo).
+4. Vídeo de até 3 minutos, release `v1.0.0` com notas e post no LinkedIn. Opcional: publicar a imagem no GitHub Container Registry ao criar a tag.
+
+**Entregáveis:** URL pública, README final, vídeo, release, post.
+
+**Definição de pronto**
+
+- Uma pessoa que nunca viu o projeto clona, roda `docker compose up --build` e executa o `demo.http` seguindo só o README.
+- A URL pública responde `/actuator/health` e o login de demonstração.
+- A release `v1.0.0` existe com CI verde no commit da tag.
+
+<Callout tipo="erro" titulo="Armadilhas deste marco">
+- **Deploy que "dorme".** Planos gratuitos desligam sem uso; avise no README que a primeira chamada pode demorar.
+- **README que lista tecnologias e não decisões.** "Usei Spring Boot" não diz nada; "o saldo é derivado de movimentações imutáveis, veja o ADR-001" diz.
+- **Gerente público.** O usuário de demonstração é `CONSULTA`; um gerente anônimo apaga seus dados.
+</Callout>
+
+**Aulas de apoio:** [Docker](../../../aulas/14-devops/03-docker/) · [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/) · [Observabilidade](../../../aulas/14-devops/05-observabilidade/) · [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/) · [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/) · [Currículo, ATS e LinkedIn](../../../aulas/17-carreira/02-curriculo-ats-e-linkedin/)
+
+</Marco>
+
+## Estratégia de testes
+
+As garantias mais importantes (unicidade, `CHECK`, lock, trigger, SQL) **só existem no banco**, então a pirâmide tem base larga de regras puras e um andar de integração forte, sempre com PostgreSQL 18 no Testcontainers e as migrations aplicadas. Nenhum H2.
+
+| Nível | O que cobre | Ferramentas |
+|---|---|---|
+| Unidade | `Sku`, `Ean13`, `Cnpj`, `CustoMedio`, `TipoMovimentacao`, estados do pedido, leitor de CSV | JUnit 6, AssertJ, testes parametrizados |
+| Fatia web | Validação, códigos HTTP, Problem Details, matriz de permissões | `@WebMvcTest`, `@MockitoBean`, `MockMvcTester` |
+| Integração | Movimentações, idempotência, trigger, recebimento, importação, relatórios, conciliação | `@SpringBootTest`, Testcontainers 2, `@ServiceConnection` |
+| Concorrência | Vendas, transferências cruzadas e entradas simultâneas | `ExecutorService`, `CountDownLatch` |
+| Manual | Roteiro do `demo.http` contra o Compose | Arquivo `.http` |
+
+Reaproveite **um** container na suíte inteira e comece cada teste de um estado conhecido (`TRUNCATE ... RESTART IDENTITY CASCADE` ou dados com identificadores únicos).
+
+**Cenários obrigatórios**, cada um com pelo menos um teste de nome descritivo:
+
+1. Todos os critérios de aceite de RF-01 a RF-13.
+2. Os exemplos válidos e inválidos de EAN-13 (RN-09) e CNPJ (RN-05).
+3. A tabela completa de custo médio (RN-19) e a entrada com custo zero.
+4. Quantidade fracionária: `UN` recusa, `KG` aceita 3 casas.
+5. Limite do ajuste em R$ 499,99, 500,00 e 500,01.
+6. Os três testes de concorrência de RF-07, terminando com a conciliação vazia.
+7. Pedido: as 24 combinações estado × ação; rollback do recebimento excedente.
+8. Importação: vários erros na mesma linha, SKU repetido, EAN de outro SKU, cabeçalho errado, limite, simulação, reimportação e 10.000 linhas no tempo.
+9. Matriz de permissões completa e bloqueio de login com `Clock` controlado.
+10. Erro inesperado → `500` sem stack trace.
+
+## Entregáveis do portfólio
+
+### Modelo de README
+
+````markdown
+# Estoque Certo
+
+API de estoque e compras para varejo com vários depósitos. O saldo é derivado de
+movimentações imutáveis, nunca fica negativo (nem com vendas simultâneas) e alimenta
+compras, importação de catálogo e relatórios de curva ABC e giro.
+
+[badge do CI] · Demo: <url> · Vídeo (3 min): <link> · Swagger: <url>/swagger-ui.html
+
+## O problema
+Um parágrafo: a Casa Aurora, as planilhas, o saldo em que ninguém confia.
+
+## O que a API faz
+Cinco a sete bullets, cada um com um número (10 mil linhas em X s, 3 papéis...).
+
+## Arquitetura e decisões
+Diagrama + tabela: decisão | escolha | por quê | link do ADR.
+
+## Concorrência: a prova
+Linha do tempo, link para o teste, saída sem o lock e com o lock.
+
+## Como rodar
+    cp .env.example .env
+    docker compose up --build
+Usuários de exemplo do perfil dev.
+
+## Como testar
+    ./mvnw verify    # PostgreSQL 18 via Testcontainers
+
+## Resultados medidos
+| Medida | Meta | Resultado | Como medi |
+
+## Limitações conhecidas e próximos passos
+````
+
+### Outros entregáveis
+
+- **Diagramas** em `docs/` (ER, arquitetura, estados do pedido, linha do tempo da concorrência); Mermaid no README serve.
+- **ADRs** 001 a 006 em `docs/adr/`.
+- **`docs/demo.http`**: login, produto, entrada, venda, venda além do saldo (`409`), transferência, contagem, pedido com recebimento parcial, importação com erros, curva ABC, cada um com um comentário do que mostrar.
+- **`docs/pdv-simulado.sh`**: N vendas simultâneas do mesmo produto com `curl` em paralelo (`xargs -P`), imprimindo quantas deram `201` e quantas `409`.
+- **Vídeo de até 3 minutos:** (0:00) o problema; (0:20) Swagger: login, produto, entrada, venda e extrato; (0:50) o script do PDV com 20 vendas do último item, 10 aceitas, 10 recusadas, conciliação vazia, e o trecho do lock; (1:30) importação com erros e a reimportação com `criados = 0`; (2:10) curva ABC e o `EXPLAIN` antes e depois; (2:40) CI, ADRs e link.
+- **Post no LinkedIn**: o problema, a decisão mais interessante, um número medido e o link. Sem "estou muito feliz em anunciar".
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível (Júnior) | Acima do nível |
+|---|---|---|---|
+| Modelagem do saldo | `quantidade` editável, sem histórico | Movimentações imutáveis, projeção, extrato com `saldoApos`, trigger | Projeção reconstruível por comando; conciliação agendada |
+| Concorrência | Não tratada, ou `synchronized` | Lock no banco justificado em ADR; teste de 20 threads que falha sem o lock | Pessimista e otimista comparados com medições sob contenção |
+| Dinheiro | `double` em algum lugar | `BigDecimal`, escalas e `RoundingMode` documentados, `compareTo` | Tipos próprios (`Dinheiro`, `Quantidade`) que impedem misturar escalas |
+| Regras de negócio | Validações espalhadas nos controllers | RN no domínio, cada uma com teste do exemplo do enunciado | TDD visível no histórico de commits |
+| Banco | Esquema gerado pelo Hibernate | Flyway, `CHECK`, `UNIQUE`, índices justificados por `EXPLAIN` | Índice parcial e `INCLUDE` bem usados; massa reproduzível |
+| SQL de relatório | Calculado em Java | ABC com janelas, giro com saldo em data passada, determinístico | Vários cenários conferidos contra cálculo à mão |
+| API | HTTP inconsistente; stack trace no erro | REST coerente, paginação limitada, Problem Details com `codigo`, OpenAPI | `Location` e `Retry-After` corretos em todos os casos; exemplos no OpenAPI |
+| Importação | Para no primeiro erro, ou grava metade em silêncio | Relatório por linha, simulação, idempotência, 10 mil linhas no tempo | Processamento assíncrono com status |
+| Segurança | Segredo no repositório | JWT validado, matriz testada, BCrypt, bloqueio | Testes de token adulterado e rotação de segredo documentada |
+| Testes | Poucos, com H2 ou mocks de repositório | Unidade, fatia e integração com Testcontainers; cenários obrigatórios; CI verde | ArchUnit; cobertura acima de 90% no domínio |
+| Operação | Roda só na máquina da pessoa | Compose, CI, deploy, health, logs estruturados | Imagem publicada por tag; métricas de negócio |
+| Comunicação | README lista tecnologias | Problema, decisões, resultados medidos, ADRs, vídeo | PRs bem descritos; post técnico sobre a concorrência |
+
+## Como apresentar na entrevista
+
+### Pitch (60 a 90 segundos)
+
+> "O Estoque Certo é uma API de estoque para uma rede pequena de lojas com vários depósitos. O problema é o saldo em que ninguém confia, então o saldo não é um campo editável: ele é derivado de movimentações imutáveis, com um trigger no PostgreSQL impedindo alteração e um extrato com o saldo depois de cada lançamento. A parte mais interessante foi a concorrência: escrevi primeiro um teste com vinte threads vendendo o último item contra um PostgreSQL de verdade no Testcontainers, vi o saldo ficar errado, e resolvi com lock pessimista na linha do produto, porque o custo médio depende do saldo total. Agora o teste dá sempre dez vendas aceitas e dez recusadas. Tem também pedido de compra com recebimento parcial, importação de dez mil linhas de CSV com relatório de erros, e curva ABC e giro em SQL com funções de janela e índices justificados por EXPLAIN. Sobe com um `docker compose up`, tem CI e está no ar."
+
+### Perguntas prováveis e pontos-chave
+
+1. **"Por que não guardar só a quantidade no produto?"** Sem histórico, sem autor, e o `UPDATE` direto perde atualizações. Com movimentações, o saldo em qualquer data é uma soma (o giro depende disso). A projeção é conferida pela conciliação.
+2. **"Como o saldo não fica negativo com duas vendas ao mesmo tempo?"** A corrida (as duas leem 1), o lock pego **antes** da leitura, o `CHECK` como última defesa, o teste com `CountDownLatch` que falha sem o lock. Por que travar o produto e não só o saldo.
+3. **"Por que pessimista e não otimista?"** Contenção alta no item mais vendido viraria fila de retentativas; otimista ficou nos cadastros. Custos do pessimista: transações curtas, ordem de lock, `lock_timeout`.
+4. **"E com duas instâncias da aplicação?"** O lock está no banco, então funciona; `synchronized` não funcionaria.
+5. **"Como funciona o custo médio? Por que 4 casas?"** A fórmula, o exemplo 5,75 → 5,975, só entradas mudam o custo, erro acumulado com 2 casas, `HALF_EVEN` e `compareTo`.
+6. **"E se o PDV mandar a mesma venda duas vezes?"** `Idempotency-Key` com `UNIQUE`; repetição idêntica devolve a original; conteúdo diferente é `409`. Por que "consultar antes" não basta.
+7. **"Como a importação lida com 10 mil linhas e com falha no meio?"** Erros acumulados por linha, lotes de 500, *upsert* por SKU, `SEQUENCE` em vez de `IDENTITY`, `flush`/`clear`, o tempo medido.
+8. **"Me explica a query da curva ABC."** Agregação por produto, `SUM(...) OVER (ORDER BY valor DESC, sku)`, percentual com `NULLIF`, classe pelo acumulado anterior, desempate determinístico.
+9. **"Que índices você criou e como sabe que ajudam?"** Dois exemplos com a consulta e o `EXPLAIN` antes e depois; FK não é indexada sozinha.
+10. **"Como você testou?"** A pirâmide, por que sem H2 (trigger, `CHECK`, índice parcial), testes de concorrência, CI.
+11. **"Como funciona a autenticação?"** JWT HS256, Resource Server, papel no claim, matriz testada; limite da revogação e por que 60 minutos.
+12. **"O que você faria a seguir?"** Reserva de estoque, mínimo por depósito, lotes e validade, eventos com outbox. Mostra que você sabe onde o projeto para.
+
+**Trade-offs para mencionar sem esperar a pergunta:** projeção versus soma a cada consulta; o lock serializa as operações de um mesmo produto (correção acima de vazão, aceitável no volume de uma loja); `409` versus `422`; monólito porque o domínio é um só e a consistência transacional manda.
+
+## Para ir além
+
+- **Reserva de estoque** (disponível = saldo − reservado), com expiração.
+- **Mínimo por depósito** e pedido em rascunho gerado a partir dos alertas de um fornecedor.
+- **Lotes e validade** com saída FEFO e relatório de vencimento próximo.
+- **Conversão de unidades** (compra em caixa, venda em unidade).
+- **Envio do pedido por e-mail** com um SMTP falso no Docker (como o Mailpit).
+- **Eventos de estoque** (`EstoqueAbaixoDoMinimo`, `MercadoriaRecebida`) com transactional outbox (módulo 12).
+- **Importação assíncrona** com `202 Accepted` e consulta de progresso.
+- **Inventário por ciclo**, priorizando a curva A.
+- **Refresh token** com rotação.
+- **Métricas de negócio** no Actuator e um painel no Grafana.

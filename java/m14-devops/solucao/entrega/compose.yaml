@@ -1,0 +1,36 @@
+# Exercício 14.04 — ambiente local: aplicação + PostgreSQL.
+# Uso: POSTGRES_PASSWORD=segredo docker compose -f entrega/compose.yaml up --build
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: entrega/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/trilha
+      SPRING_DATASOURCE_USERNAME: trilha
+      # Senha vem do ambiente; o compose falha se ela não for definida.
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        # "started" não basta: o Postgres demora alguns segundos para aceitar conexões.
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: trilha
+      POSTGRES_USER: trilha
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trilha -d trilha"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - dados:/var/lib/postgresql
+
+volumes:
+  dados:

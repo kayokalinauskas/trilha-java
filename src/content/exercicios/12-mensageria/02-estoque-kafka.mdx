@@ -1,0 +1,345 @@
+---
+titulo: "Projeção de estoque com Kafka: chaves, ordem e DLT"
+codigo: "12.02"
+resumo: Publique movimentos de estoque num tópico de 3 partições com a chave certa para garantir a ordem por SKU, consuma com um consumer group que mantém o saldo, e trate as falhas — retry para o que é transitório, DLT para o que é permanente e para a mensagem envenenada. Você confere tudo contra um Kafka 4 (KRaft) de verdade, com um programa que publica cada cenário e lê o DLT.
+modulo: 12-mensageria
+ordem: 2
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [Kafka, partição, chave, ordem, consumer group, DefaultErrorHandler, DLT, poison pill, Spring Kafka 4]
+aulas: [12-mensageria/03-kafka, 12-mensageria/06-retry-e-dlq]
+java:
+  modulo: m12-mensageria
+  arquivos:
+    - src/main/java/dev/trilhajava/m12/estoque/ConfiguracaoKafka.java
+    - src/main/java/dev/trilhajava/m12/estoque/PublicadorDeMovimentos.java
+    - src/main/java/dev/trilhajava/m12/estoque/ConsumidorDeMovimentos.java
+    - src/main/resources/estoque.properties
+---
+
+## Contexto
+
+Um varejista tem estoque em três centros de distribuição. Cada entrada (compra do fornecedor) e cada saída (venda, perda, devolução ao fornecedor) é publicada como um **movimento** num tópico Kafka. Vários sistemas consomem esse tópico; o seu é a **projeção de estoque**, que mantém o saldo atual de cada SKU para o site mostrar "últimas unidades".
+
+A primeira versão tinha dois defeitos. O saldo às vezes ficava negativo: um `+10` era aplicado depois dos `-1` que vieram em seguida. E um movimento inválido travava o consumidor: ele falhava, o Kafka o entregava de novo, ele falhava de novo, e nenhum movimento daquela partição andava até alguém apagar o tópico.
+
+Sua missão é corrigir as duas coisas: ordem por SKU e uma política de falhas que repete o que é passageiro e tira do caminho o que nunca vai dar certo.
+
+## O que você vai praticar
+
+- **Partições e chaves.** Um tópico é dividido em partições, e o Kafka só garante ordem **dentro** de uma partição. Quem escolhe a partição é a chave da mensagem (um hash da chave, módulo o número de partições). Veja [Kafka](../../../aulas/12-mensageria/03-kafka/).
+- **Consumer groups.** Os consumidores de um mesmo grupo dividem as partições entre si: cada partição é lida por um consumidor só do grupo, e por isso na ordem. Com `concurrency = "3"` num `@KafkaListener`, o Spring cria três consumidores. Mesma aula.
+- **Produtor durável.** `acks=all` faz o líder só confirmar depois que as réplicas em sincronia gravaram; o produtor idempotente não duplica mensagens quando repete um envio. Mesma aula.
+- **Retry e DLT.** O `DefaultErrorHandler` do Spring Kafka repete a entrega segundo um *backoff* e, esgotadas as tentativas, entrega a mensagem a um recuperador; o `DeadLetterPublishingRecoverer` a publica num tópico de mensagens mortas (DLT), com cabeçalhos que contam de onde ela veio e por que falhou. Exceções "não repetíveis" vão direto para o recuperador. Veja [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/).
+- **Mensagem envenenada (*poison pill*).** Uma mensagem que nunca vai ser lida (um JSON quebrado) não pode travar a partição. A forma mais simples de garantir isso é ler o JSON no listener, onde o erro vira uma exceção comum que o error handler sabe classificar.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m12.estoque` (não precisa mudar):
+
+- `MovimentoDeEstoque(UUID id, String sku, int quantidade, Instant ocorridoEm)`: quantidade positiva é entrada, negativa é saída. O construtor recusa SKU vazio e quantidade zero com `IllegalArgumentException`. `MovimentoDeEstoque.de(sku, quantidade)` gera o `id` e o `ocorridoEm`;
+- `ProjecaoDeEstoque` (`@Component`), o "banco" da projeção: `aplicar(movimento)` soma a quantidade ao saldo do SKU e lança `SaldoNegativoException` (**falha permanente**) se o saldo ficaria negativo; `saldo(sku)` devolve o saldo atual (0 para um SKU desconhecido);
+- `BancoIndisponivelException`, a **falha transitória** que um banco real lançaria. A `ProjecaoDeEstoque` em memória nunca a lança; o programa do **Experimente** a substitui por uma versão que lança;
+- `EstoqueApplication`, a aplicação Spring Boot, que carrega `estoque.properties`.
+
+### O que você implementa
+
+Três classes, já criadas e vazias, e um arquivo de propriedades. Os nomes das classes, dos tópicos, do grupo e do método `publicar` são fixos.
+
+```java
+// ConfiguracaoKafka (@Configuration)
+@Bean NewTopic movimentos()                                     // regra 1
+@Bean NewTopic movimentosMortos()                               // regra 1
+@Bean DefaultErrorHandler tratadorDeErros(KafkaOperations<String, String> kafka)   // regras 7 a 10
+
+// PublicadorDeMovimentos (@Component)
+public PublicadorDeMovimentos(KafkaTemplate<String, String> kafka, JsonMapper json)
+public CompletableFuture<SendResult<String, String>> publicar(MovimentoDeEstoque movimento)   // regras 2 e 3
+
+// ConsumidorDeMovimentos (@Component)
+ConsumidorDeMovimentos(ProjecaoDeEstoque projecao, JsonMapper json)
+@KafkaListener(...) void receber(String mensagem)               // regras 5 e 6
+```
+
+```properties
+# estoque.properties — regras 3 e 4
+spring.kafka.producer.…
+spring.kafka.consumer.…
+```
+
+## Regras
+
+**Tópicos e produtor**
+
+1. **Dois tópicos, criados pela aplicação na subida, com 3 partições cada:** `estoque.movimentos` e o DLT `estoque.movimentos-dlt`. O DLT precisa de pelo menos tantas partições quanto o original, porque o recuperador publica na partição de mesmo número. Atenção ao nome: no Spring Kafka 4, o sufixo padrão do DLT é `-dlt` (até o 3.x era `.DLT`).
+2. **A chave é o SKU, e o valor é o movimento em JSON (texto).** Exemplo: `publicar(MovimentoDeEstoque.de("TENIS-42", 10))` envia chave `TENIS-42` e valor `{"id":"0b6c…","sku":"TENIS-42","quantidade":10,"ocorridoEm":"2026-10-01T12:00:00.123Z"}`. Consequência: os onze movimentos de um SKU caem **todos na mesma partição**; SKUs diferentes se espalham pelas três.
+3. **Serialização e durabilidade declaradas em `estoque.properties`.** Chave e valor como `String` no produtor e no consumidor (`StringSerializer` e `StringDeserializer`), `acks=all` e `enable.idempotence=true` **explícitos**. Os dois últimos já são o padrão do cliente Kafka desde a versão 3; declarar deixa claro que é uma decisão, e não um acaso, para quem mexer depois.
+4. **Um grupo novo lê o tópico desde o início:** `auto-offset-reset=earliest`. Com o padrão (`latest`), um grupo novo ignoraria tudo que foi publicado antes de ele existir.
+
+**Consumidor**
+
+5. **Grupo `projecao-estoque`, com 3 consumidores.** Um `@KafkaListener` no tópico `estoque.movimentos`, `groupId = "projecao-estoque"` e `concurrency = "3"`: uma thread por partição.
+6. **O listener recebe `String`, converte com o `JsonMapper` e chama `projecao.aplicar(...)`. Nada mais.** Sem `try/catch`: a política de erro fica num lugar só (regras 7 a 10). Exemplo: `+10` e depois `-3` no mesmo SKU → saldo `7`.
+
+**Falhas**
+
+7. **Ordem garantida por SKU.** `+10` seguido de dez `-1` no mesmo SKU termina com saldo `0`, onze movimentos aplicados e nada no DLT, por mais que você rode.
+8. **Falha transitória: 1 tentativa + 2 repetições, 200 ms entre elas.** `BancoIndisponivelException` → o movimento é reentregue. Exemplos: uma projeção que falha duas vezes e depois funciona → 3 tentativas, saldo aplicado **uma** vez, nada no DLT. Uma projeção que falha sempre → 3 tentativas, saldo inalterado e a mensagem no DLT.
+9. **Falha permanente: direto para o DLT, uma tentativa só.** `SaldoNegativoException` não se repete. Exemplo: `-5` num SKU com saldo 0 → 1 tentativa, mensagem no DLT, saldo continua 0.
+10. **Mensagem envenenada não trava a partição.** JSON malformado (`{isto não é json`) e movimento inválido (`"quantidade":0`, que o construtor do record recusa) vão direto para o DLT, sem repetir e sem chegar à projeção; o movimento **seguinte** da mesma partição é aplicado normalmente.
+11. **A mensagem no DLT é a original.** Mesma chave e mesmo valor (inclusive o texto quebrado do veneno), mais os cabeçalhos do Spring Kafka com o tópico de origem (`kafka_dlt-original-topic` = `estoque.movimentos`) e a exceção (`kafka_dlt-exception-fqcn` e `kafka_dlt-exception-cause-fqcn`).
+
+## Passo a passo sugerido
+
+1. **Suba o Kafka** (comando no **Experimente**).
+2. **Tópicos e propriedades (regras 1, 3 e 4).** Declare os dois `NewTopic` com `TopicBuilder` e escreva `estoque.properties`. Suba `EstoqueApplication` e liste os tópicos com o comando do **Experimente**.
+3. **O publicador (regra 2).** `kafka.send(topico, chave, valor)` devolve o `CompletableFuture` que o método precisa devolver.
+4. **O consumidor (regras 5 e 6).** Rode o programa do **Experimente**: a linha do `TENIS-42` já deve mostrar saldo 0 e uma partição só. Os cenários de falha ainda não dão o resultado da tabela.
+5. **A política de erros (regras 8 a 11).** Declare o `DefaultErrorHandler` com o recuperador e o backoff, e classifique as exceções não repetíveis. Rode o programa de novo e confira cada linha.
+6. **Experimente tirar a chave** do `publicar` (mande `null`) e rode algumas vezes: em algum momento, o `TENIS-42` aparece com saldo diferente de 0 ou com movimentos no DLT. Volte a chave.
+
+## Experimente
+
+Suba um Kafka 4 em modo KRaft (sem ZooKeeper), com um nó só (é preciso ter o Docker):
+
+```bash
+docker run -d --name kafka -p 9092:9092 apache/kafka:4.2.1
+```
+
+O Spring Boot se conecta por padrão a `localhost:9092`. Para listar os tópicos e ver as partições, depois de subir a aplicação:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic estoque.movimentos
+```
+
+O programa abaixo sobe a sua aplicação com uma **projeção instável** no lugar da `ProjecaoDeEstoque`: SKUs que começam com `INSTAVEL` falham nas duas primeiras tentativas, e os que começam com `FORA-DO-AR` falham sempre (com `BancoIndisponivelException`). Ela conta as tentativas por SKU. O programa publica os cenários, espera o consumo, imprime saldo e tentativas, e lê o DLT com um grupo novo. Cada execução usa um sufixo diferente nos SKUs, porque o tópico guarda o que as execuções anteriores publicaram. Salve-o em `src/main/java/dev/trilhajava/m12/estoque/DemonstracaoDoEstoque.java`, no starter:
+
+```java
+package dev.trilhajava.m12.estoque;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.support.GenericApplicationContext;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.KafkaHeaders;
+
+public class DemonstracaoDoEstoque {
+
+    /** Conta as tentativas por SKU. SKUs "INSTAVEL-..." falham 2 vezes; "FORA-DO-AR-..." falham sempre. */
+    static final class ProjecaoInstavel extends ProjecaoDeEstoque {
+        final Map<String, AtomicInteger> tentativas = new ConcurrentHashMap<>();
+
+        @Override
+        public void aplicar(MovimentoDeEstoque movimento) {
+            int n = tentativas.computeIfAbsent(movimento.sku(), s -> new AtomicInteger()).incrementAndGet();
+            if (movimento.sku().startsWith("FORA-DO-AR") || (movimento.sku().startsWith("INSTAVEL") && n <= 2)) {
+                throw new BancoIndisponivelException("conexão recusada");
+            }
+            super.aplicar(movimento);
+        }
+
+        int tentativas(String sku) {
+            return tentativas.getOrDefault(sku, new AtomicInteger()).get();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        var projecao = new ProjecaoInstavel();
+        ApplicationContextInitializer<GenericApplicationContext> registrar = contexto -> contexto.registerBean(
+                "projecaoInstavel", ProjecaoDeEstoque.class, () -> projecao, definicao -> definicao.setPrimary(true));
+
+        try (ConfigurableApplicationContext app = new SpringApplicationBuilder(EstoqueApplication.class)
+                .initializers(registrar)
+                .run(args)) {
+            var publicador = app.getBean(PublicadorDeMovimentos.class);
+            @SuppressWarnings("unchecked")
+            KafkaTemplate<String, String> kafka = app.getBean(KafkaTemplate.class);
+
+            // Um sufixo por execução: o tópico guarda o que as execuções anteriores publicaram.
+            String rodada = UUID.randomUUID().toString().substring(0, 4);
+            String tenis = "TENIS-42-" + rodada;
+            String instavel = "INSTAVEL-" + rodada;
+            String foraDoAr = "FORA-DO-AR-" + rodada;
+            String negativo = "NEGATIVO-" + rodada;
+            String veneno = "VENENO-" + rodada;
+            String zero = "ZERO-" + rodada;
+
+            Set<Integer> particoes = new TreeSet<>();
+            particoes.add(publicador.publicar(MovimentoDeEstoque.de(tenis, 10)).get().getRecordMetadata().partition());
+            for (int i = 0; i < 10; i++) {
+                particoes.add(publicador.publicar(MovimentoDeEstoque.de(tenis, -1)).get().getRecordMetadata().partition());
+            }
+            System.out.println("partições usadas pelo " + tenis + ": " + particoes);
+
+            publicador.publicar(MovimentoDeEstoque.de(instavel, 5)).get();
+            publicador.publicar(MovimentoDeEstoque.de(foraDoAr, 5)).get();
+            publicador.publicar(MovimentoDeEstoque.de(negativo, -5)).get();
+            kafka.send("estoque.movimentos", veneno, "{isto não é json").get();
+            publicador.publicar(MovimentoDeEstoque.de(veneno, 3)).get();
+            kafka.send("estoque.movimentos", zero, """
+                    {"id":"%s","sku":"%s","quantidade":0,"ocorridoEm":"2026-10-01T12:00:00Z"}"""
+                    .formatted(UUID.randomUUID(), zero)).get();
+
+            Thread.sleep(5_000); // tempo para consumir e repetir (só neste programa de teste)
+            for (String sku : List.of(tenis, instavel, foraDoAr, negativo, veneno, zero)) {
+                System.out.printf("%-16s saldo=%-3d tentativas=%d%n", sku, projecao.saldo(sku), projecao.tentativas(sku));
+            }
+
+            System.out.println("no DLT:");
+            ConsumerFactory<?, ?> fabrica = app.getBean(ConsumerFactory.class);
+            @SuppressWarnings("unchecked")
+            Consumer<String, String> leitor = (Consumer<String, String>) fabrica.createConsumer("leitor-" + rodada, null);
+            try (leitor) {
+                leitor.subscribe(List.of("estoque.movimentos-dlt"));
+                long fim = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                while (System.nanoTime() < fim) {
+                    for (ConsumerRecord<String, String> r : leitor.poll(Duration.ofMillis(500))) {
+                        if (r.key() != null && r.key().endsWith(rodada)) {
+                            String causa = cabecalho(r, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN);
+                            System.out.printf("  %-16s origem=%s causa=%s valor=%.40s%n", r.key(),
+                                    cabecalho(r, KafkaHeaders.DLT_ORIGINAL_TOPIC),
+                                    causa == null ? null : causa.substring(causa.lastIndexOf('.') + 1), r.value());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static String cabecalho(ConsumerRecord<String, String> registro, String nome) {
+        Header h = registro.headers().lastHeader(nome);
+        return h == null ? null : new String(h.value(), StandardCharsets.UTF_8);
+    }
+}
+```
+
+Rode pelo ▶ do IntelliJ ou, na pasta do starter:
+
+```bash
+mvn -q compile exec:java "-Dexec.mainClass=dev.trilhajava.m12.estoque.DemonstracaoDoEstoque"
+```
+
+Com a sua solução pronta, a saída (sem as linhas de log do Spring) é esta:
+
+```text
+partições usadas pelo TENIS-42-3f9a: [1]
+TENIS-42-3f9a    saldo=0   tentativas=11
+INSTAVEL-3f9a    saldo=5   tentativas=3
+FORA-DO-AR-3f9a  saldo=0   tentativas=3
+NEGATIVO-3f9a    saldo=0   tentativas=1
+VENENO-3f9a      saldo=3   tentativas=1
+ZERO-3f9a        saldo=0   tentativas=0
+no DLT:
+  FORA-DO-AR-3f9a  origem=estoque.movimentos causa=BancoIndisponivelException valor={"id":"0b6c2f3e-8a1d-4c5e-9f00-1a2b3c4d
+  NEGATIVO-3f9a    origem=estoque.movimentos causa=SaldoNegativoException valor={"id":"7d1e4b2a-5c3f-4e6d-8a9b-0c1d2e3f
+  VENENO-3f9a      origem=estoque.movimentos causa=StreamReadException valor={isto não é json
+  ZERO-3f9a        origem=estoque.movimentos causa=ValueInstantiationException valor={"id":"2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b
+```
+
+O que pode variar: o sufixo (`3f9a`), o número da partição, os `id`, a ordem das linhas do DLT (elas vêm de partições diferentes, e o Kafka não ordena entre partições) e o nome exato das exceções do Jackson nas duas últimas linhas, que dependem da versão. Os avisos no log com a pilha das exceções são esperados. O programa espera alguns segundos de propósito (é um programa de teste; no código de produção, `Thread.sleep` não entra).
+
+Como ler a saída quando algo está errado:
+
+- **Mais de uma partição para o `TENIS-42`:** a chave não é o SKU.
+- **`TENIS-42` com saldo diferente de 0, ou aparecendo no DLT com `SaldoNegativoException`:** a ordem quebrou. Confira a chave e se o listener não tem um executor próprio que processa as mensagens em paralelo.
+- **`INSTAVEL` com 1 tentativa e no DLT:** `BancoIndisponivelException` está entre as não repetíveis, ou não há backoff.
+- **`NEGATIVO` com 3 tentativas:** `SaldoNegativoException` está sendo repetida.
+- **`VENENO` com saldo 0:** a partição travou no veneno. Se o log mostra a mesma exceção de desserialização em loop, o JSON está sendo lido no deserializer, e não no listener.
+- **DLT vazio e o log dizendo que o tópico não existe:** o nome do DLT não é `estoque.movimentos-dlt`.
+
+## Critérios de aceite
+
+- [ ] Os cenários do **Experimente** dão a saída indicada, com a sua aplicação rodando contra um Kafka 4.
+- [ ] O `kafka-topics.sh --describe` mostra 3 partições em `estoque.movimentos` e em `estoque.movimentos-dlt`.
+- [ ] O listener não tem `try/catch`: a política de erro está num lugar só.
+- [ ] Você explica por que `+10` seguido de dez `-1` nunca gera saldo negativo na sua solução, e o que aconteceria sem a chave.
+
+## Desafios opcionais
+
+- Troque a leitura por `ErrorHandlingDeserializer` + `JacksonJsonDeserializer` e compare com a solução baseada em `String`.
+- Exponha o **lag** do grupo (`kafka-consumer-groups.sh --describe --group projecao-estoque`, ou a métrica `records-lag-max` do Micrometer).
+- Implemente um reprocessador que lê o DLT e republica no tópico original as mensagens de um SKU.
+- Escreva a sua própria suíte de testes com `@SpringBootTest` e Testcontainers (`KafkaContainer` com `@ServiceConnection`), transformando cada linha da saída num teste.
+
+<Dicas>
+<Dica nivel={1}>
+A ordem no Kafka só existe dentro de uma partição, e quem escolhe a partição é a **chave**. Que campo do movimento identifica "a coisa que precisa de ordem"?
+</Dica>
+<Dica nivel={2}>
+- Tópicos: beans `NewTopic` com `TopicBuilder.name(...).partitions(3).replicas(1).build()`. O `KafkaAdmin` do Spring Boot os cria na subida.
+- Erros: um bean `DefaultErrorHandler(new DeadLetterPublishingRecoverer(kafka), new FixedBackOff(200, 2))`. O Spring Boot o liga na fábrica de listeners.
+- Leia o JSON **no listener**, a partir de uma `String`: assim um JSON inválido vira uma exceção comum, que o error handler sabe tratar.
+</Dica>
+<Dica nivel={3}>
+`tratador.addNotRetryableExceptions(SaldoNegativoException.class, JacksonException.class, IllegalArgumentException.class)`. O `JacksonException` (do Jackson 3, pacote `tools.jackson.core`) cobre o JSON malformado e o `IllegalArgumentException` do construtor do record, que o Jackson embrulha numa exceção dele. A classificação verifica as causas da exceção, então funciona apesar do `ListenerExecutionFailedException` que envolve a sua.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="ConfiguracaoKafka">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/estoque/ConfiguracaoKafka.java" />
+</Tab>
+<Tab rotulo="Publicador">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/estoque/PublicadorDeMovimentos.java" />
+</Tab>
+<Tab rotulo="Consumidor">
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/estoque/ConsumidorDeMovimentos.java" />
+</Tab>
+</Tabs>
+
+```properties
+# estoque.properties
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.producer.acks=all
+spring.kafka.producer.properties.enable.idempotence=true
+spring.kafka.consumer.auto-offset-reset=earliest
+```
+
+A solução de referência tem uma suíte com Testcontainers, em `java/m12-mensageria/solucao/src/test`, que cobre os mesmos cenários do **Experimente**.
+
+### Por que assim
+
+- **Chave = SKU.** Todos os movimentos de um SKU caem na mesma partição, e a partição é lida por um consumidor só do grupo: o `+10` é aplicado antes dos `-1`. Sem chave, eles se espalham pelas 3 partições, cada uma com uma thread, e a ordem vira sorte.
+- **`String` no deserializer.** Um `StringDeserializer` nunca falha. O JSON é lido no listener, onde um erro vira uma exceção que o `DefaultErrorHandler` classifica como não repetível e manda para o DLT. A partição segue.
+- **Um lugar só para a política de erro.** O listener é uma linha. Repetir, desistir e publicar no DLT são decisões do `DefaultErrorHandler`, fáceis de testar e de mudar.
+- **DLT com 3 partições.** O recuperador publica na partição de mesmo número da original. Com menos partições no DLT, ele cairia num fallback e registraria um aviso.
+
+### O que deu errado no caminho
+
+Na primeira versão da solução, nada chegava ao `estoque.movimentos.DLT`. O log mostrava o recuperador publicando em `estoque.movimentos-dlt`, que não existia. O Spring Kafka 4 mudou o sufixo padrão (era `.DLT` até o 3.x). A correção foi adotar o novo padrão, e ela virou um aviso na aula de retry e DLQ.
+
+### Alternativas e trade-offs
+
+- **Tópicos de retry** (`@RetryableTopic`) em vez do retry bloqueante: a mensagem que falha vai para um tópico de espera e a partição segue. Ganha vazão, mas **perde a ordem** por SKU: enquanto o `+10` espera no tópico de retry, os `-1` passam à frente. Para saldo, o retry bloqueante é a escolha certa.
+- **`ErrorHandlingDeserializer`** em vez de ler `String`: mantém o listener tipado, ao custo de mais configuração; o resultado para o veneno é o mesmo.
+
+### Avalie sua solução
+
+- Se o tópico passar de 3 para 6 partições com o sistema rodando, o que acontece com a ordem dos movimentos de um SKU durante a transição?
+- A `ProjecaoDeEstoque` não é idempotente: um movimento reentregue soma duas vezes. Como você usaria o `id` do movimento para corrigir isso (veja a aula de consumidores idempotentes)?
+- Uma falha transitória que dura 10 minutos manda para o DLT tudo que chegar nesse intervalo. O que seria melhor: mais repetições, um backoff exponencial, ou pausar o consumidor?
+
+</Solucao>

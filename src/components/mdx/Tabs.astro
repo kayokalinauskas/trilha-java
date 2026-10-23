@@ -1,0 +1,117 @@
+---
+/** Abas acessíveis. Filhos devem ser <Tab rotulo="...">. O tablist é montado no cliente. */
+interface Props {
+  /** abas com o mesmo grupo sincronizam a escolha (ex.: "so" para Windows/macOS/Linux) */
+  grupo?: string;
+}
+const { grupo } = Astro.props;
+---
+
+<div class="tabs" data-tabs data-grupo={grupo}>
+  <div class="tablist" role="tablist"></div>
+  <slot />
+</div>
+
+<script>
+  let n = 0;
+  const grupos = new Map<string, Set<(rotulo: string) => void>>();
+
+  document.querySelectorAll<HTMLElement>('[data-tabs]').forEach((tabs) => {
+    const lista = tabs.querySelector<HTMLElement>('.tablist')!;
+    const paineis = [...tabs.querySelectorAll<HTMLElement>(':scope > [data-tab]')];
+    const grupo = tabs.dataset.grupo;
+    const botoes = paineis.map((p, i) => {
+      const id = `tab-${++n}`;
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.role = 'tab';
+      b.id = id;
+      b.textContent = p.dataset.tab!;
+      b.setAttribute('aria-controls', (p.id ||= `${id}-painel`));
+      p.setAttribute('role', 'tabpanel');
+      p.setAttribute('aria-labelledby', id);
+      b.addEventListener('click', () => selecionar(i, true));
+      lista.append(b);
+      return b;
+    });
+
+    function selecionar(i: number, propagar = false) {
+      botoes.forEach((b, j) => {
+        b.setAttribute('aria-selected', String(i === j));
+        b.tabIndex = i === j ? 0 : -1;
+        paineis[j].hidden = i !== j;
+      });
+      if (propagar && grupo) {
+        try {
+          localStorage.setItem(`trilha-java:aba:${grupo}`, paineis[i].dataset.tab!);
+        } catch {}
+        grupos.get(grupo)?.forEach((fn) => fn(paineis[i].dataset.tab!));
+      }
+    }
+
+    lista.addEventListener('keydown', (e) => {
+      const atual = botoes.findIndex((b) => b.getAttribute('aria-selected') === 'true');
+      let prox = atual;
+      if (e.key === 'ArrowRight') prox = (atual + 1) % botoes.length;
+      else if (e.key === 'ArrowLeft') prox = (atual - 1 + botoes.length) % botoes.length;
+      else if (e.key === 'Home') prox = 0;
+      else if (e.key === 'End') prox = botoes.length - 1;
+      else return;
+      e.preventDefault();
+      selecionar(prox, true);
+      botoes[prox].focus();
+    });
+
+    let inicial = 0;
+    if (grupo) {
+      const porRotulo = (r: string) => paineis.findIndex((p) => p.dataset.tab === r);
+      if (!grupos.has(grupo)) grupos.set(grupo, new Set());
+      grupos.get(grupo)!.add((r) => porRotulo(r) >= 0 && selecionar(porRotulo(r)));
+      try {
+        const salvo = localStorage.getItem(`trilha-java:aba:${grupo}`);
+        if (salvo && porRotulo(salvo) >= 0) inicial = porRotulo(salvo);
+      } catch {}
+    }
+    selecionar(inicial);
+  });
+</script>
+
+<style>
+  .tabs {
+    margin-block: 1.5em;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .tablist {
+    display: flex;
+    gap: 2px;
+    padding: 6px 6px 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-soft);
+    overflow-x: auto;
+  }
+  .tablist :global(button) {
+    padding: 8px 14px;
+    border: 0;
+    border-radius: 8px 8px 0 0;
+    background: transparent;
+    color: var(--text-3);
+    font-size: 0.88rem;
+    font-weight: 600;
+    white-space: nowrap;
+    border-bottom: 2px solid transparent;
+  }
+  .tablist :global(button[aria-selected='true']) {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+    background: var(--surface);
+  }
+  .tabs > :global([data-tab]) {
+    padding: 4px 16px 14px;
+  }
+  .tabs > :global([data-tab] > * + *) {
+    margin-top: 0.8em;
+  }
+</style>

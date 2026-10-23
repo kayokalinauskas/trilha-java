@@ -1,0 +1,2170 @@
+---
+titulo: "Ozamigos Share — POC de compartilhamento de tela de jogos"
+resumo: "Prova de conceito guiada passo a passo: um servidor de sinalização em Java (Spring Boot e WebSocket) e uma página em HTML e JavaScript que compartilham a tela de um jogo em 1080p a 60 fps de navegador para navegador com WebRTC, explicando cada conceito pelo caminho."
+nivel: junior
+ordem: 3
+dominio: "Jogos · tempo real (prova de conceito)"
+horas: 33
+stack: [Java 25, Spring Boot 4, WebSocket, Jackson 3, JUnit 6, AssertJ, HTML, JavaScript, WebRTC, Docker, Render]
+competencias:
+  - Explicar como vídeo em tempo real funciona — captura, compressão, transporte por UDP e as etapas do WebRTC — com números
+  - Servidor de sinalização em Java com WebSocket, salas em memória e acesso concorrente seguro
+  - Acesso protegido por uma senha do grupo, com o segredo fora do código (variável de ambiente) e conferido no servidor
+  - Protocolo de mensagens próprio em JSON, com o servidor como fonte da verdade sobre quem é quem
+  - Conexão ponto a ponto entre navegadores atravessando NAT com STUN, sabendo onde ela falha e por quê
+  - Medir em vez de achar — 60 fps confirmados pelas estatísticas do próprio WebRTC, antes e depois de cada ajuste
+  - Deploy gratuito com Docker no Render, com HTTPS, entendendo proxy reverso, porta por variável de ambiente e os limites do plano grátis
+  - Uma POC que funciona de verdade, com README, vídeo e os próximos passos claros
+modulos: [02-poo, 03-colecoes-generics-excecoes, 06-concorrencia, 08-spring-boot, 10-testes]
+marcos:
+  - { id: preparacao, titulo: "Preparação e projeto Spring Boot", resumo: "Ambiente pronto, projeto gerado no Spring Initializr e a aplicação rodando vazia." }
+  - { id: salas, titulo: "Salas em memória", resumo: "A classe que guarda quem está em cada sala e quem está compartilhando, segura com cliques simultâneos, e os testes dela." }
+  - { id: sinalizacao, titulo: "Servidor de sinalização com WebSocket", resumo: "O WebSocket que confere a senha do grupo, põe as pessoas nas salas e repassa as mensagens do WebRTC, testado pelo console do navegador." }
+  - { id: pagina, titulo: "A página: entrar na sala", resumo: "HTML, CSS e a primeira parte do JavaScript: código da sala, senha, link e entrada, com duas abas se vendo." }
+  - { id: captura, titulo: "Escolher o que compartilhar", resumo: "Botões para compartilhar um aplicativo ou a tela inteira, troca de fonte sem parar, contexto seguro e a prévia da sua tela." }
+  - { id: conexao, titulo: "A conexão WebRTC", resumo: "Oferta, resposta e candidatos ICE: a tela chegando na outra aba e em outra máquina." }
+  - { id: sessenta-fps, titulo: "1080p a 60 fps, medido", resumo: "Estatísticas na tela, H.264, bitrate e manter os 60 fps quando a rede aperta, comparando antes e depois." }
+  - { id: deploy, titulo: "Deploy gratuito no Render", resumo: "Dockerfile, porta, proxy HTTPS e a senha numa variável de ambiente, publicação no Render a partir do GitHub e o teste com um amigo em outra rede." }
+  - { id: entrega, titulo: "README, vídeo e próximos passos", resumo: "Documentar o que funciona, o que não funciona e por quê, e gravar a demonstração." }
+---
+
+## Visão geral
+
+Você vai construir o **Ozamigos Share**: abre um link, clica em **Compartilhar um aplicativo** (só a janela do jogo) ou **Compartilhar a tela inteira**, e os amigos que abriram o mesmo link e digitaram a senha do grupo veem o jogo em **1080p a 60 fps**, com atraso menor que meio segundo. Sem instalar nada.
+
+É uma **prova de conceito (POC)**: o menor sistema que prova que a ideia funciona. São duas peças:
+
+- **Um servidor em Java** (Spring Boot com WebSocket) que apresenta os navegadores um ao outro. Ele é o "servidor de sinalização".
+- **Uma página em HTML e JavaScript puro** que captura a tela e a envia **direto para o navegador do amigo**, com WebRTC. O vídeo não passa pelo Java.
+
+No fim, o Ozamigos Share fica **no ar de graça no Render**, com um endereço HTTPS que você manda para os amigos.
+
+<Callout tipo="info" titulo="Este projeto é diferente dos outros">
+Os outros projetos da trilha trazem só a especificação, e você escreve tudo sozinho. Este é um **guia**: cada passo traz o código completo, explicado nos pontos importantes, e um **Confira** para você testar antes de seguir. O objetivo é que você entenda como compartilhamento de tela em tempo real funciona de verdade, base para os projetos [Arquibancada](../../pleno/03-arquibancada/) (Pleno) e [Resenha](../../senior/03-resenha/) (Sênior). Digite o código em vez de copiar e colar: é assim que ele fica na cabeça.
+</Callout>
+
+**Os limites, ditos logo de cara:** até 3 pessoas por sala, uma compartilhando por vez, e a conexão pela internet funciona na maioria das redes domésticas, mas não em todas. Cada limite tem um motivo, explicado abaixo, e a solução aparece nos projetos seguintes.
+
+## Os conceitos antes do código
+
+Leia esta parte com calma. Tudo o que vem depois é a tradução destas ideias em código.
+
+### O caminho de um quadro, do jogo até a tela do amigo
+
+Um vídeo é uma sequência de imagens (quadros). A 60 fps, são 60 quadros por segundo, ou seja, um a cada 16,7 milissegundos. Cada quadro percorre este caminho:
+
+| Etapa | O que acontece | Quem faz |
+|---|---|---|
+| 1. Captura | O sistema operacional copia a imagem da janela ou da tela | Navegador (`getDisplayMedia`) |
+| 2. Codificação | O quadro é comprimido | Placa de vídeo, chamada pelo navegador |
+| 3. Transporte | Os pedaços comprimidos viajam pela rede em pacotes UDP | WebRTC |
+| 4. Decodificação | O navegador do amigo descomprime | Placa de vídeo do amigo |
+| 5. Exibição | O quadro aparece no elemento `<video>` | Navegador do amigo |
+
+Se qualquer etapa demorar mais que 16,7 ms em média, o fps cai. É por isso que, no marco 7, você vai medir cada uma separadamente.
+
+### Por que comprimir: a conta
+
+Um quadro de 1920×1080 tem 2.073.600 pixels. No formato que os codificadores usam (YUV 4:2:0), isso dá 1,5 byte por pixel, ou **3,1 MB por quadro**. A 60 fps:
+
+> 3,1 MB × 60 = 186,6 MB por segundo ≈ **1.493 Mbps**
+
+Nenhuma internet doméstica sobe isso. O **codec** H.264 reduz para cerca de **8 Mbps**, uma compressão de quase 190 vezes. Ele consegue porque quadros vizinhos são muito parecidos: em vez de mandar cada imagem inteira, ele manda de vez em quando um **quadro-chave** (a imagem completa) e, entre eles, só **o que mudou**. Movimento rápido muda mais coisa, e por isso jogos precisam de mais bits que uma planilha.
+
+Codificar 60 quadros de 1080p por segundo é pesado para o processador. Quase toda placa de vídeo dos últimos anos tem um **codificador H.264 em hardware**, que faz isso sem pesar no jogo. É por isso que vamos preferir H.264 no marco 7.
+
+### Por que UDP, e não TCP
+
+A internet perde pacotes o tempo todo. O **TCP** garante que tudo chegue e em ordem: se um pacote se perde, ele espera o reenvio antes de entregar os seguintes. Para uma página web, ótimo. Para vídeo ao vivo, péssimo: esperar o quadro 120 atrasa os quadros 121, 122, 123… e a imagem congela.
+
+O **UDP** manda e esquece. Se um pacote se perde, o quadro seguinte chega na hora mesmo assim. O WebRTC usa UDP e cuida do resto por conta própria: pede de volta só o que vale a pena, pede um quadro-chave novo quando a imagem estraga e ajusta a qualidade à rede.
+
+### O que é o WebRTC
+
+**WebRTC** (*Web Real-Time Communication*) é um conjunto de APIs que **todo navegador moderno já tem**, feito para áudio e vídeo em tempo real entre navegadores. A peça central é o `RTCPeerConnection`: uma conexão entre dois navegadores, por onde passam as trilhas (*tracks*) de vídeo e áudio. Ele cuida de codificação, criptografia (sempre ligada), transporte e adaptação à rede.
+
+Mas há uma coisa que o WebRTC **não** faz: apresentar os dois navegadores um ao outro. Para isso, cada um precisa contar ao outro duas coisas:
+
+1. **O que sei fazer e o que vou mandar** — os codecs, as trilhas, as chaves de criptografia. Isso vem num texto chamado **SDP** (*Session Description Protocol*). Quem começa manda uma **oferta**; o outro devolve uma **resposta**.
+2. **Por onde você me encontra** — os endereços de rede possíveis (IP e porta) de cada lado. Cada endereço é um **candidato ICE**.
+
+### Sinalização: o trabalho do seu servidor Java
+
+Como os navegadores ainda não se conhecem, essas mensagens precisam passar por um intermediário que os dois já alcançam: o **servidor de sinalização**. O WebRTC não diz como ele deve ser; cada aplicação escolhe. O nosso é um servidor Java com **WebSocket**: uma conexão que fica aberta e deixa o servidor mandar mensagens ao navegador a qualquer momento (com HTTP comum, só o navegador pergunta).
+
+Uma analogia: o servidor é a recepção de um prédio. Ele não participa da conversa; só leva o bilhete "a Ana quer falar com o Beto, e ela fala H.264" até o Beto, e traz de volta "o Beto topa, e ele está no endereço tal". Depois disso, os dois conversam direto.
+
+<Figura legenda="A sinalização passa pelo servidor Java; o vídeo vai direto de um navegador para o outro">
+<svg viewBox="0 0 860 440" width="860" role="img" aria-labelledby="es-seq-t es-seq-d">
+  <title id="es-seq-t">Sequência de sinalização do Ozamigos Share</title>
+  <desc id="es-seq-d">Ana e Beto entram na sala pelo servidor Java. Ana avisa que vai compartilhar e o servidor libera. Ana manda a oferta SDP pelo servidor até Beto; Beto devolve a resposta pelo mesmo caminho; os dois trocam candidatos ICE pelo servidor. Por fim, o vídeo vai direto de Ana para Beto, sem passar pelo servidor.</desc>
+  <defs><marker id="es-seq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="50" y="20" width="140" height="36" rx="8" class="d-box"/>
+  <text x="120" y="43" text-anchor="middle" class="d-text">Ana (compartilha)</text>
+  <rect x="350" y="20" width="160" height="36" rx="8" class="d-accent"/>
+  <text x="430" y="43" text-anchor="middle" class="d-text">Servidor Java</text>
+  <rect x="670" y="20" width="140" height="36" rx="8" class="d-box"/>
+  <text x="740" y="43" text-anchor="middle" class="d-text">Beto (assiste)</text>
+  <path d="M120 56 L120 420" class="d-line"/>
+  <path d="M430 56 L430 380" class="d-line"/>
+  <path d="M740 56 L740 420" class="d-line"/>
+  <text x="275" y="82" text-anchor="middle" class="d-label">entrar → bem-vindo</text>
+  <path d="M122 90 L426 90" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="585" y="112" text-anchor="middle" class="d-label">entrar → bem-vindo</text>
+  <path d="M738 120 L434 120" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="275" y="142" text-anchor="middle" class="d-label">"entrou: Beto"</text>
+  <path d="M426 150 L124 150" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="275" y="172" text-anchor="middle" class="d-label">comecei → pode-compartilhar</text>
+  <path d="M122 180 L426 180" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="275" y="212" text-anchor="middle" class="d-label">oferta (SDP)</text>
+  <path d="M122 220 L426 220" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="585" y="212" text-anchor="middle" class="d-label">oferta (SDP), de: Ana</text>
+  <path d="M434 220 L736 220" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="585" y="252" text-anchor="middle" class="d-label">resposta (SDP)</text>
+  <path d="M738 260 L434 260" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="275" y="252" text-anchor="middle" class="d-label">resposta (SDP), de: Beto</text>
+  <path d="M426 260 L124 260" class="d-line" marker-end="url(#es-seq-seta)"/>
+  <text x="430" y="292" text-anchor="middle" class="d-label">candidatos ICE, nos dois sentidos, sempre pelo servidor</text>
+  <path d="M122 300 L426 300" class="d-line" marker-start="url(#es-seq-seta)" marker-end="url(#es-seq-seta)"/>
+  <path d="M434 300 L736 300" class="d-line" marker-start="url(#es-seq-seta)" marker-end="url(#es-seq-seta)"/>
+  <rect x="200" y="350" width="460" height="40" rx="8" class="d-ok"/>
+  <text x="430" y="375" text-anchor="middle" class="d-text">vídeo e áudio: direto de Ana para Beto (UDP)</text>
+  <path d="M122 400 L736 400" class="d-line" marker-end="url(#es-seq-seta)"/>
+</svg>
+</Figura>
+
+### NAT, STUN e TURN: como dois computadores se encontram
+
+O seu computador quase nunca tem um endereço público. Ele está atrás do roteador, com um endereço local (`192.168.0.10`), e o roteador traduz isso para o endereço público da sua casa. Essa tradução se chama **NAT**. O navegador do amigo não consegue mandar nada para `192.168.0.10`: esse endereço só existe dentro da sua casa.
+
+- **STUN** é um servidor público e gratuito que responde a uma pergunta só: "de onde você está vindo?". Com a resposta, o navegador descobre o próprio endereço público e o oferece como candidato. Os dois lados então tentam se alcançar ao mesmo tempo, e na maioria dos roteadores domésticos isso funciona. Vamos usar o STUN público do Google.
+- **TURN** é um servidor que **retransmite** o vídeo quando a conexão direta é impossível. Acontece em redes corporativas, em algumas redes móveis e em provedores que colocam vários clientes atrás do mesmo endereço público (o *CGNAT*, comum no Brasil). O TURN custa banda de quem o hospeda, e por isso fica fora desta POC. A Arquibancada resolve isso.
+
+Na mesma rede local, nada disso é necessário: os candidatos com endereço local já funcionam.
+
+### Ponto a ponto e a conta do upload
+
+No Ozamigos Share, quem compartilha manda **uma cópia do vídeo para cada pessoa que assiste**. Com 8 Mbps por cópia:
+
+| Pessoas assistindo | Upload de quem compartilha |
+|---|---|
+| 1 | 8 Mbps |
+| 2 | 16 Mbps |
+| 5 | 40 Mbps |
+
+Por isso a sala vai até 3 pessoas (1 compartilhando e 2 assistindo). Para mais gente, entra um **SFU**: um servidor que recebe uma cópia e redistribui, que é o que a Arquibancada faz.
+
+### A qualidade se adapta sozinha
+
+O WebRTC **estima a banda disponível** o tempo todo e ajusta o bitrate do codificador. No começo da conexão ele ainda não sabe quanto a rede aguenta, então começa baixo e vai subindo. Nos primeiros segundos você verá 720p ou menos, e depois 1080p. Quando a rede aperta, ele precisa escolher entre **manter a resolução e perder quadros** ou **manter os 60 fps e baixar a resolução**. Para jogo, a segunda opção é a certa, e você vai pedir isso explicitamente no marco 7.
+
+### Aplicativo ou tela inteira: o que a página pode e não pode fazer
+
+Por segurança, **uma página não consegue listar as janelas abertas no seu computador** nem escolher uma delas sozinha: se pudesse, qualquer site espiaria o que você tem aberto. Quem escolhe é sempre você, no **seletor do navegador**. O que a página pode fazer é **sugerir**:
+
+- `displaySurface: 'window'` abre o seletor já na aba "Janela"; `'monitor'`, na aba "Tela inteira".
+- `monitorTypeSurfaces: 'exclude'` esconde a aba "Tela inteira", para quem clicou em "Compartilhar um aplicativo".
+- `selfBrowserSurface: 'exclude'` tira a própria aba do Ozamigos Share da lista (compartilhar a si mesma dá um efeito de espelho infinito).
+
+Por isso o Ozamigos Share tem dois botões, **Compartilhar um aplicativo** e **Compartilhar a tela inteira**, e cada um abre o seletor no lugar certo. A diferença importa por dois motivos:
+
+| | Um aplicativo (janela) | A tela inteira |
+|---|---|---|
+| O que os amigos veem | Só o jogo, mesmo que você abra outra coisa por cima | Tudo o que aparece no monitor, inclusive notificações |
+| Áudio do jogo | Depende do navegador e do sistema; muitas vezes vai sem som | No Chrome e no Edge para Windows, marcando "Compartilhar áudio do sistema" |
+| Jogo em tela cheia exclusiva | Pode aparecer preto | Funciona |
+
+Uma lista própria de janelas, com miniaturas, só é possível num **app desktop** (com Electron), que é o caminho do projeto Sênior [Resenha](../../senior/03-resenha/).
+
+### Contexto seguro
+
+Por segurança, o navegador só deixa uma página capturar a tela se ela vier de **HTTPS** ou de **localhost**. Quem compartilha precisa abrir a página como `http://localhost:8080` (no computador que roda o servidor) ou por um endereço HTTPS (o Render, no marco 8, já entrega HTTPS). Quem só assiste pode abrir por `http://192.168.0.10:8080`, porque receber vídeo não exige contexto seguro.
+
+### Senha do grupo: por que o link não basta
+
+Um link vaza fácil: um print, uma mensagem no grupo errado, o histórico de alguém. Por isso, para entrar numa sala, além do link é preciso a **senha do grupo**: uma senha só, que todos os amigos conhecem. Não há cadastro nem conta por pessoa; cada amigo digita a senha uma vez e o navegador lembra.
+
+- **Onde a senha mora: numa variável de ambiente.** O servidor lê a senha de `OZAMIGOS_SENHA`, que você configura no seu computador e no painel do Render. Ela **nunca** vai para o código: o repositório no GitHub é público, e qualquer um a leria. Se a variável não existir, o servidor **nem sobe**: falhar logo na largada é melhor que subir aberto sem ninguém perceber.
+- **Onde a senha é conferida: no servidor.** Conferir no JavaScript não serviria: o código da página roda no navegador de quem visita, e qualquer um pode pular essa checagem ou abrir o WebSocket direto. Por isso a senha vai na mensagem `entrar`, e o servidor a confere **antes de tudo**: quem erra é desconectado sem descobrir nada, nem se a sala existe.
+- **Comparar senhas sem dar pistas.** Um `equals` comum para no primeiro caractere diferente, então uma senha com o começo certo demora um pouco mais para ser recusada. Medindo milhares de tentativas, dá para descobrir a senha aos poucos (um *ataque de tempo*). `MessageDigest.isEqual` compara tudo, sempre, no mesmo tempo.
+- **O que a senha protege, e o que não.** Ela protege as salas. A página (HTML e JavaScript) continua pública, e tudo bem: não há nada secreto nela. No Render, a senha viaja criptografada (`wss://`); em `http://localhost`, não. O navegador do amigo guarda a senha em texto no `localStorage`: é a conveniência de um app entre amigos, não a segurança de um banco.
+- **Uma senha boa.** Qualquer pessoa pode escrever um programa que tenta senhas sem parar. Use uma frase de quatro ou mais palavras sem relação entre si, como `pastel trombone feira azul`: fácil de ditar para um amigo, difícil de adivinhar.
+
+O limite de uma senha compartilhada: não dá para tirar **uma** pessoa do grupo. Para isso, você troca a senha e manda a nova para quem continua. Contas por pessoa e convites aparecem na [Arquibancada](../../pleno/03-arquibancada/).
+
+## Escopo
+
+### Dentro
+
+- Senha do grupo para entrar em qualquer sala, configurada no servidor.
+- Salas por link, com até 3 pessoas e uma compartilhando por vez.
+- Escolher entre compartilhar **um aplicativo** ou **a tela inteira**, e trocar a fonte durante o compartilhamento sem derrubar ninguém.
+- Áudio do sistema ao compartilhar a tela inteira (no Chrome ou no Edge para Windows).
+- 1080p a 60 fps com H.264, bitrate máximo de 8 Mbps e preferência por manter os 60 fps.
+- Estatísticas na tela (fps, resolução, Mbps, codec, motivo de limitação).
+- Rede local e internet com STUN.
+- Deploy gratuito no Render, com Docker e HTTPS.
+
+### Fora (e onde está)
+
+- Mais de uma tela ao mesmo tempo e salas maiores → [Arquibancada](../../pleno/03-arquibancada/) (SFU com simulcast).
+- TURN, contas e login por pessoa, banco de dados, produção numa VPS → Arquibancada.
+- Voz, chat e app desktop com lista própria de janelas → [Resenha](../../senior/03-resenha/).
+- Servidor sempre ligado (o plano gratuito do Render dorme) → uma VPS, como na Arquibancada.
+
+## Regras da POC
+
+| Regra | Descrição |
+|---|---|
+| RN-01 | Uma sala é identificada por um código de 6 a 20 letras e números. Sem código na URL, a página gera um aleatório de 10 caracteres e o coloca no link. |
+| RN-02 | Até 3 pessoas por sala. A quarta recebe o erro `sala-cheia` e é desconectada. |
+| RN-03 | Só uma pessoa compartilha por vez. Quem tentar com alguém compartilhando recebe `ja-tem-alguem-compartilhando`. |
+| RN-04 | Quem entra no meio de um compartilhamento recebe a tela sem ninguém fazer nada. |
+| RN-05 | Quando quem compartilha para (pelo botão, pela barra do Chrome ou fechando a aba), todos são avisados e qualquer um pode compartilhar. |
+| RN-06 | O servidor só repassa ofertas, respostas e candidatos para alguém da **mesma sala**, e é ele quem diz quem enviou (o campo `de`), nunca o cliente. |
+| RN-07 | Sala vazia é apagada da memória. |
+| RN-08 | O WebSocket só aceita conexões de páginas do próprio servidor, inclusive atrás do proxy HTTPS do Render. |
+| RN-09 | Vídeo em até 1920×1080, até 60 fps, H.264 de preferência, até 8 Mbps, mantendo os 60 fps quando a rede apertar. |
+| RN-10 | Se a conexão direta falhar, a página explica que a rede exige TURN, em vez de ficar carregando para sempre. |
+| RN-11 | Dois botões: **Compartilhar um aplicativo** abre o seletor na aba de janelas, sem a opção de tela inteira; **Compartilhar a tela inteira** abre na aba de telas. A página mostra o que está sendo compartilhado e se há áudio. |
+| RN-12 | Durante o compartilhamento, os botões viram **Trocar para um aplicativo** e **Trocar para a tela inteira**: a fonte muda sem refazer as conexões nem interromper quem assiste. |
+| RN-13 | O navegador manda um `ping` ao servidor a cada 30 segundos, para a conexão não ser fechada por inatividade. |
+| RN-14 | O servidor usa a porta da variável `PORT` (8080 se ela não existir) e entende os cabeçalhos do proxy HTTPS. |
+| RN-15 | Para entrar numa sala é preciso a senha do grupo. Senha errada recebe `senha-errada` e é desconectada, antes de qualquer informação sobre a sala; a página deixa tentar de novo. |
+| RN-16 | A senha vem da variável de ambiente `OZAMIGOS_SENHA`, nunca do código. Sem ela, o servidor não sobe. |
+| RN-17 | O navegador lembra a senha depois de uma entrada aceita e a esquece se ela for recusada. |
+
+## O protocolo de mensagens
+
+Todas as mensagens são JSON, com um campo `tipo`.
+
+| Tipo | Direção | Campos | Significado |
+|---|---|---|---|
+| `entrar` | navegador → servidor | `sala`, `senha` | Quero entrar nesta sala, e esta é a senha do grupo |
+| `bem-vindo` | servidor → quem entrou | `id`, `outros`, `quemCompartilha` | Seu id, quem já está aqui e quem está compartilhando |
+| `entrou` / `saiu` | servidor → os outros | `id` | Alguém entrou ou saiu |
+| `comecei` | navegador → servidor | — | Quero compartilhar |
+| `pode-compartilhar` | servidor → quem pediu | — | Liberado: mande as ofertas |
+| `compartilhando` | servidor → os outros | `id` | Fulano começou a compartilhar |
+| `parei` / `parou` | navegador → servidor / servidor → os outros | `id` (no `parou`) | Parou de compartilhar |
+| `oferta`, `resposta`, `candidato` | navegador → servidor → navegador | `para` na ida, `de` na volta, mais `sdp` ou `candidato` | Mensagens do WebRTC, repassadas sem o servidor olhar o conteúdo |
+| `erro` | servidor → navegador | `motivo` | `senha-errada`, `sala-cheia`, `ja-tem-alguem-compartilhando`, `codigo-invalido`… |
+| `ping` | navegador → servidor | — | "Ainda estou aqui"; o servidor não responde |
+
+## Antes de começar
+
+| Item | Para quê |
+|---|---|
+| JDK 25 e uma IDE Java (IntelliJ IDEA) | O servidor ([aula de ambiente](../../../aulas/00-comece-aqui/02-ambiente/)) |
+| Google Chrome ou Microsoft Edge | Compartilhar e ver as estatísticas internas (`chrome://webrtc-internals`) |
+| Um segundo computador (ou celular) na mesma rede | Ver a tela chegando em outra máquina |
+| Contas no GitHub e no Render (marco 8) | Publicar a POC de graça |
+| Um amigo em outra rede (marco 8) | O teste pela internet |
+| Um jogo (qualquer um com movimento) | Testar de verdade |
+
+Não precisa de banco de dados nem Node.js. O Docker é opcional (o Render monta a imagem por você). Tempo estimado: 33 horas, umas 3 semanas a 10 horas por semana.
+
+## Passo a passo
+
+O código final tem 4 classes Java, 3 classes de teste, 1 página HTML, 1 CSS, 1 arquivo JavaScript de umas 300 linhas e um Dockerfile. A estrutura:
+
+```text
+ozamigos-share/
+├── Dockerfile                           (marco 8)
+├── .dockerignore                        (marco 8)
+├── .gitattributes                       (marco 8)
+├── pom.xml
+└── src/
+    ├── main/
+    │   ├── java/dev/ozamigos/
+    │   │   ├── OzamigosShareApplication.java (gerado)
+    │   │   ├── Salas.java                   (marco 2)
+    │   │   ├── SenhaDoGrupo.java            (marco 3)
+    │   │   ├── SinalizacaoHandler.java      (marco 3)
+    │   │   └── WebSocketConfig.java         (marco 3)
+    │   └── resources/
+    │       ├── application.properties       (marcos 3 e 8)
+    │       └── static/
+    │           ├── index.html               (marco 4)
+    │           ├── estilo.css               (marco 4)
+    │           └── app.js                   (marcos 4 a 7)
+    └── test/java/dev/ozamigos/
+        ├── OzamigosShareApplicationTests.java (gerado, ajustado no marco 3)
+        ├── SalasTest.java                   (marco 2)
+        └── SenhaDoGrupoTest.java            (marco 3)
+```
+
+<Marco id="preparacao" numero={1} titulo="Preparação e projeto Spring Boot" horas={2}>
+
+**Objetivo:** a aplicação Spring Boot vazia rodando na porta 8080.
+
+**Passo 1 — Gerar o projeto.** Em [start.spring.io](https://start.spring.io), escolha: **Maven**, **Java**, a versão estável mais recente do Spring Boot 4, Group `dev.ozamigos`, Artifact `ozamigos-share`, Package name `dev.ozamigos`, Packaging **Jar**, Java **25**. Em *Dependencies*, adicione **Spring Web** e **WebSocket**. Clique em *Generate*, descompacte e abra a pasta na IDE.
+
+Só isso de dependência: o *Spring Web* traz o servidor (Tomcat), que também serve a página, e o Jackson, que lê e escreve JSON. O *WebSocket* traz o suporte a conexões WebSocket. Nada de banco: as salas vão ficar na memória.
+
+**Passo 2 — Rodar.** Rode a classe `OzamigosShareApplication` pela IDE (ou `./mvnw spring-boot:run` no terminal; no Windows, `mvnw.cmd spring-boot:run`).
+
+**Confira:** o log termina com `Tomcat started on port 8080` e `http://localhost:8080` abre uma página de erro *Whitelabel*. Isso é bom: o servidor está de pé e ainda não tem nada para mostrar.
+
+**Passo 3 — Git.** `git init`, primeiro commit, e um repositório público no GitHub. Commit a cada passo que funcionar.
+
+**Aulas de apoio:** [Ambiente](../../../aulas/00-comece-aqui/02-ambiente/), [Git e testes](../../../aulas/00-comece-aqui/04-git-e-testes/), [Spring Boot e Spring MVC](../../../aulas/08-spring-boot/04-spring-boot-e-spring-mvc/).
+
+</Marco>
+
+<Marco id="salas" numero={2} titulo="Salas em memória" horas={3}>
+
+**Objetivo:** uma classe que sabe quem está em cada sala e quem está compartilhando, e que não se confunde quando duas pessoas clicam ao mesmo tempo.
+
+**O conceito: estado compartilhado entre threads.** O Tomcat atende cada mensagem WebSocket numa thread. Se a Ana e o Beto clicarem em **Compartilhar** no mesmo milissegundo, duas threads vão perguntar "tem alguém compartilhando?" ao mesmo tempo. Sem cuidado, as duas leem "não" e as duas viram quem compartilha, quebrando a RN-03. É a **condição de corrida**.
+
+A solução mais simples é `synchronized`: só uma thread por vez executa qualquer método marcado assim no mesmo objeto. Como o Spring cria **um único** objeto `Salas` (um *bean*), todas as threads passam pela mesma "porta", uma de cada vez. Para uma POC com poucas pessoas, é perfeito. Em sistemas com milhares de salas, travar tudo por um só cadeado vira gargalo, e aí entram estruturas como `ConcurrentHashMap` ou o Redis (como na Arquibancada).
+
+Outros detalhes do código:
+
+- **`record`** para os resultados (`Entrada`, `Saida`): objetos imutáveis só com dados, sem precisar escrever getters, `equals` e `hashCode`.
+- **`LinkedHashMap`** para os participantes, que mantém a ordem de entrada.
+- **`List.copyOf` e `new ArrayList<>(...)`**: os métodos devolvem **cópias**. Se devolvessem a lista interna, outra thread poderia mexer nela enquanto o chamador a percorre, fora do `synchronized`.
+- O valor guardado para cada pessoa é a `WebSocketSession` dela: é por ela que o servidor manda mensagens.
+
+**Passo 1 — `Salas.java`.** Crie em `src/main/java/dev/ozamigos/`:
+
+```java
+package dev.ozamigos;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.WebSocketSession;
+
+/**
+ * Guarda as salas em memória. Todos os métodos são synchronized: duas pessoas clicando
+ * ao mesmo tempo nunca veem a sala pela metade.
+ */
+@Component
+public class Salas {
+
+    public static final int LIMITE_POR_SALA = 3;
+
+    /** O que quem acabou de entrar precisa saber. */
+    public record Entrada(List<String> outros, String quemCompartilha) {}
+
+    /** O que sobrou depois que alguém saiu. */
+    public record Saida(List<WebSocketSession> restantes, boolean estavaCompartilhando) {}
+
+    private static final class Sala {
+        final Map<String, WebSocketSession> participantes = new LinkedHashMap<>();
+        String quemCompartilha;
+    }
+
+    private final Map<String, Sala> salas = new HashMap<>();
+
+    /** Devolve null se a sala estiver cheia. */
+    public synchronized Entrada entrar(String codigo, String id, WebSocketSession sessao) {
+        Sala sala = salas.computeIfAbsent(codigo, c -> new Sala());
+        if (sala.participantes.size() >= LIMITE_POR_SALA) {
+            return null;
+        }
+        List<String> outros = List.copyOf(sala.participantes.keySet());
+        sala.participantes.put(id, sessao);
+        return new Entrada(outros, sala.quemCompartilha);
+    }
+
+    public synchronized Saida sair(String codigo, String id) {
+        Sala sala = salas.get(codigo);
+        if (sala == null || !sala.participantes.containsKey(id)) {
+            return new Saida(List.of(), false);
+        }
+        sala.participantes.remove(id);
+        boolean estavaCompartilhando = id.equals(sala.quemCompartilha);
+        if (estavaCompartilhando) {
+            sala.quemCompartilha = null;
+        }
+        if (sala.participantes.isEmpty()) {
+            salas.remove(codigo);
+        }
+        return new Saida(new ArrayList<>(sala.participantes.values()), estavaCompartilhando);
+    }
+
+    /** Só uma pessoa compartilha por vez. Devolve false se já houver alguém. */
+    public synchronized boolean comecarACompartilhar(String codigo, String id) {
+        Sala sala = salas.get(codigo);
+        if (sala == null || !sala.participantes.containsKey(id) || sala.quemCompartilha != null) {
+            return false;
+        }
+        sala.quemCompartilha = id;
+        return true;
+    }
+
+    public synchronized boolean pararDeCompartilhar(String codigo, String id) {
+        Sala sala = salas.get(codigo);
+        if (sala == null || !id.equals(sala.quemCompartilha)) {
+            return false;
+        }
+        sala.quemCompartilha = null;
+        return true;
+    }
+
+    /** A sessão de alguém da mesma sala, ou null se a pessoa não estiver lá. */
+    public synchronized WebSocketSession sessao(String codigo, String id) {
+        Sala sala = salas.get(codigo);
+        return sala == null ? null : sala.participantes.get(id);
+    }
+
+    public synchronized List<WebSocketSession> outros(String codigo, String id) {
+        Sala sala = salas.get(codigo);
+        if (sala == null) {
+            return List.of();
+        }
+        List<WebSocketSession> outros = new ArrayList<>();
+        sala.participantes.forEach((outroId, sessao) -> {
+            if (!outroId.equals(id)) {
+                outros.add(sessao);
+            }
+        });
+        return outros;
+    }
+}
+```
+
+**Passo 2 — Testes.** Crie `src/test/java/dev/ozamigos/SalasTest.java`. Os testes passam `null` como sessão, porque aqui só importa a regra, não a conexão:
+
+```java
+package dev.ozamigos;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import org.junit.jupiter.api.Test;
+
+class SalasTest {
+
+    private final Salas salas = new Salas();
+
+    @Test
+    void quartaPessoaNaoEntra() {
+        assertThat(salas.entrar("sala123", "a", null)).isNotNull();
+        assertThat(salas.entrar("sala123", "b", null)).isNotNull();
+        assertThat(salas.entrar("sala123", "c", null)).isNotNull();
+
+        assertThat(salas.entrar("sala123", "d", null)).isNull();
+    }
+
+    @Test
+    void soUmaPessoaCompartilhaPorVez() {
+        salas.entrar("sala123", "a", null);
+        salas.entrar("sala123", "b", null);
+
+        assertThat(salas.comecarACompartilhar("sala123", "a")).isTrue();
+        assertThat(salas.comecarACompartilhar("sala123", "b")).isFalse();
+
+        salas.pararDeCompartilhar("sala123", "a");
+        assertThat(salas.comecarACompartilhar("sala123", "b")).isTrue();
+    }
+
+    @Test
+    void quemChegaDepoisSabeQuemEstaCompartilhando() {
+        salas.entrar("sala123", "a", null);
+        salas.comecarACompartilhar("sala123", "a");
+
+        Salas.Entrada entrada = salas.entrar("sala123", "b", null);
+
+        assertThat(entrada.outros()).containsExactly("a");
+        assertThat(entrada.quemCompartilha()).isEqualTo("a");
+    }
+
+    @Test
+    void sairLiberaOCompartilhamento() {
+        salas.entrar("sala123", "a", null);
+        salas.entrar("sala123", "b", null);
+        salas.comecarACompartilhar("sala123", "a");
+
+        Salas.Saida saida = salas.sair("sala123", "a");
+
+        assertThat(saida.estavaCompartilhando()).isTrue();
+        assertThat(salas.comecarACompartilhar("sala123", "b")).isTrue();
+    }
+}
+```
+
+**Confira:** rode só esta classe de teste pela IDE: 4 testes verdes. (O teste gerado `OzamigosShareApplicationTests` ainda passa nesta etapa; ele muda no próximo marco.)
+
+<Callout tipo="erro" titulo="Remover do mapa e testar se voltou null">
+Uma primeira versão natural de `sair` seria `if (sala.participantes.remove(id) == null) return …`. Só que o teste guarda sessões `null`, e então `remove` devolve `null` mesmo quando a pessoa estava lá. Por isso o código pergunta primeiro com `containsKey`. É o tipo de detalhe que só um teste revela.
+</Callout>
+
+**Aulas de apoio:** [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/), [List, Set e Map](../../../aulas/03-colecoes-generics-excecoes/01-list-set-map/), [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/), [JUnit e AssertJ](../../../aulas/10-testes/02-junit-e-assertj/).
+
+</Marco>
+
+<Marco id="sinalizacao" numero={3} titulo="Servidor de sinalização com WebSocket" horas={6}>
+
+**Objetivo:** o endereço `ws://localhost:8080/sinal` aceitando conexões, conferindo a senha do grupo, pondo pessoas nas salas e repassando as mensagens do WebRTC.
+
+**O conceito: o ciclo de vida de um WebSocket.** O navegador faz uma requisição HTTP especial pedindo para "trocar de protocolo" (o *handshake*). O servidor aceita, e a partir daí a conexão fica aberta nos dois sentidos até alguém fechar. No Spring, você estende `TextWebSocketHandler` e sobrescreve três métodos:
+
+| Método | Quando é chamado | O que fazemos |
+|---|---|---|
+| `afterConnectionEstablished` | A conexão abriu | Damos um id aleatório e embrulhamos a sessão para envios seguros |
+| `handleTextMessage` | Chegou uma mensagem | Lemos o `tipo` e agimos |
+| `afterConnectionClosed` | A conexão fechou (aba fechada, rede caiu) | Tiramos a pessoa da sala e avisamos os outros |
+
+**Três detalhes que derrubam quem faz isso pela primeira vez:**
+
+1. **Envios simultâneos na mesma sessão.** Se a Ana e o Beto mandarem mensagens para o Caio ao mesmo tempo, duas threads escrevem na conexão do Caio juntas, e o Tomcat lança erro. O `ConcurrentWebSocketSessionDecorator` põe os envios em fila; guardamos essa versão "segura" e só enviamos por ela.
+2. **O limite de 8 KB.** O Tomcat aceita, por padrão, mensagens de texto de até 8 KB. Uma oferta SDP com vídeo já tem uns 6 KB, e com áudio passa perto do limite. Acima dele, a conexão é fechada sem explicação. Aumentamos para 64 KB.
+3. **A origem.** Qualquer site poderia tentar abrir um WebSocket para o seu servidor a partir do navegador de alguém. Por padrão, o Spring só aceita conexões cujo cabeçalho `Origin` seja o próprio servidor. Deixamos assim; no marco 8 você vai ver o cuidado extra que isso pede atrás do HTTPS do Render.
+
+**Sobre o Jackson 3.** O Spring Boot 4 usa o Jackson 3, cujo pacote é `tools.jackson` (no Jackson 2 era `com.fasterxml.jackson`). O Spring já cria um `JsonMapper` pronto, que recebemos no construtor. Lemos a mensagem como `JsonNode` (uma árvore genérica de JSON), porque cada tipo de mensagem tem campos diferentes e o servidor só precisa de alguns.
+
+**Passo 1 — `SenhaDoGrupo.java`.** Releia [Senha do grupo](#senha-do-grupo-por-que-o-link-não-basta) antes. A classe recebe a senha da configuração pelo `@Value` e se recusa a existir sem ela; como o Spring cria os beans ao subir, isso impede o servidor inteiro de subir sem senha (RN-16).
+
+```java
+package dev.ozamigos;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+/**
+ * A senha que o grupo de amigos usa para entrar nas salas.
+ * Ela vem da configuração (variável de ambiente OZAMIGOS_SENHA), nunca do código.
+ */
+@Component
+public class SenhaDoGrupo {
+
+    private final byte[] senha;
+
+    public SenhaDoGrupo(@Value("${ozamigos.senha}") String senha) {
+        if (senha == null || senha.isBlank()) {
+            throw new IllegalStateException("Defina a senha do grupo na variável de ambiente OZAMIGOS_SENHA.");
+        }
+        this.senha = senha.getBytes(StandardCharsets.UTF_8);
+    }
+
+    public boolean confere(String tentativa) {
+        if (tentativa == null) {
+            return false;
+        }
+        // MessageDigest.isEqual leva o mesmo tempo seja qual for o primeiro caractere errado.
+        return MessageDigest.isEqual(senha, tentativa.getBytes(StandardCharsets.UTF_8));
+    }
+}
+```
+
+**Passo 2 — Testes da senha.** `SenhaDoGrupoTest.java`, ao lado do `SalasTest`:
+
+```java
+package dev.ozamigos;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import org.junit.jupiter.api.Test;
+
+class SenhaDoGrupoTest {
+
+    private final SenhaDoGrupo senha = new SenhaDoGrupo("pastel de feira");
+
+    @Test
+    void aceitaSoASenhaCerta() {
+        assertThat(senha.confere("pastel de feira")).isTrue();
+        assertThat(senha.confere("Pastel de feira")).isFalse();
+        assertThat(senha.confere("")).isFalse();
+        assertThat(senha.confere(null)).isFalse();
+    }
+
+    @Test
+    void naoSobeSemSenhaConfigurada() {
+        assertThatThrownBy(() -> new SenhaDoGrupo(" "))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("OZAMIGOS_SENHA");
+    }
+}
+```
+
+**Passo 3 — Ligar a configuração à variável de ambiente.** Acrescente ao fim de `src/main/resources/application.properties`:
+
+```properties
+# A senha do grupo vem de uma variável de ambiente: segredo não vai para o código nem para o GitHub.
+ozamigos.senha=${OZAMIGOS_SENHA:}
+```
+
+O `${OZAMIGOS_SENHA:}` quer dizer "o valor da variável `OZAMIGOS_SENHA`, ou vazio se ela não existir". Vazio, a `SenhaDoGrupo` lança o erro com a mensagem explicando o que fazer.
+
+**Passo 4 — `SinalizacaoHandler.java`.**
+
+```java
+package dev.ozamigos;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.UUID;
+import java.util.regex.Pattern;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ObjectNode;
+
+/**
+ * O servidor de sinalização: põe as pessoas em salas e repassa as mensagens
+ * do WebRTC (oferta, resposta e candidatos) de um navegador para o outro.
+ * O vídeo nunca passa por aqui.
+ */
+@Component
+public class SinalizacaoHandler extends TextWebSocketHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(SinalizacaoHandler.class);
+    private static final Pattern CODIGO_VALIDO = Pattern.compile("[A-Za-z0-9]{6,20}");
+
+    private final Salas salas;
+    private final SenhaDoGrupo senhaDoGrupo;
+    private final JsonMapper json;
+
+    public SinalizacaoHandler(Salas salas, SenhaDoGrupo senhaDoGrupo, JsonMapper json) {
+        this.salas = salas;
+        this.senhaDoGrupo = senhaDoGrupo;
+        this.json = json;
+    }
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession sessao) {
+        Map<String, Object> atributos = sessao.getAttributes();
+        atributos.put("id", UUID.randomUUID().toString().substring(0, 8));
+        // Envios de threads diferentes na mesma sessão precisam ser em fila.
+        atributos.put("segura", new ConcurrentWebSocketSessionDecorator(sessao, 5_000, 512 * 1024));
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession sessao, TextMessage mensagem) throws IOException {
+        JsonNode msg = json.readTree(mensagem.getPayload());
+        String id = (String) sessao.getAttributes().get("id");
+        String sala = (String) sessao.getAttributes().get("sala");
+        String tipo = msg.path("tipo").asString("");
+
+        if (sala == null && !tipo.equals("entrar")) {
+            erro(sessao, "entre-numa-sala-primeiro");
+            return;
+        }
+        switch (tipo) {
+            case "entrar" -> entrar(sessao, id, msg.path("sala").asString(""), msg.path("senha").asString(""));
+            case "comecei" -> comecei(sessao, id, sala);
+            case "parei" -> parei(id, sala);
+            case "oferta", "resposta", "candidato" -> repassar(sessao, id, sala, (ObjectNode) msg);
+            case "ping" -> { } // só mantém a conexão viva
+            default -> erro(sessao, "tipo-desconhecido");
+        }
+    }
+
+    private void entrar(WebSocketSession sessao, String id, String codigo, String senha) throws IOException {
+        // A senha vem antes de tudo: sem ela, a pessoa não descobre nada sobre a sala.
+        if (!senhaDoGrupo.confere(senha)) {
+            log.info("{} errou a senha", id);
+            erro(sessao, "senha-errada");
+            sessao.close(CloseStatus.POLICY_VIOLATION);
+            return;
+        }
+        if (sessao.getAttributes().containsKey("sala")) {
+            erro(sessao, "ja-esta-numa-sala");
+            return;
+        }
+        if (!CODIGO_VALIDO.matcher(codigo).matches()) {
+            erro(sessao, "codigo-invalido");
+            return;
+        }
+        Salas.Entrada entrada = salas.entrar(codigo, id, segura(sessao));
+        if (entrada == null) {
+            erro(sessao, "sala-cheia");
+            sessao.close(CloseStatus.POLICY_VIOLATION);
+            return;
+        }
+        sessao.getAttributes().put("sala", codigo);
+        log.info("{} entrou na sala {}", id, codigo);
+
+        ObjectNode boasVindas = json.createObjectNode()
+                .put("tipo", "bem-vindo")
+                .put("id", id)
+                .put("quemCompartilha", entrada.quemCompartilha());
+        ArrayNode outros = boasVindas.putArray("outros");
+        entrada.outros().forEach(outros::add);
+        enviar(segura(sessao), boasVindas);
+
+        ObjectNode entrou = json.createObjectNode().put("tipo", "entrou").put("id", id);
+        for (WebSocketSession outro : salas.outros(codigo, id)) {
+            enviar(outro, entrou);
+        }
+    }
+
+    private void comecei(WebSocketSession sessao, String id, String sala) throws IOException {
+        if (!salas.comecarACompartilhar(sala, id)) {
+            erro(sessao, "ja-tem-alguem-compartilhando");
+            return;
+        }
+        enviar(segura(sessao), json.createObjectNode().put("tipo", "pode-compartilhar"));
+        ObjectNode aviso = json.createObjectNode().put("tipo", "compartilhando").put("id", id);
+        for (WebSocketSession outro : salas.outros(sala, id)) {
+            enviar(outro, aviso);
+        }
+    }
+
+    private void parei(String id, String sala) throws IOException {
+        if (salas.pararDeCompartilhar(sala, id)) {
+            ObjectNode aviso = json.createObjectNode().put("tipo", "parou").put("id", id);
+            for (WebSocketSession outro : salas.outros(sala, id)) {
+                enviar(outro, aviso);
+            }
+        }
+    }
+
+    /** Oferta, resposta e candidato vão só para o destinatário, e só dentro da mesma sala. */
+    private void repassar(WebSocketSession sessao, String id, String sala, ObjectNode msg) throws IOException {
+        WebSocketSession destino = salas.sessao(sala, msg.path("para").asString(""));
+        if (destino == null) {
+            erro(sessao, "destinatario-nao-esta-na-sala");
+            return;
+        }
+        msg.remove("para");
+        msg.put("de", id); // quem enviou é o servidor que diz, nunca o cliente
+        enviar(destino, msg);
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession sessao, CloseStatus status) throws IOException {
+        String id = (String) sessao.getAttributes().get("id");
+        String sala = (String) sessao.getAttributes().get("sala");
+        if (sala == null) {
+            return;
+        }
+        Salas.Saida saida = salas.sair(sala, id);
+        log.info("{} saiu da sala {}", id, sala);
+        ObjectNode saiu = json.createObjectNode().put("tipo", "saiu").put("id", id);
+        for (WebSocketSession restante : saida.restantes()) {
+            enviar(restante, saiu);
+        }
+    }
+
+    private WebSocketSession segura(WebSocketSession sessao) {
+        return (WebSocketSession) sessao.getAttributes().get("segura");
+    }
+
+    private void erro(WebSocketSession sessao, String motivo) throws IOException {
+        enviar(segura(sessao), json.createObjectNode().put("tipo", "erro").put("motivo", motivo));
+    }
+
+    private void enviar(WebSocketSession destino, JsonNode msg) throws IOException {
+        if (destino.isOpen()) {
+            destino.sendMessage(new TextMessage(json.writeValueAsString(msg)));
+        }
+    }
+}
+```
+
+Repare em duas coisas. No começo de `entrar`, a senha é conferida **antes de tudo**: quem erra recebe `senha-errada` e é desconectado sem saber se a sala existe ou se está cheia (RN-15). E no método `repassar`, o servidor **não confia** no cliente para dizer quem enviou: ele apaga o `para` e escreve o `de` com o id da sessão (RN-06), e só entrega se o destinatário estiver na mesma sala.
+
+**Passo 5 — `WebSocketConfig.java`.**
+
+```java
+package dev.ozamigos;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.socket.config.annotation.EnableWebSocket;
+import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
+import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+import org.springframework.web.socket.server.standard.ServletServerContainerFactoryBean;
+
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    private final SinalizacaoHandler handler;
+
+    public WebSocketConfig(SinalizacaoHandler handler) {
+        this.handler = handler;
+    }
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registro) {
+        // Sem setAllowedOrigins: o Spring só aceita conexões vindas de páginas do próprio servidor.
+        registro.addHandler(handler, "/sinal");
+    }
+
+    /** Uma oferta SDP passa fácil de 8 KB, o limite padrão do Tomcat para mensagens de texto. */
+    @Bean
+    public ServletServerContainerFactoryBean configuracaoDoWebSocket() {
+        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
+        container.setMaxTextMessageBufferSize(64 * 1024);
+        return container;
+    }
+}
+```
+
+**Passo 6 — Ajustar o teste gerado.** O `ServletServerContainerFactoryBean` precisa do suporte a WebSocket que só o Tomcat de verdade oferece. O `@SpringBootTest` padrão sobe a aplicação sem servidor, e o teste gerado passa a falhar com `Attribute 'jakarta.websocket.server.ServerContainer' not found`. E, sem senha configurada, a aplicação nem sobe no teste: o `properties` dá a ela uma senha só para o teste. Troque o conteúdo de `OzamigosShareApplicationTests.java` por:
+
+```java
+package dev.ozamigos;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+
+// RANDOM_PORT sobe o Tomcat de verdade, que é quem fornece o suporte a WebSocket.
+@SpringBootTest(webEnvironment = WebEnvironment.RANDOM_PORT, properties = "ozamigos.senha=teste")
+class OzamigosShareApplicationTests {
+
+    @Test
+    void contextLoads() {
+    }
+}
+```
+
+**Confira (testes):** `./mvnw test` → 7 testes verdes.
+
+**Rodar com a senha.** Agora a aplicação só sobe com a variável `OZAMIGOS_SENHA`. Rode sem ela uma vez, de propósito: o log mostra `Defina a senha do grupo na variável de ambiente OZAMIGOS_SENHA`. Depois, defina a variável de um destes jeitos:
+
+- **IntelliJ:** *Run* → *Edit Configurations…* → a configuração `OzamigosShareApplication` → *Environment variables*: `OZAMIGOS_SENHA=teste`.
+- **Terminal (PowerShell):** `$env:OZAMIGOS_SENHA = "teste"` e, no mesmo terminal, `.\mvnw.cmd spring-boot:run`.
+- **Terminal (Linux, macOS ou Git Bash):** `OZAMIGOS_SENHA=teste ./mvnw spring-boot:run`.
+
+**Confira (na mão):** rode a aplicação e abra `http://localhost:8080` em **duas abas** (a página de erro serve: o que importa é a origem). Em cada uma, abra o console (F12) e cole:
+
+```js
+const ws = new WebSocket('ws://localhost:8080/sinal');
+ws.onmessage = (e) => console.log('chegou', e.data);
+ws.onopen = () => ws.send(JSON.stringify({ tipo: 'entrar', sala: 'teste123', senha: 'teste' }));
+```
+
+A primeira aba recebe `bem-vindo` com `outros: []`. A segunda recebe `bem-vindo` com o id da primeira em `outros`, e a primeira recebe `entrou`. Agora, na segunda aba, mande uma mensagem para a primeira (troque `ID_DA_PRIMEIRA`):
+
+```js
+ws.send(JSON.stringify({ tipo: 'oferta', para: 'ID_DA_PRIMEIRA', sdp: 'teste' }));
+```
+
+A primeira recebe `{"tipo":"oferta","sdp":"teste","de":"…"}`, com o `de` preenchido pelo servidor. Feche a segunda aba: a primeira recebe `saiu`. Por fim, numa terceira aba, repita o primeiro trecho com `senha: 'errada'`: chega `{"tipo":"erro","motivo":"senha-errada"}`, a conexão fecha, e a primeira aba não recebe nada.
+
+**Aulas de apoio:** [HTTP na prática](../../../aulas/08-spring-boot/01-http-na-pratica/), [IoC e injeção de dependências](../../../aulas/08-spring-boot/03-ioc-e-injecao-de-dependencias/), [Exceções](../../../aulas/03-colecoes-generics-excecoes/05-excecoes/), [Threads e memória](../../../aulas/06-concorrencia/01-threads-e-memoria/).
+
+<Callout tipo="erro" titulo="Guardar o estado da sala em variáveis do handler sem sincronizar">
+Um `HashMap` comum dentro do `SinalizacaoHandler`, mexido direto em `handleTextMessage`, funciona nos seus testes manuais e falha quando duas mensagens chegam juntas. Por isso todo o estado mora na classe `Salas`, atrás do `synchronized`.
+</Callout>
+
+</Marco>
+
+<Marco id="pagina" numero={4} titulo="A página: entrar na sala" horas={4}>
+
+**Objetivo:** abrir `http://localhost:8080`, ganhar um link de sala, digitar a senha do grupo, clicar em **Entrar** e ver quantas pessoas estão na sala.
+
+**O conceito: arquivos estáticos.** Tudo o que estiver em `src/main/resources/static/` o Spring Boot serve direto: `index.html` vira a página inicial. A página e o WebSocket vêm do mesmo servidor, e por isso a regra de origem do marco 3 passa.
+
+**Passo 1 — `index.html`** em `src/main/resources/static/`. A página tem dois "estados": a seção `entrada` (antes de entrar) e a seção `sala` (depois). O botão **Entrar** existe por um motivo além do óbvio: o navegador só deixa uma página tocar áudio depois de um clique do usuário, e esse clique libera o som da transmissão mais tarde. A entrada é um `<form>`: assim o Enter no campo de senha também entra, o `required` não deixa enviar a senha vazia, e o `autocomplete="current-password"` deixa o gerenciador de senhas do navegador oferecer para salvá-la.
+
+```html
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ozamigos Share</title>
+  <link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+  <main>
+    <h1>Ozamigos Share</h1>
+    <p id="aviso"></p>
+
+    <form id="entrada">
+      <p>Sala <strong id="codigo-sala"></strong></p>
+      <p>
+        <label for="senha">Senha do grupo</label>
+        <input id="senha" type="password" autocomplete="current-password" required>
+        <button id="botao-entrar">Entrar</button>
+      </p>
+    </form>
+
+    <section id="sala" hidden>
+      <p>
+        Mande este link para os amigos: <code id="link-sala"></code>
+        <button id="botao-copiar">Copiar</button>
+      </p>
+      <p id="pessoas"></p>
+      <p>
+        <button id="botao-aplicativo">Compartilhar um aplicativo</button>
+        <button id="botao-tela">Compartilhar a tela inteira</button>
+        <button id="botao-parar" hidden>Parar</button>
+        <button id="botao-tela-cheia" hidden>Tela cheia</button>
+      </p>
+      <p id="fonte"></p>
+      <p class="dica">
+        Jogo em tela cheia aparecendo preto? Use o modo "janela sem bordas" ou compartilhe a tela inteira.
+        Para levar o som do jogo, compartilhe a tela inteira e marque "Compartilhar áudio do sistema".
+      </p>
+      <video id="video" autoplay playsinline></video>
+      <pre id="estatisticas"></pre>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
+```
+
+**Passo 2 — `estilo.css`.**
+
+```css
+body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+button { padding: 8px 16px; font-size: 16px; cursor: pointer; }
+input { padding: 8px; font-size: 16px; }
+code { background: #222; padding: 2px 6px; }
+video { width: 100%; background: #000; aspect-ratio: 16 / 9; }
+#aviso { color: #fc6; min-height: 1.4em; }
+.dica { color: #999; font-size: 14px; }
+#estatisticas { color: #8f8; font-size: 13px; }
+```
+
+**Passo 3 — `app.js`, primeira versão.** O arquivo final tem 7 seções. Agora entram a 1 (estado), a 2 (código da sala), a 3 (sinalização) e a 6 (tela). As outras chegam nos próximos marcos.
+
+Três ideias importantes nesta parte:
+
+- **`estado`**: um objeto só com tudo o que a página sabe. Facilita entender e depurar (digite `estado` no console a qualquer momento).
+- **O código da sala** vem da URL (`?sala=…`). Sem ele, a página gera um aleatório com `crypto.getRandomValues` (aleatório de verdade, não `Math.random`) e o coloca na URL com `history.replaceState`, que muda o endereço sem recarregar. O link da sala é o próprio endereço.
+- **A senha lembrada**: depois de uma entrada aceita, a senha vai para o `localStorage`, um armazenamento do navegador que sobrevive ao recarregar; da próxima vez, o campo já vem preenchido. Se o servidor recusar, a página a esquece (ela pode ter mudado) e deixa tentar de novo. O `try/catch` existe porque, em aba anônima ou com o armazenamento bloqueado, o `localStorage` pode lançar erro; aí a página só não lembra.
+- **O `ping` a cada 30 segundos**: um `setInterval` só, para a página inteira; depois que a conexão WebRTC se forma, o WebSocket fica em silêncio. Proxies e hospedagens gratuitas fecham conexões paradas, e o Render põe o serviço para dormir sem tráfego. O `ping` não carrega informação; ele só prova que a conexão está viva.
+- **A fila de mensagens**: cada mensagem do servidor é tratada só depois que a anterior terminou (`fila = fila.then(…)`). Isso vai importar muito no marco 6, quando o tratamento for assíncrono.
+- **`tratar` e `tratarErro` provisórias**: por enquanto, elas só cuidam de entrar, sair, quem está compartilhando e erros. O marco 5 acrescenta uma linha à `tratarErro`, e o marco 6 troca a `tratar` pela versão completa.
+
+```js
+// ===== 1. Configuração e estado =====
+
+// STUN: um servidor público que diz ao navegador qual é o seu endereço visto da internet.
+const SERVIDORES_ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+const BITRATE_MAXIMO = 8_000_000; // 8 Mbps para 1080p a 60 fps
+
+const estado = {
+  ws: null,               // conexão com o servidor de sinalização
+  sala: null,             // código da sala
+  meuId: null,            // id que o servidor me deu
+  pessoas: new Set(),     // ids das outras pessoas na sala
+  quemCompartilha: null,  // id de quem está compartilhando agora (ou null)
+  minhaTela: null,        // a MediaStream da minha tela, se eu estiver compartilhando
+  conexoes: new Map(),    // id da outra pessoa -> { pc, pendentes }
+  recusado: false,        // o servidor recusou a entrada (senha errada, sala cheia, código inválido)
+};
+
+const $ = (id) => document.getElementById(id);
+
+// ===== 2. Código da sala e entrada =====
+
+function codigoDaSala() {
+  const daUrl = new URLSearchParams(location.search).get('sala');
+  if (daUrl) return daUrl;
+  // Sem código na URL: gera um aleatório e coloca na URL, para virar o link da sala.
+  const letras = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const aleatorios = crypto.getRandomValues(new Uint8Array(10));
+  const codigo = Array.from(aleatorios, (n) => letras[n % letras.length]).join('');
+  history.replaceState(null, '', `?sala=${codigo}`);
+  return codigo;
+}
+
+estado.sala = codigoDaSala();
+$('codigo-sala').textContent = estado.sala;
+$('link-sala').textContent = location.href;
+$('senha').value = senhaLembrada();
+$('entrada').onsubmit = (evento) => {
+  evento.preventDefault(); // o formulário não recarrega a página: quem entra é o JavaScript
+  entrar();
+};
+$('botao-copiar').onclick = () => navigator.clipboard.writeText(location.href);
+
+// O navegador lembra a senha para a pessoa não digitar toda vez. Em aba anônima,
+// ou com o armazenamento bloqueado, localStorage pode falhar: aí só não lembra.
+function senhaLembrada() {
+  try {
+    return localStorage.getItem('ozamigos-senha') ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function lembrarSenha(senha) {
+  try {
+    if (senha) localStorage.setItem('ozamigos-senha', senha);
+    else localStorage.removeItem('ozamigos-senha');
+  } catch {
+    // sem armazenamento: segue sem lembrar
+  }
+}
+
+// ===== 3. Sinalização (WebSocket com o servidor Java) =====
+
+function entrar() {
+  $('botao-entrar').disabled = true; // dois cliques abririam duas conexões (uma "pessoa fantasma")
+  estado.recusado = false;
+  const protocolo = location.protocol === 'https:' ? 'wss' : 'ws';
+  estado.ws = new WebSocket(`${protocolo}://${location.host}/sinal`);
+  estado.ws.onopen = () => enviar({ tipo: 'entrar', sala: estado.sala, senha: $('senha').value });
+  estado.ws.onclose = () => {
+    if (!estado.recusado) avisar('Conexão com o servidor perdida. Recarregue a página.');
+  };
+
+  // As mensagens são tratadas uma de cada vez, na ordem em que chegaram.
+  let fila = Promise.resolve();
+  estado.ws.onmessage = (evento) => {
+    const msg = JSON.parse(evento.data);
+    fila = fila.then(() => tratar(msg)).catch((erro) => console.error('Erro ao tratar', msg, erro));
+  };
+}
+
+function enviar(msg) {
+  estado.ws.send(JSON.stringify(msg));
+}
+
+// Um "estou aqui" a cada 30 s: sem isso, proxies e hospedagens gratuitas fecham a conexão parada.
+setInterval(() => {
+  if (estado.ws?.readyState === WebSocket.OPEN && estado.meuId) enviar({ tipo: 'ping' });
+}, 30_000);
+
+async function tratar(msg) {
+  switch (msg.tipo) {
+    case 'bem-vindo':
+      estado.meuId = msg.id;
+      msg.outros.forEach((id) => estado.pessoas.add(id));
+      estado.quemCompartilha = msg.quemCompartilha;
+      lembrarSenha($('senha').value);
+      avisar('');
+      $('entrada').hidden = true;
+      $('sala').hidden = false;
+      break;
+    case 'entrou':
+      estado.pessoas.add(msg.id);
+      break;
+    case 'saiu':
+      estado.pessoas.delete(msg.id);
+      if (estado.quemCompartilha === msg.id) estado.quemCompartilha = null;
+      break;
+    case 'compartilhando':
+      estado.quemCompartilha = msg.id;
+      avisar('Recebendo a tela…');
+      break;
+    case 'parou':
+      estado.quemCompartilha = null;
+      avisar('');
+      break;
+    case 'erro':
+      tratarErro(msg.motivo);
+      break;
+  }
+  atualizarTela();
+}
+
+function tratarErro(motivo) {
+  const textos = {
+    'senha-errada': 'Senha errada. Confira com quem mandou o link.',
+    'sala-cheia': 'A sala está cheia (máximo de 3 pessoas).',
+    'ja-tem-alguem-compartilhando': 'Alguém já está compartilhando. Espere a pessoa parar.',
+  };
+  avisar(textos[motivo] ?? `Erro: ${motivo}`);
+  if (motivo === 'sala-cheia' || motivo === 'codigo-invalido') estado.recusado = true;
+  if (motivo === 'senha-errada') {
+    estado.recusado = true;
+    lembrarSenha(''); // esquece a senha antiga (ela pode ter mudado)
+    $('senha').select();
+    $('botao-entrar').disabled = false; // pode tentar de novo
+  }
+}
+
+// ===== 6. Tela =====
+
+function atualizarTela() {
+  const total = estado.pessoas.size + 1;
+  $('pessoas').textContent = `${total} ${total === 1 ? 'pessoa' : 'pessoas'} na sala`;
+  const euCompartilho = estado.minhaTela !== null;
+  const outroCompartilha = estado.quemCompartilha !== null && estado.quemCompartilha !== estado.meuId;
+  const podeCapturar = Boolean(navigator.mediaDevices?.getDisplayMedia);
+  for (const id of ['botao-aplicativo', 'botao-tela']) {
+    $(id).disabled = !podeCapturar || outroCompartilha;
+    $(id).title = podeCapturar ? '' : 'Para compartilhar, use Chrome ou Edge no computador, por HTTPS ou localhost';
+  }
+  $('botao-aplicativo').textContent = euCompartilho ? 'Trocar para um aplicativo' : 'Compartilhar um aplicativo';
+  $('botao-tela').textContent = euCompartilho ? 'Trocar para a tela inteira' : 'Compartilhar a tela inteira';
+  $('botao-parar').hidden = !euCompartilho;
+  $('botao-tela-cheia').hidden = !outroCompartilha;
+  $('fonte').textContent = euCompartilho ? descreverFonte() : '';
+}
+
+function descreverFonte() {
+  const { displaySurface } = estado.minhaTela.getVideoTracks()[0].getSettings();
+  const nomes = { window: 'um aplicativo', monitor: 'a tela inteira', browser: 'uma aba do navegador' };
+  const audio = estado.minhaTela.getAudioTracks().length > 0 ? 'com' : 'sem';
+  return `Você está compartilhando ${nomes[displaySurface] ?? 'a sua tela'}, ${audio} áudio.`;
+}
+
+function avisar(texto) {
+  $('aviso').textContent = texto;
+}
+```
+
+**Confira:** reinicie a aplicação (arquivos em `static/` são copiados no build) e abra `http://localhost:8080`. A URL ganha `?sala=…`. Digite uma senha errada e tecle Enter: aparece "Senha errada" e o campo fica pronto para outra tentativa. Digite a senha certa (a do `OZAMIGOS_SENHA`): aparece "1 pessoa na sala". Abra o **mesmo link** em outra aba e entre: as duas mostram "2 pessoas". Numa terceira e numa quarta aba: a quarta mostra "A sala está cheia". Feche uma aba: as outras voltam a contar certo. Recarregue uma aba: a senha já vem preenchida.
+
+**Aulas de apoio:** [Java essencial](../../../aulas/01-java-essencial/01-tipos-e-variaveis/) (para comparar com o JavaScript), [HTTP na prática](../../../aulas/08-spring-boot/01-http-na-pratica/).
+
+</Marco>
+
+<Marco id="captura" numero={5} titulo="Escolher o que compartilhar" horas={3}>
+
+**Objetivo:** clicar em **Compartilhar um aplicativo** ou **Compartilhar a tela inteira**, escolher o que mostrar, ver a prévia na sua própria página, trocar a fonte sem parar e o servidor avisar os outros.
+
+**O conceito: `getDisplayMedia`.** É a função do navegador que abre o seletor ("Tela inteira", "Janela", "Guia") e devolve uma **`MediaStream`**: um conjunto de trilhas (*tracks*), uma de vídeo e, se a pessoa marcar a opção, uma de áudio. Os detalhes:
+
+- **Precisa de um gesto do usuário.** O navegador só abre o seletor se a chamada vier logo de um clique. Por isso chamamos `getDisplayMedia` **primeiro**, dentro do clique, e só depois avisamos o servidor com `comecei`. Se fizéssemos o contrário (perguntar ao servidor, esperar a resposta e então abrir o seletor), o gesto poderia "expirar".
+- **Os dois botões só mudam a sugestão.** O objeto `FONTES` guarda o que cada botão pede: `displaySurface` (em qual aba o seletor abre) e `monitorTypeSurfaces` (se a aba "Tela inteira" aparece). Releia [Aplicativo ou tela inteira](#aplicativo-ou-tela-inteira-o-que-a-página-pode-e-não-pode-fazer) se precisar.
+- **As restrições são pedidos.** `frameRate: { ideal: 60 }` pede 60 fps; o navegador entrega o que conseguir. `width: { max: 1920 }` e `height: { max: 1080 }` reduzem telas maiores (um monitor 2560×1440 vira 1920×1080) mantendo a proporção.
+- **`contentHint = 'motion'`** diz ao codificador que o conteúdo é movimento (jogo, vídeo), e não texto. Sem isso, o Chrome trata compartilhamento de tela como "documento" e prioriza nitidez em vez de fluidez.
+- **`getSettings().displaySurface`** diz o que a pessoa **de fato** escolheu (`window`, `monitor` ou `browser`), porque ela pode ignorar a sugestão e trocar de aba no seletor. A frase "Você está compartilhando…" vem daí.
+- **Trocar sem parar: `replaceTrack`.** Cada conexão WebRTC tem um "remetente" por trilha. `sender.replaceTrack(novaTrilha)` põe a trilha nova no lugar da antiga **dentro da conexão que já existe**: não há nova oferta, nova resposta nem novos candidatos, e quem assiste nem percebe a troca. Antes de parar a trilha antiga, tiramos o `onended` dela; senão, parar a antiga dispararia o "parar de compartilhar".
+
+**Passo 1 — Seção 4.** Acrescente ao `app.js`, entre a seção 3 e a 6:
+
+```js
+// ===== 4. Compartilhar a minha tela =====
+
+// O que cada botão pede ao navegador. A escolha final (qual janela, qual monitor) é sempre
+// da pessoa, no seletor do navegador: por segurança, a página não pode listar as janelas abertas.
+const FONTES = {
+  aplicativo: { displaySurface: 'window', monitorTypeSurfaces: 'exclude' },
+  tela: { displaySurface: 'monitor', monitorTypeSurfaces: 'include' },
+};
+
+async function capturar(fonte) {
+  try {
+    // Precisa ser chamado direto no clique: o navegador exige um gesto do usuário.
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        displaySurface: FONTES[fonte].displaySurface, // abre o seletor já na aba certa
+        width: { max: 1920 },
+        height: { max: 1080 },
+        frameRate: { ideal: 60, max: 60 },
+      },
+      audio: true,                                    // áudio, se a pessoa marcar a opção
+      monitorTypeSurfaces: FONTES[fonte].monitorTypeSurfaces,
+      selfBrowserSurface: 'exclude',                  // não oferecer a própria aba do Ozamigos Share
+      systemAudio: 'include',
+    });
+  } catch {
+    return null; // a pessoa cancelou o seletor
+  }
+}
+
+async function escolherFonte(fonte) {
+  const tela = await capturar(fonte);
+  if (!tela) return;
+  if (estado.minhaTela) {
+    await trocarFonte(tela);
+  } else {
+    usarTela(tela);
+    enviar({ tipo: 'comecei' });
+  }
+  atualizarTela();
+}
+
+function usarTela(tela) {
+  estado.minhaTela = tela;
+  const [video] = tela.getVideoTracks();
+  video.contentHint = 'motion'; // jogo: priorizar movimento fluido em vez de nitidez de texto
+  video.onended = () => pararDeCompartilhar(true); // botão "Parar compartilhamento" do Chrome
+  $('video').srcObject = tela;
+  $('video').muted = true; // não tocar o meu próprio áudio de volta
+}
+
+// Troca o que está sendo compartilhado sem refazer as conexões:
+// replaceTrack põe a trilha nova no lugar da antiga, dentro da conexão que já existe.
+async function trocarFonte(nova) {
+  const antiga = estado.minhaTela;
+  usarTela(nova);
+  const [video] = nova.getVideoTracks();
+  const [audio] = nova.getAudioTracks();
+  for (const { pc } of estado.conexoes.values()) {
+    for (const transceptor of pc.getTransceivers()) {
+      const tipo = transceptor.receiver.track.kind;
+      await transceptor.sender.replaceTrack(tipo === 'video' ? video : audio ?? null);
+    }
+  }
+  antiga.getVideoTracks()[0].onended = null; // parar a antiga não pode encerrar o compartilhamento
+  antiga.getTracks().forEach((trilha) => trilha.stop());
+}
+
+function pararDeCompartilhar(avisarServidor) {
+  if (!estado.minhaTela) return;
+  estado.minhaTela.getTracks().forEach((trilha) => trilha.stop());
+  estado.minhaTela = null;
+  for (const id of [...estado.conexoes.keys()]) fecharConexao(id);
+  $('video').srcObject = null;
+  if (avisarServidor) enviar({ tipo: 'parei' });
+  if (estado.quemCompartilha === estado.meuId) estado.quemCompartilha = null;
+  atualizarTela();
+}
+```
+
+O `pararDeCompartilhar` e o `trocarFonte` já percorrem `estado.conexoes`, que só ganha conteúdo no marco 6; por enquanto ele está sempre vazio, e os laços não fazem nada.
+
+**Passo 2 — Ligar os botões.** No fim da seção 2, logo depois da linha do `botao-copiar`, acrescente:
+
+```js
+$('botao-aplicativo').onclick = () => escolherFonte('aplicativo');
+$('botao-tela').onclick = () => escolherFonte('tela');
+$('botao-parar').onclick = () => pararDeCompartilhar(true);
+$('botao-tela-cheia').onclick = () => $('video').requestFullscreen();
+```
+
+**Passo 3 — `tratarErro` completo.** Acrescente a última linha abaixo à função `tratarErro`: se o servidor recusar porque outra pessoa já está compartilhando, a captura que você abriu precisa ser fechada.
+
+```js
+  if (motivo === 'ja-tem-alguem-compartilhando') pararDeCompartilhar(false);
+```
+
+**Confira:** em `http://localhost:8080`, entre e clique em **Compartilhar um aplicativo**: o seletor abre na aba de janelas, sem a opção de tela inteira. Escolha o jogo: a prévia aparece, a página diz "Você está compartilhando um aplicativo" e os botões viram **Trocar para…** e **Parar**. Clique em **Trocar para a tela inteira**: o seletor abre na aba de telas, e a prévia muda sem você parar. Numa segunda aba na mesma sala, aparece "Recebendo a tela…" (o vídeo ainda não chega: falta o marco 6), e os botões de compartilhar ficam desabilitados. Clique em **Parar** (ou em "Parar compartilhamento" na barra do Chrome): a segunda aba volta ao normal.
+
+<Callout tipo="erro" titulo="Testar por http://192.168.x.x e achar que o botão quebrou">
+Por esse endereço a página não está num contexto seguro, e o `navigator.mediaDevices.getDisplayMedia` nem existe; por isso o botão aparece desabilitado. Quem compartilha usa `localhost` (ou HTTPS, no marco 8). Quem só assiste pode usar o IP da rede local.
+</Callout>
+
+</Marco>
+
+<Marco id="conexao" numero={6} titulo="A conexão WebRTC" horas={6}>
+
+**Objetivo:** o vídeo da sua tela chegando na outra aba e em outro computador da sua rede.
+
+**O conceito: a dança da oferta e da resposta.** Para cada pessoa que assiste, quem compartilha cria um `RTCPeerConnection` e segue esta ordem:
+
+| # | Quem compartilha (Ana) | Quem assiste (Beto) |
+|---|---|---|
+| 1 | `addTransceiver(trilha)`: "vou mandar este vídeo" | — |
+| 2 | `createOffer()` e `setLocalDescription(oferta)` | — |
+| 3 | Envia a oferta pelo servidor | Recebe: `setRemoteDescription(oferta)` |
+| 4 | — | `createAnswer()` e `setLocalDescription(resposta)` |
+| 5 | Recebe: `setRemoteDescription(resposta)` | Envia a resposta pelo servidor |
+| 6 | Candidatos ICE indo e vindo (evento `onicecandidate` de um lado, `addIceCandidate` do outro) | idem |
+| 7 | — | Evento `ontrack`: o vídeo chegou; vai para o `<video>` |
+
+Cada lado tem uma **descrição local** (o que ele mesmo disse) e uma **descrição remota** (o que o outro disse). A conexão só começa a mandar mídia quando os dois lados têm as duas e algum par de candidatos funcionou.
+
+**Por que existe a lista de "pendentes".** Os candidatos ICE começam a ser descobertos logo depois do `setLocalDescription` e são enviados na hora. Por isso, um candidato pode chegar **antes** da oferta ou da resposta ter sido aplicada do outro lado, e o `addIceCandidate` falha se ainda não houver descrição remota. A solução: se não houver descrição remota, guarda o candidato e aplica logo depois do `setRemoteDescription`. Junto com a fila de mensagens do marco 4, isso elimina as falhas "às vezes funciona, às vezes não", que são o problema mais comum de quem começa com WebRTC.
+
+**Quem chega no meio.** Se você já está compartilhando e alguém entra (mensagem `entrou`), você manda uma oferta só para essa pessoa (RN-04).
+
+**Por que sempre um canal de áudio.** O `addTransceiver(audio ?? 'audio', …)` cria o canal de áudio mesmo quando você compartilha sem som (passando só o tipo, `'audio'`, em vez de uma trilha). Assim, se você trocar de um aplicativo sem som para a tela inteira com som, o `replaceTrack` do marco 5 tem onde pôr o áudio, sem renegociar a conexão.
+
+**Passo 1 — Seção 5, primeira versão.** Acrescente entre a seção 4 e a 6. Esta versão ainda **não** ajusta a qualidade; o marco 7 faz isso, comparando antes e depois.
+
+```js
+// ===== 5. Conexões WebRTC =====
+
+function novaConexao(idRemoto) {
+  const pc = new RTCPeerConnection({ iceServers: SERVIDORES_ICE });
+  const conexao = { pc, pendentes: [] };
+  estado.conexoes.set(idRemoto, conexao);
+
+  // Cada caminho de rede descoberto (candidato ICE) vai para o outro lado pelo servidor.
+  pc.onicecandidate = (evento) => {
+    if (evento.candidate) enviar({ tipo: 'candidato', para: idRemoto, candidato: evento.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    console.log(`Conexão com ${idRemoto}: ${pc.connectionState}`);
+    if (pc.connectionState === 'failed') {
+      avisar('Não foi possível conectar direto com a outra pessoa. Algumas redes exigem um servidor TURN.');
+    }
+  };
+  return conexao;
+}
+
+function fecharConexao(idRemoto) {
+  const conexao = estado.conexoes.get(idRemoto);
+  if (!conexao) return;
+  conexao.pc.close();
+  estado.conexoes.delete(idRemoto);
+}
+
+// Lado de quem compartilha: uma conexão (e uma oferta) para cada pessoa.
+async function enviarOferta(idEspectador) {
+  fecharConexao(idEspectador);
+  const { pc } = novaConexao(idEspectador);
+  const [video] = estado.minhaTela.getVideoTracks();
+  pc.addTransceiver(video, { direction: 'sendonly', streams: [estado.minhaTela] });
+  // Sempre cria o canal de áudio, mesmo sem áudio agora: assim a troca de fonte não precisa renegociar.
+  const [audio] = estado.minhaTela.getAudioTracks();
+  pc.addTransceiver(audio ?? 'audio', { direction: 'sendonly', streams: [estado.minhaTela] });
+  await pc.setLocalDescription(await pc.createOffer());
+  enviar({ tipo: 'oferta', para: idEspectador, sdp: pc.localDescription });
+}
+
+async function receberResposta(idEspectador, sdp) {
+  const conexao = estado.conexoes.get(idEspectador);
+  if (!conexao) return;
+  await conexao.pc.setRemoteDescription(sdp);
+  await aplicarCandidatosPendentes(conexao);
+}
+
+// Lado de quem assiste: responde à oferta e mostra o vídeo que chegar.
+async function receberOferta(idCompartilhador, sdp) {
+  fecharConexao(idCompartilhador);
+  const conexao = novaConexao(idCompartilhador);
+  conexao.pc.ontrack = (evento) => {
+    $('video').srcObject = evento.streams[0];
+    $('video').muted = false;
+    avisar('');
+  };
+  await conexao.pc.setRemoteDescription(sdp);
+  await aplicarCandidatosPendentes(conexao);
+  await conexao.pc.setLocalDescription(await conexao.pc.createAnswer());
+  enviar({ tipo: 'resposta', para: idCompartilhador, sdp: conexao.pc.localDescription });
+}
+
+// Um candidato pode chegar antes da oferta ou da resposta: guarda e aplica depois.
+async function receberCandidato(idRemoto, candidato) {
+  const conexao = estado.conexoes.get(idRemoto);
+  if (!conexao) return;
+  if (conexao.pc.remoteDescription) {
+    await conexao.pc.addIceCandidate(candidato);
+  } else {
+    conexao.pendentes.push(candidato);
+  }
+}
+
+async function aplicarCandidatosPendentes(conexao) {
+  for (const candidato of conexao.pendentes) await conexao.pc.addIceCandidate(candidato);
+  conexao.pendentes = [];
+}
+
+function quemCompartilhavaParou() {
+  estado.quemCompartilha = null;
+  if (!estado.minhaTela) $('video').srcObject = null;
+  avisar('');
+}
+```
+
+**Passo 2 — `tratar` completo.** Troque a função `tratar` provisória do marco 4 por esta, que agora usa as funções da seção 5:
+
+```js
+async function tratar(msg) {
+  switch (msg.tipo) {
+    case 'bem-vindo':
+      estado.meuId = msg.id;
+      msg.outros.forEach((id) => estado.pessoas.add(id));
+      estado.quemCompartilha = msg.quemCompartilha;
+      lembrarSenha($('senha').value);
+      avisar('');
+      $('entrada').hidden = true;
+      $('sala').hidden = false;
+      break;
+    case 'entrou':
+      estado.pessoas.add(msg.id);
+      // Se eu estou compartilhando, quem chegou também precisa receber a minha tela.
+      if (estado.minhaTela) await enviarOferta(msg.id);
+      break;
+    case 'saiu':
+      estado.pessoas.delete(msg.id);
+      fecharConexao(msg.id);
+      if (estado.quemCompartilha === msg.id) quemCompartilhavaParou();
+      break;
+    case 'pode-compartilhar':
+      estado.quemCompartilha = estado.meuId;
+      for (const id of estado.pessoas) await enviarOferta(id);
+      break;
+    case 'compartilhando':
+      estado.quemCompartilha = msg.id;
+      avisar('Recebendo a tela…');
+      break;
+    case 'parou':
+      fecharConexao(msg.id);
+      quemCompartilhavaParou();
+      break;
+    case 'oferta':
+      await receberOferta(msg.de, msg.sdp);
+      break;
+    case 'resposta':
+      await receberResposta(msg.de, msg.sdp);
+      break;
+    case 'candidato':
+      await receberCandidato(msg.de, msg.candidato);
+      break;
+    case 'erro':
+      tratarErro(msg.motivo);
+      break;
+  }
+  atualizarTela();
+}
+```
+
+**Confira (mesma máquina):** duas abas na mesma sala; compartilhe uma janela de jogo na primeira. Em até 2 segundos, o jogo aparece na segunda. Agora clique em **Trocar para a tela inteira** na primeira: a segunda passa a mostrar a tela inteira sem piscar "Recebendo a tela…" de novo. Em `chrome://webrtc-internals` (abra numa terceira aba) aparece uma conexão por aba, com gráficos.
+
+**Confira (outra máquina):** descubra o IP do seu computador na rede (`ipconfig` no Windows) e, no outro computador, abra `http://SEU_IP:8080/?sala=O_MESMO_CODIGO`. Se não abrir, permita o Java no Firewall do Windows para redes privadas (o Windows costuma perguntar na primeira vez). Compartilhe no seu computador por `localhost`: o vídeo aparece no outro.
+
+<Callout tipo="erro" titulo="Ver só uma tela preta no espectador">
+Três causas comuns. (1) O jogo em **tela cheia exclusiva**: alguns jogos não deixam capturar; use o modo "janela sem bordas". (2) O vídeo chegou, mas o navegador bloqueou a reprodução: confira se você clicou em **Entrar** (o clique libera o áudio e o vídeo com som). (3) A conexão não fechou: veja no console a mensagem `Conexão com …: failed` e em `chrome://webrtc-internals` o estado do ICE.
+</Callout>
+
+**Aulas de apoio:** [CompletableFuture](../../../aulas/06-concorrencia/04-completablefuture/) (a mesma ideia de `async`/`await` e promessas em cadeia), [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/).
+
+</Marco>
+
+<Marco id="sessenta-fps" numero={7} titulo="1080p a 60 fps, medido" horas={3}>
+
+**Objetivo:** provar com números que a transmissão está em 1080p a 60 fps e ajustar o WebRTC para jogo, comparando antes e depois.
+
+**O conceito: `getStats()`.** Todo `RTCPeerConnection` responde a `getStats()` com dezenas de relatórios. Os que importam aqui:
+
+| Relatório | Lado | Campos que vamos usar |
+|---|---|---|
+| `outbound-rtp` (vídeo) | quem compartilha | `framesPerSecond`, `frameWidth`, `frameHeight`, `bytesSent`, `qualityLimitationReason`, `encoderImplementation` |
+| `inbound-rtp` (vídeo) | quem assiste | `framesPerSecond`, `frameWidth`, `frameHeight`, `bytesReceived`, `freezeCount`, `framesDropped` |
+| `codec` | os dois | `mimeType` (por exemplo, `video/H264`) |
+
+O bitrate não vem pronto: calculamos pela diferença de bytes entre duas leituras, dividida pelo tempo. O `qualityLimitationReason` diz **por que** a qualidade está abaixo do pedido: `none` (nada limita), `bandwidth` (a rede) ou `cpu` (o computador). O `encoderImplementation` mostra o codificador (o nome muda de máquina para máquina; um codificador de hardware costuma aparecer com o nome da tecnologia da placa de vídeo, e o de software como `OpenH264` ou `libvpx`).
+
+**Passo 1 — Seção 7: estatísticas.** Acrescente no fim do `app.js`:
+
+```js
+// ===== 7. Estatísticas: a prova dos 60 fps =====
+
+const anteriores = new Map(); // id do relatório -> { bytes, momento }
+
+setInterval(async () => {
+  const linhas = [];
+  for (const [id, { pc }] of estado.conexoes) {
+    const relatorio = await pc.getStats();
+    relatorio.forEach((r) => {
+      if (r.kind !== 'video' || (r.type !== 'outbound-rtp' && r.type !== 'inbound-rtp')) return;
+      const enviando = r.type === 'outbound-rtp';
+      const bytes = enviando ? r.bytesSent : r.bytesReceived;
+      const anterior = anteriores.get(r.id);
+      const mbps = anterior ? ((bytes - anterior.bytes) * 8) / ((r.timestamp - anterior.momento) * 1000) : 0;
+      anteriores.set(r.id, { bytes, momento: r.timestamp });
+      const codec = relatorio.get(r.codecId)?.mimeType ?? '?';
+      let linha = `${enviando ? 'enviando para' : 'recebendo de'} ${id}: ` +
+        `${r.framesPerSecond ?? 0} fps · ${r.frameWidth ?? '?'}x${r.frameHeight ?? '?'} · ` +
+        `${mbps.toFixed(1)} Mbps · ${codec}`;
+      if (enviando) {
+        linha += ` · limitação: ${r.qualityLimitationReason} · codificador: ${r.encoderImplementation ?? '?'}`;
+      } else {
+        linha += ` · congelamentos: ${r.freezeCount ?? 0} · quadros perdidos: ${r.framesDropped ?? 0}`;
+      }
+      linhas.push(linha);
+    });
+  }
+  $('estatisticas').textContent = linhas.join('\n');
+}, 1000);
+```
+
+**Passo 2 — Medir o antes.** Transmita o jogo por 2 minutos para outra máquina e anote o que as estatísticas mostram: fps, resolução, Mbps, codec e limitação. Guarde para o README.
+
+**Passo 3 — Os três ajustes.** Agora troque `enviarOferta` e `receberResposta` pelas versões finais e acrescente `preferirH264`:
+
+```js
+// Lado de quem compartilha: uma conexão (e uma oferta) para cada pessoa.
+async function enviarOferta(idEspectador) {
+  fecharConexao(idEspectador);
+  const { pc } = novaConexao(idEspectador);
+  const [video] = estado.minhaTela.getVideoTracks();
+  const transceptor = pc.addTransceiver(video, {
+    direction: 'sendonly',
+    streams: [estado.minhaTela],
+    sendEncodings: [{ maxBitrate: BITRATE_MAXIMO, maxFramerate: 60 }],
+  });
+  preferirH264(transceptor);
+  // Sempre cria o canal de áudio, mesmo sem áudio agora: assim a troca de fonte não precisa renegociar.
+  const [audio] = estado.minhaTela.getAudioTracks();
+  pc.addTransceiver(audio ?? 'audio', { direction: 'sendonly', streams: [estado.minhaTela] });
+  await pc.setLocalDescription(await pc.createOffer());
+  enviar({ tipo: 'oferta', para: idEspectador, sdp: pc.localDescription });
+}
+
+// H.264 é o codec que quase toda placa de vídeo codifica em hardware.
+function preferirH264(transceptor) {
+  if (!transceptor.setCodecPreferences) return;
+  const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
+  const h264 = codecs.filter((c) => c.mimeType === 'video/H264');
+  if (h264.length === 0) return;
+  transceptor.setCodecPreferences([...h264, ...codecs.filter((c) => c.mimeType !== 'video/H264')]);
+}
+
+async function receberResposta(idEspectador, sdp) {
+  const conexao = estado.conexoes.get(idEspectador);
+  if (!conexao) return;
+  await conexao.pc.setRemoteDescription(sdp);
+  await aplicarCandidatosPendentes(conexao);
+  // Se a rede apertar, manter os 60 fps e baixar a resolução (o contrário borraria o movimento).
+  const remetente = conexao.pc.getSenders().find((s) => s.track?.kind === 'video');
+  const parametros = remetente.getParameters();
+  parametros.degradationPreference = 'maintain-framerate';
+  try {
+    await remetente.setParameters(parametros);
+  } catch (erro) {
+    console.warn('O navegador não aceitou degradationPreference', erro);
+  }
+}
+```
+
+O que cada ajuste faz:
+
+- **`sendEncodings` com `maxBitrate` de 8 Mbps e `maxFramerate` de 60**: sem isso, o navegador usa um teto próprio de bitrate, pensado para videochamada, baixo demais para um jogo em 1080p.
+- **`preferirH264`**: reordena a lista de codecs para o H.264 vir primeiro. O navegador escolhe o primeiro que os dois lados suportam. O H.264 é o que quase toda placa de vídeo codifica em hardware, aliviando o processador enquanto você joga.
+- **`degradationPreference = 'maintain-framerate'`**: quando a rede apertar, baixa a resolução e mantém os 60 fps. Ele é aplicado depois da resposta, porque só então a conexão está negociada. O `try/catch` protege navegadores que não suportam a opção.
+
+**Passo 4 — Medir o depois.** Repita a medição do passo 2.
+
+**Confira:** quem assiste vê `59` ou `60 fps · 1920x1080 · video/H264`, com cerca de 8 Mbps, e `congelamentos: 0` depois dos primeiros segundos. Nos primeiros 5 a 15 segundos, a resolução pode aparecer menor (720p) com a limitação `bandwidth`: é a estimativa de banda do WebRTC subindo aos poucos, e é normal. A tabela "antes × depois" vai para o README.
+
+<Callout tipo="dica" titulo="Se não chegar a 60 fps">
+Olhe o `qualityLimitationReason` de quem compartilha. `cpu` com um codificador de software: atualize o driver da placa de vídeo e confira em `chrome://gpu` se a aceleração por hardware está ligada. `bandwidth`: teste por cabo, ou com as duas máquinas na mesma rede. Fps abaixo de 60 já na captura (com `none`): o jogo em tela cheia exclusiva, ou o monitor a 60 Hz com o jogo travado em menos que isso. Mantenha o Chrome aberto com a aba visível durante o primeiro teste; depois, teste com o jogo na frente, que é o uso real.
+</Callout>
+
+</Marco>
+
+<Marco id="deploy" numero={8} titulo="Deploy gratuito no Render" horas={4}>
+
+**Objetivo:** o Ozamigos Share no ar num endereço `https://….onrender.com`, de graça, e um amigo em outra rede assistindo ao seu jogo.
+
+**O conceito: o que é fazer deploy.** Até agora, o servidor roda no seu computador, que não é alcançável pela internet. Fazer deploy é rodar o mesmo programa num computador que é. O **Render** é uma hospedagem com plano gratuito: você conecta o repositório do GitHub, ele monta a aplicação a partir de um **Dockerfile** e a publica com HTTPS. Quatro ideias aparecem aqui:
+
+- **Contêiner e Dockerfile.** Um Dockerfile é a receita para montar uma "caixa" com tudo o que o programa precisa (o Java, o `.jar`) e rodar igual em qualquer lugar. O nosso tem duas etapas: a primeira compila com o JDK completo; a segunda copia só o `.jar` para uma imagem com o JRE, menor e mais rápida de subir. Isso se chama *multi-stage build*.
+- **A porta vem de fora.** Hospedagens dizem ao programa em qual porta escutar pela variável de ambiente `PORT`. O `server.port=${PORT:8080}` significa "use `PORT` se existir; senão, 8080".
+- **Segredos ficam no painel, não no código.** A senha do grupo vai como variável de ambiente no Render, do mesmo jeito que a `PORT` vem dele. Quem lê o seu repositório vê `ozamigos.senha=${OZAMIGOS_SENHA:}`, e não a senha.
+- **O proxy reverso.** O HTTPS do Render termina num proxy na frente da sua aplicação, que recebe a requisição já em HTTP comum. Sem configuração, o Spring acha que a página veio por `http`, enquanto o navegador diz que a origem é `https`, e a checagem de origem do WebSocket (RN-08) **recusa a conexão** com `403`. O proxy avisa o protocolo original no cabeçalho `X-Forwarded-Proto`, e `server.forward-headers-strategy=framework` faz o Spring ler esse cabeçalho.
+
+**O que o plano gratuito do Render exige que você saiba** (confira a página [Deploy for Free](https://render.com/docs/free), porque as regras mudam):
+
+| Regra | O que muda para o Ozamigos Share |
+|---|---|
+| Dorme depois de 15 minutos sem tráfego (requisições HTTP ou mensagens WebSocket) | O `ping` a cada 30 s mantém o serviço acordado enquanto alguém está numa sala |
+| Leva cerca de 1 minuto para acordar | A primeira pessoa do dia espera a página carregar; avise os amigos |
+| 750 horas gratuitas por mês por conta | Dá para um serviço ficar ligado o mês inteiro |
+| Sistema de arquivos e memória perdidos ao reiniciar | As salas estão em memória: um reinício derruba quem está numa sala, e basta entrar de novo |
+| Uma instância só, com pouca memória | Perfeito para salas em memória (com duas instâncias, cada uma teria salas diferentes) |
+
+**Passo 1 — `application.properties`.** Troque o conteúdo de `src/main/resources/application.properties` por:
+
+```properties
+spring.application.name=ozamigos-share
+
+# Na nuvem, a porta vem da variável de ambiente PORT; no seu computador, 8080.
+server.port=${PORT:8080}
+
+# Atrás do proxy HTTPS do Render, o Spring precisa ler os cabeçalhos X-Forwarded-*
+# para saber que a página veio por https (senão a checagem de origem do WebSocket recusa).
+server.forward-headers-strategy=framework
+
+# A senha do grupo vem de uma variável de ambiente: segredo não vai para o código nem para o GitHub.
+ozamigos.senha=${OZAMIGOS_SENHA:}
+```
+
+**Passo 2 — `Dockerfile`, na raiz do projeto.**
+
+```dockerfile
+# Etapa 1: compila o projeto com o JDK completo.
+FROM eclipse-temurin:25-jdk AS build
+WORKDIR /app
+COPY . .
+RUN chmod +x mvnw && ./mvnw -q -DskipTests package
+
+# Etapa 2: só o necessário para rodar (JRE + o .jar), numa imagem menor.
+FROM eclipse-temurin:25-jre
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
+# Usa até 75% da memória do contêiner (o plano gratuito do Render tem 512 MB).
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75"
+EXPOSE 8080
+CMD ["java", "-jar", "app.jar"]
+```
+
+O `chmod +x mvnw` existe porque, vindo de um repositório criado no Windows, o `mvnw` pode chegar sem permissão de execução no Linux do contêiner. O `MaxRAMPercentage` faz o Java respeitar o limite de memória do contêiner, em vez de calcular o tamanho do heap pela memória da máquina inteira.
+
+**Passo 3 — `.dockerignore` e `.gitattributes`, na raiz.** O primeiro evita copiar para a imagem o que não precisa (a pasta `target` do seu computador); o segundo garante que o `mvnw` vá para o GitHub com quebras de linha do Linux. Com as do Windows, o build falha com `/bin/sh^M: bad interpreter`.
+
+```text
+target/
+.idea/
+.vscode/
+*.iml
+```
+
+```text
+# O mvnw roda no Linux do Docker: precisa de quebras de linha LF.
+mvnw text eol=lf
+```
+
+**Passo 4 (opcional) — Testar a imagem no seu computador**, se tiver o Docker instalado:
+
+```bash
+docker build -t ozamigos-share .
+```
+
+```bash
+docker run --rm -p 8080:8080 -e OZAMIGOS_SENHA=teste ozamigos-share
+```
+
+**Confira:** `http://localhost:8080` funciona como antes, agora rodando dentro do contêiner.
+
+**Passo 5 — Enviar ao GitHub.** Commit e `git push` de tudo, incluindo os três arquivos novos.
+
+**Passo 6 — Criar o serviço no Render.** Entre em [render.com](https://render.com) com a sua conta do GitHub. Clique em **New** → **Web Service**, escolha o repositório `ozamigos-share` e confira:
+- **Language/Runtime:** Docker (o Render detecta o Dockerfile);
+- **Branch:** `main`;
+- **Instance Type:** **Free**;
+- **Environment Variables:** clique em **Add Environment Variable**, com nome `OZAMIGOS_SENHA` e, como valor, a senha do grupo (uma frase de quatro palavras, como explicado nos conceitos).
+
+Clique em **Deploy Web Service** e acompanhe o log: o primeiro build baixa o Maven e as dependências e leva alguns minutos. A cada `git push` na `main`, o Render publica de novo sozinho. Para trocar a senha depois, edite a variável em **Environment** e salve: o Render reinicia o serviço com a senha nova.
+
+**Confira:** o log termina com `Tomcat started on port …` e a página abre em `https://ozamigos-share-xxxx.onrender.com`. Entre numa sala e compartilhe: como a página já vem por HTTPS, os botões de compartilhar funcionam em qualquer computador, não só no `localhost`.
+
+**Passo 7 — Testar com um amigo em outra rede.** Mande o link da sala (com o `?sala=…`) para ele, e a senha **separada do link** (falando, ou noutra conversa): quem achar só o link não entra. Ele digita a senha uma vez; nas próximas, o navegador lembra. Então compartilhe o jogo. Só a página e a sinalização passam pelo Render; o vídeo continua indo **direto** entre os navegadores, com os endereços descobertos pelo STUN.
+
+**Confira:** o amigo vê o jogo, e as estatísticas dele mostram os fps. Em `chrome://webrtc-internals`, no par de candidatos selecionado, o candidato remoto é do tipo `srflx` ou `prflx` (endereço público, descoberto pelo STUN ou durante a própria conexão), e não `host` (endereço local).
+
+**E se não conectar?** Se a página do amigo mostrar "Não foi possível conectar direto", as duas redes (ou uma delas) não permitem conexão direta: CGNAT, rede corporativa ou de celular. Isso **não é bug da POC**: é o caso que exige um servidor TURN, como explicado nos conceitos. Anote no README em que redes funcionou e em quais não.
+
+<Callout tipo="erro" titulo="Deploy falhando com “Defina a senha do grupo”">
+O serviço não sobe e o log do Render mostra `Defina a senha do grupo na variável de ambiente OZAMIGOS_SENHA`: faltou a variável, ou o nome está diferente (maiúsculas importam). Corrija em **Environment**. Não resolva escrevendo a senha no `application.properties`: ela iria parar no GitHub.
+</Callout>
+
+<Callout tipo="erro" titulo="WebSocket recusado com 403 só no Render">
+Se em `localhost` tudo funciona e no Render a página carrega mas "Conexão com o servidor perdida" aparece ao clicar em **Entrar**, quase sempre falta o `server.forward-headers-strategy=framework`: o Spring vê `http`, o navegador diz `https`, e a checagem de origem recusa. Não resolva liberando todas as origens (`setAllowedOriginPatterns("*")`): isso deixaria qualquer site abrir conexões com o seu servidor.
+</Callout>
+
+**Aulas de apoio:** [Docker](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/).
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="README, vídeo e próximos passos" horas={2}>
+
+**Objetivo:** deixar a POC apresentável e explicar o que ela prova.
+
+**Passo 1 — README.** Use este modelo:
+
+```markdown
+# Ozamigos Share — compartilhamento de tela de jogos em 1080p60 (POC)
+
+Prova de conceito: servidor de sinalização em Java (Spring Boot + WebSocket) e WebRTC no navegador.
+O vídeo vai direto de navegador para navegador; o Java só apresenta um ao outro.
+
+![GIF: o jogo chegando em outra máquina com as estatísticas a 60 fps](docs/demo.gif)
+
+No ar: https://ozamigos-share-xxxx.onrender.com (plano gratuito: a primeira visita do dia leva ~1 min)
+Acesso: senha do grupo, configurada na variável de ambiente OZAMIGOS_SENHA.
+
+## Como rodar
+OZAMIGOS_SENHA=teste ./mvnw spring-boot:run → abra http://localhost:8080, digite a senha, clique em Entrar e mande o link.
+Deploy: Dockerfile + Render (Web Service gratuito, publicado a cada push na main, com OZAMIGOS_SENHA em Environment).
+
+## Resultados
+| Ajuste | fps recebidos | Resolução | Mbps | Codec |
+|---|---|---|---|---|
+| Padrão do navegador | ... | ... | ... | ... |
+| Com bitrate, H.264 e maintain-framerate | 60 | 1920x1080 | ~8 | H.264 |
+
+## Como funciona
+(o diagrama da sinalização e um parágrafo)
+
+## Limites e por quê
+- Até 3 pessoas: cada espectador custa 8 Mbps de upload de quem compartilha (P2P).
+- Algumas redes não conectam sem TURN (testei em: ...).
+
+## Próximos passos
+SFU com simulcast para mais pessoas e telas, TURN, login e produção.
+```
+
+**Passo 2 — Vídeo de 1 minuto.** O link do Render abrindo em outra máquina, o clique em **Compartilhar um aplicativo**, o jogo aparecendo do outro lado com as estatísticas a 60 fps, e a troca para a tela inteira sem interromper.
+
+**Passo 3 — Revisar o próprio código.** Releia as três classes Java e o `app.js` e explique em voz alta, para você mesmo, cada seção. Se algum trecho não fizer sentido, volte à explicação do marco correspondente: na entrevista, você vai precisar explicar com as suas palavras.
+
+**Confira:** o repositório tem README com a tabela de resultados, o vídeo ou o GIF e os limites explicados.
+
+**Aulas de apoio:** [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/).
+
+</Marco>
+
+## O código final do `app.js`
+
+Para conferir o seu arquivo inteiro, depois do marco 7:
+
+```js
+// ===== 1. Configuração e estado =====
+
+// STUN: um servidor público que diz ao navegador qual é o seu endereço visto da internet.
+const SERVIDORES_ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
+const BITRATE_MAXIMO = 8_000_000; // 8 Mbps para 1080p a 60 fps
+
+const estado = {
+  ws: null,               // conexão com o servidor de sinalização
+  sala: null,             // código da sala
+  meuId: null,            // id que o servidor me deu
+  pessoas: new Set(),     // ids das outras pessoas na sala
+  quemCompartilha: null,  // id de quem está compartilhando agora (ou null)
+  minhaTela: null,        // a MediaStream da minha tela, se eu estiver compartilhando
+  conexoes: new Map(),    // id da outra pessoa -> { pc, pendentes }
+  recusado: false,        // o servidor recusou a entrada (senha errada, sala cheia, código inválido)
+};
+
+const $ = (id) => document.getElementById(id);
+
+// ===== 2. Código da sala e entrada =====
+
+function codigoDaSala() {
+  const daUrl = new URLSearchParams(location.search).get('sala');
+  if (daUrl) return daUrl;
+  // Sem código na URL: gera um aleatório e coloca na URL, para virar o link da sala.
+  const letras = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const aleatorios = crypto.getRandomValues(new Uint8Array(10));
+  const codigo = Array.from(aleatorios, (n) => letras[n % letras.length]).join('');
+  history.replaceState(null, '', `?sala=${codigo}`);
+  return codigo;
+}
+
+estado.sala = codigoDaSala();
+$('codigo-sala').textContent = estado.sala;
+$('link-sala').textContent = location.href;
+$('senha').value = senhaLembrada();
+$('entrada').onsubmit = (evento) => {
+  evento.preventDefault(); // o formulário não recarrega a página: quem entra é o JavaScript
+  entrar();
+};
+$('botao-copiar').onclick = () => navigator.clipboard.writeText(location.href);
+$('botao-aplicativo').onclick = () => escolherFonte('aplicativo');
+$('botao-tela').onclick = () => escolherFonte('tela');
+$('botao-parar').onclick = () => pararDeCompartilhar(true);
+$('botao-tela-cheia').onclick = () => $('video').requestFullscreen();
+
+// O navegador lembra a senha para a pessoa não digitar toda vez. Em aba anônima,
+// ou com o armazenamento bloqueado, localStorage pode falhar: aí só não lembra.
+function senhaLembrada() {
+  try {
+    return localStorage.getItem('ozamigos-senha') ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function lembrarSenha(senha) {
+  try {
+    if (senha) localStorage.setItem('ozamigos-senha', senha);
+    else localStorage.removeItem('ozamigos-senha');
+  } catch {
+    // sem armazenamento: segue sem lembrar
+  }
+}
+
+// ===== 3. Sinalização (WebSocket com o servidor Java) =====
+
+function entrar() {
+  $('botao-entrar').disabled = true; // dois cliques abririam duas conexões (uma "pessoa fantasma")
+  estado.recusado = false;
+  const protocolo = location.protocol === 'https:' ? 'wss' : 'ws';
+  estado.ws = new WebSocket(`${protocolo}://${location.host}/sinal`);
+  estado.ws.onopen = () => enviar({ tipo: 'entrar', sala: estado.sala, senha: $('senha').value });
+  estado.ws.onclose = () => {
+    if (!estado.recusado) avisar('Conexão com o servidor perdida. Recarregue a página.');
+  };
+
+  // As mensagens são tratadas uma de cada vez, na ordem em que chegaram.
+  let fila = Promise.resolve();
+  estado.ws.onmessage = (evento) => {
+    const msg = JSON.parse(evento.data);
+    fila = fila.then(() => tratar(msg)).catch((erro) => console.error('Erro ao tratar', msg, erro));
+  };
+}
+
+function enviar(msg) {
+  estado.ws.send(JSON.stringify(msg));
+}
+
+// Um "estou aqui" a cada 30 s: sem isso, proxies e hospedagens gratuitas fecham a conexão parada.
+setInterval(() => {
+  if (estado.ws?.readyState === WebSocket.OPEN && estado.meuId) enviar({ tipo: 'ping' });
+}, 30_000);
+
+async function tratar(msg) {
+  switch (msg.tipo) {
+    case 'bem-vindo':
+      estado.meuId = msg.id;
+      msg.outros.forEach((id) => estado.pessoas.add(id));
+      estado.quemCompartilha = msg.quemCompartilha;
+      lembrarSenha($('senha').value);
+      avisar('');
+      $('entrada').hidden = true;
+      $('sala').hidden = false;
+      break;
+    case 'entrou':
+      estado.pessoas.add(msg.id);
+      // Se eu estou compartilhando, quem chegou também precisa receber a minha tela.
+      if (estado.minhaTela) await enviarOferta(msg.id);
+      break;
+    case 'saiu':
+      estado.pessoas.delete(msg.id);
+      fecharConexao(msg.id);
+      if (estado.quemCompartilha === msg.id) quemCompartilhavaParou();
+      break;
+    case 'pode-compartilhar':
+      estado.quemCompartilha = estado.meuId;
+      for (const id of estado.pessoas) await enviarOferta(id);
+      break;
+    case 'compartilhando':
+      estado.quemCompartilha = msg.id;
+      avisar('Recebendo a tela…');
+      break;
+    case 'parou':
+      fecharConexao(msg.id);
+      quemCompartilhavaParou();
+      break;
+    case 'oferta':
+      await receberOferta(msg.de, msg.sdp);
+      break;
+    case 'resposta':
+      await receberResposta(msg.de, msg.sdp);
+      break;
+    case 'candidato':
+      await receberCandidato(msg.de, msg.candidato);
+      break;
+    case 'erro':
+      tratarErro(msg.motivo);
+      break;
+  }
+  atualizarTela();
+}
+
+function tratarErro(motivo) {
+  const textos = {
+    'senha-errada': 'Senha errada. Confira com quem mandou o link.',
+    'sala-cheia': 'A sala está cheia (máximo de 3 pessoas).',
+    'ja-tem-alguem-compartilhando': 'Alguém já está compartilhando. Espere a pessoa parar.',
+  };
+  avisar(textos[motivo] ?? `Erro: ${motivo}`);
+  if (motivo === 'sala-cheia' || motivo === 'codigo-invalido') estado.recusado = true;
+  if (motivo === 'senha-errada') {
+    estado.recusado = true;
+    lembrarSenha(''); // esquece a senha antiga (ela pode ter mudado)
+    $('senha').select();
+    $('botao-entrar').disabled = false; // pode tentar de novo
+  }
+  if (motivo === 'ja-tem-alguem-compartilhando') pararDeCompartilhar(false);
+}
+
+// ===== 4. Compartilhar a minha tela =====
+
+// O que cada botão pede ao navegador. A escolha final (qual janela, qual monitor) é sempre
+// da pessoa, no seletor do navegador: por segurança, a página não pode listar as janelas abertas.
+const FONTES = {
+  aplicativo: { displaySurface: 'window', monitorTypeSurfaces: 'exclude' },
+  tela: { displaySurface: 'monitor', monitorTypeSurfaces: 'include' },
+};
+
+async function capturar(fonte) {
+  try {
+    // Precisa ser chamado direto no clique: o navegador exige um gesto do usuário.
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        displaySurface: FONTES[fonte].displaySurface, // abre o seletor já na aba certa
+        width: { max: 1920 },
+        height: { max: 1080 },
+        frameRate: { ideal: 60, max: 60 },
+      },
+      audio: true,                                    // áudio, se a pessoa marcar a opção
+      monitorTypeSurfaces: FONTES[fonte].monitorTypeSurfaces,
+      selfBrowserSurface: 'exclude',                  // não oferecer a própria aba do Ozamigos Share
+      systemAudio: 'include',
+    });
+  } catch {
+    return null; // a pessoa cancelou o seletor
+  }
+}
+
+async function escolherFonte(fonte) {
+  const tela = await capturar(fonte);
+  if (!tela) return;
+  if (estado.minhaTela) {
+    await trocarFonte(tela);
+  } else {
+    usarTela(tela);
+    enviar({ tipo: 'comecei' });
+  }
+  atualizarTela();
+}
+
+function usarTela(tela) {
+  estado.minhaTela = tela;
+  const [video] = tela.getVideoTracks();
+  video.contentHint = 'motion'; // jogo: priorizar movimento fluido em vez de nitidez de texto
+  video.onended = () => pararDeCompartilhar(true); // botão "Parar compartilhamento" do Chrome
+  $('video').srcObject = tela;
+  $('video').muted = true; // não tocar o meu próprio áudio de volta
+}
+
+// Troca o que está sendo compartilhado sem refazer as conexões:
+// replaceTrack põe a trilha nova no lugar da antiga, dentro da conexão que já existe.
+async function trocarFonte(nova) {
+  const antiga = estado.minhaTela;
+  usarTela(nova);
+  const [video] = nova.getVideoTracks();
+  const [audio] = nova.getAudioTracks();
+  for (const { pc } of estado.conexoes.values()) {
+    for (const transceptor of pc.getTransceivers()) {
+      const tipo = transceptor.receiver.track.kind;
+      await transceptor.sender.replaceTrack(tipo === 'video' ? video : audio ?? null);
+    }
+  }
+  antiga.getVideoTracks()[0].onended = null; // parar a antiga não pode encerrar o compartilhamento
+  antiga.getTracks().forEach((trilha) => trilha.stop());
+}
+
+function pararDeCompartilhar(avisarServidor) {
+  if (!estado.minhaTela) return;
+  estado.minhaTela.getTracks().forEach((trilha) => trilha.stop());
+  estado.minhaTela = null;
+  for (const id of [...estado.conexoes.keys()]) fecharConexao(id);
+  $('video').srcObject = null;
+  if (avisarServidor) enviar({ tipo: 'parei' });
+  if (estado.quemCompartilha === estado.meuId) estado.quemCompartilha = null;
+  atualizarTela();
+}
+
+// ===== 5. Conexões WebRTC =====
+
+function novaConexao(idRemoto) {
+  const pc = new RTCPeerConnection({ iceServers: SERVIDORES_ICE });
+  const conexao = { pc, pendentes: [] };
+  estado.conexoes.set(idRemoto, conexao);
+
+  // Cada caminho de rede descoberto (candidato ICE) vai para o outro lado pelo servidor.
+  pc.onicecandidate = (evento) => {
+    if (evento.candidate) enviar({ tipo: 'candidato', para: idRemoto, candidato: evento.candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    console.log(`Conexão com ${idRemoto}: ${pc.connectionState}`);
+    if (pc.connectionState === 'failed') {
+      avisar('Não foi possível conectar direto com a outra pessoa. Algumas redes exigem um servidor TURN.');
+    }
+  };
+  return conexao;
+}
+
+function fecharConexao(idRemoto) {
+  const conexao = estado.conexoes.get(idRemoto);
+  if (!conexao) return;
+  conexao.pc.close();
+  estado.conexoes.delete(idRemoto);
+}
+
+// Lado de quem compartilha: uma conexão (e uma oferta) para cada pessoa.
+async function enviarOferta(idEspectador) {
+  fecharConexao(idEspectador);
+  const { pc } = novaConexao(idEspectador);
+  const [video] = estado.minhaTela.getVideoTracks();
+  const transceptor = pc.addTransceiver(video, {
+    direction: 'sendonly',
+    streams: [estado.minhaTela],
+    sendEncodings: [{ maxBitrate: BITRATE_MAXIMO, maxFramerate: 60 }],
+  });
+  preferirH264(transceptor);
+  // Sempre cria o canal de áudio, mesmo sem áudio agora: assim a troca de fonte não precisa renegociar.
+  const [audio] = estado.minhaTela.getAudioTracks();
+  pc.addTransceiver(audio ?? 'audio', { direction: 'sendonly', streams: [estado.minhaTela] });
+  await pc.setLocalDescription(await pc.createOffer());
+  enviar({ tipo: 'oferta', para: idEspectador, sdp: pc.localDescription });
+}
+
+// H.264 é o codec que quase toda placa de vídeo codifica em hardware.
+function preferirH264(transceptor) {
+  if (!transceptor.setCodecPreferences) return;
+  const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
+  const h264 = codecs.filter((c) => c.mimeType === 'video/H264');
+  if (h264.length === 0) return;
+  transceptor.setCodecPreferences([...h264, ...codecs.filter((c) => c.mimeType !== 'video/H264')]);
+}
+
+async function receberResposta(idEspectador, sdp) {
+  const conexao = estado.conexoes.get(idEspectador);
+  if (!conexao) return;
+  await conexao.pc.setRemoteDescription(sdp);
+  await aplicarCandidatosPendentes(conexao);
+  // Se a rede apertar, manter os 60 fps e baixar a resolução (o contrário borraria o movimento).
+  const remetente = conexao.pc.getSenders().find((s) => s.track?.kind === 'video');
+  const parametros = remetente.getParameters();
+  parametros.degradationPreference = 'maintain-framerate';
+  try {
+    await remetente.setParameters(parametros);
+  } catch (erro) {
+    console.warn('O navegador não aceitou degradationPreference', erro);
+  }
+}
+
+// Lado de quem assiste: responde à oferta e mostra o vídeo que chegar.
+async function receberOferta(idCompartilhador, sdp) {
+  fecharConexao(idCompartilhador);
+  const conexao = novaConexao(idCompartilhador);
+  conexao.pc.ontrack = (evento) => {
+    $('video').srcObject = evento.streams[0];
+    $('video').muted = false;
+    avisar('');
+  };
+  await conexao.pc.setRemoteDescription(sdp);
+  await aplicarCandidatosPendentes(conexao);
+  await conexao.pc.setLocalDescription(await conexao.pc.createAnswer());
+  enviar({ tipo: 'resposta', para: idCompartilhador, sdp: conexao.pc.localDescription });
+}
+
+// Um candidato pode chegar antes da oferta ou da resposta: guarda e aplica depois.
+async function receberCandidato(idRemoto, candidato) {
+  const conexao = estado.conexoes.get(idRemoto);
+  if (!conexao) return;
+  if (conexao.pc.remoteDescription) {
+    await conexao.pc.addIceCandidate(candidato);
+  } else {
+    conexao.pendentes.push(candidato);
+  }
+}
+
+async function aplicarCandidatosPendentes(conexao) {
+  for (const candidato of conexao.pendentes) await conexao.pc.addIceCandidate(candidato);
+  conexao.pendentes = [];
+}
+
+function quemCompartilhavaParou() {
+  estado.quemCompartilha = null;
+  if (!estado.minhaTela) $('video').srcObject = null;
+  avisar('');
+}
+
+// ===== 6. Tela =====
+
+function atualizarTela() {
+  const total = estado.pessoas.size + 1;
+  $('pessoas').textContent = `${total} ${total === 1 ? 'pessoa' : 'pessoas'} na sala`;
+  const euCompartilho = estado.minhaTela !== null;
+  const outroCompartilha = estado.quemCompartilha !== null && estado.quemCompartilha !== estado.meuId;
+  const podeCapturar = Boolean(navigator.mediaDevices?.getDisplayMedia);
+  for (const id of ['botao-aplicativo', 'botao-tela']) {
+    $(id).disabled = !podeCapturar || outroCompartilha;
+    $(id).title = podeCapturar ? '' : 'Para compartilhar, use Chrome ou Edge no computador, por HTTPS ou localhost';
+  }
+  $('botao-aplicativo').textContent = euCompartilho ? 'Trocar para um aplicativo' : 'Compartilhar um aplicativo';
+  $('botao-tela').textContent = euCompartilho ? 'Trocar para a tela inteira' : 'Compartilhar a tela inteira';
+  $('botao-parar').hidden = !euCompartilho;
+  $('botao-tela-cheia').hidden = !outroCompartilha;
+  $('fonte').textContent = euCompartilho ? descreverFonte() : '';
+}
+
+function descreverFonte() {
+  const { displaySurface } = estado.minhaTela.getVideoTracks()[0].getSettings();
+  const nomes = { window: 'um aplicativo', monitor: 'a tela inteira', browser: 'uma aba do navegador' };
+  const audio = estado.minhaTela.getAudioTracks().length > 0 ? 'com' : 'sem';
+  return `Você está compartilhando ${nomes[displaySurface] ?? 'a sua tela'}, ${audio} áudio.`;
+}
+
+function avisar(texto) {
+  $('aviso').textContent = texto;
+}
+
+// ===== 7. Estatísticas: a prova dos 60 fps =====
+
+const anteriores = new Map(); // id do relatório -> { bytes, momento }
+
+setInterval(async () => {
+  const linhas = [];
+  for (const [id, { pc }] of estado.conexoes) {
+    const relatorio = await pc.getStats();
+    relatorio.forEach((r) => {
+      if (r.kind !== 'video' || (r.type !== 'outbound-rtp' && r.type !== 'inbound-rtp')) return;
+      const enviando = r.type === 'outbound-rtp';
+      const bytes = enviando ? r.bytesSent : r.bytesReceived;
+      const anterior = anteriores.get(r.id);
+      const mbps = anterior ? ((bytes - anterior.bytes) * 8) / ((r.timestamp - anterior.momento) * 1000) : 0;
+      anteriores.set(r.id, { bytes, momento: r.timestamp });
+      const codec = relatorio.get(r.codecId)?.mimeType ?? '?';
+      let linha = `${enviando ? 'enviando para' : 'recebendo de'} ${id}: ` +
+        `${r.framesPerSecond ?? 0} fps · ${r.frameWidth ?? '?'}x${r.frameHeight ?? '?'} · ` +
+        `${mbps.toFixed(1)} Mbps · ${codec}`;
+      if (enviando) {
+        linha += ` · limitação: ${r.qualityLimitationReason} · codificador: ${r.encoderImplementation ?? '?'}`;
+      } else {
+        linha += ` · congelamentos: ${r.freezeCount ?? 0} · quadros perdidos: ${r.framesDropped ?? 0}`;
+      }
+      linhas.push(linha);
+    });
+  }
+  $('estatisticas').textContent = linhas.join('\n');
+}, 1000);
+```
+
+## Problemas comuns
+
+| Sintoma | Causa provável | O que fazer |
+|---|---|---|
+| O servidor não sobe: `Defina a senha do grupo na variável de ambiente OZAMIGOS_SENHA` | Variável não definida no IntelliJ, no terminal ou no Render | Marco 3 (rodar com a senha) e marco 8, passo 6 |
+| "Senha errada" com a senha certa | Maiúsculas, espaço no fim, ou a senha mudou no Render | Confira o valor em **Environment** no Render e digite de novo |
+| A conexão WebSocket fecha logo ao entrar, sem mensagem (local) | O `Origin` recusado: abriu a página por um endereço e o WebSocket foi para outro | Abra a página pelo mesmo endereço do servidor |
+| Funciona local, mas no Render dá "Conexão com o servidor perdida" | Falta `server.forward-headers-strategy=framework` | Marco 8, passo 1 |
+| Build do Render falha com `permission denied` ou `bad interpreter` | `mvnw` sem permissão ou com quebras de linha do Windows | `chmod +x` no Dockerfile e o `.gitattributes` do marco 8 |
+| A página do Render demora cerca de 1 minuto para abrir | O serviço gratuito estava dormindo | Normal no plano gratuito |
+| Todos caíram da sala de uma vez | O Render reiniciou ou publicou uma versão nova; as salas em memória se perderam | Entrar de novo; é o limite de uma POC sem banco |
+| A conexão fecha ao começar a compartilhar | A mensagem passou do limite de texto do Tomcat | Confira o `ServletServerContainerFactoryBean` com 64 KB |
+| Botões de compartilhar desabilitados | Página fora de contexto seguro, ou navegador sem `getDisplayMedia` | Use `localhost` ou o endereço HTTPS do Render, no Chrome ou no Edge do computador |
+| Vídeo preto ao compartilhar um aplicativo | Jogo em tela cheia exclusiva | Modo janela sem bordas, ou **Compartilhar a tela inteira** |
+| Compartilhando um aplicativo, os amigos não ouvem o jogo | O áudio de uma janela depende do navegador e do sistema | **Compartilhar a tela inteira** e marcar "Compartilhar áudio do sistema" |
+| Funciona em casa e não com o amigo | Rede sem conexão direta (CGNAT, corporativa) | Esperado sem TURN; anote no README |
+| "Às vezes conecta, às vezes não" | Candidato chegando antes da descrição remota, ou mensagens fora de ordem | Confira a fila de mensagens e a lista de pendentes |
+| 720p nos primeiros segundos | Estimativa de banda subindo | Normal; espere 10 a 15 segundos |
+| Abaixo de 60 fps com `cpu` | Codificação por software | Driver da placa de vídeo e `chrome://gpu` |
+
+## Rubrica de autoavaliação
+
+| Critério | Ainda não | Pronto | Além do esperado |
+|---|---|---|---|
+| Funciona | Só na mesma máquina | No ar no Render, com um amigo assistindo pela internet; aplicativo e tela inteira, com troca sem interromper | Testado em várias redes, com o resultado de cada uma no README |
+| 60 fps | "Parece fluido" | Estatísticas mostrando 60 fps e a tabela antes × depois | Explica o `qualityLimitationReason` de uma medição ruim e como resolveu |
+| Servidor Java | Estado sem sincronização, ou senha conferida só no JavaScript | `Salas` sincronizada, senha conferida no servidor e vinda de variável de ambiente, testes passando, `de` preenchido pelo servidor | Um teste de integração com dois clientes WebSocket de verdade, ou um limite de tentativas de senha erradas |
+| Entendimento | Copiou sem entender | Explica sinalização, SDP, ICE, STUN e TURN com as próprias palavras | Explica por que o próximo passo é um SFU, com a conta do upload |
+| Apresentação | Sem README | README com resultados, limites e vídeo | Post no LinkedIn com o GIF e o que aprendeu |
+
+## Como apresentar na entrevista
+
+**Pitch (30 segundos):** "Fiz uma prova de conceito de compartilhamento de tela de jogos em 1080p a 60 fps, no ar de graça no Render e protegida por uma senha do grupo. A pessoa escolhe compartilhar um aplicativo ou a tela inteira, e pode trocar sem interromper quem assiste. O vídeo vai direto de navegador para navegador com WebRTC; o meu servidor em Java, com Spring Boot e WebSocket, faz a sinalização: põe as pessoas nas salas e repassa a oferta, a resposta e os candidatos de rede. Medi os 60 fps pelas estatísticas do próprio WebRTC, e documentei por que a POC vai até 3 pessoas e o que mudaria para escalar."
+
+**Perguntas prováveis:**
+
+1. **O vídeo passa pelo seu servidor?** Não: só a sinalização. O vídeo vai por UDP direto entre os navegadores.
+2. **Por que UDP?** Perder um pacote é melhor que atrasar todos os seguintes.
+3. **O que são SDP e candidatos ICE?** O "o que vou mandar e como" e o "por onde me encontrar".
+4. **O que acontece se duas pessoas clicarem em Compartilhar ao mesmo tempo?** O `synchronized` em `Salas` garante que só uma vira quem compartilha.
+5. **Por que só 3 pessoas?** A conta do upload no ponto a ponto, e como um SFU resolve.
+6. **Por que às vezes não conecta pela internet?** NAT, STUN e quando é preciso TURN.
+7. **Como você sabe que é 60 fps?** `getStats()`, e o que cada campo significa.
+8. **Por que a página não mostra uma lista das janelas abertas?** Segurança do navegador; a página só sugere a aba do seletor, e uma lista própria exige app desktop.
+9. **Como você troca a fonte sem derrubar quem assiste?** `replaceTrack` no remetente da conexão existente, sem nova negociação.
+10. **Como fez o deploy e quais os limites?** Dockerfile multi-stage, porta pela variável `PORT`, cabeçalhos do proxy, plano gratuito que dorme, salas em memória numa instância só.
+11. **Como você impede que alguém com o link entre?** Senha do grupo conferida no servidor, antes de qualquer informação sobre a sala; vem de variável de ambiente, nunca do código; comparada com `MessageDigest.isEqual`. E o limite: não dá para tirar uma pessoa só, e contas por pessoa seriam o próximo passo.
+
+## Próximos passos
+
+O caminho natural é a [Arquibancada](../../pleno/03-arquibancada/) (Pleno): o mesmo produto com um SFU (LiveKit) e simulcast para até 10 pessoas e 4 telas, login, TURN, qualidade medida como SLO e produção numa VPS. Depois, o [Resenha](../../senior/03-resenha/) (Sênior) acrescenta voz, chat, comunidades e app desktop.
+
+## Para aprender mais
+
+- [WebRTC for the Curious](https://webrtcforthecurious.com/): livro gratuito que explica sinalização, ICE, NAT, mídia e segurança.
+- [MDN: WebRTC API](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API) e [MDN: Screen Capture API](https://developer.mozilla.org/en-US/docs/Web/API/Screen_Capture_API).
+- [MDN: Perfect negotiation](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation): o padrão para quando os dois lados podem iniciar a negociação (um bom próximo estudo).
+- [Spring Framework: WebSocket](https://docs.spring.io/spring-framework/reference/web/websocket.html).
+- [Chrome: controles de compartilhamento de tela](https://developer.chrome.com/docs/web-platform/screen-sharing-controls) (`displaySurface`, `monitorTypeSurfaces`, `selfBrowserSurface`).
+- [Render: Deploy for Free](https://render.com/docs/free) e [Docker no Render](https://render.com/docs/docker).
+- [High Performance Browser Networking, capítulo de WebRTC](https://hpbn.co/webrtc/).

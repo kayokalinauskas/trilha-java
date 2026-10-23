@@ -1,0 +1,112 @@
+---
+titulo: Projeção de conta a partir de eventos
+codigo: "04.04"
+resumo: Reconstrua o estado de contas bancárias a partir de um histórico de eventos imutáveis (event sourcing), usando sealed types, switch exaustivo com record patterns e Streams.
+modulo: 04-java-moderno
+ordem: 4
+dificuldade: dificil
+tempo: 2–3h
+conceitos: [sealed, record patterns, event sourcing, Streams, java.time]
+aulas: [04-java-moderno/05-java-moderno-na-pratica, 02-poo/06-sealed-e-pattern-matching]
+java:
+  modulo: m04-java-moderno
+  teste: ProjecaoContaTest
+---
+
+## Contexto
+
+Um banco digital adotou **event sourcing** no núcleo de contas: em vez de guardar o saldo e sobrescrevê-lo, cada fato é gravado como um evento imutável (`ContaAberta`, `Deposito`, `Saque`, `TransferenciaRecebida`, `ContaBloqueada`). O saldo atual é **calculado** a partir dos eventos. Isso dá auditoria completa — exigência do regulador — e permite responder "qual era o saldo no dia 15?".
+
+Você vai escrever a **projeção**: o código que transforma a sequência de eventos no estado atual da conta.
+
+## O modelo (pronto)
+
+```java
+sealed interface EventoConta {
+    String contaId();
+    Instant momento();
+    record ContaAberta(String contaId, Instant momento, String titular) implements EventoConta { }
+    record Deposito(String contaId, Instant momento, BigDecimal valor) implements EventoConta { }
+    record Saque(String contaId, Instant momento, BigDecimal valor) implements EventoConta { }
+    record TransferenciaRecebida(String contaId, Instant momento, BigDecimal valor, String origem) implements EventoConta { }
+    record ContaBloqueada(String contaId, Instant momento, String motivo) implements EventoConta { }
+}
+record EstadoConta(String contaId, String titular, BigDecimal saldo, boolean bloqueada, int eventosAplicados) { }
+```
+
+## Requisitos
+
+| Método | Comportamento |
+|---|---|
+| `reconstruir(eventos)` | Eventos de **uma** conta: ordena pelo `momento` e aplica a partir do estado vazio |
+| `reconstruirTodas(eventos)` | Histórico misturado → `Map<contaId, EstadoConta>` com as contas em ordem alfabética |
+| `descrever(evento)` | Texto do extrato (formatos abaixo), com **record patterns** |
+| `totalMovimentado(eventos, dia, fuso)` | Soma de depósitos, saques e transferências recebidas no **dia local** informado |
+
+**Regras:**
+
+- A ordem de chegada não importa: os eventos são **ordenados pelo momento** antes de aplicar.
+- O primeiro evento de uma conta **precisa** ser `ContaAberta`; senão, `IllegalStateException` citando "ContaAberta". Lista vazia também é inválida.
+- `reconstruir` com eventos de mais de uma conta: `IllegalArgumentException`.
+- Bloqueio **não altera o saldo**; eventos continuam sendo aplicados depois dele (o evento já aconteceu — é um fato).
+
+**Descrições:**
+
+```text
+Conta aberta para Ana
+Depósito de R$ 500.00
+Saque de R$ 120.00
+Transferência de R$ 75.50 recebida de A
+Conta bloqueada: suspeita de fraude
+```
+
+## Detalhe de fuso horário
+
+Um depósito às 23h59 de 02/03 em São Paulo acontece às 02h59 de 03/03 em UTC. `totalMovimentado` recebe o `ZoneId` e deve converter cada `Instant` para a data **local** antes de comparar. É um bug clássico de sistemas financeiros — e o teste tem um evento exatamente às 23h59.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ProjecaoContaTest` passam.
+- [ ] Nenhum `switch` tem `default`.
+- [ ] A regra de aplicar um evento é uma **função pura** `(estado, evento) → novo estado`.
+- [ ] Adicionar um novo tipo de evento ao `sealed` faria o código parar de compilar nos lugares certos.
+
+## Desafios opcionais
+
+- `saldoEm(eventos, instante)`: o saldo em qualquer momento do passado.
+- **Snapshot**: dado um `EstadoConta` já calculado e os eventos posteriores, continue a partir dele sem reprocessar tudo.
+- Rejeite saques quando a conta estiver bloqueada — e discuta: isso é regra da **projeção** ou de quem **gera** os eventos?
+
+<Dicas>
+<Dica nivel={1}>
+Separe o problema em três partes: validar (lista vazia, contas misturadas, primeiro evento), ordenar (`sorted(Comparator.comparing(EventoConta::momento))`) e aplicar em sequência, com uma variável de estado atualizada a cada evento.
+</Dica>
+<Dica nivel={2}>
+Escreva `private static EstadoConta aplicar(EstadoConta atual, EventoConta evento)` com um `switch` sobre o evento. No `case ContaAberta`, o estado anterior é ignorado (ainda não existe); nos outros, crie um novo `EstadoConta` a partir do atual. `reconstruirTodas` = `groupingBy(contaId, TreeMap::new, collectingAndThen(toList(), ProjecaoConta::reconstruir))`.
+</Dica>
+<Dica nivel={3}>
+Record patterns com `var` para os componentes que não interessam: `case Deposito(var conta, var momento, BigDecimal valor) -> "Depósito de R$ " + valor;`. Para o fuso: `evento.momento().atZone(fuso).toLocalDate().equals(dia)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m04-java-moderno/solucao/src/main/java/dev/trilhajava/m04/eventos/ProjecaoConta.java" />
+
+### Os conceitos em jogo
+
+- **Fold de eventos.** `reconstruir` é um "reduce" de eventos sobre o estado: o laço aplica `aplicar` em sequência. Poderia ser escrito com `Stream.reduce`, mas `reduce` exige uma função de combinação associativa (para paralelismo), que não faz sentido aqui — a ordem importa. O laço é mais honesto.
+- **Função pura e imutabilidade.** `aplicar` nunca altera o estado recebido; sempre cria um novo `EstadoConta`. Reconstruir a mesma conta duas vezes sempre dá o mesmo resultado, e testar é trivial.
+- **`groupingBy` + `collectingAndThen`** reaproveita `reconstruir` para cada conta, com as validações incluídas.
+- **Exaustividade em três lugares.** `aplicar`, `descrever` e `valorMovimentado` tratam todos os tipos de evento sem `default`. Um novo `EstornoRecebido` quebraria os três na compilação — exatamente onde é preciso decidir o que ele significa.
+- **`Instant` + `ZoneId`.** Eventos guardam o instante universal; a conversão para o dia local acontece só na borda, onde o negócio pergunta "quanto movimentou no dia 2, no horário de Brasília?".
+
+### Avalie sua solução
+
+- O depósito de 23h59 entra no dia 02/03 na sua soma?
+- Seu `reconstruir` altera (muta) algum objeto de estado, ou sempre cria um novo?
+- Você usou `default` em algum switch? Remova e veja o que o compilador diz.
+
+</Solucao>

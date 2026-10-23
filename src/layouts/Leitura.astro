@@ -1,0 +1,356 @@
+---
+/**
+ * Layout de leitura em 3 colunas: navegação do módulo | conteúdo | sumário da página.
+ * Usado por aulas, exercícios e projetos. Tem modo foco e barra de progresso de leitura.
+ * Sem `modulo` (projetos), a coluna da esquerda mostra o slot "lateral".
+ */
+import type { MarkdownHeading } from 'astro';
+import Base from './Base.astro';
+import Icon from '../components/Icon.astro';
+import '../styles/prose.css';
+import { getAulas, getExercicios, pad2, type Modulo } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+interface Props {
+  title: string;
+  description: string;
+  modulo?: Modulo;
+  headings: MarkdownHeading[];
+  /** id do item atual no formato "a:<id>" ou "e:<id>" */
+  atual?: string;
+}
+
+const { title, description, modulo, headings, atual } = Astro.props;
+const [aulas, exercicios] = modulo ? await Promise.all([getAulas(modulo.id), getExercicios(modulo.id)]) : [[], []];
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+<Base title={title} description={description} compact>
+  <div class="read-progress" aria-hidden="true"><span></span></div>
+  <div class="leitura">
+    {!modulo && (
+      <aside class="nav-mod" aria-label="Plano do projeto">
+        <slot name="lateral" />
+      </aside>
+    )}
+    {modulo && (
+    <aside class="nav-mod" aria-label={`Módulo ${modulo.data.titulo}`}>
+      <div class="nav-mod-inner">
+        <a class="nav-mod-head" href={url(`modulos/${modulo.id}`)}>
+          <span class="mono">{pad2(modulo.data.numero)}</span>
+          <span>{modulo.data.titulo}</span>
+        </a>
+        <p class="nav-sec">Aulas</p>
+        <ol>
+          {
+            aulas.map((a) => (
+              <li>
+                <a
+                  href={url(`aulas/${a.id}`)}
+                  data-item={`a:${a.id}`}
+                  aria-current={atual === `a:${a.id}` ? 'page' : undefined}
+                >
+                  <span class="dot" aria-hidden="true" />
+                  {a.data.titulo}
+                </a>
+              </li>
+            ))
+          }
+        </ol>
+        {
+          exercicios.length > 0 && (
+            <>
+              <p class="nav-sec">Exercícios</p>
+              <ol>
+                {exercicios.map((e) => (
+                  <li>
+                    <a
+                      href={url(`exercicios/${e.id}`)}
+                      data-item={`e:${e.id}`}
+                      aria-current={atual === `e:${e.id}` ? 'page' : undefined}
+                    >
+                      <span class="dot" aria-hidden="true" />
+                      <span class="mono cod">{e.data.codigo}</span> {e.data.titulo}
+                    </a>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )
+        }
+      </div>
+    </aside>
+    )}
+
+    <article class="conteudo" data-pagefind-body>
+      <div class="tools" data-pagefind-ignore>
+        <button type="button" class="btn btn-ghost btn-sm" id="modo-foco" aria-pressed="false">
+          <Icon name="focus" size={15} /> <span>Modo foco</span>
+        </button>
+      </div>
+      <slot name="header" />
+      <slot />
+      <slot name="footer" />
+    </article>
+
+    <aside class="toc" aria-label="Nesta página" data-pagefind-ignore>
+      {
+        toc.length > 0 && (
+          <div class="toc-inner">
+            <p class="nav-sec">Nesta página</p>
+            <ul>
+              {toc.map((h) => (
+                <li class={`d${h.depth}`}>
+                  <a href={`#${h.slug}`} data-toc={h.slug}>
+                    {h.text}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      }
+    </aside>
+  </div>
+</Base>
+
+<script>
+  import { aoMudar, ler, toast } from '../lib/progresso';
+
+  // status na navegação lateral
+  function marcar() {
+    const p = ler();
+    document.querySelectorAll<HTMLElement>('.nav-mod [data-item]').forEach((el) => {
+      const [tipo, ...r] = el.dataset.item!.split(':');
+      const id = r.join(':');
+      el.classList.toggle('feito', tipo === 'a' ? !!p.aulas[id] : p.exercicios[id]?.status === 'concluido');
+    });
+  }
+  marcar();
+  aoMudar(marcar);
+
+  // barra de progresso de leitura
+  const barra = document.querySelector<HTMLElement>('.read-progress span')!;
+  const artigo = document.querySelector<HTMLElement>('.conteudo')!;
+  const onScroll = () => {
+    const r = artigo.getBoundingClientRect();
+    const total = r.height - innerHeight;
+    const pct = total > 0 ? Math.min(1, Math.max(0, -r.top / total)) : 1;
+    barra.style.transform = `scaleX(${pct})`;
+  };
+  addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+
+  // destaca a seção atual no sumário
+  const links = new Map([...document.querySelectorAll<HTMLAnchorElement>('[data-toc]')].map((a) => [a.dataset.toc!, a]));
+  if (links.size) {
+    const obs = new IntersectionObserver(
+      (entradas) => {
+        for (const e of entradas) {
+          if (e.isIntersecting) {
+            links.forEach((a) => a.removeAttribute('aria-current'));
+            links.get(e.target.id)?.setAttribute('aria-current', 'true');
+          }
+        }
+      },
+      { rootMargin: '-80px 0px -70% 0px' },
+    );
+    links.forEach((_, id) => {
+      const alvo = document.getElementById(id);
+      if (alvo) obs.observe(alvo);
+    });
+  }
+
+  // modo foco
+  const html = document.documentElement;
+  const foco = document.getElementById('modo-foco')!;
+  const aplicarFoco = () => {
+    const ativo = html.hasAttribute('data-foco');
+    foco.setAttribute('aria-pressed', String(ativo));
+    foco.querySelector('span')!.textContent = ativo ? 'Sair do foco' : 'Modo foco';
+  };
+  aplicarFoco();
+  foco.addEventListener('click', () => {
+    html.toggleAttribute('data-foco');
+    try {
+      localStorage.setItem('trilha-java:foco', html.hasAttribute('data-foco') ? '1' : '0');
+    } catch {}
+    aplicarFoco();
+    if (html.hasAttribute('data-foco')) toast('Modo foco ativado. Tecla F alterna.');
+  });
+  document.addEventListener('keydown', (e) => {
+    const alvo = e.target as HTMLElement;
+    if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey && !alvo.closest('input, textarea, dialog')) foco.click();
+  });
+</script>
+
+<style>
+  .read-progress {
+    position: fixed;
+    top: var(--header-h);
+    left: 0;
+    right: 0;
+    height: 2px;
+    z-index: 39;
+    pointer-events: none;
+  }
+  .read-progress span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transform-origin: left;
+    transform: scaleX(0);
+  }
+  .leitura {
+    display: grid;
+    grid-template-columns: 17rem minmax(0, 1fr) 14rem;
+    gap: clamp(24px, 3vw, 3.5rem);
+    max-width: var(--page-max);
+    margin-inline: auto;
+    padding-inline: var(--gutter);
+  }
+  .nav-mod,
+  .toc {
+    position: sticky;
+    top: var(--header-h);
+    align-self: start;
+    max-height: calc(100dvh - var(--header-h));
+    overflow-y: auto;
+    padding-block: 28px;
+    scrollbar-width: thin;
+  }
+  .nav-mod-head {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    text-decoration: none;
+    font-family: var(--font-display);
+    font-weight: 650;
+    line-height: 1.3;
+  }
+  .nav-mod-head .mono {
+    color: var(--accent);
+  }
+  .mono {
+    font-family: var(--font-mono);
+  }
+  .nav-sec {
+    margin: 20px 12px 8px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .nav-mod ol,
+  .toc ul {
+    list-style: none;
+    padding: 0;
+  }
+  .nav-mod a {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    padding: 7px 12px;
+    border-radius: 9px;
+    font-size: 0.88rem;
+    line-height: 1.4;
+    color: var(--text-2);
+    text-decoration: none;
+  }
+  .nav-mod a:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .nav-mod a[aria-current='page'] {
+    background: var(--accent-soft);
+    color: var(--text);
+    font-weight: 600;
+  }
+  .nav-mod .cod {
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .dot {
+    flex-shrink: 0;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 1.5px solid var(--border-strong);
+    translate: 0 -1px;
+  }
+  .nav-mod a[aria-current='page'] .dot {
+    border-color: var(--accent);
+  }
+  .nav-mod a.feito .dot {
+    background: var(--ok);
+    border-color: var(--ok);
+  }
+  .conteudo {
+    min-width: 0;
+    padding-block: 28px 64px;
+  }
+  .tools {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 4px;
+  }
+  .toc-inner {
+    border-left: 1px solid var(--border);
+  }
+  .toc .nav-sec {
+    margin-top: 0;
+  }
+  .toc a {
+    display: block;
+    padding: 5px 12px;
+    margin-left: -1px;
+    border-left: 2px solid transparent;
+    font-size: 0.83rem;
+    line-height: 1.4;
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .toc .d3 a {
+    padding-left: 24px;
+  }
+  .toc a:hover {
+    color: var(--text);
+  }
+  .toc a[aria-current='true'] {
+    color: var(--accent);
+    border-left-color: var(--accent);
+  }
+
+  :global(html[data-foco]) .leitura {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: calc(var(--measure) + 2 * var(--gutter));
+  }
+  :global(html[data-foco]) .nav-mod,
+  :global(html[data-foco]) .toc {
+    display: none;
+  }
+
+  @media (max-width: 1240px) {
+    .leitura {
+      grid-template-columns: 15.5rem minmax(0, 1fr);
+    }
+    .toc {
+      display: none;
+    }
+  }
+  @media (max-width: 900px) {
+    .leitura {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .nav-mod,
+    .tools {
+      display: none;
+    }
+  }
+</style>

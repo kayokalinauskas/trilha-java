@@ -1,0 +1,886 @@
+---
+titulo: "Falhas no consumo: retry com backoff, DLQ e mensagens envenenadas"
+descricao: "O que fazer quando o consumidor falha: separar falha transitória de permanente, repetir com backoff exponencial e jitter, escolher entre retry bloqueante (DefaultErrorHandler) e tópicos de retry (@RetryableTopic), mandar para o DLT com headers de diagnóstico, neutralizar a mensagem envenenada e reprocessar a DLQ sem criar uma tempestade de retries. Tudo rodando num Kafka embutido, sem Docker."
+modulo: 12-mensageria
+ordem: 6
+duracao: 120
+objetivos:
+  - Classificar uma falha de consumo em transitória, permanente ou bug e decidir, para cada uma, entre repetir e mandar para a DLQ
+  - Calcular e configurar backoff exponencial com teto e jitter (ExponentialBackOff do Spring Framework 7) e explicar por que o jitter evita a tempestade de retries
+  - Configurar no Spring Kafka 4 o DefaultErrorHandler com DeadLetterPublishingRecoverer, exceções não repetíveis e um RetryListener que mede as falhas
+  - Ler os headers de diagnóstico de uma mensagem no DLT (tópico, partição, offset, causa) e explicar por que o DLT termina em -dlt no Spring Kafka 4
+  - Escolher entre retry bloqueante e @RetryableTopic com base na ordem por chave e no tempo de espera, e demonstrar a perda de ordem num teste
+  - Reconhecer a mensagem envenenada no deserializer e neutralizá-la com ErrorHandlingDeserializer ou leitura como String
+  - Reprocessar mensagens do DLT com filtro, limite e contador de reprocessamentos, contando com um consumidor idempotente
+tags: [retry, backoff, jitter, DLQ, DLT, DefaultErrorHandler, poison pill, RetryableTopic, DeadLetterPublishingRecoverer, reprocessamento]
+flashcards:
+  - frente: Falha transitória × permanente
+    verso: Transitória pode dar certo se tentar de novo (timeout, 503, 429, deadlock, broker reiniciando). Permanente nunca vai dar certo (JSON inválido, regra de negócio violada, 400, 404, 422). Só a transitória merece retry; a permanente vai direto para a DLQ.
+  - frente: Para que serve o jitter no backoff?
+    verso: Espalhar as novas tentativas no tempo. Sem jitter, mil consumidores que falharam juntos tentam de novo juntos (thundering herd) e derrubam o serviço que estava se recuperando. Com jitter, a carga chega distribuída.
+  - frente: O que é uma mensagem envenenada (poison pill)?
+    verso: "Uma mensagem que sempre falha. Se a falha acontece no deserializer, antes do listener, o DefaultErrorHandler não consegue tratá-la, o offset não avança e a partição inteira trava. Saída: ErrorHandlingDeserializer, ou ler String e converter no listener."
+  - frente: Qual o sufixo padrão do dead letter topic no Spring Kafka 4?
+    verso: 'O sufixo "-dlt" (por exemplo, pedidos.pagos-dlt), o mesmo dos tópicos de retry. Até o 3.x, o DeadLetterPublishingRecoverer usava ".DLT". O DLT precisa existir com pelo menos o mesmo número de partições do tópico original.'
+  - frente: Retry bloqueante × tópicos de retry (@RetryableTopic)
+    verso: O bloqueante (DefaultErrorHandler com BackOff) repete na mesma partição e preserva a ordem, mas segura as mensagens seguintes. Os tópicos de retry não bloqueiam a partição, mas a mensagem que falhou passa para trás das seguintes.
+  - frente: Que headers o DeadLetterPublishingRecoverer acrescenta?
+    verso: "kafka_dlt-original-topic, -original-partition, -original-offset, -original-timestamp, -original-consumer-group, -exception-fqcn, -exception-cause-fqcn, -exception-message e -exception-stacktrace: de onde a mensagem veio e por que morreu."
+  - frente: O que é uma tempestade de retries?
+    verso: Quando as repetições multiplicam a carga sobre um serviço que já está com problema. Acontece com retry sem jitter, sem limite, ou em várias camadas ao mesmo tempo (3 tentativas em 3 camadas viram 27 chamadas). Remédio - jitter, orçamento de retries, um único ponto de retry e circuit breaker.
+  - frente: Como reprocessar a DLQ com segurança?
+    verso: Corrigir a causa primeiro; selecionar só as mensagens que a correção resolve (por causa, período, chave); republicar com a mesma chave, em lotes; contar os reprocessamentos num header e parar no limite; e ter um consumidor idempotente, porque parte das mensagens pode já ter efeito aplicado.
+---
+
+Sexta-feira de Black Friday, 2h03 da manhã. O serviço de faturamento da loja consome o tópico `pedidos.pagos` e, para cada pedido, chama a API do emissor de notas fiscais. A API começa a responder `503 Service Unavailable`. Ela volta quatro minutos depois, mas o estrago depende de como o consumidor foi escrito. Se ele **engole** a exceção num `catch` e segue em frente, 11 mil pedidos ficam sem nota e ninguém percebe até o primeiro cliente reclamar. Se ele **repete para sempre, sem esperar**, a partição fica girando em falso, os logs enchem o disco e, quando o emissor volta, recebe todas as repetições de uma vez e cai de novo. E se, no meio disso, chega um único evento com o JSON quebrado, a partição inteira pode parar até alguém intervir.
+
+Nas aulas anteriores, o consumidor funcionava: você aprendeu a publicar com segurança ([outbox](../../12-mensageria/04-transactional-outbox/)) e a processar duas vezes sem efeito duplicado ([consumidores idempotentes](../../12-mensageria/05-consumidores-idempotentes/)). Esta aula é sobre quando ele **não** funciona. A pergunta é sempre a mesma: **tentar de novo, ou desistir e guardar a mensagem num lugar seguro?** E, quando desistir, como alguém fica sabendo, investiga e reprocessa sem piorar a situação?
+
+Você vai construir e testar, num Kafka de verdade que roda dentro da JVM do teste (sem Docker), um consumidor que repete falhas transitórias com backoff exponencial e jitter, manda as permanentes direto para o *dead letter topic*, mede cada falha, e uma ferramenta que reprocessa o DLT depois da correção. Vai ver também a alternativa não bloqueante, com tópicos de retry, e a mensagem envenenada que trava a partição, com o log real de 30 mil erros em seis segundos.
+
+## A intuição: o carteiro e a seção de não entregues
+
+Pense num carteiro. Ele chega a uma casa e ninguém atende. Isso é uma falha **transitória**: amanhã talvez tenha alguém. Ele não volta cinco minutos depois, nem fica parado na porta: volta no dia seguinte, depois em dois dias, depois em quatro. Isso é o **backoff exponencial**: esperar mais a cada tentativa, porque se a primeira espera não bastou, o problema provavelmente é maior do que parecia.
+
+Agora ele chega a um endereço que não existe. Isso é uma falha **permanente**: voltar amanhã não muda nada. A carta vai para a seção de "objetos não entregues" da agência, com uma etiqueta dizendo de onde veio e por que não deu. Essa seção é a **DLQ** (*dead letter queue*, fila de mensagens mortas), e a etiqueta são os **headers de diagnóstico**. Alguém examina a seção, corrige o endereço e manda a carta de novo para a rota: o **reprocessamento**.
+
+Mais dois detalhes. Se todos os carteiros combinam de voltar aos prédios fechados "amanhã às 8h em ponto", a portaria vira um caos; melhor cada um voltar num horário sorteado. Esse sorteio é o **jitter**. E se o carteiro espera na porta, as outras cartas da rota atrasam (retry **bloqueante**); se deixa a carta para a rota de amanhã, a rota segue, mas a carta 2 do mesmo destinatário pode chegar antes da carta 1 (retry **não bloqueante**).
+
+<Figura legenda="O caminho de uma mensagem que falha: a exceção é classificada; a transitória espera e tenta de novo; a permanente (ou a que esgotou as tentativas) vai para o DLT com headers; depois da correção, o reprocessador devolve a mensagem ao tópico original">
+<svg viewBox="0 0 760 470" width="760" role="img" aria-labelledby="fluxo-dlt-titulo fluxo-dlt-desc">
+  <title id="fluxo-dlt-titulo">Fluxo de retry e DLT no consumidor de pedidos pagos</title>
+  <desc id="fluxo-dlt-desc">O tópico pedidos.pagos entrega a mensagem ao listener, que emite a nota fiscal. Se der certo, a nota é emitida. Se falhar, a exceção é classificada. Falha transitória vai para o backoff com jitter e volta ao listener, até três vezes. Falha permanente, ou transitória que esgotou as tentativas, vai para o tópico pedidos.pagos-dlt com headers de diagnóstico. Do DLT sai um alerta para investigação; depois da correção, o ReprocessadorDaDlt republica a mensagem no tópico original.</desc>
+  <defs><marker id="mk-fluxo-dlt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="30" width="180" height="56" rx="10" class="d-info"/>
+  <text x="110" y="54" text-anchor="middle" class="d-mono">pedidos.pagos</text>
+  <text x="110" y="74" text-anchor="middle" class="d-label">tópico original</text>
+  <path d="M200 58 L258 58" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <rect x="260" y="30" width="200" height="56" rx="10" class="d-box"/>
+  <text x="360" y="54" text-anchor="middle" class="d-title">Listener</text>
+  <text x="360" y="74" text-anchor="middle" class="d-label">emitir a nota fiscal</text>
+  <path d="M460 58 L538 58" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="499" y="50" text-anchor="middle" class="d-label">ok</text>
+  <rect x="540" y="30" width="180" height="56" rx="10" class="d-ok"/>
+  <text x="630" y="54" text-anchor="middle" class="d-title">Nota emitida</text>
+  <text x="630" y="74" text-anchor="middle" class="d-label">offset avança</text>
+  <path d="M360 86 L360 138" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="368" y="117" class="d-label">exceção</text>
+  <rect x="230" y="140" width="260" height="60" rx="10" class="d-violet"/>
+  <text x="360" y="164" text-anchor="middle" class="d-title">Classificar a exceção</text>
+  <text x="360" y="186" text-anchor="middle" class="d-mono">addNotRetryableExceptions</text>
+  <path d="M260 200 L160 248" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="150" y="222" text-anchor="middle" class="d-label">transitória</text>
+  <rect x="20" y="250" width="240" height="70" rx="10" class="d-box"/>
+  <text x="140" y="274" text-anchor="middle" class="d-title">Backoff com jitter</text>
+  <text x="140" y="294" text-anchor="middle" class="d-label">~200, ~400, ~800 ms</text>
+  <text x="140" y="311" text-anchor="middle" class="d-label">até 3 repetições</text>
+  <path d="M200 250 L300 88" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="236" y="150" text-anchor="end" class="d-label">tenta de novo</text>
+  <path d="M460 200 L560 248" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="540" y="222" class="d-label">permanente</text>
+  <path d="M260 290 L478 290" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="369" y="282" text-anchor="middle" class="d-label">esgotou</text>
+  <rect x="480" y="250" width="260" height="70" rx="10" class="d-accent"/>
+  <text x="610" y="274" text-anchor="middle" class="d-mono">pedidos.pagos-dlt</text>
+  <text x="610" y="294" text-anchor="middle" class="d-label">headers: tópico, offset,</text>
+  <text x="610" y="311" text-anchor="middle" class="d-label">partição e causa</text>
+  <path d="M610 320 L610 368" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <rect x="490" y="370" width="240" height="60" rx="10" class="d-box"/>
+  <text x="610" y="394" text-anchor="middle" class="d-title">Alerta e investigação</text>
+  <text x="610" y="415" text-anchor="middle" class="d-label">corrigir a causa primeiro</text>
+  <path d="M490 400 L442 400" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <rect x="240" y="370" width="200" height="60" rx="10" class="d-info"/>
+  <text x="340" y="394" text-anchor="middle" class="d-mono">ReprocessadorDaDlt</text>
+  <text x="340" y="415" text-anchor="middle" class="d-label">filtro, limite, contador</text>
+  <path d="M240 400 L8 400 L8 58 L18 58" class="d-line" marker-end="url(#mk-fluxo-dlt)"/>
+  <text x="124" y="452" text-anchor="middle" class="d-label">republica com a mesma chave</text>
+</svg>
+</Figura>
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Falha transitória** | Pode dar certo se tentar de novo: timeout, conexão recusada, `503`, `429`, deadlock, broker reiniciando |
+| **Falha permanente** | Nunca vai dar certo com a mesma mensagem: JSON inválido, campo obrigatório ausente, regra de negócio violada, `400`, `404`, `422` |
+| **Bug** | O código está errado (`NullPointerException`, `ClassCastException`). Repetir não conserta; a mensagem espera a correção |
+| **Backoff** | A espera entre uma tentativa (*retry*) e a seguinte. **Exponencial**: multiplica a cada vez (200, 400, 800 ms), até um **teto** |
+| **Jitter** | Uma parcela aleatória somada ou sorteada na espera, para as tentativas de muitos consumidores não coincidirem |
+| **Tempestade de retries** (*thundering herd*, *retry storm*) | As repetições multiplicam a carga sobre um serviço que já está com problema e o impedem de se recuperar |
+| **DLQ / DLT** | *Dead letter queue* / *dead letter topic*: onde ficam as mensagens que desistimos de processar. No Kafka, é um tópico comum, com um nome convencionado |
+| **DLX** | *Dead letter exchange*, o mecanismo de mensagens mortas do RabbitMQ |
+| **Recuperador** (*recoverer*) | Quem decide o destino final da mensagem quando o retry desiste. O mais comum publica no DLT |
+| **Retry bloqueante** | A mesma partição para e espera enquanto a mensagem é repetida. Preserva a ordem |
+| **Retry não bloqueante** | A mensagem é movida para um tópico de retry e a partição original segue. Não preserva a ordem |
+| **Mensagem envenenada** (*poison pill*) | Uma mensagem que sempre falha. Num lugar ruim (o deserializer), trava a partição |
+| **Reprocessamento** (*redrive*) | Republicar mensagens do DLT no tópico de origem, depois de corrigir a causa |
+
+## Transitória, permanente ou bug?
+
+A primeira decisão não é "quantas vezes repetir", é **se vale repetir**. Repetir uma falha permanente não é inofensivo: cada tentativa gasta tempo, no retry bloqueante segura todas as mensagens seguintes da partição, enche o log e, se a falha envolve um serviço externo, gasta a cota de chamadas dele.
+
+| Falha | Tipo | Tentar de novo? |
+|---|---|---|
+| timeout, conexão recusada, `502`, `503`, `504` | transitória | sim, com espera |
+| `429 Too Many Requests` | transitória | sim, respeitando o `Retry-After` quando houver |
+| deadlock, *lock timeout*, `OptimisticLockException` | transitória | sim; quase sempre resolve na segunda |
+| JSON inválido, campo obrigatório ausente | **permanente** | não: direto para a DLQ |
+| regra de negócio violada (valor negativo, pedido cancelado) | **permanente** | não |
+| `400`, `404`, `409`, `422` da API chamada | **permanente** | não |
+| `500 Internal Server Error` | ambígua | poucas vezes; se persistir, DLQ |
+| `NullPointerException`, `ClassCastException` | **bug** | não; a mensagem espera a correção na DLQ |
+
+Três observações tornam essa tabela útil na prática.
+
+**A classificação é por tipo de exceção, então crie tipos que digam o que aconteceu.** O adaptador HTTP (a classe que chama o emissor) é quem conhece o código de status. Ele traduz `503` em `ServicoIndisponivelException` e `422` em algo como `MensagemInvalidaException`. O consumidor e a configuração de retry só olham para esses tipos. Se o adaptador lançar a mesma `RuntimeException` genérica para tudo, ninguém consegue classificar nada, e a configuração vira "repete tudo" ou "não repete nada".
+
+**O `500` é o caso cinzento**: pode ser um bug do outro lado disparado por um dado específico, ou uma instabilidade momentânea. Repita poucas vezes e, se persistir, desista. **E bug não é falha transitória**: um `NullPointerException` acontece de novo em cada tentativa; o lugar dele é a DLQ, com alerta, até a correção do código.
+
+## Backoff exponencial com jitter
+
+Quando a falha merece outra tentativa, **espere**, e espere **mais** a cada vez. A fórmula do backoff exponencial é:
+
+```text
+espera(n) = mínimo(teto, base × multiplicador^(n − 1))
+
+base 200 ms, multiplicador 2, teto 30 s:
+tentativa 1 → falha → espera 200 ms
+tentativa 2 → falha → espera 400 ms
+tentativa 3 → falha → espera 800 ms
+...
+tentativa 9 → falha → espera 30 s (51,2 s cortados no teto)
+```
+
+Por que exponencial, e não fixo? Porque a duração do problema é desconhecida: um deadlock se resolve em milissegundos, uma pane de rede leva minutos. Espera fixa curta martela o serviço numa pane longa; espera fixa longa atrasa à toa a recuperação de um soluço. O exponencial começa rápido e vai se afastando, e o **teto** limita o crescimento.
+
+Agora o problema que o exponencial sozinho não resolve. O emissor de notas cai às 2h03. Os 30 consumidores do grupo (e os de outros serviços que usam o emissor) falham praticamente no mesmo instante. Com backoff puro, todos esperam exatamente 200 ms e tentam juntos; falham juntos, esperam 400 ms e tentam juntos de novo. O emissor, que está tentando voltar, recebe rajadas sincronizadas, cada uma maior que a capacidade dele. Essa é a **tempestade de retries**. O remédio é o **jitter**: sortear uma parte da espera, para as tentativas se espalharem no tempo.
+
+Há três estilos comuns de jitter, e vale saber qual a sua biblioteca usa:
+
+| Estilo | Espera sorteada | Observação |
+|---|---|---|
+| *Full jitter* | entre 0 e o valor exponencial | Espalha mais. Recomendado no artigo clássico da AWS sobre backoff |
+| *Equal jitter* | metade fixa + metade sorteada | Garante uma espera mínima |
+| ± jitter (Spring Framework 7) | valor exponencial ± o jitter configurado | O `ExponentialBackOff` sorteia entre `intervalo − jitter` e `intervalo + jitter`, multiplica o jitter junto com o intervalo e nunca fica abaixo do intervalo inicial nem acima do teto |
+
+O `ExponentialBackOff` do Spring Framework 7 (pacote `org.springframework.util.backoff`) ganhou `setJitter` nessa versão. Ele é o tipo de `BackOff` que o `DefaultErrorHandler` do Spring Kafka aceita, e é a mesma ideia do `RetryPolicy` do retry nativo do Framework 7 (com `delay`, `multiplier`, `maxDelay` e `jitter`) que o Spring AMQP usa por baixo, como você viu na [aula de RabbitMQ](../../12-mensageria/02-rabbitmq/), e que volta no módulo 13 para chamadas HTTP. Os padrões do `ExponentialBackOff`, se você não configurar nada, são: intervalo inicial de 2 s, multiplicador 1,5, teto de 30 s, jitter zero e **tentativas ilimitadas**. Esse último padrão é perigoso num consumidor; voltamos a ele em "Quando dá errado".
+
+Para ver o efeito do jitter com números, a aula traz um pequeno simulador, `EsperaComJitter`. Ele calcula o backoff exponencial com teto e uma versão com *full jitter*, e o `main` simula mil consumidores que falharam no mesmo instante, contando em que faixa de tempo cada um faz a quarta repetição:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/EsperaComJitter.java" destacar="27-28, 32-34" />
+
+O deslocamento `baseMs << expoente` multiplica por 2 elevado ao expoente, limitado a 30 para não estourar o `long`. E o `RandomGenerator` chega pelo construtor, como o `Clock` na aula de Mockito, para o teste poder controlar o sorteio.
+
+<Figura legenda="Mil consumidores fazendo a quarta repetição (base 200 ms, espera exponencial de 1.600 ms). Sem jitter, todos chegam na mesma faixa de tempo; com full jitter, a carga se divide entre as quatro faixas. Números de uma execução real do simulador">
+<svg viewBox="0 0 680 350" width="680" role="img" aria-labelledby="jitter-titulo jitter-desc">
+  <title id="jitter-titulo">Histograma de novas tentativas com e sem jitter</title>
+  <desc id="jitter-desc">Dois histogramas com quatro faixas de tempo: de 0 a 399 milissegundos, de 400 a 799, de 800 a 1199 e de 1200 a 1600. Sem jitter: 0, 0, 0 e 1000 consumidores, todos na última faixa. Com jitter: 274, 258, 246 e 222 consumidores, distribuídos quase por igual.</desc>
+  <text x="20" y="100" class="d-title">sem jitter</text>
+  <rect x="160" y="149" width="110" height="1" class="d-box"/>
+  <rect x="285" y="149" width="110" height="1" class="d-box"/>
+  <rect x="410" y="149" width="110" height="1" class="d-box"/>
+  <rect x="535" y="60" width="110" height="90" rx="4" class="d-accent"/>
+  <text x="215" y="140" text-anchor="middle" class="d-label">0</text>
+  <text x="340" y="140" text-anchor="middle" class="d-label">0</text>
+  <text x="465" y="140" text-anchor="middle" class="d-label">0</text>
+  <text x="590" y="52" text-anchor="middle" class="d-label">1.000</text>
+  <path d="M150 150 L660 150" class="d-line"/>
+  <text x="20" y="250" class="d-title">com jitter</text>
+  <rect x="160" y="265" width="110" height="25" rx="4" class="d-ok"/>
+  <rect x="285" y="267" width="110" height="23" rx="4" class="d-ok"/>
+  <rect x="410" y="268" width="110" height="22" rx="4" class="d-ok"/>
+  <rect x="535" y="270" width="110" height="20" rx="4" class="d-ok"/>
+  <text x="215" y="257" text-anchor="middle" class="d-label">274</text>
+  <text x="340" y="259" text-anchor="middle" class="d-label">258</text>
+  <text x="465" y="260" text-anchor="middle" class="d-label">246</text>
+  <text x="590" y="262" text-anchor="middle" class="d-label">222</text>
+  <path d="M150 290 L660 290" class="d-line"/>
+  <text x="215" y="310" text-anchor="middle" class="d-label">0 a 399 ms</text>
+  <text x="340" y="310" text-anchor="middle" class="d-label">400 a 799 ms</text>
+  <text x="465" y="310" text-anchor="middle" class="d-label">800 a 1.199 ms</text>
+  <text x="590" y="310" text-anchor="middle" class="d-label">1.200 a 1.600 ms</text>
+  <text x="340" y="340" text-anchor="middle" class="d-text">o mesmo total de chamadas, sem o pico</text>
+</svg>
+</Figura>
+
+O jitter não reduz o **número** de chamadas; reduz o **pico**. Para o serviço que está voltando, mil chamadas no mesmo milissegundo ou 250 a cada 400 ms é a diferença entre cair de novo e se recuperar. Para reduzir o número, as ferramentas são outras (limite de tentativas, orçamento de retries, circuit breaker), na seção de pleno e sênior.
+
+## Retry bloqueante × tópicos de retry
+
+No Kafka, a forma como o retry acontece tem uma consequência que não existe numa fila comum: **a ordem por partição**. Lembre-se da [aula de Kafka](../../12-mensageria/03-kafka/): mensagens com a mesma chave caem na mesma partição, e o consumidor lê cada partição em ordem. O retry pode respeitar essa ordem ou não.
+
+**Retry bloqueante.** É o que o `DefaultErrorHandler` faz: quando o listener lança uma exceção, o container volta o consumidor para o offset da mensagem que falhou (um *seek*), espera o backoff e entrega a mesma mensagem de novo. Enquanto isso, nenhuma mensagem seguinte **daquela partição** é processada. Com esperas de centenas de milissegundos, isso é imperceptível. Com uma espera de 10 minutos (o parceiro está fora do ar), uma única mensagem segura a partição inteira por 10 minutos.
+
+**Retry não bloqueante.** É o que o `@RetryableTopic` faz: a mensagem que falhou é **publicada num tópico de retry** e o tópico principal segue. O consumidor do tópico de retry vê, por um header, que ainda não chegou a hora, **pausa** a partição até lá e chama o mesmo método do listener. Se falhar de novo, a mensagem segue para o próximo tópico de retry e, no fim, para o DLT.
+
+<Figura legenda="Retry não bloqueante: a mensagem PED-10 percorre os tópicos de retry, cada um com a sua espera, enquanto a PED-11, que veio depois na mesma partição, é processada no tópico principal">
+<svg viewBox="0 0 640 430" width="640" role="img" aria-labelledby="topicos-retry-titulo topicos-retry-desc">
+  <title id="topicos-retry-titulo">Cadeia de tópicos de retry do @RetryableTopic</title>
+  <desc id="topicos-retry-desc">Coluna da esquerda, de cima para baixo: notas.emitidas, notas.emitidas-retry-100, notas.emitidas-retry-200, notas.emitidas-retry-400 e notas.emitidas-dlt. Setas descem de um para o outro com o rótulo falhou e a espera de cada tópico: 100, 200 e 400 milissegundos. À direita, a mensagem PED-11 é enviada a partir do tópico principal, sem esperar a PED-10.</desc>
+  <defs><marker id="mk-topicos-retry" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="20" width="270" height="56" rx="10" class="d-info"/>
+  <text x="155" y="44" text-anchor="middle" class="d-mono">notas.emitidas</text>
+  <text x="155" y="64" text-anchor="middle" class="d-label">PED-10 falha · PED-11 em seguida</text>
+  <path d="M155 76 L155 104" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="165" y="95" class="d-label">falhou</text>
+  <rect x="20" y="106" width="270" height="56" rx="10" class="d-box"/>
+  <text x="155" y="130" text-anchor="middle" class="d-mono">notas.emitidas-retry-100</text>
+  <text x="155" y="150" text-anchor="middle" class="d-label">espera 100 ms, tenta de novo</text>
+  <path d="M155 162 L155 190" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="165" y="181" class="d-label">falhou</text>
+  <rect x="20" y="192" width="270" height="56" rx="10" class="d-box"/>
+  <text x="155" y="216" text-anchor="middle" class="d-mono">notas.emitidas-retry-200</text>
+  <text x="155" y="236" text-anchor="middle" class="d-label">espera 200 ms, tenta de novo</text>
+  <path d="M155 248 L155 276" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="165" y="267" class="d-label">falhou</text>
+  <rect x="20" y="278" width="270" height="56" rx="10" class="d-box"/>
+  <text x="155" y="302" text-anchor="middle" class="d-mono">notas.emitidas-retry-400</text>
+  <text x="155" y="322" text-anchor="middle" class="d-label">espera 400 ms, última tentativa</text>
+  <path d="M155 334 L155 362" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="165" y="353" class="d-label">falhou</text>
+  <rect x="20" y="364" width="270" height="56" rx="10" class="d-accent"/>
+  <text x="155" y="388" text-anchor="middle" class="d-mono">notas.emitidas-dlt</text>
+  <text x="155" y="408" text-anchor="middle" class="d-label">@DltHandler registra e alerta</text>
+  <path d="M290 48 L398 48" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="344" y="40" text-anchor="middle" class="d-label">não espera</text>
+  <rect x="400" y="20" width="220" height="56" rx="10" class="d-ok"/>
+  <text x="510" y="44" text-anchor="middle" class="d-title">PED-11 enviada</text>
+  <text x="510" y="64" text-anchor="middle" class="d-label">antes da PED-10</text>
+  <path d="M290 220 L398 220" class="d-line" marker-end="url(#mk-topicos-retry)"/>
+  <text x="344" y="212" text-anchor="middle" class="d-label">deu certo</text>
+  <rect x="400" y="192" width="220" height="56" rx="10" class="d-ok"/>
+  <text x="510" y="216" text-anchor="middle" class="d-title">PED-10 enviada</text>
+  <text x="510" y="236" text-anchor="middle" class="d-label">na 3ª tentativa</text>
+</svg>
+</Figura>
+
+| | Bloqueante (`DefaultErrorHandler`) | Não bloqueante (`@RetryableTopic`) |
+|---|---|---|
+| Ordem por chave | preservada | **perdida**: a mensagem que falhou passa para trás |
+| Mensagens seguintes da partição | esperam | seguem |
+| Espera máxima razoável | curta (abaixo do `max.poll.interval.ms`, 5 min por padrão, e na prática bem menos) | longa (segundos, minutos) |
+| Tópicos extras | só o DLT | um por espera diferente, mais o DLT |
+| Bom para | quando a ordem importa (saldo, estoque, estados de pedido); esperas curtas | mensagens independentes entre si (e-mail, notificação, indexação); esperas longas |
+
+Não existe opção que preserve a ordem **e** não bloqueie. Em conta corrente e estoque, a ordem costuma vencer: aplicar "saque" antes de "depósito" pode recusar uma operação válida. Em envio de e-mail, a ordem não importa, e segurar todos os e-mails da partição porque o provedor rejeitou um é desperdício. Nada impede de usar os dois no mesmo serviço, cada um no listener certo, como você vai fazer nesta aula. A documentação do Spring Kafka também descreve como combinar os dois: algumas repetições bloqueantes rápidas antes de mandar a mensagem para o primeiro tópico de retry.
+
+## O código que vamos construir
+
+Tudo o que aparece nesta aula está em `java/m12-mensageria/aulas`, no pacote `dev.trilhajava.m12.aulas.retry`, e roda no CI. São dois fluxos:
+
+1. **Emissão de notas (retry bloqueante).** O `ConsumidorDePedidosPagos` lê `pedidos.pagos` e chama o `EmissorDeNotas`. Falhas transitórias são repetidas com backoff exponencial e jitter; permanentes vão direto para `pedidos.pagos-dlt`.
+2. **Envio da nota por e-mail (retry não bloqueante).** O `EnvioDeNotaPorEmail` lê `notas.emitidas` com `@RetryableTopic` e chama o `ProvedorDeEmail`.
+
+Em volta deles: as exceções que carregam a classificação (`ServicoIndisponivelException`, transitória; `MensagemInvalidaException`, permanente), dois serviços externos simulados com falhas programáveis, o `MonitorDeFalhas` e o `ReprocessadorDaDlt`.
+
+O coração do retry bloqueante é uma classe de configuração:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/ConfiguracaoDeRetry.java" destacar="16-17, 26-29, 42-52" />
+
+Leia com calma, porque cada linha é uma decisão:
+
+- **O DLT é declarado como tópico, com 3 partições.** O `DeadLetterPublishingRecoverer` publica, por padrão, na partição **de mesmo número** da original: a mensagem que morreu na partição 2 de `pedidos.pagos` vai para a partição 2 de `pedidos.pagos-dlt`. Se o DLT tiver menos partições, ou não existir, a publicação falha. Declarar o `NewTopic` faz o `KafkaAdmin` do Spring criá-lo na subida da aplicação.
+- **O sufixo é `-dlt`.** É o padrão do Spring Kafka 4, o mesmo dos tópicos de retry. Até a versão 3.x, o recuperador publicava em `<tópico>.DLT`.
+- **`ExponentialBackOff(200, 2.0)`** começa em 200 ms e dobra. `setJitter(50)` sorteia ±50 ms na primeira espera (e o jitter cresce com o multiplicador: ±100 ms na segunda, ±200 ms na terceira). `setMaxInterval(2_000)` é o teto. `setMaxAttempts(3)` limita a **três repetições**, ou seja, quatro tentativas no total contando a primeira. Sem esse limite, o padrão é repetir para sempre.
+- **`DeadLetterPublishingRecoverer(kafka)`** é o recuperador: quando o retry desiste, ele publica a mensagem original no DLT, com headers de diagnóstico.
+- **`addNotRetryableExceptions(...)`** é a classificação: `MensagemInvalidaException` e qualquer `JacksonException` (o JSON não deu para ler) vão para o recuperador na primeira falha, sem esperar. O `DefaultErrorHandler` procura essas classes também nas **causas** da exceção, o que importa porque o Spring embrulha o que o listener lança numa `ListenerExecutionFailedException`.
+- **`setRetryListeners(monitor)`** liga um ouvinte que recebe cada tentativa que falhou e cada recuperação. Sem isso, o retry acontece em silêncio.
+
+O Spring Boot detecta o bean `DefaultErrorHandler` (ele implementa `CommonErrorHandler`) e o liga na fábrica de containers dos `@KafkaListener`. Não é preciso configurar a fábrica à mão.
+
+O consumidor é curto de propósito:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/ConsumidorDePedidosPagos.java" semImports destacar="20-25" />
+
+Três decisões aqui. **Ele recebe `String`**, e não `PedidoPago`: o JSON é lido dentro do listener, então um JSON quebrado vira uma `JacksonException` comum, que o error handler classifica e manda para o DLT. Se a conversão acontecesse no deserializer do Kafka, a mesma mensagem travaria a partição (você vai ver isso acontecer em "Quando dá errado"). **Ele valida e lança uma exceção com significado** (`MensagemInvalidaException`) para valor não positivo: é uma regra de negócio, e regra violada é falha permanente. E **ele não tem `try/catch`**. Um `catch` que registra o erro e retorna faria o container achar que deu tudo certo e avançar o offset: a mensagem estaria perdida, sem retry e sem DLT. Quem decide o que fazer com a falha é o error handler.
+
+O emissor simulado guarda uma nota por número de pedido (`computeIfAbsent`), ou seja, é **idempotente**: emitir duas vezes o mesmo pedido devolve a mesma nota. O emissor de verdade precisaria garantir isso também (por exemplo, usando o número do pedido como chave de idempotência na API), porque retry e reprocessamento reentregam mensagens.
+
+## Mão na massa
+
+Os testes ficam em `java/m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/retry/`. O `RetryEDlqTest` sobe a aplicação inteira com `@SpringBootTest` e um broker Kafka real dentro da JVM do teste:
+
+```java
+@SpringBootTest(properties = "logging.level.dev.trilhajava.m12.aulas.retry=INFO")
+@EmbeddedKafka(partitions = 3, bootstrapServersProperty = "spring.kafka.bootstrap-servers")
+class RetryEDlqTest {
+```
+
+O `@EmbeddedKafka` (do `spring-kafka-test`, que vem no `spring-boot-starter-kafka-test`) inicia um broker Kafka 4 em modo KRaft numa porta livre e escreve o endereço na propriedade `spring.kafka.bootstrap-servers`, a mesma que o Spring Boot usa para configurar produtores e consumidores. Não há Docker nem Testcontainers: o broker é a mesma implementação do Kafka de produção, rodando como biblioteca. A propriedade de log liga o nível `INFO` do pacote da aula, para você ver as tentativas na saída (o projeto deixa o resto em `WARN` nos testes).
+
+A configuração da aplicação fica num arquivo próprio, carregado pela `RetryApplication` com `@PropertySource`:
+
+```properties
+# Aula 12.06 (retry e DLQ). Carregado pela RetryApplication com @PropertySource.
+spring.kafka.bootstrap-servers=localhost:9092
+# Um grupo novo começa do início do tópico (o padrão do Kafka é "latest": só o que chegar depois).
+spring.kafka.consumer.auto-offset-reset=earliest
+# O produtor só confirma depois que as réplicas em sincronia gravaram (aula 12.03).
+spring.kafka.producer.acks=all
+```
+
+Para rodar os passos, entre na pasta do módulo:
+
+```bash
+cd java/m12-mensageria/aulas
+```
+
+### Passo 1: o simulador de jitter
+
+**O que vamos fazer e por quê.** Antes de configurar o Spring, ver os números. O `main` do `EsperaComJitter` simula a quarta repetição de mil consumidores que falharam juntos.
+
+```bash
+mvn -q compile
+java -cp target/classes dev.trilhajava.m12.aulas.retry.EsperaComJitter
+```
+
+Saída de uma execução (os números da coluna "com jitter" mudam a cada vez, porque o sorteio não tem semente fixa):
+
+```text
+Tentativa 4 de 1000 consumidores (espera exponencial: 1600 ms)
+faixa de tempo      sem jitter   com jitter
+0 a 399 ms                   0          274
+400 a 799 ms                 0          258
+800 a 1199 ms                0          246
+1200 a 1600 ms            1000          222
+```
+
+**O que acabou de acontecer.** Sem jitter, os mil consumidores chegam na mesma faixa, no mesmo milissegundo (1.600 ms). Com *full jitter*, cada um sorteia uma espera entre 0 e 1.600 ms, e a carga se divide em quatro faixas de cerca de 250. Repare que alguns consumidores com jitter tentam **mais cedo** do que tentariam sem ele: o *full jitter* troca uma espera média menor por um espalhamento maior. O teste `EsperaComJitterTest` confere as duas propriedades que importam: o exponencial dobra até o teto (sem estourar o `long` na tentativa 60) e o sorteio fica sempre entre zero e o valor exponencial.
+
+### Passo 2: a falha transitória que se resolve sozinha
+
+**O que vamos fazer e por quê.** O cenário mais comum em produção: o emissor falha duas vezes (um soluço de rede, um deploy do outro lado) e volta. O retry bloqueante deve absorver isso sem que ninguém precise fazer nada.
+
+```java
+@Test
+void falhaTransitoriaSeResolveNoRetry() {
+    emissor.falharAsProximas(2);
+    int chamadasAntes = emissor.chamadas();
+
+    kafka.send(PEDIDOS_PAGOS, "PED-1", """
+            {"numeroPedido":"PED-1","clienteId":"cli-7","valor":149.90}""");
+
+    await().atMost(Duration.ofSeconds(15))
+            .until(() -> emissor.notasEmitidas().containsKey("PED-1"));
+    assertThat(emissor.chamadas() - chamadasAntes).isEqualTo(3); // 2 falhas + 1 sucesso
+}
+```
+
+```bash
+mvn test -Dtest=RetryEDlqTest#falhaTransitoriaSeResolveNoRetry
+```
+
+Saída esperada (linhas resumidas: sem a data, o PID e a thread):
+
+```text
+INFO  d.t.m12.aulas.retry.MonitorDeFalhas : tentativa 1 falhou: pedidos.pagos-1@2 chave=PED-1 causa=ServicoIndisponivelException: emissor de NF-e respondeu 503 Service Unavailable
+INFO  d.t.m12.aulas.retry.MonitorDeFalhas : tentativa 2 falhou: pedidos.pagos-1@2 chave=PED-1 causa=ServicoIndisponivelException: emissor de NF-e respondeu 503 Service Unavailable
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `kafka.send(tópico, chave, valor)` publica com a chave `PED-1`, que decide a partição (aqui, a 1) e aparece no log, no DLT e no reprocessamento.
+- A primeira entrega falhou com `ServicoIndisponivelException`, que não está na lista de não repetíveis. O `DefaultErrorHandler` chamou o `MonitorDeFalhas` (`tentativa 1 falhou`), fez o *seek* de volta para o offset 2 da partição 1, esperou o backoff e entregou de novo. Na terceira entrega o emissor respondeu, a nota foi emitida e o offset avançou.
+- `pedidos.pagos-1@2` é a notação "tópico-partição@offset", a mesma que o próprio Kafka usa. Com ela você encontra a mensagem exata no broker.
+- O `await()` é do Awaitility (vem no `spring-boot-starter-test`): o consumo é assíncrono, então o teste espera **até** a condição ser verdadeira, com um limite. Um `Thread.sleep` "que costuma bastar" deixa o teste lento ou intermitente.
+
+O `MonitorDeFalhas` que produziu essas linhas é um `RetryListener` do Spring Kafka:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/MonitorDeFalhas.java" semImports destacar="16-19, 23-26" />
+
+`failedDelivery` é chamado a cada tentativa que falhou, com o número da tentativa; `recovered`, quando o recuperador publicou no DLT; `recoveryFailed`, quando nem o DLT funcionou (o broker está fora, o tópico não existe). Nesse último caso o Spring Kafka não perde a mensagem: o offset não avança e ela será entregue de novo. `NestedExceptionUtils.getMostSpecificCause` desembrulha a `ListenerExecutionFailedException` para mostrar a causa real. Em produção, os dois contadores viram métricas do Micrometer (módulo 14), e "mensagens enviadas ao DLT" é a primeira métrica que ganha alerta.
+
+### Passo 3: a falha permanente vai direto para o DLT
+
+**O que vamos fazer e por quê.** Agora uma mensagem que nunca vai dar certo: um JSON quebrado. Ela não pode consumir as quatro tentativas, nem as esperas, nem segurar a partição: deve ir para o DLT na primeira falha, com informação suficiente para alguém investigar.
+
+```java
+@Test
+void falhaPermanenteVaiDiretoParaODltComOsHeadersDeDiagnostico() {
+    int chamadasAntes = emissor.chamadas();
+
+    kafka.send(PEDIDOS_PAGOS, "PED-2", "{\"numeroPedido\":\"PED-2\", valor: quebrado");
+
+    ConsumerRecord<String, String> morta = lerDoDlt(PEDIDOS_PAGOS_DLT, "PED-2");
+    assertThat(morta.value()).isEqualTo("{\"numeroPedido\":\"PED-2\", valor: quebrado");
+    assertThat(ReprocessadorDaDlt.texto(morta, KafkaHeaders.DLT_ORIGINAL_TOPIC)).isEqualTo(PEDIDOS_PAGOS);
+    assertThat(ReprocessadorDaDlt.texto(morta, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN))
+            .isEqualTo("tools.jackson.core.exc.StreamReadException");
+    assertThat(emissor.chamadas()).isEqualTo(chamadasAntes); // nem chegou ao emissor
+}
+```
+
+```bash
+mvn test -Dtest=RetryEDlqTest#falhaPermanenteVaiDiretoParaODltComOsHeadersDeDiagnostico
+```
+
+```text
+INFO  d.t.m12.aulas.retry.MonitorDeFalhas : tentativa 1 falhou: pedidos.pagos-2@0 chave=PED-2 causa=StreamReadException: Unexpected character ('v' (code 118)): was expecting double-quote to start property name
+WARN  d.t.m12.aulas.retry.MonitorDeFalhas : desistindo: pedidos.pagos-2@0 chave=PED-2 foi para o DLT. causa=StreamReadException: Unexpected character ('v' (code 118)): was expecting double-quote to start property name
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- Uma única tentativa e, logo em seguida, `desistindo`. A `StreamReadException` do Jackson 3 é uma subclasse de `JacksonException`, que está na lista de não repetíveis: o `DefaultErrorHandler` foi direto ao recuperador.
+- O emissor nem foi chamado: a falha aconteceu no `readValue`, antes.
+- O método auxiliar `lerDoDlt` cria um consumidor de teste, assina `pedidos.pagos-dlt` e lê até encontrar a chave `PED-2`. O **valor** no DLT é exatamente o texto original, byte a byte: é o que permite investigar e, depois de corrigido na origem, reprocessar.
+- O header `kafka_dlt-exception-cause-fqcn` traz o nome completo da classe da causa. Repare que é a **subclasse concreta** (`StreamReadException`), e não `JacksonException`: um filtro de reprocessamento que compare o nome com igualdade precisa saber disso (o passo "Quando dá errado" mostra o teste que falhou por esse motivo).
+
+### Passo 4: o DLT por dentro
+
+**O que vamos fazer e por quê.** Entender o que o `DeadLetterPublishingRecoverer` grava, porque é com isso que a pessoa de plantão vai trabalhar às 2h da manhã. Os nomes estão como constantes em `KafkaHeaders`:
+
+| Header | Conteúdo | Para que serve |
+|---|---|---|
+| `kafka_dlt-original-topic` | `pedidos.pagos` | Para onde reprocessar |
+| `kafka_dlt-original-partition`, `kafka_dlt-original-offset` | `2`, `0` | Achar a mensagem original no broker e correlacionar com logs |
+| `kafka_dlt-original-timestamp` | instante em que foi publicada | Saber há quanto tempo o evento existe (ele ainda faz sentido?) |
+| `kafka_dlt-original-consumer-group` | `emissao-de-notas` | Qual consumidor desistiu (um tópico pode ter vários grupos) |
+| `kafka_dlt-exception-fqcn` | `...ListenerExecutionFailedException` | A exceção de fora, quase sempre o envelope do Spring |
+| `kafka_dlt-exception-cause-fqcn` | `tools.jackson.core.exc.StreamReadException` | A causa real: é por ela que você filtra |
+| `kafka_dlt-exception-message` | a mensagem da exceção | Diagnóstico rápido |
+| `kafka_dlt-exception-stacktrace` | a pilha inteira | Diagnóstico de bug |
+
+Além disso, os headers que a mensagem original tinha (um `traceparent` de rastreamento distribuído, um identificador de correlação) são copiados. A chave também é preservada, e isso importa para o reprocessamento: republicar com a mesma chave devolve a mensagem para a mesma partição do tópico original.
+
+<Callout tipo="novidade" titulo="Spring Kafka 4: o DLT agora termina em -dlt">
+Até o Spring Kafka 3.x, o `DeadLetterPublishingRecoverer` publicava em `<tópico>.DLT`. No 4.x, o padrão é **`<tópico>-dlt`**, o mesmo sufixo dos tópicos de retry. Numa migração de versão, o DLT antigo deixa de receber mensagens, e o novo precisa existir, com pelo menos o mesmo número de partições. Descobrimos isso escrevendo o [exercício 12.02](../../../exercicios/12-mensageria/02-estoque-kafka/): o log mostrava `estoque.movimentos-dlt=UNKNOWN_TOPIC_OR_PARTITION`, e nenhuma mensagem chegava ao `.DLT`. Se o seu time precisa manter o nome antigo, o construtor `DeadLetterPublishingRecoverer(KafkaOperations, BiFunction)` recebe uma função que devolve o `TopicPartition` de destino.
+</Callout>
+
+O stack trace inteiro num header tem um custo: ele pode ter dezenas de kilobytes por mensagem, e fica no DLT pelo tempo de retenção do tópico. E a mensagem de exceção pode conter dados pessoais (um CPF que falhou na validação, um e-mail). Voltamos a isso na seção de pleno e sênior.
+
+### Passo 5: as esperas de verdade
+
+**O que vamos fazer e por quê.** Medir se o backoff configurado é o backoff que acontece. O emissor fica fora do ar; a mensagem `PED-3` vai esgotar as quatro tentativas. O teste é o do passo 7 (reprocessamento), mas a parte que interessa agora é o log:
+
+```bash
+mvn test -Dtest=RetryEDlqTest#depoisDaCorrecaoOReprocessamentoRecuperaAMensagem
+```
+
+```text
+00:11:51.006 INFO  MonitorDeFalhas : tentativa 1 falhou: pedidos.pagos-1@0 chave=PED-3 causa=ServicoIndisponivelException: ...
+00:11:51.508 INFO  MonitorDeFalhas : tentativa 2 falhou: pedidos.pagos-1@0 chave=PED-3 causa=ServicoIndisponivelException: ...
+00:11:52.011 INFO  MonitorDeFalhas : tentativa 3 falhou: pedidos.pagos-1@0 chave=PED-3 causa=ServicoIndisponivelException: ...
+00:11:53.020 INFO  MonitorDeFalhas : tentativa 4 falhou: pedidos.pagos-1@0 chave=PED-3 causa=ServicoIndisponivelException: ...
+00:11:53.531 WARN  MonitorDeFalhas : desistindo: pedidos.pagos-1@0 chave=PED-3 foi para o DLT. causa=ServicoIndisponivelException: ...
+```
+
+As esperas foram de cerca de **500, 500 e 1.000 ms**, e não os ~200, ~400 e ~800 ms configurados. O backoff está errado? Não. Rode de novo diminuindo o tempo que o consumidor espera por dados novos numa busca ao broker (a propriedade do Kafka `fetch.max.wait.ms`, que no Spring Boot é `spring.kafka.consumer.fetch-max-wait`, padrão 500 ms):
+
+```bash
+mvn test -Dtest=RetryEDlqTest#depoisDaCorrecaoOReprocessamentoRecuperaAMensagem -Dspring.kafka.consumer.fetch-max-wait=50ms
+```
+
+```text
+00:12:44.823 INFO  MonitorDeFalhas : tentativa 1 falhou: pedidos.pagos-1@0 chave=PED-3 ...
+00:12:45.082 INFO  MonitorDeFalhas : tentativa 2 falhou: pedidos.pagos-1@0 chave=PED-3 ...
+00:12:45.516 INFO  MonitorDeFalhas : tentativa 3 falhou: pedidos.pagos-1@0 chave=PED-3 ...
+00:12:46.425 INFO  MonitorDeFalhas : tentativa 4 falhou: pedidos.pagos-1@0 chave=PED-3 ...
+00:12:46.485 WARN  MonitorDeFalhas : desistindo: pedidos.pagos-1@0 chave=PED-3 foi para o DLT. ...
+```
+
+Agora as esperas são de **259, 434 e 909 ms**: os ~200, ~400 e ~800 ms com o jitter sorteado. **O que acabou de acontecer.** O retry bloqueante não é um laço `for` dentro do listener: depois do backoff, o container faz *seek* para o offset que falhou e **busca de novo no broker**. Quando a mensagem foi entregue pela primeira vez, o consumidor já tinha pedido ao broker os próximos dados da partição, e o broker segura esse pedido por até `fetch.max.wait.ms` quando não há nada novo. A nova busca, depois do seek, só sai quando esse pedido pendente volta. O efeito prático é que a espera real é, no mínimo, da ordem de `fetch.max.wait.ms`.
+
+A lição não é "diminua o `fetch-max-wait`": um valor baixo faz cada consumidor ocioso bater no broker com muito mais frequência. A lição é **medir**: o backoff que importa é o que acontece em produção, e um log com o número da tentativa e o instante, como o do `MonitorDeFalhas`, é o jeito mais barato de saber. Se a latência do retry importa para um SLO, aí sim avalie ajustar esse consumidor.
+
+### Passo 6: tópicos de retry com @RetryableTopic
+
+**O que vamos fazer e por quê.** O envio da nota por e-mail é o caso oposto ao da emissão: cada e-mail é independente, a ordem não importa, e o provedor de e-mail às vezes fica minutos fora. Segurar a partição seria desperdício. Aqui entra o retry não bloqueante:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/EnvioDeNotaPorEmail.java" semImports destacar="21-27, 37-40" />
+
+O que cada atributo faz:
+
+- `attempts = "4"`: quatro tentativas no total (a primeira, no tópico principal, mais três nos tópicos de retry). O padrão é 3. O valor é `String` porque aceita *placeholders* como `"${notas.retry.tentativas}"`.
+- `backOff = @BackOff(delay = 100, multiplier = 2.0, maxDelay = 1_000)`: esperas de 100, 200 e 400 ms. No Spring Kafka 4, a anotação `@BackOff` é do próprio Spring Kafka (`org.springframework.kafka.annotation.BackOff`) e também tem `jitter`. Os valores são curtos para a aula rodar rápido; em produção seriam segundos ou minutos.
+- Com backoff exponencial, os tópicos de retry são nomeados pela espera: `notas.emitidas-retry-100`, `notas.emitidas-retry-200`, `notas.emitidas-retry-400`, e o DLT é `notas.emitidas-dlt`. Com espera fixa, o padrão no Spring Kafka 4.1 é um único tópico de retry reaproveitado.
+- `numPartitions = "3"`: os tópicos de retry e o DLT são criados automaticamente (`autoCreateTopics` é `true` por padrão) com 3 partições.
+- `exclude = {...}` com `traversingCauses = "true"`: as permanentes vão direto para o DLT, procurando a classe também nas causas da exceção.
+- `@DltHandler`: o método chamado para cada mensagem que chega ao DLT. Sem ele, o Spring Kafka cria um consumidor do DLT que só registra em log.
+- O `@RetryableTopic` publica nos tópicos de retry com o `KafkaTemplate` do contexto (o único, criado pelo Spring Boot).
+
+O teste prova as duas metades do trade-off: o provedor falha duas vezes para `PED-10`, e `PED-11`, publicada **depois** e **com a mesma chave** (portanto na mesma partição), deve ser enviada **antes**:
+
+```java
+@Test
+void topicosDeRetryNaoBloqueiamAsMensagensSeguintesMasPerdemAOrdem() {
+    provedorDeEmail.falharParaOPedido("PED-10", 2);
+
+    // mesma chave = mesma partição: no retry bloqueante, PED-11 esperaria PED-10
+    kafka.send(NOTAS_EMITIDAS, "cli-7", """
+            {"numeroPedido":"PED-10","email":"ana@exemplo.com.br","chaveDaNota":"NFE-PED-10"}""");
+    kafka.send(NOTAS_EMITIDAS, "cli-7", """
+            {"numeroPedido":"PED-11","email":"ana@exemplo.com.br","chaveDaNota":"NFE-PED-11"}""");
+
+    await().atMost(Duration.ofSeconds(20))
+            .until(() -> provedorDeEmail.pedidosEnviados().contains("PED-10"));
+    assertThat(provedorDeEmail.pedidosEnviados()).containsSubsequence("PED-11", "PED-10");
+}
+```
+
+```bash
+mvn test -Dtest=RetryEDlqTest#topicosDeRetryNaoBloqueiamAsMensagensSeguintesMasPerdemAOrdem
+```
+
+```text
+00:11:48.943 INFO  [ntainer#1-0-C-1] EnvioDeNotaPorEmail : enviando a nota do pedido PED-10 (lida de notas.emitidas)
+00:11:49.382 INFO  [retry-100-0-C-1] EnvioDeNotaPorEmail : enviando a nota do pedido PED-10 (lida de notas.emitidas-retry-100)
+00:11:49.415 INFO  [ntainer#1-0-C-1] EnvioDeNotaPorEmail : enviando a nota do pedido PED-11 (lida de notas.emitidas)
+00:11:49.900 INFO  [retry-200-0-C-1] EnvioDeNotaPorEmail : enviando a nota do pedido PED-10 (lida de notas.emitidas-retry-200)
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+```
+
+**O que acabou de acontecer.**
+
+- Cada tópico tem o seu próprio container (veja as threads `retry-100` e `retry-200`): consumidores a mais, com seus próprios offsets. `PED-10` falhou no principal, falhou em `-retry-100` e deu certo em `-retry-200`.
+- `PED-11` foi enviada **entre** a segunda e a terceira tentativa de `PED-10`. Ela não esperou o retry terminar, mas também não foi instantânea: ~470 ms depois da falha de `PED-10`, o mesmo efeito de *seek* + nova busca do passo 5, porque o tópico principal também precisa reposicionar o consumidor depois de mandar a mensagem para o retry.
+- O resultado final, `[PED-11, PED-10]`, é a **perda de ordem** documentada no teste. Para e-mail, ótimo. Se fossem eventos `PedidoCriado` e `PedidoCancelado` do mesmo pedido, o cancelamento seria aplicado antes da criação.
+
+### Passo 7: reprocessando o DLT com segurança
+
+**O que vamos fazer e por quê.** O emissor ficou fora tempo demais, `PED-3` esgotou as tentativas e foi para o DLT (passo 5). O emissor voltou. Agora alguém precisa devolver `PED-3` para `pedidos.pagos`, sem devolver junto o JSON quebrado de `PED-2` (que vai falhar de novo) e sem criar um laço infinito entre o tópico e o DLT.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/retry/ReprocessadorDaDlt.java" semImports destacar="41, 46-49, 53-58, 70-76" />
+
+As regras de segurança estão no Javadoc, e cada uma resolve um problema concreto:
+
+- **Lê até o fim que o DLT tinha no início.** `endOffsets` tira uma "foto" do último offset de cada partição antes de começar. Se uma mensagem reprocessada falhar de novo e voltar ao DLT, ela fica depois da foto e não é lida de novo nesta execução. Sem isso, uma mensagem que sempre falha seria republicada em laço.
+- **Filtro (`Predicate`).** Só volta o que a correção resolve. Nesta aula, as mensagens cuja causa foi `ServicoIndisponivelException`. Em produção, também por período (só o que morreu entre 2h03 e 2h07) ou por chave.
+- **Limite (`maximo`).** Reprocessar 11 mil mensagens de uma vez é um pico de carga sobre o mesmo emissor que acabou de voltar. Lotes menores, com intervalo, evitam provocar a falha de novo.
+- **Contador de reprocessamentos.** O header `x-reprocessamentos` é incrementado a cada volta; a partir de 3, a mensagem é recusada e registrada para análise manual. É a proteção contra alguém (ou um agendamento) que reprocessa tudo, toda hora.
+- **Mesma chave, partição escolhida pelo produtor.** `new ProducerRecord<>(destino, null, chave, valor)` deixa o particionador do Kafka escolher a partição pela chave: a mensagem volta para a mesma partição de antes (se o número de partições não mudou), e a ordem relativa às próximas mensagens da mesma chave é a ordem de chegada a partir de agora.
+- **Headers de diagnóstico ficam para trás**: se falhar de novo, o recuperador grava headers novos. E só conta como republicada a mensagem que o broker **confirmou** (`get` com timeout de 10 s).
+- **Não grava offsets** (`enable.auto.commit=false`, sem `groupId`). A ferramenta é sem estado: rodar duas vezes republica duas vezes. Isso é aceitável **porque o consumidor de destino é idempotente**: emitir a nota de `PED-3` duas vezes devolve a mesma nota. Se o consumidor não fosse idempotente, a ferramenta precisaria guardar o que já republicou.
+
+O teste:
+
+```java
+@Test
+void depoisDaCorrecaoOReprocessamentoRecuperaAMensagem() {
+    emissor.ficarForaDoAr(true);
+    kafka.send(PEDIDOS_PAGOS, "PED-3", """
+            {"numeroPedido":"PED-3","clienteId":"cli-9","valor":89.00}""");
+    lerDoDlt(PEDIDOS_PAGOS_DLT, "PED-3"); // 4 tentativas (~1,4 s de espera) e foi para o DLT
+
+    emissor.ficarForaDoAr(false); // "o emissor voltou"
+    var relatorio = reprocessador.reprocessar(PEDIDOS_PAGOS_DLT,
+            morta -> "PED-3".equals(morta.key())
+                    && ServicoIndisponivelException.class.getName()
+                            .equals(ReprocessadorDaDlt.texto(morta, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN)),
+            100);
+
+    assertThat(relatorio.republicadas()).isEqualTo(1);
+    await().atMost(Duration.ofSeconds(15))
+            .until(() -> emissor.notasEmitidas().containsKey("PED-3"));
+}
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** O teste espera `PED-3` aparecer no DLT lendo o próprio DLT (e não um contador global, que poderia ser incrementado por outra mensagem de outro teste). Depois "conserta" o emissor e chama o reprocessador com um filtro por chave e por causa. `PED-2`, que também está no DLT, é ignorada pelo filtro. `PED-3` volta para `pedidos.pagos`, o consumidor normal a processa, e a nota é emitida. Na vida real, esse método seria chamado por um endpoint administrativo protegido, por uma tarefa agendada com aprovação, ou por uma ferramenta de linha de comando, sempre depois de alguém confirmar que a causa foi corrigida.
+
+### Passo 8: a suíte inteira
+
+```bash
+mvn test -Dtest="EsperaComJitterTest,RetryEDlqTest"
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.110 s -- in dev.trilhajava.m12.aulas.retry.EsperaComJitterTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 12.92 s -- in dev.trilhajava.m12.aulas.retry.RetryEDlqTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cinco testes, um broker Kafka de verdade, cerca de 13 segundos, sem Docker. Os quatro cenários de integração compartilham o mesmo broker e o mesmo contexto do Spring, por isso cada um usa chaves próprias (`PED-1`, `PED-2`, `PED-3`, `PED-10`) e verifica o próprio resultado, e não contadores globais.
+
+## A mensagem envenenada
+
+Você viu no passo 3 que um JSON quebrado, lido **dentro do listener**, vai para o DLT na primeira tentativa. Agora a mesma mensagem, num lugar ruim. É muito comum configurar a conversão de JSON no **deserializer** do Kafka, para o listener já receber o objeto pronto:
+
+```properties
+# o valor é convertido pelo deserializer, ANTES do listener
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+```
+
+O deserializer roda dentro do `poll()` do consumidor Kafka, antes de existir um `ConsumerRecord` para entregar a alguém. Se ele falha, não há listener nem error handler de registro envolvidos: o consumidor não consegue avançar o offset, faz `poll` de novo, lê a mesma mensagem, falha de novo. Para medir, a aula rodou um teste temporário com um container configurado assim, uma mensagem `isto nao e json` seguida de um pedido válido na mesma partição, e o `DefaultErrorHandler` padrão. Em **6 segundos**, o log registrou **30.408** vezes este erro, e o pedido válido nunca foi entregue:
+
+```text
+ERROR org.springframework.kafka.listener.KafkaMessageListenerContainer -- Consumer exception
+java.lang.IllegalStateException: This error handler cannot process 'SerializationException's directly; please consider configuring an 'ErrorHandlingDeserializer' in the value and/or key deserializer
+	at org.springframework.kafka.listener.DefaultErrorHandler.handleOtherException(DefaultErrorHandler.java:192)
+	...
+Caused by: org.apache.kafka.common.errors.RecordDeserializationException: Error deserializing VALUE for partition pill-0 at offset 0. If needed, please seek past the record to continue consumption.
+Caused by: tools.jackson.core.exc.StreamReadException: Unrecognized token 'isto': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')
+```
+
+A partição inteira parou, o consumidor girou em falso consumindo CPU, e o log cresceu milhares de linhas por segundo. Repare que a própria mensagem do Spring Kafka diz o que fazer. As duas saídas:
+
+<Comparar antes="ErrorHandlingDeserializer" depois="String + conversão no listener">
+
+```properties
+spring.kafka.consumer.value-deserializer=\
+  org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+spring.kafka.consumer.properties.spring.deserializer.value.delegate.class=\
+  org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+# a falha vira um registro com o erro anexado;
+# o DefaultErrorHandler trata DeserializationException
+# como não repetível e manda para o DLT
+```
+
+```java
+// o deserializer é StringDeserializer (o padrão):
+// ele nunca falha
+@KafkaListener(topics = "pedidos.pagos")
+void receber(String mensagem) {
+    var pedido = json.readValue(mensagem, PedidoPago.class);
+    // JSON inválido = JacksonException no listener:
+    // não repetível → DLT
+    emissor.emitir(pedido);
+}
+```
+
+</Comparar>
+
+O `ErrorHandlingDeserializer` embrulha o deserializer de verdade (o "delegate"): se ele falhar, em vez de lançar dentro do `poll`, devolve um registro com valor nulo e a exceção anexada, que chega ao error handler como uma `DeserializationException`. Essa exceção está na lista padrão de exceções fatais (não repetíveis) do `DefaultErrorHandler`. Um detalhe: nesse caso o valor que o recuperador publica no DLT são os **bytes originais**, então o `KafkaTemplate` do recuperador precisa saber serializar `byte[]` (o `DeadLetterPublishingRecoverer` tem um construtor que recebe um mapa de templates por tipo de valor, para isso).
+
+Esta aula e o exercício 12.02 usam a segunda: o fluxo de erro fica explícito no código e o DLT recebe o texto original. A primeira é preferível quando o listener recebe tipos ricos ou o formato é outro (Avro, Protobuf), assunto da [próxima aula](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/).
+
+Vale lembrar que mensagem envenenada não é só JSON inválido. Qualquer mensagem que **sempre** faz o listener falhar, num retry bloqueante **sem limite de tentativas**, também trava a partição. A proteção é a mesma combinação desta aula: limite de tentativas, classificação das exceções e um DLT.
+
+## DLX no RabbitMQ
+
+O mesmo problema existe no RabbitMQ, com outra mecânica, que você viu na [aula de RabbitMQ](../../12-mensageria/02-rabbitmq/). Lá, a fila é declarada com o argumento `x-dead-letter-exchange`, e uma mensagem **rejeitada sem requeue**, **expirada** (TTL) ou que passou do **limite de entregas** é desviada pelo broker para essa exchange, que a roteia para a DLQ. O header `x-death` faz o papel dos `kafka_dlt-*`: fila de origem, motivo (`rejected`, `expired`, `delivery_limit`) e contagem.
+
+As diferenças que importam para o desenho:
+
+| | Kafka (Spring Kafka) | RabbitMQ |
+|---|---|---|
+| Quem publica na DLQ | a aplicação (o recuperador) | o broker, pela configuração da fila |
+| Retry bloqueante | `DefaultErrorHandler` + `BackOff` | retry do listener (`spring.rabbitmq.listener.simple.retry.*`) |
+| Retry com espera longa | `@RetryableTopic` (tópicos de retry) | filas de espera com TTL e DLX de volta para a fila original |
+| Ordem | por partição; o retry bloqueante a preserva | uma fila com vários consumidores já não garante ordem estrita |
+| Reprocessar | republicar no tópico (o DLT continua lá até a retenção) | mover da DLQ para a exchange original (a mensagem sai da DLQ) |
+
+Por isso, uma ferramenta de reprocessamento no RabbitMQ só confirma (`ack`) a mensagem da DLQ depois que o broker confirmou a republicação; no Kafka, o DLT continua lá até a retenção (7 dias, por padrão).
+
+## Quando dá errado
+
+As mensagens abaixo são reais, geradas ao escrever esta aula.
+
+### A partição parou e o log explodiu
+
+```text
+ERROR ... KafkaMessageListenerContainer -- Consumer exception
+java.lang.IllegalStateException: This error handler cannot process 'SerializationException's directly; please consider configuring an 'ErrorHandlingDeserializer' in the value and/or key deserializer
+Caused by: org.apache.kafka.common.errors.RecordDeserializationException: Error deserializing VALUE for partition pill-0 at offset 0. If needed, please seek past the record to continue consumption.
+```
+
+**Causa:** mensagem envenenada no deserializer (seção anterior). **Como corrigir:** `ErrorHandlingDeserializer` ou `StringDeserializer` + conversão no listener. **Para destravar agora,** antes do deploy da correção, a saída é mover o offset do grupo para depois da mensagem (`kafka-consumer-groups.sh --reset-offsets --to-offset` com o consumidor parado), anotando o offset para recuperar a mensagem depois. É uma operação manual e arriscada: é por isso que a correção estrutural importa.
+
+### O DLT não existe
+
+```text
+estoque.movimentos-dlt=UNKNOWN_TOPIC_OR_PARTITION
+```
+
+**Causa:** o recuperador tenta publicar num tópico que não existe (o broker tem `auto.create.topics.enable=false`, como deve ser em produção), ou num DLT com o nome antigo depois de migrar do Spring Kafka 3 para o 4. **Como corrigir:** declare o DLT como `NewTopic`, com o sufixo `-dlt` e pelo menos o número de partições do original. Enquanto o DLT não existe, o recuperador falha, o `recoveryFailed` do `RetryListener` é chamado e a mensagem volta a ser entregue: nada se perde, mas a partição fica presa naquela mensagem.
+
+### O filtro do reprocessador não encontra nada
+
+Na primeira versão do passo 3, a asserção comparava o header de causa com o texto `Jackson`, imaginando que viria `JacksonException`:
+
+```text
+java.lang.AssertionError:
+Expecting actual:
+  "tools.jackson.core.exc.StreamReadException"
+to contain:
+  "Jackson"
+```
+
+**Causa:** `kafka_dlt-exception-cause-fqcn` traz a classe **concreta** da causa, e o pacote do Jackson 3 é `tools.jackson`, sem a palavra "Jackson" com maiúscula. Um filtro de reprocessamento escrito do mesmo jeito selecionaria zero mensagens, e a pessoa de plantão concluiria que "não havia nada para reprocessar". **Como corrigir:** filtre pelo nome exato da classe que você viu nos headers (leia algumas mensagens do DLT antes de escrever o filtro), ou carregue a classe pelo nome e use `isAssignableFrom` para aceitar subclasses. E sempre confira o relatório (`lidas`, `republicadas`, `recusadas`) contra o que você esperava.
+
+### O @RetryableTopic não sobe
+
+Se o contexto tem mais de um `KafkaTemplate` (por exemplo, um para `String` e outro para `byte[]`) e nenhum se chama `defaultRetryTopicKafkaTemplate`, a subida falha com a mensagem do Spring Kafka:
+
+```text
+A single KafkaTemplate bean could not be found in the context;  a single instance must exist, or one specifically named defaultRetryTopicKafkaTemplate
+```
+
+**Como corrigir:** dê esse nome ao template que deve publicar nos tópicos de retry, ou indique-o no atributo `kafkaTemplate` da anotação.
+
+### O retry que nunca acaba
+
+Nenhuma mensagem de erro aqui: esse é o problema. Um `new ExponentialBackOff()` sem `setMaxAttempts` nem `setMaxElapsedTime` repete **para sempre** (os padrões são ilimitados), com teto de 30 s entre as tentativas. Uma falha permanente que não foi classificada como tal (uma `IllegalStateException` de regra de negócio, por exemplo) segura a partição indefinidamente, e o único sintoma é o *lag* do consumidor crescendo. **Como corrigir:** sempre limite as tentativas (ou o tempo total) e monitore o lag.
+
+## Armadilhas e quando NÃO usar
+
+**Engolir a exceção.** O erro mais comum e mais caro. Um `catch (Exception e) { log.error(...); }` no listener faz o container avançar o offset: sem retry, sem DLT, mensagem perdida, e o log de erro se perde no meio de milhares de outros. Se precisar capturar para traduzir (uma exceção HTTP em `ServicoIndisponivelException`), relance.
+
+**Retry em várias camadas.** O cliente HTTP repete 3 vezes, o serviço que o chama repete 3 vezes, o consumidor repete 3 vezes. Uma pane do emissor vira 3 × 3 × 3 = **27** chamadas por mensagem, e o emissor que tentava voltar recebe 27 vezes a carga normal. Escolha **uma** camada para repetir (em geral, a mais externa, que sabe se a operação inteira pode ser repetida) e deixe as outras falharem rápido.
+
+**Repetir o que não é idempotente.** Se o listener faz dois efeitos (emite a nota **e** envia o e-mail) e o segundo falha, o retry refaz o primeiro. Com um emissor idempotente, tudo bem; com um gateway de pagamento sem chave de idempotência, é uma cobrança dupla. Retry e reprocessamento pressupõem um [consumidor idempotente](../../12-mensageria/05-consumidores-idempotentes/).
+
+**Mandar para o DLT e seguir com a próxima mensagem da mesma chave.** É a armadilha mais sutil. A mensagem 1 de uma conta (um depósito) vai para o DLT; a mensagem 2 (um saque) é processada em seguida e é recusada por saldo insuficiente, ou pior, aplicada sobre um estado errado. O DLT preserva a mensagem, mas **quebra a ordem** daquela chave. Em domínios em que a ordem importa, há três respostas: o consumidor rejeitar eventos fora de sequência (o número de sequência por agregado da aula de idempotência); "estacionar" também as mensagens seguintes da mesma chave até a primeira ser resolvida; ou aceitar o risco porque o reprocessamento é rápido e os efeitos são corrigíveis. Escolha conscientemente.
+
+**DLQ sem dono, ou reprocessada às cegas.** Uma DLQ sem alerta, sem time responsável e sem procedimento documentado é só um lugar para perder mensagens com mais cerimônia. E republicar 11 mil mensagens com o emissor ainda instável só as manda de volta para o DLT, dobrando a carga.
+
+**Retry quando a dependência está inteira fora.** Se o banco do serviço caiu, **toda** mensagem vai falhar. O retry vai esgotar as tentativas de cada uma e mandar milhares de mensagens perfeitas para o DLT. O certo é **pausar** o consumo: o container do Spring Kafka tem `pause()` e `resume()`, e um circuit breaker ([aula de resiliência](../../13-arquitetura/06-resiliencia/)) pode acionar a pausa quando a taxa de falhas passa de um limite. A mensagem espera no tópico, que é justamente para isso que ele existe.
+
+**Quando NÃO usar `@RetryableTopic`:** quando a ordem por chave importa; quando as esperas são curtas (o retry bloqueante resolve com menos peças); quando o número de tópicos e consumidores extras pesa na operação do cluster.
+
+**Quando NÃO usar DLQ:** quando a mensagem perde o valor rapidamente e descartar é aceitável (telemetria de alta frequência, a posição GPS de 10 minutos atrás): registre uma métrica de descarte e siga. E quando o fluxo exige ordem estrita e não tolera lacunas, a resposta pode ser parar o consumo e chamar uma pessoa, em vez de desviar a mensagem.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+### Orçamento de retries e a tempestade
+
+A pergunta de sênior não é "quantas tentativas?", é "**quanta carga extra eu aceito impor a uma dependência que já está com problema?**". Faça a conta. Um consumidor processa 500 mensagens por segundo, cada uma com uma chamada ao emissor. Com 4 tentativas, uma pane total do emissor transforma 500 chamadas por segundo em até 2.000, exatamente quando o emissor tem menos capacidade. Por isso, além de jitter e limite de tentativas, sistemas maduros usam:
+
+- **Orçamento de retries** (*retry budget*): as repetições não podem passar de uma fração das chamadas normais (por exemplo, 10%). Acima disso, falha rápido. A ideia aparece nos guias de resiliência dos grandes provedores de nuvem e em bibliotecas de cliente HTTP.
+- **Circuit breaker** combinado com **pausa do consumidor**: quando a taxa de falhas de uma dependência passa de um limite, o consumo daquele tópico para por um tempo, e as mensagens esperam no tópico, sem gastar tentativas.
+- **Um único ponto de retry** por fluxo, como na armadilha das camadas.
+- **Respeitar o `Retry-After`** que a dependência envia num `429` ou `503`. Ela está dizendo quanto aguenta.
+
+### Bloqueante, não bloqueante ou os dois
+
+A decisão é por **listener**, não por serviço, e se apoia em duas perguntas: a ordem por chave importa? A espera necessária é curta ou longa? Ordem importa e espera curta: bloqueante. Ordem não importa e espera longa: tópicos de retry. Ordem importa e espera longa é o caso difícil: em geral, bloqueante com pausa do consumidor (a partição espera, mas sem gastar tentativas), ou um desenho em que o próprio consumidor tolera eventos fora de ordem (versão por agregado), o que libera o uso de tópicos de retry.
+
+O custo operacional dos tópicos de retry é real: com 3 esperas diferentes, cada tópico original ganha 4 tópicos extras (3 de retry e 1 DLT), cada um com suas partições, réplicas e consumidores. Num cluster com centenas de tópicos, isso pesa no número de partições do broker, no tempo de rebalanceamento e no painel de monitoramento.
+
+### O que monitorar e quando alertar
+
+Quatro sinais cobrem quase tudo:
+
+1. **Mensagens enviadas ao DLT por minuto**, por tópico e por causa. Qualquer valor acima de zero num fluxo crítico (pagamento, nota fiscal) é alerta; em fluxos tolerantes, alerta por taxa.
+2. **Idade da mensagem mais antiga no DLT.** Um DLT com 3 mensagens de 6 dias atrás é um problema esquecido, e a retenção vai apagá-las amanhã.
+3. **Lag do consumidor** (quantas mensagens faltam processar). Retry bloqueante longo e mensagem envenenada aparecem aqui primeiro.
+4. **Tentativas que falharam por minuto** (o contador do `RetryListener`). Uma subida sem mensagens no DLT significa que o retry está absorvendo a instabilidade; é o aviso antecipado de que a dependência está piorando.
+
+Os dois primeiros merecem alerta fora do horário nos fluxos críticos; os outros, um painel.
+
+### Retenção, dados pessoais e acesso ao DLT
+
+O DLT é um tópico como outro qualquer, com retenção padrão de 7 dias: uma mensagem que morreu na sexta à noite pode sumir antes de alguém olhar. Configure a retenção pelo tempo de reação real do time (14 ou 30 dias são comuns), ou consuma o DLT para uma tabela de "mensagens mortas" no banco, com status, responsável e histórico, base de uma tela administrativa e de auditoria.
+
+O DLT também concentra dados sensíveis: o payload inteiro, a mensagem da exceção (que pode conter o CPF que falhou na validação) e o stack trace. Pela LGPD, isso é tratamento de dado pessoal como qualquer outro: restrinja quem pode ler o DLT (ACLs do Kafka), não copie o payload para o log nem para o alerta (mande a chave e o offset), avalie excluir o header de stack trace (`excludeHeader` no recuperador) e defina a retenção também com esse critério.
+
+E quem pode **reprocessar**? Republicar é escrever no tópico de produção: a ferramenta precisa de autenticação, autorização, registro de quem reprocessou o quê e, em fluxos financeiros, aprovação de uma segunda pessoa.
+
+### Como justificar a escolha para o time
+
+Uma boa decisão de retry cabe num ADR (*Architecture Decision Record*) curto: o fluxo, se a ordem importa, a classificação das exceções, as esperas e a conta de carga extra, o destino das falhas, o alerta e o procedimento de reprocessamento. Argumentos que convencem são números e consequências: "com 4 tentativas e jitter, a carga extra máxima sobre o emissor fica abaixo do limite contratado"; "o e-mail não depende de ordem, então tópicos de retry evitam que um provedor lento atrase todas as notas".
+
+### Quando trocar de abordagem
+
+- **De bloqueante para não bloqueante:** quando o lag causado por esperas começa a violar o SLO de latência do fluxo e a ordem não é essencial (ou o consumidor passou a tolerar desordem).
+- **Do DLT puro para uma tabela de mensagens mortas:** quando o volume de mensagens mortas exige triagem, atribuição a pessoas, correção manual do conteúdo antes de reprocessar, ou auditoria.
+- **De retry para pausa com circuit breaker:** quando as falhas costumam ser "dependência inteira fora" e não "uma mensagem com problema".
+- **Para um motor de workflow** (orquestração com estado e temporizadores): quando o "retry" passa a durar horas ou dias, com compensações. Aí você não está mais repetindo uma mensagem, está modelando um processo de negócio longo.
+
+<Callout tipo="entrevista">
+**"Como o seu consumidor lida com erros?"** Separo transitórias (backoff exponencial com teto, jitter e limite) de permanentes e bugs (direto para a DLQ), por tipos de exceção; a DLQ tem headers, alerta, dono e procedimento de reprocessamento; o consumidor é idempotente, porque retry e reprocessamento reentregam.
+
+**"Retry bloqueante ou tópicos de retry?"** Bloqueante preserva a ordem por partição, mas segura as mensagens seguintes; tópicos de retry não bloqueiam, mas a mensagem que falhou passa para trás. Escolho por listener: saldo e estoque, bloqueante; e-mail e notificação, tópicos de retry. Citar a perda de ordem com um exemplo concreto (cancelamento aplicado antes da criação) mostra experiência.
+
+**"O que é uma poison pill e como você evita?"** Uma mensagem que sempre falha; no deserializer, trava a partição, porque falha dentro do `poll`, antes do error handler. Evito com `ErrorHandlingDeserializer` ou lendo `String` e convertendo no listener, e com limite de tentativas para o caso de a falha estar no listener.
+
+**"Como você reprocessaria 10 mil mensagens de uma DLQ?"** Primeiro corrijo e confirmo a causa; seleciono só as mensagens que a correção resolve (pela causa e pelo período); reprocesso em lotes, observando a dependência; uso um contador de reprocessamentos para não entrar em laço; e conto com a idempotência do consumidor. Diferencial: mencionar dados pessoais no DLT, controle de acesso e auditoria do reprocessamento.
+</Callout>
+
+## Checkpoint
+
+O emissor de notas mudou de comportamento: quando recebe muitas requisições, responde `429 Too Many Requests` com o header `Retry-After: 30` (segundos). Além disso, passou a responder `422 Unprocessable Entity` quando o CNPJ do cliente é inválido. O consumidor de `pedidos.pagos` usa retry bloqueante e a ordem por pedido importa.
+
+**O desafio:** decida, para cada resposta, o tipo de falha, a exceção que o adaptador deve lançar e o que o `DefaultErrorHandler` deve fazer. Para o `429`, responda também: dá para usar a espera de 30 s no retry bloqueante? O que limitaria isso? Que API do `DefaultErrorHandler` permite uma espera diferente por tipo de exceção?
+
+<details>
+<summary>Solução</summary>
+
+**`422` com CNPJ inválido:** falha **permanente**. O adaptador lança uma exceção que diga isso (pode ser a própria `MensagemInvalidaException`, ou uma `CnpjInvalidoException` mais específica que a estenda), e ela já está, ou passa a estar, em `addNotRetryableExceptions`. A mensagem vai para o DLT na primeira falha. O alerta precisa chegar a quem corrige o cadastro do cliente, não só ao time de plataforma: depois da correção do CNPJ, o reprocessamento com filtro por essa causa resolve.
+
+**`429` com `Retry-After: 30`:** falha **transitória**, e o parceiro disse quanto esperar. O adaptador lança uma exceção específica (por exemplo, `RequisicoesDemaisException`) que carrega a duração lida do header. Ignorar o `Retry-After` e tentar com o backoff de 200 ms só gera mais `429`.
+
+**Dá para esperar 30 s no retry bloqueante?** Dá, com cuidado: cada espera precisa ficar **bem abaixo** do `max.poll.interval.ms` (5 minutos por padrão), senão o grupo é rebalanceado. Três esperas de 30 s seguram a partição por até 90 s; como a ordem importa, é o preço aceito. E o `429` atinge todas as mensagens, não uma: é candidato a **pausar** o consumo (ou a um circuit breaker), em vez de gastar tentativas mensagem por mensagem.
+
+**A API:** `setBackOffFunction`, herdado de `FailedRecordProcessor`, recebe uma `BiFunction` que, dado o registro e a exceção, devolve o `BackOff` a usar (ou `null` para usar o padrão). Um esboço (ilustrativo: `RequisicoesDemaisException` é a exceção hipotética descrita acima e não existe no módulo, então este trecho não está no código testado):
+
+```java
+tratador.setBackOffFunction((registro, erro) ->
+        NestedExceptionUtils.getMostSpecificCause(erro) instanceof RequisicoesDemaisException excesso
+                ? new FixedBackOff(excesso.retryAfter().toMillis(), 3)
+                : null); // null: usa o ExponentialBackOff padrão
+```
+
+Avalie sua resposta: você separou "falha desta mensagem" (`422`) de "falha da dependência" (`429`)? Considerou o efeito da espera longa sobre as outras mensagens da partição e o limite do `max.poll.interval.ms`? Pensou em quem recebe o alerta de cada uma?
+
+</details>
+
+<Quiz
+  id="12-retry"
+  questoes={[
+    {
+      pergunta: 'Qual destas falhas NÃO deve ser repetida pelo consumidor?',
+      opcoes: ['Timeout na chamada ao emissor de notas', '503 do serviço de e-mail', 'JSON sem o campo obrigatório "numeroPedido"', 'Deadlock detectado pelo banco'],
+      correta: 2,
+      explicacao: 'Dado inválido é falha permanente: a mesma mensagem vai falhar sempre. Vai direto para a DLQ, sem gastar tentativas nem segurar a partição.',
+    },
+    {
+      pergunta: 'O consumidor usa `JacksonJsonDeserializer` direto como value-deserializer e chega uma mensagem que não é JSON. O que acontece?',
+      opcoes: ['Vai para o DLT automaticamente', 'O deserializer falha dentro do poll(), antes do error handler, e a partição trava', 'O listener recebe null', 'O Kafka descarta a mensagem'],
+      correta: 1,
+      explicacao: 'O `DefaultErrorHandler` não consegue tratar a `SerializationException` e o offset não avança. Use `ErrorHandlingDeserializer`, ou receba `String` e converta no listener.',
+    },
+    {
+      pergunta: 'Mil consumidores falharam juntos quando o emissor caiu. O que o jitter no backoff resolve?',
+      opcoes: ['Reduz o número total de chamadas ao emissor', 'Espalha as novas tentativas no tempo, reduzindo o pico que derrubaria o emissor de novo', 'Preserva a ordem das mensagens', 'Garante que nenhuma mensagem vá para o DLT'],
+      correta: 1,
+      explicacao: 'O jitter reduz o pico, não o total. Para reduzir o total, limite de tentativas, orçamento de retries e circuit breaker.',
+    },
+    {
+      pergunta: 'Você precisa de retry com espera de 10 minutos, e a ordem por chave importa. Qual o dilema?',
+      opcoes: ['Nenhum: o @RetryableTopic preserva a ordem', 'O retry bloqueante preserva a ordem mas segura a partição; os tópicos de retry não bloqueiam mas perdem a ordem', 'O Kafka não permite esperar 10 minutos', 'O DLT resolve as duas coisas'],
+      correta: 1,
+      explicacao: 'É um trade-off real. Em domínios em que a ordem importa (saldo, estoque), a ordem costuma vencer, de preferência com pausa do consumidor em vez de muitas tentativas.',
+    },
+    {
+      pergunta: 'O emissor ficou fora por 20 minutos e 8 mil mensagens foram para o DLT. Ele voltou. Qual o procedimento mais seguro?',
+      opcoes: ['Republicar todas as mensagens do DLT de uma vez, imediatamente', 'Confirmar a causa, filtrar as mensagens que morreram por indisponibilidade naquele período, republicar em lotes com a mesma chave e contar com o consumidor idempotente', 'Apagar o DLT e pedir aos clientes que refaçam os pedidos', 'Aumentar o número de tentativas e esperar que se resolva'],
+      correta: 1,
+      explicacao: 'Filtro, lotes, mesma chave, contador de reprocessamentos e idempotência evitam laços, picos de carga e efeitos duplicados. Republicar tudo de uma vez pode derrubar o emissor que acabou de voltar.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Primeiro classifique: **transitória** (retry com espera), **permanente** e **bug** (direto para a DLQ). A classificação é por tipo de exceção, que o adaptador traduz a partir do status HTTP.
+- **Backoff exponencial** com **teto** e **jitter**, e sempre com **limite de tentativas**: o `ExponentialBackOff` do Spring Framework 7 repete para sempre se você não limitar. O jitter reduz o pico, não o total.
+- Spring Kafka 4: `DefaultErrorHandler` + `DeadLetterPublishingRecoverer` + `addNotRetryableExceptions` + um `RetryListener` para medir. O DLT é **`<tópico>-dlt`**, precisa existir e ter pelo menos as partições do original.
+- Os headers `kafka_dlt-*` dizem de onde a mensagem veio e por que morreu; a causa real está em `kafka_dlt-exception-cause-fqcn`, com a classe concreta.
+- O retry bloqueante depende de *seek* e nova busca: a espera real pode ser maior que a configurada. Meça.
+- **Bloqueante** preserva a ordem e segura a partição; **`@RetryableTopic`** não bloqueia e perde a ordem. Escolha por listener.
+- **Mensagem envenenada** no deserializer trava a partição: `ErrorHandlingDeserializer`, ou `String` + conversão no listener.
+- Reprocessar com segurança: corrigir antes, filtrar, limitar, mesma chave, contador de reprocessamentos e consumidor **idempotente**.
+- Em produção: alerta no DLT e na idade da mensagem mais antiga, retenção pensada, dados pessoais protegidos, reprocessamento auditado, e cuidado com a tempestade de retries (camadas, orçamento, circuit breaker).
+
+## Próximo passo
+
+No [exercício 12.02, estoque com Kafka](../../../exercicios/12-mensageria/02-estoque-kafka/), você aplica o `DefaultErrorHandler` com DLT num consumidor de movimentos de estoque, e no [marco 5 da fintech](../../../exercicios/12-mensageria/05-fintech-marco-5/) junta outbox, idempotência e retry num fluxo completo. Na próxima aula, [evolução de esquemas de eventos](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/), você vê como mudar o formato de um evento sem que os consumidores antigos passem a mandar tudo para o DLT.
+
+## Referências
+
+- Spring for Apache Kafka — [Handling Exceptions](https://docs.spring.io/spring-kafka/reference/kafka/annotation-error-handling.html) (`DefaultErrorHandler`, `DeadLetterPublishingRecoverer`, `ErrorHandlingDeserializer`)
+- Spring for Apache Kafka — [Non-Blocking Retries](https://docs.spring.io/spring-kafka/reference/retrytopic.html) e [Topic Naming](https://docs.spring.io/spring-kafka/reference/retrytopic/topic-naming.html)
+- Spring for Apache Kafka — [Testing Applications](https://docs.spring.io/spring-kafka/reference/testing.html) (`@EmbeddedKafka`)
+- Spring Framework 7 — Javadoc de [`ExponentialBackOff`](https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/util/backoff/ExponentialBackOff.html)
+- Apache Kafka — [Consumer Configs](https://kafka.apache.org/documentation/#consumerconfigs) (`fetch.max.wait.ms`, `max.poll.interval.ms`)
+- RabbitMQ — [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)
+- AWS Builders' Library — [Timeouts, retries and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)

@@ -1,0 +1,760 @@
+---
+titulo: "Domain-Driven Design na prática: do mapa de contextos ao agregado"
+descricao: "DDD para quem decide arquitetura: linguagem ubíqua, subdomínios, bounded contexts e context mapping, event storming para descobrir as fronteiras; no código, entidades, value objects em records, agregados que protegem invariantes, eventos de domínio, repositórios e serviços de domínio; como isso se encaixa na hexagonal, no monólito modular e nos microsserviços, e quando é exagero."
+modulo: 13-arquitetura
+ordem: 7
+duracao: 110
+objetivos:
+  - Classificar os subdomínios de um negócio em core, suporte e genérico e justificar onde investir
+  - Desenhar um mapa de contextos com as relações ACL, shared kernel, cliente/fornecedor e conformista
+  - Conduzir uma sessão curta de event storming e extrair dela candidatos a bounded contexts e agregados
+  - Modelar um agregado em Java que protege as próprias invariantes, com value objects em records e eventos de domínio
+  - Aplicar as regras "uma transação, um agregado" e "referência por id" e explicar a consistência eventual entre agregados
+  - Escrever uma camada anticorrupção que traduz o modelo de outro contexto
+  - Decidir, com argumentos, quando DDD tático compensa e quando é exagero
+tags: [DDD, Domain-Driven Design, bounded context, agregado, value object, event storming, ACL, context mapping]
+flashcards:
+  - frente: O que é um bounded context?
+    verso: A fronteira dentro da qual um modelo e a sua linguagem valem sem ambiguidade. "Pedido" em Vendas e "pedido" em Logística podem ser modelos diferentes, cada um correto no próprio contexto.
+  - frente: Qual a diferença entre subdomínio core, de suporte e genérico?
+    verso: Core é o que diferencia o negócio (invista o melhor time e o DDD tático). Suporte é necessário mas não diferencia (faça simples). Genérico é igual em toda empresa (compre ou use pronto - autenticação, nota fiscal, gateway).
+  - frente: O que é uma camada anticorrupção (ACL)?
+    verso: Um tradutor no lado downstream que converte o modelo de outro contexto (geralmente legado ou externo) para o modelo local, para que conceitos estranhos não vazem para o domínio.
+  - frente: Entidade ou value object?
+    verso: Entidade tem identidade que persiste enquanto os atributos mudam (Pedido 7d1c...). Value object é definido só pelos valores, é imutável e substituível (Dinheiro R$ 49,90; Sku). Em Java, value objects são records.
+  - frente: O que é um agregado?
+    verso: Um grupo de objetos tratado como unidade de consistência, com uma raiz que é a única porta de entrada. Toda invariante que precisa valer imediatamente fica dentro de um agregado, e cada transação altera um só.
+  - frente: Por que referenciar outros agregados por id?
+    verso: Para não carregar nem alterar outro agregado sem querer, manter os agregados pequenos e permitir que vivam em transações, bancos ou serviços diferentes. O Pedido guarda ClienteId, não Cliente.
+  - frente: Modelo anêmico versus modelo rico?
+    verso: No anêmico as entidades são só getters e setters e as regras ficam espalhadas em serviços. No rico, a entidade expõe operações do negócio (confirmar, adicionarItem) que validam as regras e não deixam o objeto entrar num estado inválido.
+  - frente: Quando DDD tático é exagero?
+    verso: Em CRUDs, subdomínios genéricos ou de suporte sem regras, protótipos e times sem acesso a especialistas do negócio. O DDD estratégico (linguagem e fronteiras) quase sempre vale; o tático, só onde há regra para proteger.
+---
+
+Uma loja online de cafés especiais cresceu rápido. O sistema começou como um único projeto Spring Boot com uma entidade `Cliente` e uma entidade `Pedido`, e há três anos tudo funcionava. Hoje a entidade `Cliente` tem 64 campos: o time de Vendas acrescentou endereço de entrega e preferências de torra, o Financeiro acrescentou limite de crédito e situação cadastral, a Logística acrescentou janela de recebimento e "portaria fecha às 18h". O `Pedido` tem um campo `status` com onze valores possíveis, e ninguém sabe dizer com certeza a diferença entre `FECHADO`, `FINALIZADO` e `CONCLUIDO`. Numa reunião, a gerente de Vendas diz que "o pedido fechou" quando o cliente clicou em comprar; o Financeiro diz que ele fechou quando o pagamento compensou; a Logística, quando o caminhão saiu. As três estão certas, cada uma no próprio mundo, e o código tenta atender às três com um único objeto.
+
+Os sintomas aparecem toda semana. Uma correção no frete quebrou o relatório financeiro, porque os dois liam o campo `valorTotal` com significados diferentes. Um desenvolvedor novo adicionou um item a um pedido já pago, porque `pedido.getItens().add(...)` compilava e nada o impedia. Ninguém escreveu código ruim de propósito: o problema é de **modelo**. O software nunca separou os conceitos que o negócio já separa, e nunca deu às regras um lugar para morar.
+
+O **Domain-Driven Design** (DDD), nome do livro de Eric Evans de 2003, é um conjunto de práticas para atacar exatamente isso. Ele tem duas metades. A **estratégica** trata de linguagem e fronteiras: como descobrir quais modelos o negócio tem, onde termina cada um e como eles conversam. A **tática** trata do código dentro de uma fronteira: entidades, value objects, agregados, eventos, repositórios. Nesta aula você vai ver as duas, com um exemplo completo em Java 25 puro, e principalmente vai aprender a decidir **quanto** DDD aplicar, que é o que separa quem decorou os padrões de quem os usa bem.
+
+## A intuição: o restaurante e as três comandas
+
+Pense num restaurante movimentado. No salão, o garçom anota o pedido da mesa 12: dois risotos, um sem queijo, uma água com gás, "a moça da ponta é alérgica a camarão". Para ele, um **pedido** é uma mesa, pessoas, preferências e a ordem em que os pratos devem chegar.
+
+O garçom leva a comanda até a cozinha, mas a cozinha não usa aquela comanda. Ela recebe um **ticket de preparo**: "2 risotos (1 s/ queijo) · alergia: camarão · prioridade normal". Para a cozinha, o pedido é uma lista de preparos com tempos, estações (fogão, forno, fria) e restrições. A cozinha não quer saber o nome de quem está na mesa nem se a água é com gás: isso é ruído.
+
+No fim, o caixa recebe uma **conta**: itens, preços, taxa de serviço, forma de pagamento, divisão entre pessoas. Para o caixa, o pedido é dinheiro.
+
+Repare em três coisas. A palavra "pedido" significa três coisas diferentes, e **cada significado é correto no seu lugar**; uma "comanda universal" com os campos dos três seria um papel enorme que ninguém preenche direito. Entre os departamentos existe **tradução**: alguém converte a comanda em ticket de preparo e decide o que passa. E cada departamento tem **regras próprias** que só ele protege: o caixa não fecha uma conta com valor negativo, a cozinha não começa um prato sem ticket.
+
+No vocabulário do DDD, cada departamento é um **bounded context** (contexto delimitado), cada um com a sua **linguagem ubíqua**; o tradutor é uma **camada anticorrupção**; o desenho de quem fala com quem é o **mapa de contextos**; e as regras que um departamento protege sozinho, sem perguntar a ninguém, são as **invariantes** dos seus **agregados**. A loja de cafés do começo da aula é um restaurante que obrigou salão, cozinha e caixa a usar o mesmo papel.
+
+## Vocabulário
+
+DDD tem muitos termos, e entrevistas cobram a precisão deles. Esta tabela é a referência para o resto da aula; não precisa decorar agora.
+
+| Termo | O que é | Na loja de cafés |
+|---|---|---|
+| **Domínio** | A área de negócio que o software atende | Venda de cafés especiais pela internet |
+| **Subdomínio** | Uma parte do domínio com um problema próprio | Vendas, Catálogo, Financeiro, Logística, Identidade |
+| **Core / suporte / genérico** | A importância estratégica de um subdomínio: o que diferencia, o que ajuda, o que é igual em toda empresa | Curadoria e assinatura (core), Logística (suporte), login (genérico) |
+| **Linguagem ubíqua** | O vocabulário comum entre especialistas do negócio e time técnico, usado na conversa **e** no código | "Confirmar pedido", "crédito disponível", "SKU" |
+| **Bounded context** | A fronteira em que um modelo e a sua linguagem valem sem ambiguidade | O contexto de Vendas, onde "pedido" é o carrinho confirmado |
+| **Mapa de contextos** | O desenho dos contextos e das relações entre eles (ACL, conformista e outras, vistas adiante) | A figura logo adiante |
+| **Camada anticorrupção (ACL)** | Tradutor do lado downstream que protege o modelo local do modelo alheio | `CreditoViaFinanceiro` |
+| **Entidade** | Objeto com identidade que permanece enquanto os atributos mudam | `Pedido` |
+| **Value object** | Objeto definido só pelos valores, imutável e substituível | `Dinheiro`, `Sku`, `ItemDoPedido` |
+| **Agregado** | Grupo de objetos tratado como uma unidade de consistência | `Pedido` com os seus itens |
+| **Raiz do agregado** | A única entidade do agregado que o mundo externo pode referenciar e chamar | `Pedido` |
+| **Invariante** | Regra que precisa ser verdadeira sempre, ao fim de cada operação | "Pedido confirmado não muda de itens" |
+| **Evento de domínio** | Registro de algo relevante que aconteceu, com nome no passado | `PedidoConfirmado` |
+| **Repositório** | A abstração que guarda e recupera agregados inteiros | `RepositorioDePedidos` |
+| **Serviço de domínio** | Uma regra de negócio que não pertence naturalmente a uma entidade | `PoliticaDeCredito` |
+| **Serviço de aplicação** | O caso de uso: orquestra repositórios, domínio e portas, sem regras de negócio | `ConfirmarPedido` |
+
+Dois esclarecimentos que evitam confusão. **Subdomínio** é um conceito do **problema** (como o negócio se divide); **bounded context** é um conceito da **solução** (onde o software traça fronteiras de modelo). Idealmente eles se alinham um para um, mas não é obrigatório: um subdomínio grande pode ter dois contextos, e um sistema legado pode ter um contexto atravessando três subdomínios. E **serviço de domínio** não é o `@Service` do Spring: é um conceito de modelagem, que pode ou não virar um bean.
+
+## DDD estratégico: encontrando as fronteiras
+
+A parte estratégica é a mais valiosa do DDD e a mais ignorada. Muitos times adotam os padrões táticos (repositórios, agregados, value objects) dentro de um modelo único e gigante, e terminam com uma bola de lama bem nomeada. Comece pelas fronteiras; o código vem depois.
+
+### Linguagem ubíqua
+
+A linguagem ubíqua é o vocabulário que especialistas do negócio e desenvolvedores usam **igual**, na conversa, nos documentos, nos testes e no código. Se a gerente de Vendas diz "confirmar o pedido", o método se chama `confirmar`, não `processar`, `finalizar` nem `setStatus(2)`. Se o Financeiro fala em "crédito disponível", existe um `disponivel()` em `SituacaoDeCredito`, não um cálculo `limite - aberto` repetido em cinco lugares.
+
+Isso parece cosmético, mas tem efeito direto em custo. Toda vez que o time traduz mentalmente ("quando ela diz 'fechado', no código é o status 7"), existe uma chance de erro e uma reunião a mais. Quando o código fala a língua do negócio, um especialista consegue ler um teste e dizer "não, essa regra está errada", e uma regra nova vira um método novo com nome conhecido.
+
+Na prática: mantenha **um glossário curto por contexto**, versionado com o código, com definição, exemplo e o que o termo **não** é; trate **ambiguidade como sinal de fronteira** (se "cliente" significa coisas diferentes para dois grupos, provavelmente há dois contextos ali); escreva os testes na mesma língua (`naoAceitaItensDepoisDeConfirmado` é uma frase que o negócio reconhece); e, se o negócio mudar um termo, **renomeie no código**, ou a tradução mental volta.
+
+<Callout tipo="info" titulo="Português ou inglês no código?">
+Nesta trilha o código está em português porque o domínio e o público são brasileiros. Em empresas com times internacionais, é comum manter o código em inglês. A regra do DDD não é "use o idioma X", é "use os **mesmos termos** do negócio": se o negócio fala em "boleto", "Pix" e "nota fiscal", escreva `Boleto`, `Pix` e `NotaFiscal` mesmo num código em inglês. Traduzir "boleto" para `BankSlip` cria um termo que ninguém do negócio usa.
+</Callout>
+
+### Subdomínios: onde investir
+
+Nem toda parte do sistema merece o mesmo cuidado. O DDD classifica os subdomínios em três tipos, e essa classificação é, antes de tudo, uma decisão de **investimento**.
+
+| Tipo | O que é | Na loja de cafés | Estratégia |
+|---|---|---|---|
+| **Core** | O que diferencia a empresa da concorrência; o motivo de ela existir | Curadoria de cafés, assinatura recorrente com ajuste de torra, regras de venda e preço | Desenvolver internamente, com o melhor time, DDD tático, testes fortes |
+| **Suporte** | Necessário e específico do negócio, mas não diferencia | Logística de entrega, controle de estoque, financeiro interno | Desenvolver de forma simples (CRUD bem feito costuma bastar) ou terceirizar |
+| **Genérico** | Igual em qualquer empresa | Login e identidade, emissão de nota fiscal, gateway de pagamento, envio de e-mail | Comprar ou usar pronto (Keycloak, um provedor de NF-e, um gateway) |
+
+A classificação muda o que você faz no dia a dia. Construir um sistema de autenticação próprio "porque é DDD" é desperdício: autenticação é genérica, e o mercado resolve melhor. Em compensação, usar um ERP genérico para as regras de assinatura, que são o coração do negócio, entrega o diferencial da empresa às limitações de um fornecedor. A pergunta de entrevista "como você decide entre construir e comprar?" tem aqui uma resposta estruturada.
+
+A classificação muda com o tempo e é feita **com o negócio**: "se a concorrência copiasse esta parte amanhã, perderíamos clientes?". Se não, provavelmente não é core.
+
+### Bounded contexts
+
+Um **bounded context** é a fronteira dentro da qual um modelo é consistente. Dentro dela, cada termo tem um significado só, cada regra tem um dono, e o código pode ser refatorado sem pedir licença a outros times. Fora dela, o mesmo termo pode significar outra coisa, e tudo bem.
+
+Na loja de cafés, uma divisão razoável fica assim:
+
+- **Vendas**: carrinho, pedido, itens, preço praticado, confirmação. Aqui "pedido" é o que o cliente comprou e por quanto.
+- **Catálogo**: produtos, descrições, fotos, torra, origem, preço de tabela. Aqui "produto" é algo a ser exibido e buscado.
+- **Financeiro**: limite de crédito, títulos em aberto, inadimplência. Aqui "cliente" é uma ficha de crédito.
+- **Logística**: separação, remessa, transportadora, rastreio. Aqui "pedido" é um volume com peso, endereço e janela de entrega.
+- **Identidade**: contas, senhas, papéis. Aqui "cliente" é um usuário que se autentica.
+
+Cada contexto tem o **seu** `Cliente` (ou nenhum), com os campos de que precisa. O `Cliente` de 64 campos do começo da aula se desfaz em cinco modelos pequenos, cada um com seis ou oito campos, ligados por um identificador comum. Isso não é duplicação no sentido ruim: são conceitos diferentes que por acaso tinham o mesmo nome.
+
+Sinais de que há uma fronteira: a mesma palavra com significados diferentes; grupos de pessoas que mudam regras por motivos diferentes; ritmos de mudança diferentes (o catálogo muda todo dia, as regras fiscais uma vez por ano); e **eventos pivotais**, como "pedido confirmado", depois dos quais o assunto passa para outra área. Sinal de fronteira mal traçada: duas partes que mudam juntas em quase toda funcionalidade, ou que se consultam de forma síncrona a cada operação.
+
+<Callout tipo="atencao" titulo="Contexto não é tabela nem entidade">
+Um erro comum é criar um "contexto de Cliente", um "contexto de Produto" e um "contexto de Pedido", um por substantivo. Isso reproduz o modelo de dados, não o negócio, e gera contextos que precisam conversar o tempo todo. Contextos se organizam em torno de **capacidades do negócio** (vender, entregar, cobrar), e cada um deles tem a própria visão de cliente, produto e pedido.
+</Callout>
+
+### Mapa de contextos: como os contextos se relacionam
+
+Contextos não vivem isolados. O **mapa de contextos** registra quem depende de quem e qual o tipo da relação, e isso é tanto técnico quanto **organizacional**: o tipo de relação reflete o poder de negociação entre os times. A figura mostra o mapa da loja de cafés.
+
+<Figura legenda="Mapa de contextos da loja de cafés. As setas vão do contexto upstream (que dita o modelo) para o downstream (que depende dele); o rótulo diz o tipo de relação">
+<svg viewBox="0 0 760 450" width="760" role="img" aria-labelledby="mapa-ddd-titulo mapa-ddd-desc">
+  <title id="mapa-ddd-titulo">Mapa de contextos com Vendas no centro</title>
+  <desc id="mapa-ddd-desc">Vendas, o contexto core, fica no centro. Catálogo, acima à esquerda, é upstream de Vendas numa relação cliente/fornecedor. Financeiro, acima à direita, é um legado upstream; Vendas se protege dele com uma camada anticorrupção. Identidade, abaixo à esquerda, é genérico e Vendas é conformista em relação a ele. Logística, abaixo à direita, é downstream de Vendas e consome os eventos que Vendas publica numa linguagem publicada.</desc>
+  <defs><marker id="mk-mapa-ddd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="270" y="165" width="220" height="104" rx="12" class="d-accent"/>
+  <text x="380" y="195" text-anchor="middle" class="d-title">Vendas</text>
+  <text x="380" y="217" text-anchor="middle" class="d-label">subdomínio core</text>
+  <text x="380" y="240" text-anchor="middle" class="d-mono">Pedido · Dinheiro</text>
+  <rect x="20" y="25" width="210" height="84" rx="10" class="d-info"/>
+  <text x="125" y="58" text-anchor="middle" class="d-title">Catálogo</text>
+  <text x="125" y="82" text-anchor="middle" class="d-label">suporte</text>
+  <rect x="530" y="25" width="210" height="84" rx="10" class="d-box"/>
+  <text x="635" y="58" text-anchor="middle" class="d-title">Financeiro</text>
+  <text x="635" y="82" text-anchor="middle" class="d-label">suporte · sistema legado</text>
+  <rect x="20" y="325" width="210" height="84" rx="10" class="d-violet"/>
+  <text x="125" y="358" text-anchor="middle" class="d-title">Identidade</text>
+  <text x="125" y="382" text-anchor="middle" class="d-label">genérico · produto pronto</text>
+  <rect x="530" y="325" width="210" height="84" rx="10" class="d-ok"/>
+  <text x="635" y="358" text-anchor="middle" class="d-title">Logística</text>
+  <text x="635" y="382" text-anchor="middle" class="d-label">suporte</text>
+  <rect x="440" y="140" width="64" height="28" rx="6" class="d-ok"/>
+  <text x="472" y="159" text-anchor="middle" class="d-mono">ACL</text>
+  <path d="M190 109 L290 163" class="d-line" marker-end="url(#mk-mapa-ddd)"/>
+  <text x="252" y="128" class="d-label">cliente/fornecedor</text>
+  <path d="M590 109 L500 140" class="d-line" marker-end="url(#mk-mapa-ddd)"/>
+  <text x="560" y="140" class="d-label">anticorrupção</text>
+  <path d="M190 325 L290 271" class="d-line" marker-end="url(#mk-mapa-ddd)"/>
+  <text x="252" y="312" class="d-label">conformista</text>
+  <path d="M470 271 L570 325" class="d-line" marker-end="url(#mk-mapa-ddd)"/>
+  <text x="404" y="312" class="d-label">eventos publicados</text>
+  <text x="20" y="440" class="d-text">Seta: do upstream (dita o modelo) para o downstream (depende dele).</text>
+</svg>
+</Figura>
+
+Os padrões de relação mais usados, com o que cada um custa:
+
+| Relação | Como funciona | Quando usar | Risco |
+|---|---|---|---|
+| **Shared kernel** | Um pequeno modelo (uma biblioteca, um módulo) compartilhado e mantido pelos dois | Tipos estáveis e realmente comuns (`Dinheiro`, `Cpf`) | Cresce sem controle e vira "o modelo comum" que ninguém pode mudar |
+| **Cliente/fornecedor** | O upstream (fornecedor) considera as necessidades do downstream (cliente) no planejamento; contratos negociados | Times da mesma empresa com boa relação | Depende de o upstream cumprir; precisa de testes de contrato |
+| **Conformista** | O downstream adota o modelo do upstream sem traduzir | Upstream sem interesse em negociar (um SaaS, um padrão como OIDC) e modelo aceitável | O modelo alheio vaza para o seu código |
+| **Camada anticorrupção (ACL)** | O downstream traduz o modelo alheio para o seu, num ponto só | Legado, sistema externo com modelo ruim ou instável, ou quando o seu contexto é core | Custo de manter o tradutor; precisa de testes |
+| **Open host service + linguagem publicada** | O upstream oferece uma API ou formato de eventos estável e documentado para muitos consumidores | Um contexto com muitos consumidores (os eventos de Vendas) | Exige versionamento e governança do contrato |
+A decisão mais frequente é entre **conformista** e **ACL**, e a regra de bolso é: proteja com ACL o que é **core**. O Financeiro é um legado com colunas como `VL_LIM_CRED` e situação codificada em letras; deixar isso entrar em Vendas contamina o código mais importante da empresa. Já com o provedor de identidade, ser conformista é razoável: as claims do OpenID Connect são um bom modelo. E repare: **upstream** não é quem chama, é quem **dita o modelo**. O Financeiro é upstream de Vendas, embora seja Vendas quem faz a chamada.
+
+### Event storming: descobrindo o domínio com post-its
+
+Desenhar fronteiras olhando para o código existente reproduz os erros do código existente. O **event storming**, técnica criada por Alberto Brandolini, é um workshop para descobrir o domínio **com** as pessoas que o conhecem. A ideia central é simples: em vez de começar por entidades e tabelas, comece pelo que **acontece** no negócio, escrito como eventos no passado, numa linha do tempo.
+
+O material é uma parede longa (ou um quadro virtual), post-its coloridos e as pessoas certas: especialistas do negócio, desenvolvedores, produto e operação. Cada cor é um tipo: **laranja** para eventos ("Pedido confirmado"); **azul** para comandos, a intenção que provoca o evento ("Confirmar pedido"); **amarelo pequeno** para atores; **amarelo grande** para agregados, que recebem o comando e decidem se o evento acontece; **lilás** para políticas, reações automáticas ("sempre que confirmado, reservar estoque"); **verde** para modelos de leitura; e **rosa** para pontos quentes (hot spots), dúvidas e conflitos que ninguém sabe responder ainda.
+
+<Figura legenda="Um trecho de event storming no nível de processo: comando, agregado, evento, política que dispara novo comando, e um ponto quente anotado embaixo">
+<svg viewBox="0 0 770 260" width="770" role="img" aria-labelledby="storming-titulo storming-desc">
+  <title id="storming-titulo">Sequência de post-its de event storming</title>
+  <desc id="storming-desc">Da esquerda para a direita: o comando Confirmar pedido chega ao agregado Pedido, que gera o evento Pedido confirmado. A política sempre que confirmado, reservar estoque dispara o comando Reservar estoque, que gera o evento Estoque reservado. Abaixo do evento Pedido confirmado há um ponto quente: e se o crédito mudar entre o carrinho e a confirmação?</desc>
+  <defs><marker id="mk-storming" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="30" width="112" height="96" rx="6" class="d-info"/>
+  <text x="66" y="54" text-anchor="middle" class="d-label">comando</text>
+  <text x="66" y="82" text-anchor="middle" class="d-text">Confirmar</text>
+  <text x="66" y="102" text-anchor="middle" class="d-text">pedido</text>
+  <rect x="140" y="30" width="112" height="96" rx="6" class="d-box"/>
+  <text x="196" y="54" text-anchor="middle" class="d-label">agregado</text>
+  <text x="196" y="90" text-anchor="middle" class="d-text">Pedido</text>
+  <rect x="270" y="30" width="112" height="96" rx="6" class="d-accent"/>
+  <text x="326" y="54" text-anchor="middle" class="d-label">evento</text>
+  <text x="326" y="82" text-anchor="middle" class="d-text">Pedido</text>
+  <text x="326" y="102" text-anchor="middle" class="d-text">confirmado</text>
+  <rect x="400" y="30" width="112" height="96" rx="6" class="d-violet"/>
+  <text x="456" y="54" text-anchor="middle" class="d-label">política</text>
+  <text x="456" y="82" text-anchor="middle" class="d-text">sempre que</text>
+  <text x="456" y="102" text-anchor="middle" class="d-text">confirmado...</text>
+  <rect x="530" y="30" width="112" height="96" rx="6" class="d-info"/>
+  <text x="586" y="54" text-anchor="middle" class="d-label">comando</text>
+  <text x="586" y="82" text-anchor="middle" class="d-text">Reservar</text>
+  <text x="586" y="102" text-anchor="middle" class="d-text">estoque</text>
+  <rect x="660" y="30" width="100" height="96" rx="6" class="d-accent"/>
+  <text x="710" y="54" text-anchor="middle" class="d-label">evento</text>
+  <text x="710" y="82" text-anchor="middle" class="d-text">Estoque</text>
+  <text x="710" y="102" text-anchor="middle" class="d-text">reservado</text>
+  <path d="M122 78 H138" class="d-line" marker-end="url(#mk-storming)"/>
+  <path d="M252 78 H268" class="d-line" marker-end="url(#mk-storming)"/>
+  <path d="M382 78 H398" class="d-line" marker-end="url(#mk-storming)"/>
+  <path d="M512 78 H528" class="d-line" marker-end="url(#mk-storming)"/>
+  <path d="M642 78 H658" class="d-line" marker-end="url(#mk-storming)"/>
+  <rect x="200" y="170" width="300" height="70" rx="6" class="d-box" stroke-dasharray="6 4"/>
+  <text x="350" y="192" text-anchor="middle" class="d-label">ponto quente</text>
+  <text x="350" y="216" text-anchor="middle" class="d-text">E se o crédito mudar entre</text>
+  <text x="350" y="234" text-anchor="middle" class="d-text">o carrinho e a confirmação?</text>
+  <path d="M326 126 V168" class="d-line" stroke-dasharray="4 4"/>
+</svg>
+</Figura>
+
+O workshop costuma ter três níveis de detalhe, e você escolhe qual fazer conforme a pergunta:
+
+1. **Big picture** (o domínio inteiro, de 2 a 4 horas): todos escrevem eventos livremente; depois o grupo os ordena na linha do tempo e discute os conflitos. Os **eventos pivotais** (momentos em que o assunto muda de mãos, como "Pedido confirmado") são **candidatos naturais a fronteiras de contexto**.
+2. **Processo** (um fluxo, de 1 a 2 horas): acrescente comandos, atores, políticas e modelos de leitura, como na figura. A gramática "ator dá comando → agregado decide → evento acontece → política reage" revela regras escondidas.
+3. **Design** (com o time técnico): os amarelos grandes viram candidatos a **agregados**, e a pergunta passa a ser "quais regras este agregado garante sozinho para aceitar ou recusar o comando?". É a ponte para o DDD tático.
+
+Trate os pontos quentes como o principal entregável. No exemplo da figura, "e se o crédito mudar entre o carrinho e a confirmação?" gerou uma regra concreta: o crédito é verificado **no momento da confirmação**, não ao adicionar itens. Essa decisão aparece no código desta aula, em `ConfirmarPedido`. E não espere a sessão perfeita: uma hora com dois especialistas, focada no fluxo que vai ser reescrito, já vale mais que uma semana de documentos de requisitos.
+
+## DDD tático: o modelo dentro de uma fronteira
+
+Com as fronteiras definidas, o DDD tático diz como organizar o código **dentro** de um contexto, em especial de um contexto core. Os blocos de construção são poucos, e o que importa é a responsabilidade de cada um.
+
+### Entidades e value objects
+
+Uma **entidade** é algo que tem **identidade** própria, que continua a mesma enquanto os atributos mudam. O pedido `7d1c2f9e...` é o mesmo pedido quando ganha itens, quando é confirmado e quando é cancelado. Duas entidades com os mesmos atributos e ids diferentes são coisas diferentes.
+
+Um **value object** é definido **só pelos valores**. R$ 49,90 é igual a R$ 49,90, não importa "qual" R$ 49,90. Value objects são imutáveis: você não "muda" um valor, troca por outro. Por isso, em Java 25, **value objects são records**: imutáveis, com `equals` e `hashCode` por valor de graça, e com o construtor compacto como lugar natural para validar.
+
+O ganho dos value objects é maior do que parece. Um `BigDecimal` solto aceita valor negativo, três casas decimais e a confusão entre `10.5` e `10.50` (para `BigDecimal.equals`, são diferentes). Um `Dinheiro` que valida no construtor torna esses estados **impossíveis de representar**: não há como um `Dinheiro` inválido existir no sistema, então nenhum método precisa conferir isso de novo. O mesmo vale para ids tipados: com `PedidoId` e `ClienteId` como tipos distintos, passar o id do cliente onde se espera o do pedido é erro de compilação, não bug em produção.
+
+Regra de bolso: **comece pensando em value object** e só promova a entidade quando o negócio se importar com a identidade ao longo do tempo. Endereço, período, SKU, CPF, dinheiro: value objects. Pedido, conta, remessa: entidades.
+
+### Agregados e invariantes
+
+Um **agregado** é um grupo de entidades e value objects tratado como **uma unidade de consistência**. Ele tem uma **raiz**, a única entidade que o mundo externo pode referenciar e chamar; o resto é interno. Tudo que precisa ser verdade **imediatamente**, ao fim de cada operação, é uma **invariante**, e a raiz é responsável por garanti-la.
+
+No nosso `Pedido`, as invariantes são cinco: itens só mudam enquanto o pedido é rascunho; o mesmo SKU aparece uma vez só, sempre com o mesmo preço; no máximo 20 itens distintos e total de até R$ 50.000,00; só se confirma com pelo menos um item; e cancelar de novo não faz nada. Repare que todas falam do pedido e dos seus itens, e de nada mais. Essa é a pista para o tamanho do agregado.
+
+<Figura legenda="O agregado Pedido: a raiz é a única porta de entrada; itens e valores ficam dentro da fronteira de consistência; outros agregados são referenciados só pelo id; o que acontece sai como evento">
+<svg viewBox="0 0 740 390" width="740" role="img" aria-labelledby="agregado-titulo agregado-desc">
+  <title id="agregado-titulo">Fronteira do agregado Pedido</title>
+  <desc id="agregado-desc">Uma moldura tracejada marca a fronteira de consistência do agregado, alterada numa transação. Dentro dela, a raiz Pedido, com id, status e eventos pendentes, contém os value objects ItemDoPedido, Dinheiro e Sku. Fora da moldura, à esquerda, o agregado Cliente é referenciado só por ClienteId; à direita, o Produto do contexto Catálogo é referenciado só por Sku. Abaixo, o evento PedidoConfirmado sai do agregado.</desc>
+  <defs><marker id="mk-agregado" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="160" y="14" width="420" height="270" rx="14" class="d-box" stroke-dasharray="8 5"/>
+  <text x="370" y="38" text-anchor="middle" class="d-label">fronteira de consistência (uma transação)</text>
+  <rect x="260" y="54" width="220" height="74" rx="10" class="d-accent"/>
+  <text x="370" y="84" text-anchor="middle" class="d-title">Pedido (raiz)</text>
+  <text x="370" y="108" text-anchor="middle" class="d-label">id · status · eventos</text>
+  <rect x="180" y="182" width="180" height="70" rx="10" class="d-info"/>
+  <text x="270" y="210" text-anchor="middle" class="d-title">ItemDoPedido</text>
+  <text x="270" y="232" text-anchor="middle" class="d-label">value object</text>
+  <rect x="380" y="182" width="180" height="70" rx="10" class="d-info"/>
+  <text x="470" y="210" text-anchor="middle" class="d-title">Dinheiro · Sku</text>
+  <text x="470" y="232" text-anchor="middle" class="d-label">value objects</text>
+  <path d="M330 128 L290 180" class="d-line" marker-end="url(#mk-agregado)"/>
+  <path d="M410 128 L450 180" class="d-line" marker-end="url(#mk-agregado)"/>
+  <rect x="10" y="60" width="122" height="62" rx="10" class="d-box"/>
+  <text x="71" y="87" text-anchor="middle" class="d-title">Cliente</text>
+  <text x="71" y="108" text-anchor="middle" class="d-label">outro agregado</text>
+  <path d="M260 91 H134" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-agregado)"/>
+  <text x="197" y="83" text-anchor="middle" class="d-mono">ClienteId</text>
+  <rect x="608" y="60" width="122" height="62" rx="10" class="d-box"/>
+  <text x="669" y="87" text-anchor="middle" class="d-title">Produto</text>
+  <text x="669" y="108" text-anchor="middle" class="d-label">Catálogo</text>
+  <path d="M480 91 H606" class="d-line" stroke-dasharray="5 4" marker-end="url(#mk-agregado)"/>
+  <text x="543" y="83" text-anchor="middle" class="d-mono">Sku</text>
+  <path d="M370 284 V318" class="d-line" marker-end="url(#mk-agregado)"/>
+  <rect x="250" y="320" width="240" height="50" rx="10" class="d-violet"/>
+  <text x="370" y="351" text-anchor="middle" class="d-mono">PedidoConfirmado</text>
+  <text x="505" y="304" class="d-label">evento de domínio</text>
+</svg>
+</Figura>
+
+Vaughn Vernon, no artigo *Effective Aggregate Design*, resumiu o desenho de agregados em quatro regras. Elas são o que entrevistas de nível sênior esperam ouvir:
+
+1. **Modele invariantes verdadeiras dentro das fronteiras de consistência.** O agregado existe para proteger regras que precisam valer **na hora**. Se uma regra pode ficar inconsistente por alguns segundos sem prejuízo, ela não justifica juntar objetos num agregado.
+2. **Prefira agregados pequenos.** Um `Cliente` que contém todos os pedidos, que contêm todos os itens, que contêm os produtos, é carregado inteiro a cada operação, bloqueia o banco em toda alteração e gera conflitos de concorrência constantes. Na maioria dos casos, o agregado ideal é a raiz mais alguns value objects.
+3. **Referencie outros agregados pelo id.** O `Pedido` guarda `ClienteId`, não `Cliente`. Assim é impossível alterar o cliente "sem querer" através do pedido, o pedido carrega rápido e os dois podem viver em tabelas, bancos e até serviços diferentes.
+4. **Use consistência eventual fora da fronteira.** Uma transação altera **um** agregado. Se confirmar o pedido precisa reservar o estoque, o pedido publica `PedidoConfirmado` e outra transação, disparada pelo evento, reserva o estoque.
+
+A regra 4 contraria o instinto de "fazer tudo numa transação só". Mas a transação única exige travar pedido e estoque juntos, no mesmo banco, para sempre. Com uma transação por agregado, o estoque pode ir para outro módulo ou serviço. O preço é o intervalo em que o pedido está confirmado e o estoque ainda não reservado, e a possibilidade de a reserva falhar, o que pede uma compensação (cancelar o pedido e avisar o cliente). Pergunte ao negócio: "se o estoque for reservado dois segundos depois, há problema?". Quase sempre, não há.
+
+### Eventos de domínio
+
+Um **evento de domínio** registra algo que aconteceu e que interessa a alguém: `PedidoConfirmado`, `PedidoCancelado`. Ele tem nome no passado (já aconteceu, não pode ser recusado), é imutável (um record) e carrega o que os interessados precisam saber, no momento em que aconteceu.
+
+Eventos servem a dois propósitos diferentes que vale separar. **Dentro** do contexto, eles desacoplam efeitos colaterais: o agregado não chama o serviço de estoque, só registra que foi confirmado, e quem tiver interesse reage. **Entre** contextos, viram eventos de integração: Logística e Financeiro consomem `PedidoConfirmado` por um broker. Muitos times mantêm dois tipos: o evento de domínio, interno e livre para mudar, e o evento de integração, publicado, versionado e estável (a "linguagem publicada" do mapa de contextos). A tradução entre eles acontece na borda, como qualquer outro adaptador.
+
+No nosso código, o agregado **acumula** eventos numa lista interna, e o serviço de aplicação os **retira** depois de salvar e os entrega ao publicador. O agregado não sabe nada de Kafka, Spring ou banco. O Spring Data oferece o mesmo padrão pronto: um método anotado com `@DomainEvents` na raiz devolve os eventos, e o Spring os publica quando o repositório executa `save(...)`; um método com `@AfterDomainEventPublication` limpa a lista. A classe `AbstractAggregateRoot` já implementa os dois. Funciona bem dentro de um monólito; para eventos que saem do processo, combine com o **transactional outbox** da [aula 12.04](../../12-mensageria/04-transactional-outbox/), para não perder evento quando o broker estiver fora.
+
+### Repositórios por agregado
+
+Um **repositório** dá a ilusão de uma coleção de agregados: você pede um pedido pelo id, recebe o agregado **inteiro**, altera pela raiz e salva o agregado inteiro. Por isso há **um repositório por agregado, nunca por tabela**: existe `RepositorioDePedidos`, não `RepositorioDeItensDoPedido`, porque salvar um item sozinho contornaria as invariantes do pedido. Já relatórios e listagens não precisam passar pelo agregado: uma consulta SQL direta ou uma projeção do Spring Data é legítima. Agregados existem para **escrita com regras**.
+
+Na [aula 13.03](../../13-arquitetura/03-hexagonal/), a interface do repositório ficou na camada de aplicação como porta de saída; aqui ela fica no pacote do domínio, que é a tradição do DDD. As duas posições respeitam a regra da dependência; escolha uma por projeto e documente.
+
+### Serviços de domínio e serviços de aplicação
+
+Às vezes uma regra de negócio não pertence a nenhuma entidade. "Um pedido só pode ser confirmado se o total couber no crédito disponível do cliente" envolve o pedido **e** a situação de crédito, que vem de outro contexto. Colocar isso dentro do `Pedido` obrigaria o agregado a conhecer o Financeiro; colocar no `ConfirmarPedido` misturaria regra com orquestração. O lugar certo é um **serviço de domínio**: uma classe sem estado, nomeada na linguagem do negócio (`PoliticaDeCredito`), que recebe objetos de domínio e aplica a regra.
+
+O **serviço de aplicação** é o caso de uso: carrega o agregado, consulta as portas, chama o domínio, salva e publica. Não tem `if` de regra de negócio, e é o lugar da transação e da autorização. E cuidado com o excesso de serviços de domínio: se tudo vira serviço e as entidades ficam vazias, você chegou ao modelo anêmico por outro caminho.
+
+### Modelo anêmico versus modelo rico
+
+O **modelo anêmico** (termo de Martin Fowler) tem entidades que são só dados, com getters e setters, e regras espalhadas em serviços. É o padrão de fato em muitos projetos Spring. O problema aparece com o tempo: a regra "pedido confirmado não muda de itens" existe no `PedidoService`, mas o `ImportacaoService` altera os itens direto pela lista.
+
+<Comparar antes="Modelo anêmico: regras espalhadas, objeto aceita qualquer estado" depois="Modelo rico: a raiz protege as invariantes">
+```java
+// a entidade só guarda dados
+public class Pedido {
+    private String status;
+    private List<ItemDoPedido> itens = new ArrayList<>();
+    public List<ItemDoPedido> getItens() { return itens; }
+    public void setStatus(String status) { this.status = status; }
+}
+
+// a regra mora num serviço...
+if (!"CONFIRMADO".equals(pedido.getStatus())) {
+    pedido.getItens().add(item);
+}
+// ...e qualquer outro lugar pode ignorá-la
+pedido.getItens().add(brinde);
+pedido.setStatus("CONFIRMADO");
+```
+
+```java
+// a operação de negócio é um método da raiz
+pedido.adicionarItem(sku, 2, Dinheiro.de("49.90"));
+pedido.confirmar(Instant.now(relogio));
+
+// não existe atalho: itens() devolve cópia imutável,
+// não há setStatus, e a regra vale para todos
+pedido.adicionarItem(brinde, 1, Dinheiro.ZERO);
+// RegraDoPedidoException: Não é possível adicionar
+// itens: o pedido ... está CONFIRMADO
+```
+</Comparar>
+
+Modelo rico não significa "colocar tudo na entidade". Persistência, HTTP, envio de e-mail e chamadas a outros contextos continuam fora. O que vai para dentro são as **regras que mantêm o objeto válido** e as **operações com nome do negócio**. E o modelo anêmico não é proibido: num CRUD de cadastro, sem invariantes relevantes, ele é a escolha mais barata. O problema é usar o anêmico justamente no contexto core, onde as regras são o produto.
+
+## O código que vamos construir
+
+Tudo o que aparece a seguir está no projeto Maven da trilha, em `java/m13-arquitetura/aulas`, no pacote `dev.trilhajava.m13.aulas.ddd`, em Java 25 puro, sem Spring. É o contexto de **Vendas** da loja de cafés, com um pedaço do contexto **Financeiro** (legado) do lado de fora:
+
+```text
+dev.trilhajava.m13.aulas.ddd
+├── pedidos
+│   ├── dominio      ← o modelo: Pedido (raiz), ItemDoPedido, Dinheiro, PedidoId, ClienteId, Sku,
+│   │                  StatusDoPedido, eventos (PedidoConfirmado, PedidoCancelado),
+│   │                  RepositorioDePedidos, PoliticaDeCredito (serviço de domínio), SituacaoDeCredito
+│   ├── aplicacao    ← o caso de uso ConfirmarPedido e as portas ConsultaDeCredito e PublicadorDeEventos
+│   └── adaptador    ← CreditoViaFinanceiro (a ACL), PedidosEmMemoria, EventosEmMemoria
+├── financeiro       ← o modelo do outro contexto: FichaFinanceira, SistemaFinanceiro
+└── DemonstracaoDdd  ← um main que monta tudo e percorre três cenários
+```
+
+Repare que a organização é a da arquitetura hexagonal da [aula 13.03](../../13-arquitetura/03-hexagonal/): domínio no centro, aplicação em volta, adaptadores na borda. DDD diz **o que** vai no centro e como modelá-lo; a hexagonal diz **como proteger** esse centro do resto. Os dois se complementam, e é comum vê-los juntos.
+
+## Mão na massa
+
+Os comandos partem da pasta do módulo. Se você ainda não compilou o projeto, o primeiro `mvn` baixa as dependências e demora um pouco mais.
+
+```bash
+cd java/m13-arquitetura/aulas
+```
+
+### Passo 1: value objects com records
+
+**O que vamos fazer e por quê.** Antes do agregado, os tijolos. `Dinheiro` é o value object mais importante do contexto: aparece em preço, subtotal, total, limite e evento. Validar uma vez, no construtor, tira essa preocupação de todos os outros lugares.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/Dinheiro.java" destacar="14-23" />
+
+O construtor compacto do record (`public Dinheiro { ... }`) roda antes de os campos serem atribuídos. Ele recusa valores negativos e mais de duas casas decimais e, na linha 22, **normaliza** a escala com `setScale(2)`: por isso `Dinheiro.de("10.5")` e `Dinheiro.de("10.50")` são iguais, ao contrário dos `BigDecimal` correspondentes. As operações (`mais`, `vezes`, `menosAteZero`) devolvem **novos** objetos: value objects não mudam.
+
+Os ids e o item seguem o mesmo padrão. O `ItemDoPedido` é um value object **dentro** do agregado: não tem id próprio e, para "somar quantidade", devolve um item novo.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/ItemDoPedido.java" />
+
+Compile e experimente no JShell, o console interativo do JDK:
+
+```bash
+mvn -q compile
+jshell --class-path target/classes
+```
+
+```text
+jshell> import dev.trilhajava.m13.aulas.ddd.pedidos.dominio.*
+
+jshell> var a = Dinheiro.de("10.5")
+a ==> R$ 10.50
+
+jshell> var b = Dinheiro.de("10.50")
+b ==> R$ 10.50
+
+jshell> a.equals(b)
+$4 ==> true
+
+jshell> new java.math.BigDecimal("10.5").equals(new java.math.BigDecimal("10.50"))
+$5 ==> false
+
+jshell> new ItemDoPedido(new Sku("CAFE-1KG"), 3, Dinheiro.de("49.90")).subtotal()
+$6 ==> R$ 149.70
+
+jshell> Dinheiro.de("-1")
+|  Exception java.lang.IllegalArgumentException: Dinheiro não pode ser negativo: -1
+|        at Dinheiro.<init> (Dinheiro.java:17)
+|        at Dinheiro.de (Dinheiro.java:26)
+|        at (#7:1)
+```
+
+**O que acabou de acontecer.** O `true` contra o `false` de `$4` e `$5` resume o argumento: a regra "dinheiro tem duas casas" está num lugar só, e a igualdade significa o que o negócio entende por igualdade. O `toString` (`R$ 10.50`) faz logs e erros falarem a língua do negócio. E `Dinheiro.de("-1")` nem chega a existir.
+
+### Passo 2: o agregado Pedido e as invariantes
+
+**O que vamos fazer e por quê.** Agora a raiz do agregado. Leia o Javadoc primeiro: as cinco invariantes são o contrato do `Pedido`, e cada método público existe para mudar o estado **sem** violá-las.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/Pedido.java" destacar="42-61, 64-71, 86-90, 105-107" />
+
+**O que acabou de acontecer, por partes.**
+
+- **Construtor privado e fábrica `abrir`**, com nome do negócio, que deixa espaço para regras de criação.
+- **Valida numa cópia, depois altera (linhas 42 a 61).** `adicionarItem` confere todas as regras sobre a lista `candidatos` e só então troca o conteúdo de `itens`. Se uma regra falhar, nada mudou. Sem isso, um item poderia entrar antes de o limite estourar, deixando o agregado inválido quando alguém captura a exceção e segue em frente.
+- **`confirmar` registra o evento (linhas 64 a 71)** no mesmo método que muda o status: não existe pedido confirmado sem o evento. O instante vem de fora, para o agregado não depender do relógio do sistema.
+- **`retirarEventos` (linhas 86 a 90)** devolve os pendentes e esvazia a lista: cada evento é publicado uma vez só.
+- **`itens()` devolve `List.copyOf` (linhas 105 a 107)**, uma cópia imutável, e **não há setters**. Toda mudança passa por uma operação com nome do negócio.
+
+Os testes do agregado são os mais simples do projeto: `new`, chamar métodos e conferir o estado. Sem Spring, sem banco, sem mocks.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/ddd/pedidos/PedidoTest.java" semImports />
+
+```bash
+mvn test -Dtest=PedidoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.ddd.pedidos.PedidoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.184 s
+[INFO] BUILD SUCCESS
+```
+
+Repare no terceiro teste: além de esperar a exceção, ele confere que o total continua R$ 49.999,00 e que há um item só. É essa asserção que protege o "valida numa cópia, depois altera". E no primeiro, o preço do terceiro item foi passado como `"49.9"`: graças à normalização do `Dinheiro`, ele é reconhecido como o mesmo preço de `"49.90"`.
+
+### Passo 3: eventos de domínio com sealed interface
+
+**O que vamos fazer e por quê.** Os eventos são records que implementam uma interface selada. `sealed` (Java 17) limita quem pode implementar a interface; o compilador passa a saber que só existem `PedidoConfirmado` e `PedidoCancelado`.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/EventoDeDominio.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/PedidoConfirmado.java" />
+
+O ganho aparece em quem consome: um `switch` sobre `EventoDeDominio` com um `case` para cada record não precisa de `default`, e se alguém criar `PedidoDevolvido` e acrescentá-lo ao `permits`, todo `switch` que não tratar o novo evento **para de compilar**. É o compilador lembrando o time de cada lugar que precisa reagir ao novo fato do negócio.
+
+`PedidoConfirmado` carrega pedido, cliente, total e instante: o suficiente para o Financeiro registrar o título sem consultar Vendas de volta. Eventos só com o id obrigam o consumidor a chamar o produtor, recriando o acoplamento síncrono; eventos com o pedido inteiro acoplam o consumidor ao modelo interno do produtor.
+
+### Passo 4: o serviço de domínio e o repositório
+
+**O que vamos fazer e por quê.** A regra de crédito cruza o pedido com a situação de crédito do cliente. Ela não pertence ao `Pedido` (que não deve conhecer o Financeiro) nem ao caso de uso (que não deve ter regras). Vira um serviço de domínio.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/PoliticaDeCredito.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/SituacaoDeCredito.java" />
+
+`SituacaoDeCredito` é o crédito **como Vendas o enxerga**: limite, valor em aberto, bloqueado ou não, e o `disponivel()` calculado num lugar só. Não há letras, centavos nem nomes de coluna do Financeiro aqui. A política devolve `Optional<String>` com o motivo da recusa, em vez de um `boolean`, porque o motivo é informação de negócio que vai para a mensagem de erro e, num sistema real, para a tela do atendente.
+
+O repositório é uma interface com dois métodos e um Javadoc que importa mais que o código:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/dominio/RepositorioDePedidos.java" />
+
+### Passo 5: a camada anticorrupção
+
+**O que vamos fazer e por quê.** O Financeiro é um sistema legado com o próprio modelo. A `FichaFinanceira` é exatamente o que ele expõe:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/financeiro/FichaFinanceira.java" />
+
+Centavos em `long`, nomes herdados das colunas, situação codificada em letras, `null` quando o cliente não tem ficha. Nada disso deve aparecer no contexto de Vendas. A ACL é o único lugar que conhece os dois modelos:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/adaptador/CreditoViaFinanceiro.java" destacar="25-34" />
+
+**O que acabou de acontecer.** A ACL implementa a porta `ConsultaDeCredito`, definida nos termos de Vendas, e faz três traduções. **Ausência vira regra explícita**: sem ficha, o cliente não tem crédito (linha 26), uma decisão de negócio tomada num lugar só, em vez de `NullPointerException` espalhado. **Códigos viram conceitos**: "A" é ativo; "B" (bloqueado) e "I" (inadimplente) são, para Vendas, a mesma coisa, porque Vendas só precisa saber se pode vender. **Unidades viram value objects**: centavos viram `Dinheiro`. E, importante, a ACL **falha alto** diante do que não conhece (linha 31): se o Financeiro inventar a situação "S" amanhã, é melhor recusar a venda com uma mensagem clara do que tratar "S" como ativo por omissão.
+
+### Passo 6: o caso de uso e a demonstração
+
+**O que vamos fazer e por quê.** O serviço de aplicação junta tudo: carrega um agregado, consulta o crédito pela porta, pede a decisão ao serviço de domínio, confirma, salva e publica.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/ddd/pedidos/aplicacao/ConfirmarPedido.java" destacar="35-43" />
+
+Leia as linhas 35 a 43 como uma receita, e repare no que **não** está ali: nenhum `if` sobre status, itens ou total. O caso de uso não sabe as regras; sabe a ordem dos passos. Num projeto Spring, este método teria `@Transactional`, e a transação envolveria um único agregado: o `Pedido`. O estoque, o Financeiro e a Logística reagem depois, aos eventos.
+
+A demonstração monta o contexto com adaptadores em memória e um Financeiro simulado por uma lambda. Rode:
+
+```bash
+mvn -q compile
+java -cp target/classes dev.trilhajava.m13.aulas.ddd.DemonstracaoDdd
+```
+
+```text
+== 1. Montando e confirmando um pedido
+Item: ItemDoPedido[sku=CAFE-1KG, quantidade=3, precoUnitario=R$ 49.90]
+Item: ItemDoPedido[sku=FILTRO-102, quantidade=1, precoUnitario=R$ 12.50]
+Total: R$ 162.20
+Status: CONFIRMADO
+Evento: PedidoConfirmado[pedido=7d1c2f9e-3a4b-4c5d-8e6f-0a1b2c3d4e5f, cliente=CLI-1, total=R$ 162.20, ocorridoEm=2026-10-06T13:00:00Z]
+== 2. O agregado protege as invariantes
+Recusado: Não é possível adicionar itens: o pedido 7d1c2f9e-3a4b-4c5d-8e6f-0a1b2c3d4e5f está CONFIRMADO
+Itens continuam: 2, total R$ 162.20
+== 3. A ACL traduz o Financeiro
+Recusado: Pedido 0b9e8d7c-6f5a-4b3c-9d2e-1f0a9b8c7d6e recusado: cliente bloqueado no financeiro
+Status: RASCUNHO; eventos publicados no total: 1
+```
+
+**O que acabou de acontecer.** No cenário 1, três adições viraram duas linhas, o total é 3 × 49,90 + 12,50 = 162,20, cabe no crédito disponível de CLI-1 (R$ 5.000 menos R$ 1.200) e um evento foi publicado. No cenário 2, a invariante segurou a alteração. No cenário 3, a situação "B" atravessou a ACL como `bloqueado = true`, a política recusou e **nenhum** evento novo saiu.
+
+<Callout tipo="dica" titulo="No Windows, acentos trocados no console">
+Se o terminal do Windows mostrar `N�o � poss�vel`, o código está certo: é o console usando outra codificação. Rode com `java -Dstdout.encoding=UTF-8 -cp target/classes ...` ou use o terminal do IntelliJ.
+</Callout>
+
+### Passo 7: o caso de uso nos testes
+
+**O que vamos fazer e por quê.** O caso de uso é testado com os adaptadores em memória e a ACL **real**, com o Financeiro trocado por uma lambda. Dois testes bastam: o crédito insuficiente (a política mais a ACL) e a situação desconhecida (a ACL falhando alto).
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/ddd/pedidos/ConfirmarPedidoTest.java" semImports />
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.206 s -- in dev.trilhajava.m13.aulas.ddd.pedidos.ConfirmarPedidoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.020 s -- in dev.trilhajava.m13.aulas.ddd.pedidos.PedidoTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cinco testes, todos em milissegundos, e nenhum precisou de Mockito. Esse é um efeito colateral comum do DDD tático bem feito: quando as regras moram em objetos puros e as dependências externas passam por portas pequenas, fakes de três linhas substituem os mocks (compare com a [aula 10.03](../../10-testes/03-mockito/)).
+
+## Quando dá errado
+
+As mensagens abaixo são reais, geradas com um programa temporário que usa as classes da aula de forma errada. O valor delas está em quanto dizem sobre a causa: um modelo rico erra **com a linguagem do negócio**.
+
+### Dinheiro com casas decimais demais
+
+```text
+Exception in thread "main" java.lang.IllegalArgumentException: Dinheiro tem no máximo 2 casas decimais: 19.999
+	at dev.trilhajava.m13.aulas.ddd.pedidos.dominio.Dinheiro.<init>(Dinheiro.java:20)
+	at dev.trilhajava.m13.aulas.ddd.pedidos.dominio.Dinheiro.de(Dinheiro.java:26)
+```
+
+**Causa.** Um preço calculado com divisão (um desconto de 1/3) foi passado direto para `Dinheiro.de`. **Correção.** Arredondar é decisão de negócio: qual modo (`HALF_EVEN`, `HALF_UP`) e quando (por item ou no total). Coloque-a num método com nome, na política de desconto, em vez de afrouxar o construtor. O value object acabou de revelar uma regra que ninguém tinha escrito.
+
+### Alterar a lista de itens por fora
+
+```text
+Exception in thread "main" java.lang.UnsupportedOperationException
+	at java.base/java.util.ImmutableCollections.uoe(ImmutableCollections.java:159)
+	at java.base/java.util.ImmutableCollections$AbstractImmutableCollection.add(ImmutableCollections.java:164)
+```
+
+**Causa.** Código acostumado ao modelo anêmico fez `pedido.itens().add(...)`, e a lista de `List.copyOf` é imutável. A mensagem não tem texto; reconheça a assinatura `ImmutableCollections.uoe`. **Correção.** Use a operação do agregado. Se ela não existe (remover um item, trocar a quantidade), **crie a operação na raiz**, com as regras, em vez de devolver a lista mutável.
+
+### Confirmar um pedido vazio
+
+```text
+Exception in thread "main" dev.trilhajava.m13.aulas.ddd.pedidos.dominio.RegraDoPedidoException: Um pedido sem itens não pode ser confirmado
+	at dev.trilhajava.m13.aulas.ddd.pedidos.dominio.Pedido.confirmar(Pedido.java:67)
+```
+
+**Causa.** A tela enviou a confirmação antes de o carrinho ser salvo, ou um teste montou o cenário incompleto. **Correção.** Na API, traduza `RegraDoPedidoException` para `422 Unprocessable Content` com Problem Details (aula 08), usando a mensagem, que já está em linguagem de negócio. Não valide "tem itens?" também no controller: a regra é do agregado, e duplicá-la cria duas versões que divergem com o tempo.
+
+### O mesmo produto com outro preço
+
+```text
+Exception in thread "main" dev.trilhajava.m13.aulas.ddd.pedidos.dominio.RegraDoPedidoException: O SKU CAFE-1KG já está no pedido com o preço R$ 49.90
+	at dev.trilhajava.m13.aulas.ddd.pedidos.dominio.Pedido.adicionarItem(Pedido.java:47)
+```
+
+**Causa.** O preço do catálogo mudou entre duas adições ao carrinho: um **ponto quente** típico (vale o preço antigo ou o atual?). **Correção.** É de negócio, não técnica. Pergunte ao especialista e transforme a resposta numa operação explícita, como `atualizarPreco(sku, novoPreco)`. A exceção impede o sistema de decidir sozinho o que o negócio não decidiu.
+
+### A ACL recebe o que não conhece
+
+```text
+java.lang.IllegalStateException: Situação desconhecida no Financeiro para o cliente CLI-7: X
+```
+
+**Causa.** O upstream criou uma situação nova sem avisar. **Correção.** Sem a ACL, o "X" teria caído num `else` e o cliente seria tratado como ativo ou bloqueado por acidente. Converse com o time do Financeiro, decida o que "X" significa para Vendas e acrescente um `case`. Em produção, essa falha merece alerta próprio: é quebra de contrato entre contextos, que testes de contrato (aula 10) pegariam antes do deploy.
+
+## Armadilhas e quando NÃO usar
+
+**DDD tático em tudo.** O erro mais caro: agregados e ACL para um cadastro de categorias sem regras só multiplicam arquivos. Nos subdomínios de suporte e genéricos, um controller com Spring Data costuma bastar.
+
+**Agregado gigante.** "O cliente tem pedidos, que têm itens, que têm produtos" carrega meio banco e gera conflito de concorrência em toda operação. Sem regra de consistência imediata entre dois objetos, eles não precisam estar no mesmo agregado.
+
+**Agregado anêmico com nome bonito.** Uma classe chamada `PedidoAggregate` com getters e setters públicos, e as regras num `PedidoDomainService`, não é DDD: é o modelo anêmico com outro vocabulário. O teste é simples: dá para colocar o objeto num estado inválido sem lançar exceção? Se dá, as invariantes não estão protegidas.
+
+**Transação atravessando agregados.** Um `@Transactional` que confirma o pedido, baixa o estoque e debita pontos acopla três agregados para sempre: mesmo banco, bloqueios mútuos, nenhuma chance de separá-los. Use eventos e compensação.
+
+**Shared kernel que cresce.** Começa com `Dinheiro` e `Cpf`; em um ano, a biblioteca "comum" tem `Cliente`, `Pedido` e `Endereco`, e qualquer mudança exige coordenar cinco times. Mantenha o kernel mínimo e estável, ou troque-o por cópias locais.
+
+**Modelar sem o especialista.** DDD sem acesso a quem conhece o negócio vira adivinhação com nomes elegantes. Se o time não consegue conversar com especialistas, invista primeiro nisso (nem que seja uma hora por semana) antes de investir em padrões táticos.
+
+<Callout tipo="atencao" titulo="Quando DDD é exagero">
+Não use DDD tático em: CRUDs e cadastros sem regras; subdomínios genéricos (compre ou use pronto); protótipos e provas de conceito, que vão ser jogados fora; serviços pequenos que só repassam dados de um lugar para outro; e times sem nenhum acesso a especialistas do negócio. Mesmo nesses casos, o DDD **estratégico** costuma valer: saber quais são os subdomínios e onde passam as fronteiras ajuda qualquer projeto, inclusive a decidir onde **não** investir.
+</Callout>
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Até aqui, DDD foi modelagem. Em produção, ele vira um conjunto de decisões de arquitetura, de organização e de custo, e são essas decisões que se espera de alguém pleno ou sênior.
+
+### DDD e as arquiteturas do módulo
+
+**Com a hexagonal ([13.03](../../13-arquitetura/03-hexagonal/)).** A hexagonal define a **forma** (núcleo protegido, portas, adaptadores); o DDD tático define o **conteúdo** do núcleo (agregados, value objects, serviços de domínio). A ACL é um adaptador de saída com uma responsabilidade extra: traduzir o modelo. Os eventos saem por uma porta de saída (`PublicadorDeEventos`). Não há conflito entre os dois; a combinação é o padrão mais comum para contextos core.
+
+**Com o monólito modular ([13.04](../../13-arquitetura/04-monolito-modular/)).** O encaixe mais natural: **um módulo por bounded context**. O Spring Modulith transforma a fronteira do contexto em teste, e os eventos com o registro de publicações fazem a consistência eventual entre módulos. Para a maioria dos sistemas, isso entrega quase todo o benefício do DDD com uma fração do custo operacional dos microsserviços.
+
+**Com microsserviços ([13.05](../../13-arquitetura/05-microsservicos/)).** A regra de ouro: **um microsserviço nunca é menor que um agregado e raramente é maior que um bounded context**. Um serviço por agregado obriga transações distribuídas para invariantes que deveriam ser locais; um serviço que atravessa contextos reproduz o acoplamento do monólito com latência de rede. O mapa de contextos já diz quais integrações serão síncronas (ACL, cliente/fornecedor) e quais por eventos. Ainda assim, comece pelo monólito modular: um contexto mal traçado é barato de corrigir dentro de um processo e caríssimo entre serviços.
+
+### Consistência e eventos em produção
+
+A regra "uma transação, um agregado" empurra a integração para eventos, e eventos em produção exigem cuidado:
+
+- **Não perca eventos.** Salvar e publicar são duas operações; o **transactional outbox** ([12.04](../../12-mensageria/04-transactional-outbox/)) grava o evento na mesma transação do agregado.
+- **Tolere duplicatas.** Entrega "pelo menos uma vez" um dia entrega duas: consumidores idempotentes ([12.05](../../12-mensageria/05-consumidores-idempotentes/)).
+- **Projete a compensação.** Se o estoque não puder ser reservado, o pedido é cancelado? O cliente é avisado? Essas sagas são decisões de negócio para o event storming, não descobertas em produção.
+- **Versione os eventos de integração**: são contratos com outros times, separados dos eventos de domínio internos.
+
+### Persistência do modelo rico
+
+Mapear um agregado rico com JPA tem atritos, e há três caminhos:
+
+1. **Anotar o próprio modelo.** `@Entity` na raiz, `@Embeddable` nos value objects (o Jakarta Persistence 3.2, do Jakarta EE 11, aceita records como classes embutíveis), `@ElementCollection` nos itens, `@Version` na raiz. É o mais barato; o custo é o domínio depender de anotações e de exigências do JPA (como um construtor sem argumentos, que pode ser `protected`).
+2. **Modelo de persistência separado.** Entidades JPA anêmicas no adaptador, convertidas de e para o agregado. O domínio fica puro; o custo é o mapeamento manual.
+3. **Spring Data JDBC.** Desenhado em torno de agregados: carrega e salva o agregado inteiro, sem carregamento preguiçoso. Encaixa bem com agregados pequenos.
+
+Comece pelo 1 e migre para o 2 só quando o JPA começar a distorcer o modelo; a decisão merece um ADR ([aula 13.08](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/)).
+
+**Concorrência.** O agregado é também a unidade de **bloqueio**. Com `@Version` na raiz, se dois atendentes alteram o mesmo pedido, a segunda gravação falha com `OptimisticLockException` (no Spring, `ObjectOptimisticLockingFailureException`), e a resposta é recarregar e tentar de novo ou devolver `409 Conflict`. Conflitos frequentes no mesmo agregado indicam que ele está grande demais.
+
+### Custo, time e organização
+
+DDD tem custo real: workshops, especialistas fora da rotina, mais classes, mapeamentos e curva de aprendizado. Ele se paga onde o **custo de errar a regra** é alto e a **complexidade do negócio** supera a técnica; num cadastro, só atrasa.
+
+Há também a dimensão de times. Pela **Lei de Conway**, sistemas copiam a estrutura de comunicação das organizações. Um bounded context funciona melhor com **um time** dono dele; dois times no mesmo contexto vivem em reunião. O mapa de contextos é também um mapa de times, útil para apontar contextos sem dono.
+
+### Como justificar e quando trocar
+
+Não venda "vamos fazer DDD"; venda o problema, com evidência: "40% dos bugs de produção do semestre vieram de regras de pedido violadas por caminhos diferentes", "três times editam a entidade `Cliente`". Comece pequeno (um contexto core, um agregado, um glossário), meça tempo de mudança e bugs de regra, e expanda se der resultado.
+
+E reveja a escolha quando os sinais mudarem: passe do **anêmico para o rico** quando as mesmas regras aparecerem repetidas em vários serviços; do **rico para o simples** quando um contexto que parecia core se mostrar CRUD; do **conformista para a ACL** quando o modelo do upstream começar a distorcer o seu core; de **um contexto para dois** quando a linguagem ganhar significados conflitantes no mesmo módulo; e de **agregado grande para pequenos** quando os conflitos de concorrência aparecerem.
+
+<Callout tipo="entrevista">
+**"O que é DDD?"** Uma boa resposta separa as duas metades: o estratégico (linguagem ubíqua, subdomínios core/suporte/genérico, bounded contexts e mapa de contextos) e o tático (entidades, value objects, agregados, eventos, repositórios), e diz que o estratégico é o mais valioso e o tático é para o core.
+
+**"Como você define o tamanho de um agregado?"** Pelas invariantes que precisam valer imediatamente; agregados pequenos; outros agregados por id; uma transação altera um agregado; o resto é consistência eventual por eventos, com outbox e consumidores idempotentes. Citar Vernon e o `@Version` como fronteira de concorrência mostra experiência.
+
+**"Como integrar com um sistema legado?"** Camada anticorrupção: uma porta nos termos do seu contexto e um adaptador que traduz e falha alto diante do desconhecido. Compare com o conformista e diga quando cada um vale.
+
+**"Microsserviços e DDD?"** Um serviço por bounded context, nunca por agregado ou por tabela; e, antes disso, o monólito modular com os contextos como módulos. Fechar com "DDD tático em CRUD é exagero" mostra senso de custo.
+</Callout>
+
+## Checkpoint
+
+Um mini-desafio de modelagem, para fazer no papel (ou num editor de texto) em 15 minutos. O negócio pediu um **programa de fidelidade**: a cada pedido confirmado, o cliente ganha 1 ponto por real gasto; pontos podem ser trocados por desconto em pedidos futuros (100 pontos = R$ 10,00), e um cliente nunca pode ficar com saldo de pontos negativo.
+
+Responda:
+
+1. Fidelidade é core, suporte ou genérico para a loja de cafés? Fica no contexto de Vendas ou num contexto próprio?
+2. Quais são os agregados envolvidos, e qual invariante cada um protege?
+3. Quando o cliente usa 300 pontos num pedido, o débito dos pontos e a confirmação do pedido ficam na mesma transação? Se não, como garantir que ninguém use pontos que não tem?
+4. Que eventos aparecem, e quem reage a cada um?
+
+<details>
+<summary>Solução comentada</summary>
+
+1. **Suporte, num contexto próprio (Fidelidade).** Ajuda a reter clientes, mas não é o diferencial da loja. Tem linguagem própria ("saldo", "resgate", "expiração") e muda por motivos de marketing, não de vendas.
+
+2. **Dois agregados.** `Pedido` (Vendas) ganha um value object `DescontoAplicado`, com o valor e o código do resgate. `ContaDeFidelidade` (Fidelidade), identificada por `ClienteId`, protege "o saldo nunca fica negativo". Os dois referenciam o cliente por id; nenhum contém o outro.
+
+3. **Transações separadas, com reserva.** (a) Vendas pede um **resgate** de 300 pontos; a `ContaDeFidelidade` debita na própria transação, só se houver saldo, e emite `PontosResgatados` com um código; (b) Vendas aplica o desconto citando o código; (c) se o pedido for cancelado ou expirar, Fidelidade estorna os pontos. A invariante do saldo é imediata, dentro do agregado; a coerência entre pedido e pontos é eventual, com compensação.
+
+4. **Eventos.** `PedidoConfirmado` → Fidelidade credita os pontos (`PontosCreditados`). `PontosResgatados` → Vendas aplica o desconto. `PedidoCancelado` → Fidelidade estorna (`ResgateEstornado`). Todos os consumidores são idempotentes: creditar duas vezes o mesmo pedido seria um bug caro.
+
+Se você pôs os pontos dentro do `Pedido`, ou numa transação única com ele, releia as regras de Vernon: funcionaria hoje, mas acoplaria os dois para sempre.
+
+</details>
+
+<Quiz
+  id="13-ddd"
+  questoes={[
+    {
+      pergunta: 'Na mesma empresa, "cliente" para Vendas tem endereço e preferências, e para o Financeiro tem limite de crédito e situação. Qual a abordagem do DDD?',
+      opcoes: ['Criar uma entidade Cliente única com todos os campos, para evitar duplicação', 'Reconhecer dois bounded contexts, cada um com o seu modelo de cliente, ligados por um identificador', 'Criar um shared kernel com a entidade Cliente completa', 'Deixar o Financeiro ler a tabela de Vendas diretamente'],
+      correta: 1,
+      explicacao: 'Mesma palavra com significados diferentes é sinal de fronteira. Cada contexto tem o seu modelo, pequeno e coerente; um modelo único vira a entidade de 64 campos do começo da aula.',
+    },
+    {
+      pergunta: 'Confirmar um pedido precisa também baixar o estoque, que é outro agregado. O que as regras de agregado recomendam?',
+      opcoes: ['Uma única @Transactional que altera os dois, por segurança', 'O Pedido guarda uma referência ao objeto Estoque e o altera', 'Alterar só o Pedido na transação, publicar PedidoConfirmado e reservar o estoque em outra transação, com compensação se falhar', 'Juntar Pedido e Estoque num único agregado'],
+      correta: 2,
+      explicacao: 'Uma transação, um agregado; entre agregados, consistência eventual por eventos. Isso mantém os agregados pequenos e permite separá-los em módulos ou serviços.',
+    },
+    {
+      pergunta: 'Vendas (core) precisa consumir dados de um ERP legado com códigos de situação em letras e valores em centavos. Qual relação do mapa de contextos é mais indicada?',
+      opcoes: ['Conformista: usar o modelo do ERP diretamente no domínio', 'Camada anticorrupção: uma porta nos termos de Vendas e um adaptador que traduz', 'Shared kernel com o ERP', 'Parceria'],
+      correta: 1,
+      explicacao: 'O core deve ser protegido de modelos estranhos. A ACL concentra a tradução num ponto só e pode falhar alto diante do desconhecido.',
+    },
+    {
+      pergunta: 'Por que Pedido.itens() devolve List.copyOf(itens) em vez da lista interna?',
+      opcoes: ['Por desempenho', 'Para que código de fora não altere os itens sem passar pelas regras do agregado', 'Porque o JPA exige', 'Para permitir ordenação'],
+      correta: 1,
+      explicacao: 'A raiz é a única porta de entrada. Devolver a lista mutável permitiria contornar invariantes como "pedido confirmado não muda de itens".',
+    },
+    {
+      pergunta: 'Um time quer aplicar agregados, value objects, eventos e ACL ao cadastro de categorias de produto, que tem nome e descrição. O que você recomenda?',
+      opcoes: ['Aplicar, porque DDD é sempre a melhor prática', 'Não aplicar DDD tático ali: é um CRUD de suporte sem regras; reservar o esforço para o contexto core', 'Transformar o cadastro num microsserviço', 'Usar event sourcing'],
+      correta: 1,
+      explicacao: 'DDD tático se paga onde há regras a proteger. Em CRUDs e subdomínios genéricos ou de suporte simples, é cerimônia; o DDD estratégico já ajudou ao classificar o subdomínio.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- DDD tem duas metades: **estratégica** (linguagem ubíqua, subdomínios, bounded contexts, mapa de contextos) e **tática** (entidades, value objects, agregados, eventos, repositórios, serviços). A estratégica é a mais valiosa.
+- **Subdomínios** são decisão de investimento: core se constrói com cuidado, suporte se faz simples, genérico se compra.
+- **Bounded context** é a fronteira de um modelo; a mesma palavra pode ter significados diferentes em contextos diferentes. Contextos seguem capacidades do negócio, não tabelas.
+- **Mapa de contextos**: parceria, shared kernel, cliente/fornecedor, conformista, ACL, open host service. Proteja o core com **ACL**.
+- **Event storming** descobre o domínio com quem o conhece: eventos no passado, comandos, políticas e pontos quentes; eventos pivotais sugerem fronteiras.
+- **Value objects** são records validados no construtor; **entidades** têm identidade; a **raiz do agregado** protege as invariantes, sem setters e sem expor coleções mutáveis.
+- Regras de agregado: invariantes reais, agregados pequenos, **referência por id**, **uma transação, um agregado**, consistência eventual por eventos (com outbox e idempotência).
+- **Serviço de domínio** guarda regras que não cabem numa entidade; **serviço de aplicação** orquestra e não decide.
+- Com a hexagonal, o DDD preenche o núcleo; no monólito modular, um módulo por contexto; em microsserviços, um serviço por contexto, nunca por agregado.
+- Não use DDD tático em CRUDs, subdomínios genéricos e protótipos.
+
+## Próximo passo
+
+Na próxima aula, [Decisões e evolução da arquitetura](../../13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), você vai registrar escolhas como as desta aula (onde traçar um contexto, ACL ou conformista, JPA no domínio ou modelo separado) em ADRs, e ver como uma arquitetura evolui sem reescrita. Para praticar a parte tática antes disso, o [exercício 13.02](../../../exercicios/13-arquitetura/02-reservas-hexagonal/) tem um núcleo de domínio com invariantes de reserva, e o [exercício 13.03](../../../exercicios/13-arquitetura/03-loja-modular/) organiza uma loja em módulos que são, na prática, bounded contexts.
+
+## Referências
+
+- Eric Evans — [*Domain-Driven Design Reference*](https://www.domainlanguage.com/ddd/reference/) (definições e padrões resumidos pelo autor)
+- Vaughn Vernon — [*Effective Aggregate Design*](https://www.dddcommunity.org/library/vernon_2011/) (as regras de desenho de agregados)
+- Alberto Brandolini — [EventStorming](https://www.eventstorming.com/)
+- Spring Data Commons — [Publishing Events from Aggregate Roots](https://docs.spring.io/spring-data/commons/reference/repositories/core-domain-events.html)
+- Spring Modulith — [Reference Documentation](https://docs.spring.io/spring-modulith/reference/)
+- Jakarta Persistence 3.2 — [Especificação](https://jakarta.ee/specifications/persistence/3.2/)
+- OpenJDK — [JEP 395: Records](https://openjdk.org/jeps/395) e [JEP 409: Sealed Classes](https://openjdk.org/jeps/409)

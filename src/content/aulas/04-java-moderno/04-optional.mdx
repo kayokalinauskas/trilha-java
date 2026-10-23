@@ -1,0 +1,177 @@
+---
+titulo: Optional sem anti-padrões
+descricao: Para que o Optional existe, como encadear map, flatMap, filter, or e orElseThrow, a diferença entre orElse e orElseGet, e onde NÃO usar Optional.
+modulo: 04-java-moderno
+ordem: 4
+duracao: 40
+objetivos:
+  - Usar Optional como tipo de retorno para "pode não ter resultado"
+  - Encadear operações sem nenhum null check nem get()
+  - Escolher entre orElse, orElseGet, orElseThrow e or
+  - Reconhecer os lugares em que Optional não deve ser usado
+tags: [Optional, null safety]
+flashcards:
+  - frente: Para que o Optional foi criado?
+    verso: Para ser o tipo de RETORNO de métodos que podem não ter resultado, forçando quem chama a tratar o caso vazio.
+  - frente: Qual a diferença entre orElse e orElseGet?
+    verso: orElse(x) avalia x SEMPRE, mesmo com valor presente; orElseGet(() -> x) só avalia quando o Optional está vazio.
+  - frente: Quando usar flatMap em vez de map em um Optional?
+    verso: Quando a função já devolve um Optional — map geraria Optional<Optional<T>>.
+  - frente: Onde NÃO usar Optional?
+    verso: Em atributos de entidades, parâmetros de métodos, elementos de coleções e para coleções (use coleção vazia).
+  - frente: Como transformar uma Stream de Optionals só nos valores presentes?
+    verso: stream.flatMap(Optional::stream) (Java 9+).
+---
+
+`NullPointerException` é, historicamente, a exceção mais comum em produção Java. O `Optional` não elimina o `null` da linguagem, mas dá um jeito explícito de dizer, na assinatura do método: **"isto pode não existir — trate"**.
+
+## O contrato
+
+```java
+Optional<Cliente> buscarPorCpf(String cpf);   // pode não achar
+Cliente buscarObrigatorio(String cpf);          // acha ou lança exceção
+```
+
+Quem lê a primeira assinatura sabe que precisa lidar com o "não achou". Com `Cliente buscarPorCpf(...)` devolvendo `null`, a informação some, e o `NullPointerException` aparece três camadas depois.
+
+Criando:
+
+```java
+Optional.of(cliente);          // cliente NÃO pode ser null (lança NPE se for)
+Optional.ofNullable(talvez);   // vazio se for null
+Optional.empty();              // vazio explícito
+```
+
+## Encadeando sem `if`
+
+A ideia é **transformar** o valor que talvez exista, sem abrir a caixa até o final:
+
+```java
+String emailDoGestor = diretorio.buscar(matricula)          // Optional<Funcionario>
+        .flatMap(Funcionario::gestor)                        // Optional<String> (matrícula)
+        .flatMap(diretorio::buscar)                          // Optional<Funcionario>
+        .flatMap(Funcionario::emailOpcional)                 // Optional<String>
+        .orElse("rh@empresa.com");
+```
+
+Se qualquer passo estiver vazio, os seguintes são pulados e o `orElse` entra em ação. Nenhum `if (x != null)`.
+
+| Método | Faz |
+|---|---|
+| `map(f)` | Transforma o valor, se existir |
+| `flatMap(f)` | Idem, quando `f` já devolve `Optional` (evita `Optional<Optional<T>>`) |
+| `filter(p)` | Mantém só se atender ao predicado |
+| `or(() -> outroOptional)` | Alternativa preguiçosa que também é `Optional` (Java 9+) |
+| `orElse(valor)` | Valor padrão |
+| `orElseGet(() -> valor)` | Valor padrão calculado só se necessário |
+| `orElseThrow(() -> excecao)` | Lança a exceção de negócio se vazio |
+| `ifPresent(consumer)` / `ifPresentOrElse` | Efeito colateral quando existe |
+| `stream()` | Stream de 0 ou 1 elemento (Java 9+) |
+
+### `orElse` versus `orElseGet`
+
+```java
+cliente.orElse(buscarNoCacheRemoto());           // SEMPRE chama o cache remoto
+cliente.orElseGet(() -> buscarNoCacheRemoto());   // só chama se estiver vazio
+```
+
+`orElse` recebe um **valor**, que é calculado antes da chamada — mesmo que não seja usado. Para constantes, tanto faz. Para chamadas caras ou com efeitos, use `orElseGet`.
+
+### Tratando o obrigatório
+
+```java
+Funcionario f = diretorio.buscar(matricula)
+        .orElseThrow(() -> new FuncionarioNaoEncontradoException(matricula));
+```
+
+É o padrão em serviços Spring: o repositório devolve `Optional`, o serviço converte em exceção de negócio, e o `@RestControllerAdvice` a transforma em HTTP 404.
+
+## Os anti-padrões
+
+<Comparar antes="Anti-padrão" depois="Idiomático">
+```java
+if (opt.isPresent()) {
+    return opt.get().nome();
+}
+return "desconhecido";
+
+Optional<List<Pedido>> pedidos();
+
+class Cliente {
+    private Optional<String> email;
+}
+
+void enviar(Optional<String> copia) { ... }
+```
+
+```java
+return opt.map(Cliente::nome)
+          .orElse("desconhecido");
+
+List<Pedido> pedidos();   // vazia se não houver
+
+class Cliente {
+    private String email;   // nullable internamente
+    Optional<String> email() {
+        return Optional.ofNullable(email);
+    }
+}
+
+void enviar(String para);            // sobrecarga
+void enviar(String para, String cc); // em vez de Optional
+```
+</Comparar>
+
+1. **`isPresent()` + `get()`**: é só um `null` check com mais passos. `get()` sem checagem é pior ainda — lança `NoSuchElementException`. (O método `orElseThrow()` sem argumentos existe exatamente como substituto explícito do `get()`.)
+2. **Optional de coleção**: uma coleção **vazia** já representa "nenhum". `Optional<List<T>>` cria dois jeitos de dizer a mesma coisa.
+3. **Optional como atributo**: `Optional` não é `Serializable` e não foi feito para isso. Guarde o campo como nullable e **exponha** `Optional` no acessor (o record `Funcionario` do exercício 04.02 faz isso).
+4. **Optional como parâmetro**: complica a vida de quem chama. Prefira sobrecarga ou um parâmetro nullable documentado.
+5. **Retornar `null` de um método que devolve `Optional`**: derrota todo o propósito.
+
+## Optional e Streams
+
+```java
+List<String> emails = matriculas.stream()
+        .map(diretorio::buscar)          // Stream<Optional<Funcionario>>
+        .flatMap(Optional::stream)       // Stream<Funcionario> só com os encontrados
+        .map(Funcionario::email)
+        .toList();
+```
+
+`Optional::stream` devolve uma stream com 0 ou 1 elemento, e o `flatMap` descarta os vazios. Operações terminais como `findFirst`, `max` e `min` já devolvem `Optional`.
+
+<Callout tipo="entrevista">
+"Como você usa Optional?" é pergunta de code review disfarçada de entrevista. Diga: **só como retorno**, **encadeio com map/flatMap/orElseThrow**, **nunca `get()` sem checagem**, **nunca em atributo, parâmetro ou coleção**, e cite `orElse` vs `orElseGet`. São cinco pontos que mostram que você já revisou código real.
+</Callout>
+
+<Quiz
+  id="04-optional"
+  questoes={[
+    {
+      pergunta: '`buscarCliente(id).map(Cliente::endereco)` — se `endereco()` já devolve `Optional<Endereco>`, qual o tipo do resultado?',
+      opcoes: ['`Optional<Endereco>`', '`Optional<Optional<Endereco>>`', '`Endereco`', 'Não compila'],
+      correta: 1,
+      explicacao: 'map embrulha o retorno em outro Optional. Use flatMap quando a função já devolve Optional.',
+    },
+    {
+      pergunta: 'Qual chamada evita consultar o banco quando o valor já está presente?',
+      opcoes: ['`opt.orElse(repo.buscar())`', '`opt.orElseGet(() -> repo.buscar())`', '`opt.get()`', '`opt.isPresent()`'],
+      correta: 1,
+      explicacao: 'orElseGet recebe um Supplier, avaliado só se o Optional estiver vazio.',
+    },
+    {
+      pergunta: 'Um método que busca os pedidos de um cliente deve devolver…',
+      opcoes: ['`Optional<List<Pedido>>`', '`List<Pedido>` (vazia se não houver)', '`null` quando não houver', '`Optional<Pedido[]>`'],
+      correta: 1,
+      explicacao: 'Uma coleção vazia já expressa "nenhum"; Optional de coleção é anti-padrão.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `Optional` é para **retorno** de "pode não existir".
+- Encadeie com `map`, `flatMap`, `filter`, `or` e termine com `orElse`, `orElseGet` ou `orElseThrow`.
+- `orElse` sempre avalia o argumento; `orElseGet` só quando vazio.
+- Nada de `get()` sem checagem, `Optional` em atributo, parâmetro ou coleção.
+- `flatMap(Optional::stream)` filtra os vazios em uma Stream.

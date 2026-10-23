@@ -1,0 +1,200 @@
+---
+titulo: Gerador de slugs para URLs
+codigo: "01.04"
+resumo: Transforme títulos com acentos, pontuação e espaços em slugs limpos e amigáveis para URL, com limite de tamanho sem cortar palavras.
+modulo: 01-java-essencial
+ordem: 4
+dificuldade: medio
+tempo: 1,5h
+conceitos: [String, StringBuilder, char, Unicode, Normalizer]
+aulas: [01-java-essencial/05-arrays-e-strings, 01-java-essencial/03-lacos, 01-java-essencial/02-operadores-e-decisoes]
+java:
+  modulo: m01-java-essencial
+  arquivos: [src/main/java/dev/trilhajava/m01/GeradorSlug.java]
+---
+
+## Contexto
+
+Um blog técnico usa URLs como `/posts/42`. O time de marketing quer URLs legíveis e boas para SEO, como `/posts/java-25-o-que-mudou`. Esse trecho final é o **slug**, e ele precisa ser gerado automaticamente a partir do título de cada post.
+
+Parece simples até aparecerem títulos reais: `"Ação, Reação & Opção"`, `"---Já    tem   hífens---"`, `"Café_com_pão"`, e títulos enormes que geram URLs de 200 caracteres.
+
+## O que você vai praticar
+
+- **`String` é imutável; `StringBuilder` monta texto aos pedaços.** Todo método de `String` (`toLowerCase`, `substring`...) devolve uma **nova** string. Para construir um resultado caractere a caractere dentro de um laço, use um `StringBuilder`: `append(c)` acrescenta, `length()` e `charAt(i)` consultam, `isEmpty()` diz se ainda está vazio. Veja [Montando texto](../../../aulas/01-java-essencial/05-arrays-e-strings/#montando-texto).
+- **Percorrer uma `String` com `for-each`.** `for (char c : texto.toCharArray())` visita cada caractere, em ordem. O índice não importa aqui, então o `for-each` é mais legível que o `for` clássico. Veja [Laços](../../../aulas/01-java-essencial/03-lacos/).
+- **`char` é um número.** Por isso `c >= 'a' && c <= 'z'` testa se `c` é uma letra minúscula sem acento, e `c >= '0' && c <= '9'` testa se é um dígito. Com `&&` e `||` e parênteses, você monta a condição "é letra **ou** dígito". Veja [Operadores e decisões](../../../aulas/01-java-essencial/02-operadores-e-decisoes/).
+- **Unicode e acentos (`java.text.Normalizer`).** Em Unicode, `á` pode ser um único caractere ou `a` seguido de um **acento combinante** separado. `Normalizer.normalize(texto, Normalizer.Form.NFD)` converte para a forma separada; depois, `Character.getType(c) == Character.NON_SPACING_MARK` identifica os acentos soltos, que você simplesmente não copia. Este é o único conceito que não está nas aulas: a explicação acima e a dica 2 bastam.
+- **`toLowerCase(Locale.ROOT)`.** Sem o `Locale`, o resultado depende do idioma do computador (em turco, `"I".toLowerCase()` não é `"i"`). Slugs são identificadores técnicos e precisam dar o mesmo resultado em qualquer servidor. Veja [`String`: imutável por design](../../../aulas/01-java-essencial/05-arrays-e-strings/#string-imutável-por-design).
+
+## Requisitos
+
+Implemente, na classe `GeradorSlug` (pacote `dev.trilhajava.m01`, já criada no código inicial):
+
+```java
+public static final int TAMANHO_MAXIMO = 60;
+
+public static String gerar(String titulo)
+```
+
+- **Recebe** o título de um post (pode ser `null`).
+- **Devolve** o slug, seguindo as regras abaixo.
+- **Lança** `IllegalArgumentException` quando não há slug possível (regra 6). A mensagem é livre.
+
+| Título | Slug |
+|---|---|
+| `Olá Mundo` | `ola-mundo` |
+| `Java 25: o que mudou?` | `java-25-o-que-mudou` |
+| `Ação, Reação & Opção` | `acao-reacao-opcao` |
+| `---Já    tem   hífens---` | `ja-tem-hifens` |
+| `Café_com_pão` | `cafe-com-pao` |
+| `ÇÃO Ñandú Über` | `cao-nandu-uber` |
+
+## Regras
+
+1. **Tudo em minúsculas.** `"JAVA Moderno"` → `java-moderno`.
+2. **Acentos removidos, a letra fica.** `á` → `a`, `ç` → `c`, `ñ` → `n`, `ü` → `u`. `"ÇÃO Ñandú Über"` → `cao-nandu-uber`.
+3. **Só `a`–`z` e `0`–`9` ficam.** Qualquer **sequência** de outros caracteres (espaço, pontuação, `_`, `&`, hífen...) vira **um único** hífen. `"Java 25: o que mudou?"` → `java-25-o-que-mudou` (o `": "` virou um hífen só); `"Café_com_pão"` → `cafe-com-pao`.
+4. **Sem hífen no começo nem no fim.** `"---Já    tem   hífens---"` → `ja-tem-hifens`; `"  Olá Mundo!  "` → `ola-mundo`.
+5. **No máximo 60 caracteres (`TAMANHO_MAXIMO`), sem cortar palavra no meio.** Se o slug passar de 60, fique com as **palavras inteiras** que cabem nos 60 primeiros caracteres (sem o hífen que sobraria no fim):
+   | Título | Slug |
+   |---|---|
+   | `Como resolver o problema de N mais um no Hibernate sem perder a sanidade mental` | `como-resolver-o-problema-de-n-mais-um-no-hibernate-sem` (54) |
+   | `Um guia completo de testes automatizados com JUnit e Mockito para quem está começando` | `um-guia-completo-de-testes-automatizados-com-junit-e-mockito` (60: `mockito` termina exatamente no limite e cabe inteira) |
+   | `a` repetido 80 vezes | `a` repetido 60 vezes (uma palavra única maior que 60 é cortada em 60) |
+6. **Sem nenhuma letra ou dígito, não há slug:** `null`, `""`, `"   "`, `"!!!"` e `"—"` (travessão, que não é o hífen `-`) lançam `IllegalArgumentException`.
+
+## Passo a passo sugerido
+
+Faça uma regra de cada vez e experimente depois de cada passo. Os casos das regras que você ainda não fez vão sair errados, e tudo bem: olhe só a regra em que está trabalhando.
+
+1. **Monte um jeito de experimentar.** Crie, no mesmo pacote, uma classe sua com `main` que chama `GeradorSlug.gerar` com os títulos deste enunciado e imprime o resultado (há um exemplo em **Experimente**, logo abaixo). Rode com o ▶ do IntelliJ ao lado do `main`.
+2. **Regras 1 e 3 (o esqueleto).** Converta o título para minúsculas, percorra os caracteres e copie para um `StringBuilder` só as letras `a`–`z` e os dígitos; para os outros, anexe um `'-'`. Experimente: `JAVA Moderno` já deve virar `java-moderno`, mas `Java 25: o que mudou?` ainda sai com hífens repetidos (`java-25--o-que-mudou-`).
+3. **Regras 3 e 4 (hífens bem colocados).** Troque "anexe um hífen" por "anexe um hífen só **entre** dois trechos válidos". Uma forma: guarde numa variável `boolean` que apareceu um caractere inválido, e só anexe o hífen quando o **próximo** caractere válido chegar e o builder não estiver vazio. Os casos das regras 3 e 4 devem bater, exceto os títulos com acento.
+4. **Regra 2 (acentos).** Antes do laço, aplique `Normalizer.normalize(titulo, Normalizer.Form.NFD)` e descarte os caracteres cujo `Character.getType(c)` é `Character.NON_SPACING_MARK`. Experimente: `Ação, Reação & Opção` → `acao-reacao-opcao`.
+5. **Regra 6 (nada sobrou).** Se o título for `null`, ou se o builder terminar vazio, lance `IllegalArgumentException`. Os cinco casos da regra 6 devem lançar a exceção.
+6. **Regra 5 (limite).** Se o slug tiver mais que `TAMANHO_MAXIMO` caracteres, corte. Pense nos três casos da tabela da regra 5: o que está logo **depois** do corte diz se a última palavra terminou no limite. Confira também o caso de exatamente 60.
+7. **Brinque.** Acrescente seus próprios títulos: emojis, números, `"C++ & C#"`, um título só de acentos.
+
+## Experimente
+
+Um programa simples para conferir as regras (crie-o como `ExperimenteSlug.java`, ao lado de `GeradorSlug.java`):
+
+```java
+package dev.trilhajava.m01;
+
+public class ExperimenteSlug {
+
+    public static void main(String[] args) {
+        mostrar("JAVA Moderno");
+        mostrar("Ação, Reação & Opção");
+        mostrar("---Já    tem   hífens---");
+        mostrar("Um guia completo de testes automatizados com JUnit e Mockito para quem está começando");
+        mostrar("!!!");
+    }
+
+    static void mostrar(String titulo) {
+        try {
+            String slug = GeradorSlug.gerar(titulo);
+            System.out.println(titulo);
+            System.out.println("   -> " + slug + "  (" + slug.length() + " caracteres)");
+        } catch (IllegalArgumentException e) {
+            System.out.println(titulo);
+            System.out.println("   -> IllegalArgumentException: " + e.getMessage());
+        }
+    }
+}
+```
+
+Com todas as regras implementadas, a saída fica assim (a mensagem da exceção é livre; a sua pode ser diferente):
+
+```text
+JAVA Moderno
+   -> java-moderno  (12 caracteres)
+Ação, Reação & Opção
+   -> acao-reacao-opcao  (17 caracteres)
+---Já    tem   hífens---
+   -> ja-tem-hifens  (13 caracteres)
+Um guia completo de testes automatizados com JUnit e Mockito para quem está começando
+   -> um-guia-completo-de-testes-automatizados-com-junit-e-mockito  (60 caracteres)
+!!!
+   -> IllegalArgumentException: O título não contém letras nem números: "!!!"
+```
+
+Acrescente os demais títulos das **Regras** e compare cada um com o resultado indicado lá. Todos os exemplos do enunciado precisam bater.
+
+## Critérios de aceite
+
+- [ ] Todos os títulos da tabela de **Requisitos** e das **Regras** geram exatamente o slug indicado.
+- [ ] Os cinco casos da regra 6 lançam `IllegalArgumentException` (a mensagem é livre).
+- [ ] Você consegue explicar, com o seu programa, por que o título do JUnit fica com 60 caracteres e o do Hibernate com 54.
+
+## Desafios opcionais
+
+- **Uma passada só (reflexão).** Quantas vezes a sua solução percorre o título? Conte: `normalize`, `toLowerCase`, o seu laço... Dá para remover acentos, baixar a caixa e colocar os hífens no **mesmo** laço? Vale a pena, para títulos de 80 caracteres? (Resposta honesta: quase nunca. Legibilidade costuma ganhar.)
+- **Unicidade:** implemente `gerarUnico(String titulo, Set<String> existentes)`, que acrescenta `-2`, `-3`… quando o slug já existe (e ainda respeita os 60 caracteres).
+- **Stop words:** remova palavras como "o", "a", "de", "que" (`java-25-o-que-mudou` → `java-25-mudou`) e discuta o trade-off com legibilidade.
+
+<Dicas>
+<Dica nivel={1}>
+Divida em três etapas, cada uma num método privado: (1) remover acentos, (2) filtrar caracteres e colocar os hífens, (3) limitar o tamanho. O `gerar` só chama as três em ordem e confere a regra 6. No seu programa, você pode imprimir o resultado de cada etapa para ver onde está o problema.
+</Dica>
+<Dica nivel={2}>
+Para remover acentos:
+
+```java
+String decomposto = Normalizer.normalize(texto, Normalizer.Form.NFD);   // "á" vira 'a' + '́'
+StringBuilder sb = new StringBuilder();
+for (char c : decomposto.toCharArray()) {
+    if (Character.getType(c) != Character.NON_SPACING_MARK) {   // o acento solto é uma "marca sem espaço"
+        sb.append(c);
+    }
+}
+```
+</Dica>
+<Dica nivel={3}>
+Na etapa 2, use uma variável `boolean hifenPendente`. Caractere inválido: `hifenPendente = true` e siga. Caractere válido: se `hifenPendente` e o builder **não** está vazio, anexe `'-'`; depois zere `hifenPendente` e anexe o caractere. Assim o hífen nunca entra no começo (builder vazio) nem no fim (nenhum válido chegou depois). Na etapa 3: se `slug.charAt(60) == '-'`, os 60 primeiros são palavras inteiras; senão, `slug.lastIndexOf('-', 59)` mostra onde começa a palavra cortada (e `-1` significa palavra única gigante).
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m01-java-essencial/solucao/src/main/java/dev/trilhajava/m01/GeradorSlug.java" />
+
+### Por que assim
+
+- **NFD + `NON_SPACING_MARK`:** Unicode permite escrever `é` como um único caractere (U+00E9) ou como `e` + acento agudo combinante (U+0065 U+0301). `Normalizer.Form.NFD` converte tudo para a forma decomposta, e o laço descarta as marcas. Funciona para qualquer idioma com diacríticos, não só o português.
+- **`hifenPendente`:** em vez de colocar o hífen quando aparece o caractere inválido (e depois ter de limpar repetições e pontas), a solução **adia** a decisão: o hífen só entra quando chega o próximo caractere válido. As regras 3 e 4 saem de graça.
+- **`Locale.ROOT` no `toLowerCase`:** o mesmo cuidado do exercício 00.01. Slugs são identificadores técnicos: não podem depender do idioma do servidor.
+- **Corte inteligente:** se o caractere logo **depois** do limite é um hífen, a palavra terminou exatamente em 60 e não há o que ajustar. Senão, recua até o último hífen dentro do limite; sem hífen nenhum, corta em 60.
+
+### Alternativa: expressões regulares
+
+Com regex, a solução fica mais curta. Ela **não** é necessária, mas vale conhecer:
+
+```java
+String semAcento = Normalizer.normalize(titulo, Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+String slug = semAcento.toLowerCase(Locale.ROOT)
+        .replaceAll("[^a-z0-9]+", "-")   // qualquer sequência (+) de não (^) letra/dígito vira um hífen
+        .replaceAll("^-|-$", "");        // tira um hífen do começo (^) ou do fim ($)
+```
+
+- `\p{M}` é a categoria Unicode *Mark* (todas as marcas combinantes; `NON_SPACING_MARK` é a principal delas). Em string Java, a barra é escrita duas vezes: `"\\p{M}"`.
+- `[^a-z0-9]+`: os colchetes definem um conjunto de caracteres, o `^` dentro deles nega o conjunto, e o `+` pega "um ou mais seguidos".
+- `^-|-$`: fora dos colchetes, `^` é o começo do texto e `$` o fim; `|` é "ou".
+
+O custo: cada `replaceAll` percorre a string de novo, e uma regex errada falha em silêncio (produz um slug estranho em vez de um erro). Para quem está começando, o laço explícito é mais fácil de depurar com o seu programa.
+
+### Um detalhe sobre `ß` e `Æ`
+
+`"straße"` vira `"strae"`, porque o `ß` não tem decomposição NFD em `ss`. Para idiomas assim, existem bibliotecas de transliteração (como a ICU4J). Saber **onde a solução simples para de funcionar** é parte de ser Pleno.
+
+### Avalie sua solução
+
+- Acrescente `"—"` (travessão) e `"C++ & C#"` ao seu programa. O que sai? Por quê?
+- Crie um título cujo slug tenha 61 caracteres com um hífen na posição 60. Sua solução deixa um hífen no final?
+- Se amanhã o limite mudar para 80, quantas linhas você precisa alterar?
+
+</Solucao>

@@ -1,0 +1,305 @@
+---
+import Base from '../../layouts/Base.astro';
+import Icon from '../../components/Icon.astro';
+import { DIFICULDADE_LABEL, getExercicios, getModulos, pad2 } from '../../lib/conteudo';
+import { url } from '../../lib/url';
+
+const [modulos, exercicios] = await Promise.all([getModulos(), getExercicios()]);
+const modulosComExercicios = modulos.filter((m) => exercicios.some((e) => e.data.modulo.id === m.id));
+const titulo = new Map(modulos.map((m) => [m.id, m.data.titulo]));
+const emBreve = modulos.filter((m) => m.data.status === 'em-breve');
+---
+
+<Base title="Exercícios" description="Catálogo de exercícios com testes automatizados e soluções comentadas, do básico ao Pleno.">
+  <section class="head">
+    <div class="container">
+      <p class="eyebrow">Pratique</p>
+      <h1>Exercícios com testes de verdade</h1>
+      <p class="lead">
+        Cada exercício simula uma demanda real. A maioria vem com um projeto Maven e testes JUnit, e o seu trabalho é deixar tudo verde; os
+        de revisão e de carreira pedem uma entrega escrita. Dicas em três níveis e solução comentada só quando você pedir.
+      </p>
+    </div>
+  </section>
+
+  <div class="container">
+    <div class="filtros" role="group" aria-label="Filtros">
+      <div class="grupo">
+        <span class="rot">Módulo</span>
+        <div class="chips" data-filtro="modulo">
+          <button type="button" class="chip" aria-pressed="true" data-valor="">Todos</button>
+          {
+            modulosComExercicios.map((m) => (
+              <button type="button" class="chip" aria-pressed="false" data-valor={m.id}>
+                {pad2(m.data.numero)} · {m.data.titulo}
+              </button>
+            ))
+          }
+        </div>
+      </div>
+      <div class="grupo">
+        <span class="rot">Dificuldade</span>
+        <div class="chips" data-filtro="dificuldade">
+          <button type="button" class="chip" aria-pressed="true" data-valor="">Todas</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="facil">Fácil</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="medio">Médio</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="dificil">Difícil</button>
+        </div>
+      </div>
+      <div class="grupo">
+        <span class="rot">Status</span>
+        <div class="chips" data-filtro="status">
+          <button type="button" class="chip" aria-pressed="true" data-valor="">Todos</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="pendente">Não iniciados</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="fazendo">Fazendo</button>
+          <button type="button" class="chip" aria-pressed="false" data-valor="concluido">Concluídos</button>
+        </div>
+      </div>
+    </div>
+
+    <p class="contagem" aria-live="polite"><span data-contagem>{exercicios.length}</span> exercício(s)</p>
+
+    <ul class="grid">
+      {
+        exercicios.map((e) => (
+          <li data-ex={e.id} data-modulo={e.data.modulo.id} data-dificuldade={e.data.dificuldade}>
+            <a class="card card-link ex" href={url(`exercicios/${e.id}`)}>
+              <div class="ex-top">
+                <span class="cod">{e.data.codigo}</span>
+                {e.data.marco && <span class="badge marco" title="Marco do projeto integrador"><Icon name="flag" size={12} /> Marco {e.data.marco}</span>}
+                <span class={`badge dif-${e.data.dificuldade}`}>{DIFICULDADE_LABEL[e.data.dificuldade]}</span>
+                <span class="st" data-st aria-hidden="true" />
+              </div>
+              <h2>{e.data.titulo}</h2>
+              <p>{e.data.resumo}</p>
+              <div class="ex-foot">
+                <span>
+                  <Icon name="layers" size={13} /> {titulo.get(e.data.modulo.id)}
+                </span>
+                <span>
+                  <Icon name="clock" size={13} /> {e.data.tempo}
+                </span>
+              </div>
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+    <p class="vazio" hidden data-vazio>Nenhum exercício com esses filtros.</p>
+
+    {
+      emBreve.length > 0 && (
+        <aside class="card em-breve">
+          <Icon name="sparkles" size={20} />
+          <p>
+            <strong>Mais exercícios a caminho.</strong> Os módulos {emBreve.map((m) => pad2(m.data.numero)).join(', ')} chegam nas próximas fases.
+          </p>
+        </aside>
+      )
+    }
+  </div>
+</Base>
+
+<script>
+  import { aoMudar, ler } from '../../lib/progresso';
+
+  const filtros: Record<string, string> = { modulo: '', dificuldade: '', status: '' };
+  const itens = [...document.querySelectorAll<HTMLElement>('[data-ex]')];
+
+  function statusDe(id: string) {
+    return ler().exercicios[id]?.status ?? 'pendente';
+  }
+
+  function aplicar() {
+    let visiveis = 0;
+    for (const li of itens) {
+      const st = statusDe(li.dataset.ex!);
+      const selo = li.querySelector<HTMLElement>('[data-st]')!;
+      selo.dataset.valor = st;
+      selo.textContent = st === 'concluido' ? '✓ Concluído' : st === 'fazendo' ? 'Fazendo' : '';
+      const ok =
+        (!filtros.modulo || li.dataset.modulo === filtros.modulo) &&
+        (!filtros.dificuldade || li.dataset.dificuldade === filtros.dificuldade) &&
+        (!filtros.status || st === filtros.status);
+      li.hidden = !ok;
+      if (ok) visiveis++;
+    }
+    document.querySelector('[data-contagem]')!.textContent = String(visiveis);
+    document.querySelector<HTMLElement>('[data-vazio]')!.hidden = visiveis > 0;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-filtro]').forEach((grupo) => {
+    grupo.addEventListener('click', (ev) => {
+      const chip = (ev.target as HTMLElement).closest<HTMLButtonElement>('.chip');
+      if (!chip) return;
+      grupo.querySelectorAll('.chip').forEach((c) => c.setAttribute('aria-pressed', String(c === chip)));
+      filtros[grupo.dataset.filtro!] = chip.dataset.valor ?? '';
+      aplicar();
+    });
+  });
+
+  aplicar();
+  aoMudar(aplicar);
+</script>
+
+<style>
+  .head {
+    padding-block: 40px 28px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 260px at 90% 0%, var(--accent-soft), transparent 70%);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .lead {
+    max-width: 68ch;
+  }
+  .filtros {
+    display: grid;
+    gap: 14px;
+    padding-block: 28px 8px;
+  }
+  .grupo {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    min-width: 0;
+  }
+  .rot {
+    flex-shrink: 0;
+    width: 90px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-width: 0;
+  }
+  .chip {
+    padding: 6px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 0.85rem;
+    font-weight: 550;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .chip:hover {
+    border-color: var(--border-strong);
+  }
+  .chip[aria-pressed='true'] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+  }
+  .contagem {
+    margin-block: 12px 16px;
+    font-size: 0.85rem;
+    color: var(--text-3);
+  }
+  .grid {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+  }
+  .grid li {
+    display: flex;
+  }
+  .ex {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 20px;
+    width: 100%;
+  }
+  .ex-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cod {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .st {
+    margin-left: auto;
+    font-size: 0.75rem;
+    font-weight: 700;
+  }
+  .st[data-valor='concluido'] {
+    color: var(--ok);
+  }
+  .st[data-valor='fazendo'] {
+    color: var(--accent);
+  }
+  .ex h2 {
+    font-size: 1.12rem;
+    line-height: 1.3;
+  }
+  .ex p {
+    color: var(--text-3);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    flex: 1;
+  }
+  .ex-foot {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 0.78rem;
+    color: var(--text-3);
+  }
+  .ex-foot span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .vazio {
+    padding: 40px;
+    text-align: center;
+    color: var(--text-3);
+  }
+  .em-breve {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    margin-top: 32px;
+    padding: 20px;
+    border-style: dashed;
+    color: var(--accent);
+  }
+  .em-breve p {
+    color: var(--text-2);
+    font-size: 0.93rem;
+  }
+  @media (max-width: 640px) {
+    .grupo {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 8px;
+    }
+    .chips {
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      width: 100%;
+      padding-bottom: 4px;
+      scrollbar-width: none;
+    }
+    .chip {
+      white-space: nowrap;
+    }
+  }
+</style>

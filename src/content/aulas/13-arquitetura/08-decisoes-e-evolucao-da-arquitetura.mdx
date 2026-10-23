@@ -1,0 +1,934 @@
+---
+titulo: "Decisões e evolução da arquitetura: ADRs, fitness functions e migração sem big bang"
+descricao: "O trabalho de arquitetura de quem é Sênior: pesar atributos de qualidade, registrar decisões em ADRs e design docs, separar decisões reversíveis das irreversíveis, proteger as decisões com fitness functions e evoluir o sistema aos poucos, com strangler fig, branch by abstraction, feature flags e expand/contract, sem esquecer a dívida técnica, a lei de Conway e como defender uma escolha para o time."
+modulo: 13-arquitetura
+ordem: 8
+duracao: 110
+objetivos:
+  - Descrever um requisito de arquitetura como cenário de atributo de qualidade mensurável (fonte, estímulo, resposta e meta)
+  - Classificar uma decisão como reversível ou irreversível e ajustar o esforço de análise a essa classificação
+  - Escrever um ADR completo, com contexto, opções, decisão, consequências e gatilhos de reavaliação, e guardá-lo junto do código
+  - Migrar uma regra de negócio com branch by abstraction, feature flag com rollout gradual e modo sombra, sem big bang
+  - Transformar uma decisão de arquitetura em fitness function com ArchUnit, que quebra o build quando é violada
+  - Planejar uma mudança de esquema de banco e de contrato de API em fases de expand/contract
+  - Registrar e priorizar dívida técnica e relacionar a estrutura dos times à arquitetura (Conway e Team Topologies)
+tags: [arquitetura, ADR, trade-offs, fitness functions, ArchUnit, strangler fig, branch by abstraction, feature flags, expand/contract, dívida técnica, Team Topologies]
+flashcards:
+  - frente: O que é um ADR e o que ele precisa conter?
+    verso: "Architecture Decision Record: um texto curto, versionado com o código, que registra UMA decisão significativa. Contém título numerado, status, contexto (forças e restrições), opções consideradas, decisão, consequências (boas e ruins) e, idealmente, quando reavaliar."
+  - frente: Qual a diferença prática entre decisão reversível e irreversível?
+    verso: A reversível (porta de duas vias) custa pouco para desfazer, então se decide rápido, com quem está perto do problema. A irreversível (porta de uma via) custa caro para desfazer (contrato público, banco principal, divisão em serviços), então merece análise, protótipo e revisão mais ampla.
+  - frente: O que é uma fitness function de arquitetura?
+    verso: Uma verificação automática e objetiva de que o sistema continua respeitando uma característica desejada (dependências entre camadas, latência p95, tamanho do artefato). Roda no CI ou em produção e falha quando a decisão é violada.
+  - frente: Como funciona o branch by abstraction?
+    verso: "Cria-se uma abstração na frente do código a ser trocado, todos os clientes passam a usá-la, a nova implementação nasce atrás dela, o tráfego vira aos poucos (flag) e, no fim, a antiga é apagada. Tudo no tronco principal, sem branch longa e sem parar entregas."
+  - frente: Quais são as fases do expand/contract num banco?
+    verso: "Expandir (criar a estrutura nova, compatível com o código antigo), migrar (escrita dupla e backfill em lotes), virar a leitura para a nova estrutura e só então contrair (remover a antiga). Cada fase é um deploy separado e reversível."
+  - frente: Por que o rollout gradual usa o id do cliente, e não um sorteio a cada requisição?
+    verso: Para que o mesmo cliente veja sempre a mesma regra. Com sorteio, o frete mudaria entre o carrinho e o pagamento, e as métricas das duas regras se misturariam.
+  - frente: O que diz a lei de Conway?
+    verso: Sistemas tendem a copiar a estrutura de comunicação da organização que os constrói. Quem quer uma arquitetura precisa olhar também para a forma como os times estão divididos e conversam (a manobra inversa de Conway).
+  - frente: Qual o perigo de uma feature flag de release?
+    verso: Ela deveria viver dias ou semanas. Esquecida, vira um caminho de código morto que ninguém testa e que alguém religa por engano. Toda flag de release precisa de dono e data de remoção.
+---
+
+O frete da sua loja é calculado por uma classe escrita em 2019: preço fixo por região, não importa o peso. Quando quase tudo o que se vendia eram livros, funcionava. Hoje a loja vende panelas, cadeiras de escritório e kits de ferramentas, e o financeiro trouxe o número: **18% dos pedidos pesam mais de 3 kg, e cada um deles dá, em média, R$ 6,40 de prejuízo só de frete**. São cerca de R$ 41 mil por mês.
+
+Na reunião, três propostas aparecem em dez minutos. Alguém quer "reescrever o frete do zero num microsserviço novo, já em Kotlin". Outra pessoa quer "só trocar a tabela, é uma tarde". Uma terceira lembra que o checkout é o fluxo que mais vende e que a última mudança nele, feita numa branch de três semanas, derrubou a conversão por dois dias. Todo mundo olha para você, a pessoa Sênior do time. Ninguém espera que você escreva a regra nova sozinho: espera que você **decida como decidir**, registre o porquê, proponha um caminho que não pare o negócio e garanta que, daqui a um ano, ninguém desfaça a decisão sem perceber.
+
+Esse é o trabalho de arquitetura no dia a dia. Não é desenhar caixas num quadro uma vez por ano: é uma sequência de escolhas pequenas e médias, cada uma com custos dos dois lados, feitas com informação incompleta e que precisam ser explicadas para pessoas diferentes. Nesta aula, você vai aprender as ferramentas desse trabalho (atributos de qualidade, ADRs, design docs, fitness functions) e as técnicas que permitem **evoluir** um sistema em produção em vez de reescrevê-lo, e vai aplicar as principais delas no problema do frete, com código Java testado.
+
+## A intuição: reformar a casa com a família morando dentro
+
+Pense numa reforma de cozinha numa casa em que a família continua morando. Ninguém derruba a casa para construir outra: a família precisa comer todos os dias. A boa empreiteira faz assim:
+
+1. **Antes de quebrar qualquer coisa, decide e anota.** Onde vai a pia nova, por que o fogão muda de parede, o que foi descartado (a ilha central, cara demais para o espaço). Daqui a cinco anos, quando alguém quiser mexer de novo, a anotação explica o que parecia estranho. Isso é um **ADR**.
+2. **Separa o que é fácil de desfazer do que não é.** A cor do armário dá para trocar no ano que vem. Mover o ponto de gás exige obra, licença e tem risco. A primeira decisão se toma na hora; a segunda, com cuidado. São as decisões **reversíveis e irreversíveis**.
+3. **Monta uma cozinha provisória.** Um fogareiro na área de serviço mantém a casa funcionando enquanto a cozinha nova é montada atrás de um tapume. Quando a nova está pronta, a família passa a cozinhar nela, e o fogareiro vai embora. É o **branch by abstraction**, e o tapume é a abstração.
+4. **Testa antes de confiar.** Antes de ligar o forno novo no jantar de Natal, a família assa um bolo nele num domingo qualquer. É o **modo sombra** e o **rollout gradual**.
+5. **Garante que a regra continue valendo.** O disjuntor do forno não deixa ninguém ligar um aparelho de 5.000 W na tomada errada, mesmo que a pessoa não saiba que existe uma regra. É a **fitness function**.
+
+Arquitetura evolutiva é isso: decidir com consciência, mudar em passos pequenos e reversíveis e deixar verificações automáticas de guarda para que as decisões não se percam.
+
+## Vocabulário
+
+| Termo | O que significa |
+|---|---|
+| **Atributo de qualidade** | Uma característica que o sistema precisa ter além de "funcionar": latência, disponibilidade, custo, segurança, manutenibilidade. Também chamado de requisito não funcional. |
+| **Trade-off** | Uma troca: melhorar um atributo piora outro. Cache reduz latência e aumenta o risco de dado desatualizado; replicar reduz o risco de indisponibilidade e aumenta o custo. |
+| **ADR** (*Architecture Decision Record*) | Registro curto, versionado com o código, de uma decisão de arquitetura: contexto, opções, decisão e consequências. |
+| **RFC / design doc** | Documento que propõe uma mudança maior **antes** de ela ser feita, para receber críticas. Pode gerar um ou vários ADRs. |
+| **Decisão reversível / irreversível** | Classificação pelo custo de desfazer. Também chamadas de porta de duas vias e porta de uma via. |
+| **Fitness function** | Verificação automática e objetiva de que uma característica de arquitetura continua valendo (um teste do ArchUnit, um limite de latência no teste de carga, um alerta de SLO). |
+| **Strangler fig** | Substituir um sistema antigo aos poucos, desviando uma funcionalidade de cada vez para o sistema novo, até que o antigo possa ser desligado. |
+| **Branch by abstraction** | Trocar uma implementação dentro de uma base de código criando uma abstração na frente dela, fazendo a nova crescer atrás e virando o uso aos poucos, tudo no tronco principal. |
+| **Feature flag** | Um ponto de decisão no código controlado por configuração em tempo de execução: liga, desliga ou libera para uma porcentagem dos usuários sem novo deploy. |
+| **Modo sombra** (*shadow mode*) | Rodar a implementação nova em paralelo com a oficial, comparando os resultados, sem que a nova afete o usuário. |
+| **Expand/contract** | Mudar um esquema de banco ou um contrato de API em fases: primeiro acrescenta o novo, compatível com o antigo; depois migra os usuários; só então remove o antigo. Também chamado de *parallel change*. |
+| **Dívida técnica** | O custo futuro de um atalho tomado hoje. Como dívida financeira, cobra juros: cada mudança naquela área fica mais lenta. |
+| **Lei de Conway** | A observação de que a estrutura de um sistema tende a copiar a estrutura de comunicação da organização que o constrói. |
+
+## Atributos de qualidade: o que você está otimizando
+
+Toda discussão de arquitetura que não diz **o que se quer otimizar** acaba virando disputa de gosto. "Microsserviço é melhor" e "monólito é mais simples" são afirmações vazias até alguém dizer: melhor **para quê**? Os atributos de qualidade dão nome a esse "para quê". A norma ISO/IEC 25010 lista dezenas; no backend, quase toda decisão gira em torno de um punhado:
+
+| Atributo | Pergunta que ele responde | Como se mede |
+|---|---|---|
+| **Latência** | Quanto o usuário espera? | Percentis (p50, p95, p99) do tempo de resposta, nunca a média |
+| **Disponibilidade** | Quanto tempo o sistema responde corretamente? | Porcentagem de requisições boas num período (SLO) |
+| **Vazão** | Quanto o sistema aguenta? | Requisições ou mensagens por segundo no pico, com a latência dentro da meta |
+| **Custo** | Quanto custa operar? | Reais por mês de infraestrutura, licenças e horas de plantão |
+| **Manutenibilidade** | Quanto custa mudar? | Tempo do pedido até a produção (*lead time*), taxa de falha das mudanças, horas por funcionalidade |
+| **Segurança** | O que acontece se alguém tentar abusar? | Superfície de ataque, tempo para corrigir uma vulnerabilidade, achados de auditoria |
+| **Consistência** | Duas leituras concordam? | Janela máxima de dado desatualizado aceitável |
+
+### Escreva o atributo como cenário
+
+"O sistema precisa ser rápido" não serve para decidir nada. Um **cenário de atributo de qualidade** transforma o desejo em algo verificável, com quatro partes: a fonte, o estímulo, o ambiente e a resposta medida.
+
+> **Cenário:** na Black Friday (ambiente), com 1.200 cálculos de frete por segundo (estímulo) vindos do checkout (fonte), o cálculo responde em até 80 ms no p99 e não falha em mais de 0,1% das chamadas (resposta medida).
+
+Com o cenário escrito, as opções podem ser comparadas. Uma chamada síncrona a um microsserviço de frete do outro lado da rede acrescenta de 5 a 20 ms por requisição e uma dependência a mais que pode cair; uma classe no mesmo processo, quase nada. Para esse cenário, a distância de rede é um custo real, e não uma opinião.
+
+### Disponibilidade custa caro, e cada nove custa mais
+
+A disponibilidade costuma ser expressa em "noves". Vale ter os números na cabeça, porque eles mostram o tamanho do custo de cada nove adicional:
+
+| Meta | Indisponibilidade permitida por mês (30,4 dias) | Por ano |
+|---|---|---|
+| 99% | 7,3 horas | 3,65 dias |
+| 99,9% | 43,8 minutos | 8,76 horas |
+| 99,95% | 21,9 minutos | 4,38 horas |
+| 99,99% | 4,4 minutos | 52,6 minutos |
+
+Com 43 minutos por mês, um deploy que dá errado e é revertido à mão em 15 minutos cabe no orçamento. Com 4 minutos, não cabe: você precisa de deploy gradual automatizado, rollback automático, réplicas em mais de uma zona e plantão que atende em minutos. Cada nove a mais multiplica o custo de infraestrutura **e** de operação. Por isso, a pergunta Sênior não é "como chegar a 99,99%?", e sim "**quanto o negócio perde por minuto parado?**". Se a resposta for R$ 200, quatro noves raramente se pagam.
+
+### Os trade-offs que mais aparecem
+
+Alguns pares de atributos brigam com tanta frequência que vale reconhecê-los de longe:
+
+- **Latência × consistência.** Ler de uma réplica ou de um cache é mais rápido e aceita dado um pouco antigo. O saldo de uma conta pede consistência; a lista de produtos mais vendidos aceita cinco minutos de atraso.
+- **Disponibilidade × consistência.** Durante uma falha de rede entre réplicas, ou você responde com o que tem (disponível, talvez inconsistente) ou se recusa a responder (consistente, indisponível). É o teorema CAP, que o módulo 15 aprofunda.
+- **Custo × disponibilidade.** Três zonas de disponibilidade custam cerca de três vezes uma zona.
+- **Manutenibilidade × desempenho.** O código mais rápido costuma ser o mais difícil de mudar (SQL escrito à mão, estruturas desnormalizadas, cache em várias camadas). Otimize onde o perfil de execução mostrou o gargalo, não onde você imagina que ele está.
+
+Não existe arquitetura que maximize tudo. Arquitetura é escolher **quais atributos priorizar** para este sistema, neste momento, e aceitar conscientemente o que se perde.
+
+<Callout tipo="dica" titulo="Priorize no máximo três">
+Peça ao time e ao produto para escolherem os três atributos mais importantes do sistema, em ordem. Se todos forem "muito importantes", nenhum é. Para o checkout da loja, uma boa ordem é: disponibilidade, latência e manutenibilidade. Para o relatório financeiro mensal, é outra: consistência, auditabilidade e custo. A mesma empresa tem prioridades diferentes em partes diferentes do sistema, e é por isso que uma única "arquitetura padrão" para tudo costuma falhar.
+</Callout>
+
+## Decisões reversíveis e irreversíveis
+
+O maior desperdício em arquitetura não é decidir errado: é gastar a mesma energia em todas as decisões. Uma discussão de duas semanas sobre o nome de um pacote é tão ruim quanto escolher o banco de dados principal numa conversa de corredor.
+
+A distinção mais útil vem da carta aos acionistas da Amazon de 2015: decisões são **portas de uma via** ou **portas de duas vias**. Pela porta de duas vias, se você não gostar do outro lado, volta. Pela de uma via, não há volta (ou a volta custa muito caro).
+
+<Figura legenda="O esforço de análise deve ser proporcional ao custo de desfazer a decisão; boa parte do trabalho de arquitetura é transformar portas de uma via em portas de duas vias">
+<svg viewBox="0 0 680 330" width="680" role="img" aria-labelledby="portas-titulo portas-desc">
+  <title id="portas-titulo">Decisões reversíveis e irreversíveis</title>
+  <desc id="portas-desc">Dois quadros lado a lado. À esquerda, porta de duas vias, reversível, decida rápido: nome de classe ou pacote, pool de conexões e timeouts, biblioteca interna de um módulo, funcionalidade atrás de feature flag. À direita, porta de uma via, irreversível, decida com cuidado: linguagem e banco de dados principal, contrato de API pública, formato de evento já publicado, divisão em microsserviços. Uma seta vai do quadro da direita para o da esquerda com o texto: abstração, flags e expand/contract tornam a decisão reversível.</desc>
+  <defs><marker id="mk-portas" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="10" width="320" height="230" rx="10" class="d-ok"/>
+  <text x="170" y="38" text-anchor="middle" class="d-title">Porta de duas vias</text>
+  <text x="170" y="60" text-anchor="middle" class="d-label">reversível: decida rápido, perto do problema</text>
+  <text x="30" y="100" class="d-text">• nome de classe ou pacote</text>
+  <text x="30" y="132" class="d-text">• pool de conexões e timeouts</text>
+  <text x="30" y="164" class="d-text">• biblioteca interna de um módulo</text>
+  <text x="30" y="196" class="d-text">• funcionalidade atrás de flag</text>
+  <rect x="350" y="10" width="320" height="230" rx="10" class="d-accent"/>
+  <text x="510" y="38" text-anchor="middle" class="d-title">Porta de uma via</text>
+  <text x="510" y="60" text-anchor="middle" class="d-label">irreversível: analise, prototipe, revise</text>
+  <text x="370" y="100" class="d-text">• linguagem e banco principal</text>
+  <text x="370" y="132" class="d-text">• contrato de API pública</text>
+  <text x="370" y="164" class="d-text">• formato de evento publicado</text>
+  <text x="370" y="196" class="d-text">• divisão em microsserviços</text>
+  <path d="M510 244 L510 280 L170 280 L170 246" class="d-line" marker-end="url(#mk-portas)"/>
+  <text x="340" y="310" text-anchor="middle" class="d-label">abstração, flags e expand/contract tornam a decisão reversível</text>
+</svg>
+</Figura>
+
+Duas consequências práticas:
+
+1. **Ajuste o processo ao tipo de porta.** Porta de duas vias: quem está perto do problema decide, registra em uma linha no pull request e segue. Porta de uma via: design doc, protótipo que testa a hipótese mais arriscada, revisão com quem vai operar e um ADR.
+2. **Transforme portas de uma via em portas de duas vias sempre que o custo for baixo.** Esta é, talvez, a habilidade mais valiosa de quem faz arquitetura. Uma interface na frente do provedor de pagamento torna a troca de provedor reversível. Uma feature flag torna o lançamento reversível. O expand/contract torna a mudança de esquema reversível. Um monólito modular com fronteiras bem definidas torna a extração de um serviço uma decisão adiável, como você viu na [aula sobre monólito modular](../../13-arquitetura/04-monolito-modular/).
+
+Há também o **último momento responsável**: adiar uma decisão irreversível até o ponto em que adiar mais começaria a custar caro. Adiar dá tempo de aprender; adiar além desse ponto faz a escolha acontecer por omissão.
+
+No caso do frete, "a regra nova é por peso" é uma decisão de negócio. "Criar um microsserviço de frete" seria uma porta de uma via (nova implantação, novo banco, nova dependência síncrona no checkout, novo plantão). "Criar uma interface e trocar a implementação dentro do monólito" é uma porta de duas vias: se a regra nova der problema, a flag volta para zero em segundos.
+
+## ADR: registrando a decisão
+
+Seis meses depois da migração do frete, alguém novo no time abre `CalculadoraDeFretePorPeso` e pergunta: "por que isso não é um serviço separado? Por que a interface tem uma implementação só?". Sem registro, a resposta depende de quem ainda está na empresa e do que essa pessoa lembra. Com um **ADR**, a resposta está no repositório, ao lado do código, com data e autoria.
+
+O formato foi proposto por Michael Nygard em 2011 e continua o mais usado justamente por ser curto. Um ADR é **um arquivo por decisão**, numerado, em Markdown, com estas seções:
+
+| Seção | Conteúdo |
+|---|---|
+| **Título** | Número sequencial e uma frase curta com a decisão: "0007. Calcular frete por peso no monólito, migrando por branch by abstraction" |
+| **Status** | Proposto, Aceito, Rejeitado, Obsoleto ou Substituído por ADR-NNNN |
+| **Contexto** | As forças em jogo: o problema, os números, as restrições (prazo, equipe, regulação), os atributos de qualidade priorizados. Escrito de forma neutra |
+| **Opções consideradas** | Duas a quatro alternativas reais, com prós e contras de cada uma (o formato MADR dá nome a essa seção) |
+| **Decisão** | O que foi escolhido, na voz ativa: "Vamos…" |
+| **Consequências** | O que fica mais fácil, o que fica mais difícil, os riscos aceitos e o que precisa ser feito por causa da decisão |
+
+Duas seções extras fazem muita diferença na prática: **gatilhos de reavaliação** (em que situação a decisão deve ser revista) e **como verificamos** (qual fitness function protege a decisão).
+
+### Um ADR completo
+
+Este é o ADR que o time escreveria para o frete. Repare no tamanho: cabe numa tela e meia. Um ADR de dez páginas é um design doc com o nome errado.
+
+```markdown
+# 0007. Calcular frete por peso no monólito, migrando por branch by abstraction
+
+- Status: Aceito
+- Data: 2026-10-06
+- Decisores: Ana Ribeiro (tech lead, checkout), Bruno Sato (logística), Carla Mendes (produto)
+- Consultados: time de plataforma, financeiro
+
+## Contexto
+
+A regra atual (CalculadoraDeFreteLegada, 2019) cobra preço fixo por região.
+Hoje 18% dos pedidos pesam mais de 3 kg e geram prejuízo médio de R$ 6,40
+de frete cada, cerca de R$ 41 mil por mês (relatório financeiro de setembro).
+
+O cálculo é chamado de forma síncrona no checkout, nosso fluxo mais crítico:
+meta de 99,95% de disponibilidade e p99 de 80 ms para o cálculo, com pico de
+1.200 cálculos por segundo na Black Friday. A Black Friday começa em 7 semanas
+e há congelamento de mudanças no checkout 10 dias antes.
+
+O time de checkout tem 5 pessoas; não há time de logística com capacidade para
+assumir um serviço novo e o plantão dele.
+
+## Opções consideradas
+
+### A. Microsserviço de frete novo
+- (+) Implantação independente; a logística poderia assumir no futuro.
+- (-) Acrescenta uma chamada de rede síncrona no checkout (5 a 20 ms e uma
+  dependência a mais para cair) e um serviço novo para operar sem dono.
+- (-) Não fica pronto e estável antes do congelamento.
+
+### B. Trocar a tabela na classe atual, num único deploy
+- (+) Uma tarde de trabalho.
+- (-) Big bang: sem comparação prévia, sem rollback além de outro deploy.
+  Uma regra errada afeta 100% dos pedidos de uma vez.
+
+### C. Branch by abstraction no monólito, com modo sombra e flag
+- (+) Sem rede nova; rollback em segundos (flag em 0%).
+- (+) A regra nova roda em sombra e é comparada com a antiga antes de valer.
+- (-) Código das duas regras convive por algumas semanas; a flag precisa
+  ser removida depois (dívida planejada).
+
+## Decisão
+
+Vamos adotar a opção C. O checkout passa a depender só da interface
+CalculadoraDeFrete. A regra nova roda em modo sombra por uma semana, depois
+vira com a flag "frete-por-peso" em 5%, 25%, 50% e 100%, com pelo menos dois
+dias em cada etapa, olhando conversão e reclamações de frete.
+
+## Consequências
+
+- Fica mais fácil trocar a regra de frete no futuro (inclusive extrair para
+  um serviço): só a classe MontagemDoFrete conhece as implementações.
+- Fica mais difícil: durante a migração, duas regras precisam de manutenção.
+- Risco aceito: o modo sombra dobra o custo de CPU do cálculo por uma semana
+  (estimado em menos de 1% da CPU do checkout).
+- Tarefas geradas: remover a CalculadoraDeFreteLegada e a flag até 15/12
+  (issue LOJA-1432, dona: Ana).
+
+## Como verificamos
+
+- Fitness function FitnessFunctionsTest: nenhuma classe fora do pacote
+  frete depende de frete.legado ou frete.novo.
+- Painel "frete-sombra": taxa de divergência por faixa de peso.
+
+## Gatilhos de reavaliação
+
+- A logística ganha um time próprio com plantão: reavaliar a opção A.
+- O cálculo passa a depender de cotação externa (transportadoras em tempo
+  real): reavaliar, porque a latência e as falhas mudam de natureza.
+```
+
+### Quando escrever um ADR
+
+Nem toda decisão precisa de ADR. Um bom filtro: escreva quando **pelo menos uma** destas condições valer:
+
+- a decisão é difícil ou cara de reverter (porta de uma via);
+- ela afeta mais de um time ou mais de um módulo;
+- alguém razoável escolheria diferente, ou seja, houve trade-off de verdade;
+- você já explicou a mesma decisão três vezes em code reviews;
+- a decisão contraria o padrão da empresa (e alguém vai perguntar por quê).
+
+Não escreva ADR para escolhas que o próprio código explica (o nome de um método) nem para padrões já decididos em outro ADR. E escreva **na hora**, não meses depois: um ADR retroativo perde exatamente o que tem de mais valioso, que são as opções descartadas e o contexto do momento.
+
+### Onde guardar
+
+O lugar mais comum, e o mais recomendado, é **no próprio repositório**, numa pasta como `docs/adr/`, com nome `0007-frete-por-peso-com-branch-by-abstraction.md`. Os motivos:
+
+- o ADR passa pelo mesmo pull request e pelo mesmo code review do código que o implementa;
+- o histórico do Git mostra quando e por quem foi aceito;
+- quem lê o código encontra a decisão sem procurar numa wiki que ninguém atualiza.
+
+Decisões que atravessam vários repositórios (o padrão de autenticação entre serviços, a escolha do broker) costumam ir para um repositório central de arquitetura, com links a partir dos repositórios afetados.
+
+**ADRs aceitos não se editam.** Se a decisão mudou, escreva um ADR novo ("0019. Extrair o frete para o serviço de logística") e marque o antigo como "Substituído por ADR-0019". O valor do conjunto está justamente em mostrar a evolução: por que fazia sentido antes e o que mudou. Correções de digitação e um link para o ADR que o substitui são as únicas edições aceitáveis.
+
+## RFC e design doc: discutir antes de decidir
+
+O ADR registra uma decisão tomada. Para mudanças maiores, há uma etapa antes: o **design doc** (no Google), a **RFC** (*Request for Comments*, nome herdado dos padrões da internet e usado em empresas como Uber e em projetos abertos como o Rust), ou a "proposta técnica". O nome varia; a ideia é a mesma: **escrever a proposta para que outras pessoas a critiquem antes de o custo de mudar de ideia ficar alto**.
+
+Uma estrutura que funciona bem:
+
+1. **Resumo** em três frases: o problema, a proposta e o pedido ("preciso de aprovação até sexta").
+2. **Contexto e problema**, com números.
+3. **Objetivos e não objetivos.** Os não objetivos evitam que a discussão se espalhe ("não vamos mudar o cálculo de prazo de entrega").
+4. **Proposta**: o desenho, os diagramas, os contratos de API e de evento, o plano de migração e de rollback.
+5. **Alternativas consideradas**, e por que perderam.
+6. **Riscos, questões em aberto e como serão respondidas** (um protótipo, um teste de carga).
+7. **Plano de entrega** em fases, cada uma com critério de sucesso.
+8. **Impacto operacional**: monitoração, alertas, plantão, custo.
+
+Quando usar cada um:
+
+| Situação | Documento |
+|---|---|
+| Decisão local, reversível | Uma linha na descrição do pull request |
+| Decisão significativa e bem entendida | ADR direto, revisado no pull request |
+| Mudança grande, várias equipes, várias decisões, ou muita incerteza | Design doc / RFC, que depois gera um ou mais ADRs |
+
+O design doc é um documento de **discussão**: tem comentários, versões e, no fim, pode ser aprovado, alterado ou abandonado. Abandonar um design doc depois de uma semana de discussão é um sucesso, não um fracasso: o time descobriu no papel, de forma barata, o que descobriria em produção, de forma cara.
+
+Toda RFC precisa de um **prazo de comentários** e de **quem decide** no fim. Sem prazo, a decisão acontece por cansaço; sem alguém que decida, vira votação, que tende a escolher a opção que ninguém odeia, não a melhor.
+
+## O código que vamos construir
+
+A decisão do ADR-0007 vai virar código. A estrutura, no pacote `dev.trilhajava.m13.aulas.decisoes` do módulo `java/m13-arquitetura/aulas`:
+
+```text
+decisoes/
+  checkout/ServicoDeCheckout.java          ← quem usa o frete; só conhece a interface
+  frete/
+    CalculadoraDeFrete.java                ← a abstração
+    Remessa.java                           ← os dados de entrada
+    FeatureFlags.java, FlagsEmMemoria.java ← de quantos % dos clientes a flag está ligada
+    CalculadoraDeFreteComAlternancia.java  ← escolhe a regra antiga ou a nova, pela flag
+    CalculadoraDeFreteEmSombra.java        ← roda a nova ao lado e registra as diferenças
+    MontagemDoFrete.java                   ← o único lugar que conhece as implementações
+    legado/CalculadoraDeFreteLegada.java   ← a regra de 2019
+    novo/CalculadoraDeFretePorPeso.java    ← a regra nova
+```
+
+E os testes, em `src/test/java`: `AlternanciaDeFreteTest` (a flag, o rollout gradual e o modo sombra) e `FitnessFunctionsTest` (a decisão do ADR como regra do ArchUnit). Há ainda uma classe de teste "intrusa", `pullrequest/RelatorioDeFreteApressado`, que simula um pull request que fura a decisão.
+
+<Figura legenda="As quatro fases do branch by abstraction: o sistema continua no ar, e cada fase é um deploy pequeno e reversível">
+<svg viewBox="0 0 800 230" width="800" role="img" aria-labelledby="bba-titulo bba-desc">
+  <title id="bba-titulo">Fases do branch by abstraction</title>
+  <desc id="bba-desc">Quatro caixas da esquerda para a direita, ligadas por setas. Fase 1, criar a abstração: o checkout usa a interface e só a regra legada está atrás dela. Fase 2, nova em sombra: a legada responde e a nova só é comparada. Fase 3, virar com a flag: 5, 25, 50 e 100 por cento dos clientes, e o rollback é a flag em zero. Fase 4, remover a legada: apagar a classe antiga e a flag; a abstração pode ficar. Abaixo, uma nota: todas as fases vão para o tronco principal, sem branch longa.</desc>
+  <defs><marker id="mk-bba" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="175" height="130" rx="10" class="d-box"/>
+  <text x="97" y="48" text-anchor="middle" class="d-title">1. Abstrair</text>
+  <text x="97" y="84" text-anchor="middle" class="d-label">checkout usa a</text>
+  <text x="97" y="102" text-anchor="middle" class="d-label">interface; só a</text>
+  <text x="97" y="120" text-anchor="middle" class="d-label">legada atrás dela</text>
+  <path d="M187 85 L211 85" class="d-line" marker-end="url(#mk-bba)"/>
+  <rect x="213" y="20" width="175" height="130" rx="10" class="d-info"/>
+  <text x="300" y="48" text-anchor="middle" class="d-title">2. Nova em sombra</text>
+  <text x="300" y="84" text-anchor="middle" class="d-label">a legada responde;</text>
+  <text x="300" y="102" text-anchor="middle" class="d-label">a nova só é</text>
+  <text x="300" y="120" text-anchor="middle" class="d-label">comparada</text>
+  <path d="M390 85 L414 85" class="d-line" marker-end="url(#mk-bba)"/>
+  <rect x="416" y="20" width="175" height="130" rx="10" class="d-violet"/>
+  <text x="503" y="48" text-anchor="middle" class="d-title">3. Virar com flag</text>
+  <text x="503" y="84" text-anchor="middle" class="d-label">5% → 25% → 50%</text>
+  <text x="503" y="102" text-anchor="middle" class="d-label">→ 100% dos clientes</text>
+  <text x="503" y="120" text-anchor="middle" class="d-label">rollback: flag em 0</text>
+  <path d="M593 85 L617 85" class="d-line" marker-end="url(#mk-bba)"/>
+  <rect x="619" y="20" width="175" height="130" rx="10" class="d-ok"/>
+  <text x="706" y="48" text-anchor="middle" class="d-title">4. Remover</text>
+  <text x="706" y="84" text-anchor="middle" class="d-label">apagar a legada</text>
+  <text x="706" y="102" text-anchor="middle" class="d-label">e a flag; a</text>
+  <text x="706" y="120" text-anchor="middle" class="d-label">abstração pode ficar</text>
+  <text x="400" y="190" text-anchor="middle" class="d-text">Todas as fases vão para o tronco principal: nenhuma branch longa,</text>
+  <text x="400" y="212" text-anchor="middle" class="d-text">e o checkout continua vendendo durante a migração inteira.</text>
+</svg>
+</Figura>
+
+## Mão na massa
+
+Todos os comandos rodam a partir da pasta `java/m13-arquitetura/aulas`, com o JDK 25. Abra o projeto no IntelliJ (File → Open → `java/pom.xml`) para navegar pelas classes.
+
+### Passo 1: a abstração e quem a usa
+
+A primeira fase não muda comportamento nenhum: cria a interface e faz todos os clientes passarem a depender dela. Em código legado de verdade, esta costuma ser a fase mais trabalhosa, porque a classe antiga é chamada em vários lugares, às vezes com métodos estáticos. Cada ponto de chamada é trocado num pull request pequeno, e a suíte de testes existente garante que nada mudou.
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/CalculadoraDeFrete.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/Remessa.java" />
+
+O checkout recebe a interface no construtor e não sabe qual regra está valendo:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/checkout/ServicoDeCheckout.java" />
+
+A regra antiga passa a implementar a interface, sem nenhuma outra mudança:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/legado/CalculadoraDeFreteLegada.java" />
+
+Neste ponto, o deploy vai para produção e **nada muda para o cliente**. É exatamente isso que se quer: a fase 1 tem risco quase zero e já entrega valor (o acoplamento ao código antigo acabou).
+
+### Passo 2: a regra nova, atrás da mesma interface
+
+A regra nova mantém a base por região e acrescenta R$ 2,00 por quilo iniciado acima do primeiro:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/novo/CalculadoraDeFretePorPeso.java" />
+
+A conta `(pesoEmGramas - 1) / 1000` usa divisão inteira: de 1 g a 1.000 g, zero quilos excedentes; de 1.001 g a 2.000 g, um; 5.000 g dão quatro. Uma remessa de 5 kg para São Paulo custa, portanto, 15,90 + 4 × 2,00 = **R$ 23,90** na regra nova e R$ 15,90 na antiga. Essa diferença de R$ 8,00 é o prejuízo que motivou o ADR.
+
+Por que a tabela de regiões está duplicada em vez de reaproveitada da classe antiga? Porque a antiga vai ser apagada. Se a nova dependesse dela, a remoção da fase 4 viraria uma refatoração. Duplicação temporária e consciente, com data para acabar, é mais barata que um acoplamento que impede a limpeza.
+
+### Passo 3: a flag e o rollout gradual
+
+A alternância escolhe a implementação a cada chamada, consultando a flag. A flag não é um booleano, e sim uma porcentagem, para permitir o rollout gradual:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/FeatureFlags.java" />
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/CalculadoraDeFreteComAlternancia.java" />
+
+O detalhe mais importante está no método `balde`. Cada cliente cai num "balde" de 0 a 99, calculado a partir do próprio id. Com a flag em 30%, os clientes dos baldes 0 a 29 veem a regra nova. Isso garante três propriedades:
+
+- **Estabilidade:** o mesmo cliente vê sempre a mesma regra. Se a escolha fosse um sorteio a cada chamada, o frete mudaria entre o carrinho e o pagamento, o cliente desconfiaria e as métricas das duas regras ficariam misturadas.
+- **Crescimento monotônico:** quem estava na regra nova com 30% continua nela com 50%. A população só aumenta.
+- **Reprodutibilidade:** `String.hashCode` tem fórmula definida na especificação da classe `String`, então o balde do cliente é o mesmo em todas as instâncias da aplicação e em todas as versões do Java. (Um `hashCode` de objeto qualquer não teria essa garantia.)
+
+`Math.floorMod` em vez de `%` não é detalhe: `hashCode` pode ser negativo, e `-7 % 100` dá `-7`, um balde que não existe. `Math.floorMod(-7, 100)` dá `93`.
+
+A implementação das flags, para os testes e para a aula, é um mapa em memória:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/FlagsEmMemoria.java" />
+
+Em produção, as flags vêm de um serviço que permite mudar o valor sem deploy: uma ferramenta comercial, um serviço interno ou um provedor compatível com o **OpenFeature**, a especificação aberta da CNCF para feature flags. Com o SDK Java do OpenFeature (artefato `dev.openfeature:sdk`), a consulta fica parecida com isto, independentemente do fornecedor que está por trás:
+
+```java
+// Ilustração: com o OpenFeature, o fornecedor das flags é um "provider" plugável.
+Client flags = OpenFeatureAPI.getInstance().getClient();
+EvaluationContext contexto = new ImmutableContext(remessa.clienteId());   // a "targeting key"
+boolean usaNova = flags.getBooleanValue("frete-por-peso", false, contexto); // false = valor padrão
+```
+
+O valor padrão (`false`) importa: se o serviço de flags cair, o sistema volta à regra conhecida, não à experimental. A interface `FeatureFlags` desta aula cumpre o mesmo papel de isolar o código do fornecedor.
+
+A montagem fica num único lugar, que é o único que conhece as duas implementações:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/MontagemDoFrete.java" />
+
+Agora os testes. O primeiro confere que a flag decide a regra e que voltar a flag para zero é o "botão de pânico". O segundo confere o rollout gradual com dez mil clientes: com 30%, entre 2.700 e 3.300 deles caem na regra nova, e o mesmo cliente recebe sempre o mesmo valor:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/decisoes/frete/AlternanciaDeFreteTest.java" semImports />
+
+```bash
+mvn test -Dtest=AlternanciaDeFreteTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.decisoes.frete.AlternanciaDeFreteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.140 s -- in dev.trilhajava.m13.aulas.decisoes.frete.AlternanciaDeFreteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+(O tempo varia de máquina para máquina.) O terceiro teste da classe é o do modo sombra, que vem a seguir.
+
+### Passo 4: o modo sombra
+
+Antes de qualquer cliente pagar o frete novo, o time quer saber: **em que casos a regra nova diverge da antiga, e por quanto?** Uma planilha de simulação ajuda, mas os dados reais de produção sempre trazem surpresas (CEPs de outra UF digitados errado, peso cadastrado como zero, produtos com peso em quilos onde se esperava gramas). O modo sombra roda as duas regras em produção, devolve sempre a oficial e registra as diferenças:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/main/java/dev/trilhajava/m13/aulas/decisoes/frete/CalculadoraDeFreteEmSombra.java" />
+
+Três decisões de projeto, todas deliberadas:
+
+1. **O valor oficial é calculado primeiro e devolvido sempre.** A sombra nunca muda o que o cliente vê.
+2. **Uma falha da candidata não pode derrubar a oficial.** Por isso a chamada fica num `try`, e a falha também é registrada como divergência (com o erro). Não é um `catch` vazio: engolir a exceção esconderia exatamente o que a sombra existe para revelar.
+3. **O registro é um `Consumer`.** No teste, é uma lista. Em produção, seria um contador de métricas (por faixa de peso e região) e uma amostra das divergências no log, nunca um log por chamada: com 1.200 cálculos por segundo, isso seria mais de 100 milhões de linhas por dia.
+
+O teste do passo 3 já cobre a sombra: uma remessa de 800 g não diverge; uma de 5 kg diverge (15,90 contra 23,90); e uma candidata que lança exceção não afeta o valor devolvido.
+
+Em produção, o modo sombra custa CPU (o cálculo roda duas vezes) e, se a candidata fizesse I/O, poderia custar latência. Uma regra de frete em memória custa microssegundos; uma candidata que consultasse uma API externa teria de rodar de forma assíncrona e com amostragem, para não pôr a latência do checkout em risco. O ADR registrou esse custo como "risco aceito".
+
+### Passo 5: a decisão vira fitness function
+
+O ADR-0007 diz: "o checkout passa a depender só da interface". Daqui a seis meses, alguém vai escrever um relatório com pressa e fazer `new CalculadoraDeFreteLegada()` direto, porque "era só para ver um número". Ninguém vai lembrar do ADR no code review. A decisão precisa de um guarda automático.
+
+A ferramenta já é conhecida: o **ArchUnit**, que você usou na [aula de TDD e arquitetura](../../10-testes/06-tdd-e-arquitetura/#parte-2-testes-de-arquitetura-com-archunit). Ele importa os `.class` compilados e verifica regras sobre dependências entre classes e pacotes. Primeiro, a dependência no `pom.xml` do módulo de aulas (a versão vem do `spring-parent`):
+
+```xml
+<!-- Aula 13.08: fitness function de arquitetura (a versão vem do spring-parent) -->
+<dependency>
+  <groupId>com.tngtech.archunit</groupId>
+  <artifactId>archunit-junit5</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+E o teste:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/decisoes/FitnessFunctionsTest.java" semImports />
+
+Pontos a notar:
+
+- A regra diz **o que é proibido** (`noClasses()...should().dependOnClassesThat()`), não o que é permitido. Regras de proibição são mais robustas: uma classe nova num pacote novo já nasce coberta.
+- O `.because(...)` aponta para o ADR. Quando a regra quebrar, a mensagem diz **por que** a regra existe, e quem leu a mensagem sabe onde está a discussão.
+- No primeiro teste, `ImportOption.Predefined.DO_NOT_INCLUDE_TESTS` importa só o código de produção. No segundo, a importação inclui as classes de teste, onde está o pull request intruso:
+
+<CodigoJava caminho="m13-arquitetura/aulas/src/test/java/dev/trilhajava/m13/aulas/decisoes/pullrequest/RelatorioDeFreteApressado.java" semImports />
+
+Num projeto real, você teria só o primeiro teste; o segundo existe aqui para mostrar, de forma reproduzível, a regra pegando uma violação.
+
+```bash
+mvn test -Dtest=FitnessFunctionsTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m13.aulas.decisoes.FitnessFunctionsTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.723 s -- in dev.trilhajava.m13.aulas.decisoes.FitnessFunctionsTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Se o relatório apressado estivesse no código de produção, o build quebraria com a mensagem que está na seção "Quando dá errado", mais abaixo.
+
+### Passo 6: a suíte inteira e o plano de virada
+
+```bash
+mvn verify
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.decisoes.FitnessFunctionsTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m13.aulas.decisoes.frete.AlternanciaDeFreteTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+(Se outras aulas do módulo já tiverem código no mesmo projeto, a contagem total será maior.) Com a suíte verde, o plano de produção do ADR fica assim, cada linha um passo que pode ser desfeito:
+
+| Semana | O que muda | Critério para seguir | Como voltar |
+|---|---|---|---|
+| 1 | Deploy da abstração (fase 1) | Testes e métricas do checkout iguais | Reverter o deploy |
+| 2 | Sombra ligada | Divergências explicadas por faixa de peso; nenhuma falha da candidata | Desligar a sombra |
+| 3 | Flag em 5% | Conversão do grupo novo dentro de ±1 ponto percentual do grupo antigo | Flag em 0% |
+| 3–4 | 25%, 50% | Idem, mais o volume de reclamações de frete no atendimento | Flag em 0% |
+| 5 | 100% | Dois dias estáveis | Flag em 0% |
+| 7 | Remoção da legada, da sombra e da flag (fase 4) | Duas semanas em 100% sem incidentes | Reverter o commit |
+
+A última linha é a que mais se esquece. Sem ela, daqui a dois anos o código terá três regras de frete, duas flags que ninguém sabe se podem ser desligadas e uma classe de alternância que ninguém entende.
+
+### Passo 7: a fase 4, a limpeza
+
+Com 100% dos clientes na regra nova há duas semanas, a limpeza é:
+
+1. Apagar `CalculadoraDeFreteLegada`, `CalculadoraDeFreteComAlternancia`, `CalculadoraDeFreteEmSombra` e a flag no serviço de flags.
+2. Em `MontagemDoFrete`, devolver diretamente `new CalculadoraDeFretePorPeso()`.
+3. **Manter a interface** `CalculadoraDeFrete`, se ela ainda fizer sentido (aqui faz: é a costura que permitiria extrair o frete para um serviço no futuro, como prevê o gatilho de reavaliação do ADR). Se a abstração existia só para a migração e tem uma única implementação sem perspectiva de outra, apague-a também.
+4. Acrescentar ao ADR-0007 uma linha "Implementado em 2026-11-24 (PR #2381)". Essa é uma das poucas edições aceitáveis num ADR aceito.
+
+Esse passo fica como checkpoint, no fim da aula.
+
+## Evolução incremental além de uma classe
+
+O branch by abstraction troca uma implementação **dentro** de uma base de código. As mesmas ideias (abstração, convivência temporária, virada gradual, limpeza) aparecem em outras escalas.
+
+### Strangler fig: substituindo um sistema inteiro
+
+A figueira-estranguladora nasce no alto de uma árvore, desce raízes até o chão e, ao longo de anos, envolve a hospedeira até substituí-la. Martin Fowler usou a imagem para descrever a substituição gradual de um sistema legado:
+
+1. **Coloque uma fachada na frente do sistema antigo**: um API gateway, um proxy reverso ou o próprio balanceador. No começo, ela encaminha 100% das rotas para o legado.
+2. **Escolha uma fatia** (uma rota, um caso de uso, um tipo de cliente), construa-a no sistema novo e mude a fachada para encaminhar só aquela fatia.
+3. **Repita**, fatia por fatia, começando pelas que dão mais valor com menos risco.
+4. **Desligue o legado** quando ele não receber mais tráfego. (Em muitas empresas, esse dia nunca chega, e tudo bem se as fatias que restaram são estáveis e baratas. Ainda assim, é melhor decidir isso explicitamente do que deixar acontecer.)
+
+Os cuidados que separam uma estrangulação bem-sucedida de dois sistemas eternos:
+
+- **Dados são a parte difícil.** Rotas se desviam com uma linha de configuração; dados compartilhados não. Se o sistema novo e o antigo escrevem nas mesmas tabelas, você tem um monólito distribuído. Defina, por fatia, quem é o **dono** de cada dado e como o outro lado o consulta (API, evento, réplica somente leitura). A [aula de microsserviços](../../13-arquitetura/05-microsservicos/) discute essa armadilha.
+- **Uma camada anticorrupção** traduz o modelo do legado para o modelo novo, para que os conceitos mal resolvidos do sistema antigo não contaminem o novo.
+
+### Feature flags: tipos diferentes, ciclos de vida diferentes
+
+O artigo de Pete Hodgson sobre feature toggles, publicado no site de Martin Fowler, classifica as flags em quatro tipos. A distinção importa porque cada tipo tem uma vida útil e uma governança diferente:
+
+| Tipo | Para que serve | Vida útil | Exemplo |
+|---|---|---|---|
+| **Release** | Esconder código incompleto ou fazer virada gradual | Dias a semanas | `frete-por-peso` |
+| **Operacional** (*kill switch*) | Desligar uma funcionalidade cara ou instável sob pressão | Longa, às vezes permanente | Desligar recomendações na Black Friday |
+| **Experimento** | Teste A/B com medição estatística | Semanas, até a decisão | Duas versões da página de frete |
+| **Permissão** | Liberar algo para um grupo de clientes (plano pago, beta) | Permanente | Frete grátis para assinantes |
+
+As regras que tornam flags sustentáveis:
+
+- **Toda flag de release tem dono e data de remoção**, idealmente registrados numa issue criada junto com a flag. Algumas equipes acrescentam um teste que falha quando a data passa.
+- **Poucas flags ativas ao mesmo tempo no mesmo fluxo.** Com 5 flags booleanas, há 32 combinações possíveis; ninguém testa todas.
+- **O valor padrão é o comportamento seguro**, para quando o serviço de flags estiver fora.
+- **Mudança de flag é mudança de produção.** Ela precisa de auditoria (quem mudou, quando) e aparece na linha do tempo dos incidentes. Muitos incidentes graves começam com "alguém mudou uma flag".
+
+### Expand/contract no banco de dados
+
+Mudar um esquema em produção, com várias instâncias da aplicação rodando versões diferentes durante o deploy, é uma porta de uma via se feito de uma vez: o código novo espera a coluna nova; o código antigo, ainda rodando, espera a antiga. O **expand/contract** (ou *parallel change*) transforma essa mudança em vários passos reversíveis.
+
+Exemplo: a tabela `remessa` guarda o peso em quilos, como `peso_kg numeric(8,3)`. A regra nova trabalha em gramas inteiros, e o time quer a coluna `peso_gramas integer not null`. Com Flyway, como na [aula de locking e Flyway](../../09-persistencia/06-locking-e-flyway/):
+
+**Fase 1, expandir** (deploy A). A coluna nova nasce aceitando nulo, para não quebrar o código antigo, que não sabe que ela existe:
+
+```sql
+-- V41__remessa_peso_gramas_expandir.sql
+ALTER TABLE remessa ADD COLUMN peso_gramas integer;
+```
+
+No PostgreSQL, acrescentar uma coluna anulável e sem valor padrão só altera o catálogo: é instantâneo, mesmo numa tabela de cem milhões de linhas.
+
+**Fase 2, escrita dupla** (deploy B). A aplicação passa a gravar nas duas colunas. Instâncias antigas que ainda estejam rodando continuam gravando só em `peso_kg`, e tudo bem: o backfill vai cobri-las.
+
+**Fase 3, backfill em lotes**. Um único `UPDATE` na tabela inteira seguraria bloqueios por muito tempo e geraria um volume enorme de WAL de uma vez. Faça em lotes, repetidos até não sobrar linha, com uma pausa entre eles:
+
+```sql
+UPDATE remessa
+   SET peso_gramas = round(peso_kg * 1000)
+ WHERE id IN (SELECT id FROM remessa WHERE peso_gramas IS NULL LIMIT 5000);
+```
+
+**Fase 4, virar a leitura** (deploy C, de preferência atrás de uma flag). A aplicação lê `peso_gramas`. Se algo der errado, volta-se a ler `peso_kg`, que continua sendo gravada.
+
+**Fase 5, contrair** (deploy D, dias depois). Só agora a restrição e a remoção:
+
+```sql
+-- V42__remessa_peso_gramas_contrair.sql
+ALTER TABLE remessa ADD CONSTRAINT remessa_peso_gramas_nn CHECK (peso_gramas IS NOT NULL) NOT VALID;
+ALTER TABLE remessa VALIDATE CONSTRAINT remessa_peso_gramas_nn;
+ALTER TABLE remessa ALTER COLUMN peso_gramas SET NOT NULL;
+ALTER TABLE remessa DROP CONSTRAINT remessa_peso_gramas_nn;
+```
+
+```sql
+-- V43__remessa_remove_peso_kg.sql (num deploy posterior, quando nenhum código lê mais peso_kg)
+ALTER TABLE remessa DROP COLUMN peso_kg;
+```
+
+Por que o desvio pela `CHECK ... NOT VALID`? Um `SET NOT NULL` direto percorre a tabela inteira segurando um bloqueio exclusivo, que trava leituras e escritas. A `CHECK` criada como `NOT VALID` não percorre nada; o `VALIDATE CONSTRAINT` percorre com um bloqueio mais fraco, que permite leituras e escritas; e, como a documentação do PostgreSQL descreve, o `SET NOT NULL` pula a varredura quando uma `CHECK` válida já prova que não há nulos. É o tipo de detalhe que separa uma migração tranquila de uma madrugada de incidente.
+
+Repare na ordem: **remover é sempre o último passo, e sempre num deploy separado**. Entre cada fase, o sistema funciona com as duas versões da aplicação no ar ao mesmo tempo, que é exatamente o que acontece durante um deploy gradual.
+
+### Expand/contract em APIs e eventos
+
+O mesmo raciocínio vale para contratos. Para trocar o campo `pesoKg` (decimal) por `pesoEmGramas` (inteiro) numa API pública:
+
+1. **Expandir:** a resposta passa a trazer os dois campos; a requisição aceita qualquer um dos dois. Campos novos são aditivos e não quebram clientes tolerantes.
+2. **Anunciar:** documente o campo antigo como obsoleto e sinalize nas respostas com os cabeçalhos HTTP `Deprecation` (RFC 9745) e `Sunset` (RFC 8594), que informam que o recurso está obsoleto e a data a partir da qual pode deixar de funcionar.
+3. **Medir:** registre quem ainda usa o campo antigo (por cliente de API). Sem essa métrica, a data de remoção é um palpite.
+4. **Contrair:** depois da data anunciada e com o uso perto de zero (e os clientes restantes avisados um a um), remova o campo, ou faça isso na próxima versão maior da API.
+
+Para eventos publicados num broker, o contrato dura ainda mais, porque mensagens antigas ficam guardadas e podem ser reprocessadas. Esse caso é tema do módulo 12, na aula de [evolução de esquemas de eventos](../../12-mensageria/07-evolucao-de-esquemas-de-eventos/).
+
+## Fitness functions: protegendo as decisões
+
+O termo vem do livro *Building Evolutionary Architectures* (Ford, Parsons, Kua e Sadalage): assim como um algoritmo genético usa uma função de aptidão para medir quão perto uma solução está do objetivo, uma arquitetura usa **fitness functions** para medir se continua com as características que se decidiu que ela teria. A ideia central é simples: **uma decisão que não é verificada automaticamente se perde**. Code review não é suficiente: revisores cansam, mudam de time e não conhecem todos os ADRs.
+
+Elas podem ser **atômicas** (uma característica, como uma regra de dependência) ou **holísticas** (várias juntas, como um teste de carga do fluxo completo), e **disparadas** (no CI, a cada mudança) ou **contínuas** (em produção, como um alerta de SLO).
+
+### Estrutura e dependências: ArchUnit
+
+É o tipo que você escreveu no passo 5, e o mais barato: roda em segundos, é determinístico e dá mensagens precisas. Boas candidatas a regra:
+
+- camadas e direção das dependências (o domínio não depende de infraestrutura, como na [aula sobre arquitetura hexagonal](../../13-arquitetura/03-hexagonal/));
+- módulos que não conversam diretamente (no Spring Modulith, a verificação de módulos é construída sobre o ArchUnit);
+- ausência de ciclos entre pacotes (`slices().matching(...).should().beFreeOfCycles()`);
+- convenções que evitam bugs reais: nenhuma classe usa `java.util.Date`; nenhuma classe fora do adaptador HTTP usa `RestTemplate`.
+
+Para código legado com muitas violações, o `FreezingArchRule` (mostrado na aula do módulo 10) grava as violações existentes e só acusa as novas. Assim, a regra entra no CI no primeiro dia, sem exigir que a dívida inteira seja paga antes.
+
+### Desempenho: teste de carga com limites
+
+Uma decisão como "o cálculo de frete responde em até 80 ms no p99" só se mantém se um teste de carga com limites roda com regularidade. No k6, visto na [aula de desempenho e carga](../../10-testes/08-desempenho-e-carga/), os limites (*thresholds*) fazem o teste terminar com código de saída diferente de zero quando a meta é violada, e é isso que quebra o pipeline:
+
+```javascript
+export const options = {
+  thresholds: {
+    http_req_duration: ['p(99)<80'],   // 99% das requisições em menos de 80 ms
+    http_req_failed: ['rate<0.001'],   // menos de 0,1% de falhas
+  },
+};
+```
+
+Testes de carga são mais lentos e mais sensíveis ao ambiente que os do ArchUnit. Na prática, rodam todas as noites ou antes de cada release, num ambiente com tamanho estável, e comparam com a execução anterior: uma piora de 20% no p99 merece investigação mesmo que a meta absoluta ainda esteja sendo cumprida.
+
+### Métricas no CI
+
+Outras características viram fitness functions com uma linha no pipeline:
+
+- **Cobertura mínima** nas camadas de domínio, com o objetivo `check` do JaCoCo (com cuidado: cobertura é um piso, não uma meta; 100% de linhas cobertas não diz nada sobre a qualidade das asserções).
+- **Dependências com vulnerabilidade conhecida**: o build falha quando uma dependência tem CVE acima de certa gravidade.
+- **Tamanho da imagem**: uma regra como "a imagem não passa de 250 MB" pega a dependência pesada que entrou sem querer.
+
+### Em produção: SLOs como fitness functions contínuas
+
+A verificação mais honesta é a de produção. Um SLO ("99,95% dos cálculos de frete com sucesso e em até 80 ms, medidos em janela de 30 dias") com alerta de consumo do orçamento de erros é uma fitness function contínua e holística: ela avalia a arquitetura sob a carga real, com os dados reais. O módulo 14 trata de observabilidade e SLOs.
+
+<Callout tipo="dica" titulo="Comece por uma">
+Não tente cobrir todas as características com fitness functions no primeiro mês. Escolha a decisão cuja violação seria mais cara (normalmente uma regra de dependência entre módulos ou uma meta de latência do fluxo principal), automatize-a, e acrescente uma nova a cada ADR importante. Uma seção "Como verificamos" no modelo de ADR cria o hábito.
+</Callout>
+
+## Dívida técnica gerenciada
+
+A metáfora foi criada por Ward Cunningham em 1992: entregar código que ainda não reflete o entendimento correto do problema é como pegar dinheiro emprestado. Pode ser uma boa ideia, desde que você pague depois. Se não pagar, os **juros** (cada mudança naquela área demora mais e quebra mais) acabam consumindo toda a capacidade do time.
+
+Martin Fowler organizou a dívida em quatro quadrantes, cruzando **deliberada × inadvertida** com **prudente × imprudente**:
+
+| | Imprudente | Prudente |
+|---|---|---|
+| **Deliberada** | "Não temos tempo para design." | "Precisamos lançar agora e lidamos com as consequências depois." |
+| **Inadvertida** | "O que é separar em camadas?" | "Agora sabemos como deveríamos ter feito." |
+
+A flag e a regra duplicada do frete são dívida **deliberada e prudente**: escolhida, registrada no ADR, com dono e data. É dívida saudável. O problema nunca é ter dívida; é ter dívida **invisível**.
+
+Como gerenciá-la na prática:
+
+1. **Registre num lugar só.** Issues com um rótulo (`divida-tecnica`), cada uma dizendo onde está, qual o **juro** que ela cobra hoje (o que fica mais lento, mais arriscado ou mais caro) e uma estimativa de custo para pagar.
+2. **Quantifique os juros em linguagem de negócio.** "O módulo de frete é feio" não ganha prioridade. "Cada mudança no frete leva, em média, 4 dias em vez de 1, e tivemos 3 incidentes no trimestre causados por ele" ganha.
+3. **Pague onde há movimento.** Dívida em código que ninguém mexe há dois anos quase não cobra juros. Cruze a frequência de mudanças (o histórico do Git mostra os arquivos mais alterados) com a complexidade ou com o número de bugs: o topo dessa lista é onde pagar.
+4. **Reserve capacidade fixa.** Uma fatia previsível do trabalho (muitos times usam algo entre 10% e 20%) para dívida e melhorias evita a negociação a cada sprint. Grandes pagamentos (trocar o ORM, separar um módulo) viram projetos com design doc, como qualquer outro.
+
+## Conway e Team Topologies: arquitetura também é organização
+
+Em 1968, Melvin Conway observou que "organizações que projetam sistemas tendem a produzir projetos que copiam as estruturas de comunicação dessas organizações". Quatro times que constroem um compilador produzem um compilador de quatro passos. Na prática:
+
+- se o time de checkout e o time de logística mal conversam, a fronteira entre checkout e frete vai ser uma API formal (talvez boa, talvez rígida demais);
+- se um único time cuida de oito serviços, esses serviços tendem a se acoplar, porque para o time é fácil mudá-los juntos;
+- se cada mudança de produto exige coordenar três times, o sistema tem três partes que mudam juntas, sejam elas serviços ou módulos.
+
+A **manobra inversa de Conway** usa a lei a seu favor: primeiro você desenha os times de acordo com a arquitetura que quer, e a arquitetura tende a seguir.
+
+O livro *Team Topologies*, de Matthew Skelton e Manuel Pais, organiza essa ideia em quatro tipos de time:
+
+| Tipo de time | Papel |
+|---|---|
+| **Alinhado ao fluxo** (*stream-aligned*) | Dono de ponta a ponta de um fluxo de valor (checkout, logística). A maioria dos times deveria ser deste tipo. |
+| **Plataforma** | Oferece serviços internos de autoatendimento (deploy, observabilidade, banco gerenciado) para reduzir a carga dos times de fluxo. |
+| **Habilitador** (*enabling*) | Especialistas que ajudam outros times a adquirir uma capacidade (testes de carga, segurança) por um período, e saem. |
+| **Subsistema complicado** | Cuida de uma parte que exige conhecimento muito específico (um motor de cálculo tributário, um modelo de recomendação). |
+
+E três modos de interação entre times: **colaboração** (trabalham juntos por um tempo, com alto custo de comunicação), **X como serviço** (um consome o que o outro oferece, com contrato claro) e **facilitação** (um ajuda o outro a aprender).
+
+O conceito que mais impacta decisões técnicas é o de **carga cognitiva**: um time só consegue cuidar bem de uma quantidade limitada de domínios e tecnologias. É o argumento organizacional mais forte do ADR-0007: um microsserviço de frete sem um time com capacidade para assumi-lo seria um serviço órfão. A pergunta "quem vai operar isso às três da manhã?" é uma pergunta de arquitetura.
+
+## Comunicando e defendendo uma decisão
+
+Uma boa decisão mal comunicada perde para uma decisão mediana bem comunicada. Isso não é cinismo: decisões de arquitetura só funcionam se as pessoas que vão implementá-las e operá-las entendem e aceitam o porquê.
+
+**Adapte ao público.** A mesma decisão é contada de três formas:
+
+- Para a diretoria: o problema em dinheiro, o risco e o prazo. "Perdemos R$ 41 mil por mês com frete de produtos pesados. A proposta corrige isso antes da Black Friday, com possibilidade de voltar atrás em segundos se algo der errado."
+- Para o time: as opções, os trade-offs e o plano técnico (o ADR inteiro).
+- Para quem opera: o que muda em monitoração, como saber que deu errado e como reverter.
+
+**Comece pela recomendação.** "Recomendo a opção C, porque é a única que fica pronta antes do congelamento e permite rollback em segundos. As alternativas e os números estão abaixo." Quem tem dois minutos sai sabendo o essencial.
+
+**Mostre as opções de verdade, inclusive a sua opção menos favorita, de forma justa.** Se a opção A do ADR estiver escrita para perder, quem a defendia vai perceber e parar de confiar no documento. Descreva cada opção como a pessoa que a defende descreveria.
+
+**Use números, e diga de onde vêm.** "Uma chamada de rede a mais" convence menos que "5 a 20 ms a mais no p99, medidos nas chamadas atuais entre serviços no nosso cluster". Quando não houver número, diga qual experimento vai produzi-lo.
+
+**Faça um pre-mortem.** Antes de aprovar, pergunte ao grupo: "é dezembro, e esta decisão deu muito errado. O que aconteceu?". As respostas viram riscos no ADR e, muitas vezes, critérios no plano de virada.
+
+**Saiba perder e se comprometer.** Se a decisão for diferente da sua recomendação, registre a sua divergência no ADR (é para isso que a seção de opções existe) e trabalhe para que a decisão escolhida dê certo. Essa postura, às vezes chamada de *disagree and commit*, é o que torna uma pessoa Sênior confiável.
+
+
+## Quando dá errado
+
+As mensagens abaixo são reais, geradas com o código desta aula.
+
+### A fitness function pegou uma violação
+
+Com o `RelatorioDeFreteApressado` no código de produção, o `FitnessFunctionsTest` falha com:
+
+```text
+java.lang.AssertionError: Architecture Violation [Priority: MEDIUM] - Rule 'no classes that reside outside of package '..decisoes.frete..' should depend on classes that reside in any package ['..frete.legado..', '..frete.novo..'], because o ADR-0007 decidiu que o resto do sistema só conhece CalculadoraDeFrete' was violated (2 times):
+Method <dev.trilhajava.m13.aulas.decisoes.pullrequest.RelatorioDeFreteApressado.freteMedioParaSp()> calls constructor <dev.trilhajava.m13.aulas.decisoes.frete.legado.CalculadoraDeFreteLegada.<init>()> in (RelatorioDeFreteApressado.java:11)
+Method <dev.trilhajava.m13.aulas.decisoes.pullrequest.RelatorioDeFreteApressado.freteMedioParaSp()> calls method <dev.trilhajava.m13.aulas.decisoes.frete.legado.CalculadoraDeFreteLegada.calcular(dev.trilhajava.m13.aulas.decisoes.frete.Remessa)> in (RelatorioDeFreteApressado.java:11)
+```
+
+Como ler: a primeira linha repete a regra e o motivo (o texto do `because`); cada linha seguinte é uma violação, com a classe, o método, o que foi chamado e a linha do arquivo. A correção é receber `CalculadoraDeFrete` no construtor do relatório. A tentação, que deve ser evitada, é "relaxar" a regra acrescentando uma exceção para o relatório. Se houver uma razão legítima para a exceção, ela é uma mudança de decisão: atualize ou substitua o ADR.
+
+### A regra não checou nada
+
+Um erro de digitação no nome do pacote (`chekout` em vez de `checkout`) faz a regra não encontrar nenhuma classe. Uma regra que não verifica nada passaria para sempre, dando falsa segurança. O ArchUnit, por padrão, falha nesse caso:
+
+```text
+java.lang.AssertionError: Rule 'no classes that reside in a package '..decisoes.chekout..' should depend on classes that reside in any package ['..frete.legado..']' failed to check any classes. This means either that no classes have been passed to the rule at all, or that no classes passed to the rule matched the `that()` clause. To allow rules being evaluated without checking any classes you can either use `ArchRule.allowEmptyShould(true)` on a single rule or set the configuration property `archRule.failOnEmptyShould = false` to change the behavior globally.
+```
+
+Corrija o pacote. Não desligue o `failOnEmptyShould` globalmente: ele é o que protege você de regras que não verificam nada depois de uma refatoração que renomeou pacotes.
+
+### Flag com valor inválido
+
+Alguém digita 150 no painel de flags:
+
+```text
+java.lang.IllegalArgumentException: percentual fora de 0..100: 150
+```
+
+A validação na escrita é o comportamento certo para a `FlagsEmMemoria`. Com um serviço de flags real, valide também na leitura e caia no valor padrão seguro (a regra antiga), registrando um alerta: uma configuração errada não pode derrubar o checkout.
+
+### Problemas que não geram mensagem
+
+Os erros mais caros desta aula não têm stack trace:
+
+- **A flag nunca foi removida.** Um ano depois, ninguém sabe se `frete-por-peso` pode ser desligada. Sintoma: flags com mais de 90 dias no painel. Correção: dono e data na criação, e uma revisão mensal das flags ativas.
+- **O rollout usou sorteio por requisição.** O cliente vê R$ 15,90 no carrinho e R$ 23,90 no pagamento, abandona a compra e reclama. Sintoma: aumento de abandono na etapa de pagamento só no grupo da flag. Correção: balde pelo id do cliente.
+
+## Armadilhas e quando NÃO usar
+
+<Callout tipo="erro" titulo="ADR escrito para justificar uma decisão já tomada">
+Se o ADR é escrito depois de o código estar pronto, só com a opção escolhida e com "consequências" todas positivas, ele não serve para nada além de burocracia. O valor está em mostrar as opções reais e o custo aceito. Um ADR sem nenhuma consequência negativa provavelmente não está sendo honesto.
+</Callout>
+
+- **Arquitetura de slides.** Diagramas bonitos que não correspondem ao código. Se o diagrama diz que o domínio não depende da infraestrutura, deveria existir uma regra do ArchUnit dizendo o mesmo.
+- **Branch by abstraction para mudanças pequenas.** Se a mudança cabe num pull request revisável e tem testes bons, faça direto. A técnica compensa quando a troca leva semanas, envolve risco de negócio ou precisa conviver com entregas no mesmo código.
+- **Flag como substituta de teste.** "Vamos lançar atrás de uma flag, então não precisa testar" transforma clientes em testadores. A flag reduz o impacto de um erro; não reduz a chance de ele acontecer.
+- **Modo sombra com efeitos colaterais.** Se a implementação candidata envia e-mail, cobra cartão, publica evento ou grava no banco, rodar em sombra duplica esses efeitos. Sombra é para cálculos puros, ou para candidatas com os efeitos desligados.
+- **Strangler fig sem plano de dados.** Redirecionar rotas é fácil; dois sistemas escrevendo nas mesmas tabelas por anos é um monólito distribuído com o dobro do custo.
+- **Fitness functions frágeis.** Um teste de desempenho que falha uma vez a cada cinco execuções por ruído do ambiente ensina o time a ignorar falhas e a apertar "rodar de novo". Prefira menos verificações, todas confiáveis.
+- **Expand/contract quando não há ninguém para quebrar.** Num sistema que ainda não está em produção, ou numa tabela interna lida por um único processo que você para durante o deploy, a migração direta é mais simples e suficiente.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+Uma pessoa Pleno recebe um problema bem definido e escolhe uma boa solução para ele. Uma pessoa Sênior também **define o problema**, escolhe **como decidir**, faz a decisão acontecer em produção e garante que ela continue valendo. Na prática, isso significa:
+
+**Fazer a pergunta econômica primeiro.** Antes de discutir tecnologia, pergunte quanto custa o problema (os R$ 41 mil por mês), quanto custa cada solução (horas de desenvolvimento, infraestrutura, operação, oportunidade perdida) e qual o custo de errar. Às vezes a resposta Sênior é "não vamos resolver isso agora": se o problema custa menos que a solução no horizonte de um ano, registre isso num ADR e siga.
+
+**Contar o custo de operação, não só o de construção.** Um serviço novo custa a implantação e, depois, para sempre: atualização de dependências, correção de vulnerabilidades, plantão, monitoração, migração de versão do Java e do Spring. Uma regra prática: o custo de construção costuma ser a menor parte do custo total de propriedade de um componente ao longo da vida dele.
+
+**Planejar o rollback antes do rollout.** Para cada passo de uma migração, a pergunta é "como volto em cinco minutos?". Se a resposta for "não volto", o passo é uma porta de uma via e precisa ser dividido (expand/contract) ou ensaiado (ambiente de homologação com dados reais anonimizados, teste de carga).
+
+**Pensar em falhas e segurança da própria migração.** O serviço de flags vira uma dependência crítica: se cair, qual o comportamento? Quem pode mudar uma flag em produção, e isso fica auditado? Uma flag que libera um desconto é um alvo de fraude interna tanto quanto um endpoint. O modo sombra pode registrar dados de clientes nos logs de divergência: anonimize, porque o log costuma ter controle de acesso mais fraco que o banco.
+
+**Saber quando trocar de abordagem.** O ADR-0007 tem gatilhos explícitos. Uma pessoa Sênior acompanha esses gatilhos e propõe a revisão quando eles acontecem, em vez de defender a decisão antiga por apego. Mudar de ideia com informação nova é sinal de maturidade, não de fraqueza; o ADR novo explica o que mudou.
+
+**Escalar a decisão para o tamanho da organização.** Num time de cinco pessoas, um ADR revisado no pull request basta. Numa empresa com trinta times, decisões que atravessam times precisam de um fórum (um grupo de arquitetura, uma revisão de RFCs semanal) e de padrões compartilhados ("caminhos pavimentados" oferecidos pelo time de plataforma), para que cada time não reinvente autenticação, observabilidade e deploy. O risco oposto também existe: um comitê de arquitetura que precisa aprovar tudo vira gargalo e afasta as decisões de quem conhece o problema.
+
+**Deixar o sistema mais fácil de mudar do que encontrou.** O critério final de uma arquitetura não é estar "certa", porque o negócio vai mudar e a arquitetura certa de hoje vai estar errada daqui a três anos. O critério é quão barato é mudá-la quando isso acontecer. Abstrações nas costuras certas, decisões registradas, fitness functions e o hábito de migrar em passos pequenos são, juntos, o que torna isso possível.
+
+<Callout tipo="entrevista">
+Para vagas Pleno e Sênior, perguntas comuns são: **"Conte sobre uma decisão de arquitetura que você tomou e se arrependeu"**, **"como você migraria um sistema legado sem parar o negócio?"**, **"como você convence o time de uma decisão técnica?"** e **"como você lida com dívida técnica?"**.
+
+Uma boa resposta tem, em qualquer uma delas: o **contexto com números** (carga, equipe, prazo); as **opções consideradas** e por que perderam; o **trade-off aceito** dito com todas as letras; o **registro** (ADR ou design doc); a **migração incremental** (strangler fig, branch by abstraction, flags, expand/contract) com **plano de rollback**; uma **verificação automática** que protege a decisão (fitness function); e o **resultado medido**. Na pergunta do arrependimento, o entrevistador quer ver que você reconhece o erro, explica qual informação faltava e o que mudou no seu processo depois (por exemplo, passar a escrever gatilhos de reavaliação). Respostas que só citam tecnologias ("usamos Kafka e Kubernetes") sem trade-offs soam como Júnior, por mais sofisticada que a stack seja.
+</Callout>
+
+## Checkpoint
+
+A regra nova está em 100% há duas semanas, sem incidentes. Faça a **fase 4** no código desta aula, num rascunho seu (não precisa commitar):
+
+1. Remova a regra legada, a alternância e a sombra, deixando `MontagemDoFrete` devolver a regra nova.
+2. Troque a fitness function por uma que impeça **qualquer** classe de voltar a depender do pacote `legado`, mesmo que alguém o recrie.
+3. Escreva as duas ou três linhas que você acrescentaria ao ADR-0007.
+
+Rode `mvn verify` e confira que tudo continua verde. Pergunte-se também: `AlternanciaDeFreteTest` ainda faz sentido?
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+**1. A montagem.** Apague `legado/CalculadoraDeFreteLegada.java`, `CalculadoraDeFreteComAlternancia.java`, `CalculadoraDeFreteEmSombra.java`, `FeatureFlags.java` e `FlagsEmMemoria.java` (se nada mais usar flags), e simplifique:
+
+```java
+public static CalculadoraDeFrete montar() {
+    return new CalculadoraDeFretePorPeso();
+}
+```
+
+O `AlternanciaDeFreteTest` perde o sentido: os testes de flag e sombra são apagados junto com o código que testavam. Os testes da regra por peso que você quiser manter (5 kg para SP custa 23,90; 1.000 g não paga adicional; 1.001 g paga 2,00) viram um `CalculadoraDeFretePorPesoTest` simples. Apague também a flag no serviço de flags; uma flag que aponta para código que não existe mais é uma armadilha para quem a encontrar no painel.
+
+**2. A fitness function.** Uma regra sem `that()` vale para todas as classes importadas:
+
+```java
+static final ArchRule SEM_REGRA_LEGADA = noClasses()
+        .should().dependOnClassesThat().resideInAPackage("..frete.legado..")
+        .because("ADR-0007: a regra de frete por região foi removida em 2026-11-24");
+```
+
+Como o pacote `legado` deixou de existir, esta regra não tem classes de destino para encontrar, mas ela tem classes de origem (todas as importadas), então não dispara o `failOnEmptyShould`. A regra antiga (`SO_A_ABSTRACAO_E_PUBLICA`) pode continuar, protegendo agora apenas o pacote `novo`.
+
+**3. O ADR.** ADRs aceitos não são reescritos; acrescenta-se uma nota no fim:
+
+```markdown
+## Implementação
+
+- 2026-11-24: migração concluída (PR #2381). Regra legada, sombra e flag
+  "frete-por-peso" removidas. Prejuízo de frete em pedidos acima de 3 kg
+  caiu de R$ 41 mil para R$ 3 mil no mês seguinte; conversão estável.
+```
+
+A interface `CalculadoraDeFrete` fica: é a costura que torna barata a extração para um serviço, prevista no gatilho de reavaliação do ADR.
+
+</details>
+
+<Quiz
+  id="13-decisoes-e-evolucao"
+  questoes={[
+    {
+      pergunta: 'Qual destas decisões é a mais próxima de uma porta de uma via (irreversível) e por isso merece design doc e revisão ampla?',
+      opcoes: ['Trocar o nome do pacote frete para logistica', 'Mudar o timeout de leitura do cliente HTTP de 2 s para 3 s', 'Publicar um evento PedidoPago consumido por quatro times, com um formato novo', 'Ligar uma feature flag para 5% dos clientes'],
+      correta: 2,
+      explicacao: 'Um evento publicado vira contrato com vários consumidores e fica guardado no broker; mudar o formato depois exige coordenação e convivência de versões. As outras opções se desfazem em minutos.',
+    },
+    {
+      pergunta: 'No rollout gradual da aula, por que o balde vem de `Math.floorMod(clienteId.hashCode(), 100)` e não de um número aleatório a cada chamada?',
+      opcoes: ['Porque números aleatórios são lentos em Java', 'Para que o mesmo cliente veja sempre a mesma regra e as métricas dos grupos não se misturem', 'Porque o hashCode é criptograficamente seguro', 'Para que a flag funcione sem serviço de flags'],
+      correta: 1,
+      explicacao: 'Com sorteio, o frete mudaria entre o carrinho e o pagamento. O hash do id é estável (a fórmula de `String.hashCode` é definida na especificação) e o `floorMod` evita baldes negativos.',
+    },
+    {
+      pergunta: 'Um time quer trocar a coluna `peso_kg` por `peso_gramas` NOT NULL numa tabela grande, com deploys graduais. Qual sequência é segura?',
+      opcoes: ['Num único deploy: criar peso_gramas NOT NULL, copiar os dados e remover peso_kg', 'Criar peso_gramas anulável; gravar nas duas; backfill em lotes; ler de peso_gramas; tornar NOT NULL; remover peso_kg num deploy posterior', 'Renomear peso_kg para peso_gramas e multiplicar os valores por mil', 'Remover peso_kg primeiro, para evitar dados duplicados'],
+      correta: 1,
+      explicacao: 'É o expand/contract: cada fase é compatível com a versão anterior da aplicação ainda rodando, e a remoção vem por último, num deploy separado.',
+    },
+    {
+      pergunta: 'Qual afirmação sobre ADRs está correta?',
+      opcoes: ['Quando a decisão muda, edita-se o ADR original para refletir a decisão atual', 'Um ADR deve listar só a opção escolhida, para não confundir quem lê', 'Quando a decisão muda, escreve-se um ADR novo e o antigo é marcado como substituído', 'ADRs ficam numa wiki separada do código, para não poluir o repositório'],
+      correta: 2,
+      explicacao: 'ADRs aceitos são imutáveis: o conjunto mostra a evolução das decisões e por que cada uma fazia sentido no seu contexto. Guardá-los no repositório faz com que passem pelo mesmo code review do código.',
+    },
+    {
+      pergunta: 'A regra do ArchUnit falha com "failed to check any classes". O que isso indica e o que fazer?',
+      opcoes: ['Que o código tem violações; corrija as classes apontadas', 'Que a regra não encontrou nenhuma classe para verificar, provavelmente por um nome de pacote errado; corrija o filtro', 'Que o ArchUnit não suporta Java 25; desligue a regra', 'Que é preciso usar FreezingArchRule'],
+      correta: 1,
+      explicacao: 'Uma regra que não verifica nada passaria para sempre. O `failOnEmptyShould` (ligado por padrão) existe para pegar esse caso; desligá-lo globalmente esconde regras quebradas.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Arquitetura é escolher **quais atributos de qualidade priorizar** (latência, disponibilidade, custo, manutenibilidade, segurança) e aceitar o que se perde. Escreva os atributos como **cenários mensuráveis** e pergunte quanto o negócio perde antes de buscar mais um nove.
+- Separe **portas de duas vias** (decida rápido) de **portas de uma via** (analise, prototipe, revise) e, sempre que for barato, transforme as segundas nas primeiras com abstrações, flags e expand/contract.
+- **ADR**: um arquivo curto por decisão significativa, no repositório (`docs/adr/`), com contexto, opções, decisão, consequências, como verificar e gatilhos de reavaliação. Aceito, não se edita; substitui-se. **Design doc/RFC** vem antes, para mudanças grandes, com prazo de comentários e alguém que decide.
+- **Branch by abstraction**: abstração na frente, nova implementação atrás, **modo sombra** para comparar, **feature flag** com rollout gradual por balde estável do cliente, e **remoção** do código antigo e da flag no fim.
+- **Strangler fig** aplica a mesma ideia a sistemas inteiros, com uma fachada que desvia fatias; o difícil são os dados. **Expand/contract** aplica a esquemas de banco e contratos de API: expandir, migrar, virar, contrair, com a remoção sempre por último.
+- **Fitness functions** protegem as decisões automaticamente: ArchUnit para estrutura, testes de carga com limites para desempenho, métricas no CI e SLOs em produção.
+- **Dívida técnica** é aceitável quando deliberada, visível, com dono e plano; priorize pagá-la onde há mudança frequente e quantifique os juros em linguagem de negócio.
+- **Conway**: a arquitetura copia a comunicação dos times. Considere a carga cognitiva e quem vai operar o que você propõe.
+- Comunique com a recomendação primeiro, opções justas, números com fonte e gatilhos para reabrir a discussão.
+
+## Próximo passo
+
+Antes de seguir, pratique o que viu no módulo 13 nos exercícios: do [motor de frete](../../../exercicios/13-arquitetura/01-motor-de-frete/) ao [cliente resiliente](../../../exercicios/13-arquitetura/04-cliente-resiliente/). O exercício que mais se conecta com esta aula é o 13.05, [Decisão de arquitetura: monólito modular ou microsserviços? (ADR)](../../../exercicios/13-arquitetura/05-adr-monolito-ou-microsservicos/): você vai escrever um ADR completo para um caso real de startup, com opções, consequências e gatilhos de reavaliação, como faria para o time e para a diretoria.
+
+Depois, o módulo 14 começa pelo dia a dia do time: em [Git no time: branches curtas, pull requests e versões](../../14-devops/01-git-no-time/), você vai ver por que branches de vida curta e integração frequente no tronco, que tornaram possível o branch by abstraction desta aula, são a base de entregas contínuas e seguras.
+
+## Referências
+
+- ArchUnit — *User Guide* (regras de dependência, `ImportOption`, `FreezingArchRule`, `archRule.failOnEmptyShould`): https://www.archunit.org/userguide/html/000_Index.html
+- OpenFeature — especificação e SDK Java: https://openfeature.dev/docs/reference/intro e https://github.com/open-feature/java-sdk
+- PostgreSQL 18 — *ALTER TABLE* (`ADD COLUMN`, `NOT VALID`, `VALIDATE CONSTRAINT`, `SET NOT NULL`): https://www.postgresql.org/docs/18/sql-altertable.html
+- Flyway — *Migrations*: https://documentation.red-gate.com/flyway
+- IETF — RFC 9745, *The Deprecation HTTP Response Header Field*: https://www.rfc-editor.org/rfc/rfc9745 ; RFC 8594, *The Sunset HTTP Header Field*: https://www.rfc-editor.org/rfc/rfc8594
+- k6 — *Thresholds*: https://grafana.com/docs/k6/latest/using-k6/thresholds/
+- Michael Nygard — *Documenting Architecture Decisions* (o texto original dos ADRs): https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions ; e o modelo MADR: https://adr.github.io/madr/
+- Martin Fowler — *Strangler Fig Application*, *Branch By Abstraction*, *Parallel Change*, *Technical Debt Quadrant*; Pete Hodgson — *Feature Toggles*: https://martinfowler.com
+- Melvin Conway — *How Do Committees Invent?* (1968): https://www.melconway.com/Home/Committees_Paper.html
+- Team Topologies — conceitos principais: https://teamtopologies.com/key-concepts
+- ISO/IEC 25010 — modelo de qualidade de produto de software: https://iso25000.com/index.php/en/iso-25000-standards/iso-25010

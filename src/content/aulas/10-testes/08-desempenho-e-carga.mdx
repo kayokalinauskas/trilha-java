@@ -1,0 +1,926 @@
+---
+titulo: Testes de desempenho e carga
+descricao: "Como medir se a API aguenta a Black Friday antes da Black Friday: latência, vazão e percentis, por que a média engana, omissão coordenada, tipos de teste de carga, modelo aberto e fechado, metas a partir de SLOs, microbenchmarks com JMH, teste de carga com Gatling (Java DSL) contra uma aplicação Spring de verdade, como achar o gargalo (pool de conexões, threads, GC) e como levar isso ao CI sem testes instáveis."
+modulo: 10-testes
+ordem: 8
+duracao: 120
+objetivos:
+  - Explicar a diferença entre latência e vazão e relacioná-las com a Lei de Little
+  - Ler um relatório com p50, p95 e p99 e mostrar com números por que a média esconde a cauda
+  - Reconhecer a omissão coordenada num gerador de carga e dizer como o modelo aberto a evita
+  - Escolher entre teste de carga, estresse, pico, resistência e capacidade para uma pergunta de negócio
+  - Escrever e rodar um microbenchmark com JMH, evitando aquecimento insuficiente, eliminação de código morto e constant folding
+  - Escrever uma simulação Gatling com injeção aberta e asserções de p95 e taxa de erro, e rodá-la pelo Maven contra uma aplicação Spring
+  - Localizar um gargalo de pool de conexões pelos percentis, pelos erros e pelas estatísticas do HikariCP, e corrigi-lo
+  - Planejar a execução de testes de desempenho no CI sem instabilidade, com metas derivadas de SLOs
+tags: [desempenho, carga, JMH, Gatling, k6, percentis, SLO, HikariCP]
+flashcards:
+  - frente: Qual a diferença entre latência e vazão (throughput)?
+    verso: Latência é quanto tempo UMA requisição leva (ms). Vazão é quantas requisições o sistema completa por unidade de tempo (req/s). Um sistema pode ter vazão alta com latência ruim (filas longas) e vice-versa.
+  - frente: O que diz a Lei de Little e para que ela serve num teste de carga?
+    verso: "L = λ × W: itens em atendimento = taxa de chegada × tempo médio no sistema. Com 10 conexões presas 40 ms cada, a vazão máxima é 10 / 0,04 s = 250 req/s. Acima disso, a fila cresce sem parar."
+  - frente: Por que não se usa a média de latência como meta?
+    verso: A média mistura a maioria rápida com a minoria lenta e esconde a cauda. 97 respostas de 20 ms e 3 de 2 s dão média de 79 ms, mas 3% dos clientes esperaram 2 segundos. Metas usam percentis (p95, p99).
+  - frente: O que é omissão coordenada (coordinated omission)?
+    verso: O gerador espera a resposta antes de mandar a próxima requisição. Quando o servidor trava, o gerador também para de enviar, e as requisições que teriam sofrido a espera nunca são medidas. O p99 sai bom de um servidor que travou. Evita-se medindo a partir do horário pretendido (modelo aberto).
+  - frente: Modelo aberto ou fechado de carga?
+    verso: Aberto (Gatling injectOpen, k6 constant-arrival-rate) define a TAXA de chegada; novas requisições chegam mesmo que as anteriores não tenham terminado, como clientes na internet. Fechado (injectClosed, constant-vus) define o NÚMERO de usuários simultâneos; cada um só manda a próxima depois da resposta, como um pool de workers.
+  - frente: Quais três armadilhas do JIT o JMH ajuda a evitar?
+    verso: Medir antes do aquecimento (código interpretado ou compilado pelo C1), eliminação de código morto (resultado não usado é apagado) e constant folding (conta com constantes é feita uma vez só). O JMH aquece, roda em JVMs separadas (forks) e consome o resultado com o Blackhole.
+  - frente: Como um teste de carga entra no CI sem ficar instável?
+    verso: Rodando num ambiente dedicado e estável, com aquecimento, duração suficiente e metas com folga (p95 em vez de p99, taxa de erro), comparando com a linha de base. No pipeline de cada PR entra um teste curto de fumaça; o teste longo roda agendado (por exemplo, toda noite).
+  - frente: Chamar uma API externa dentro de um @Transactional afeta o desempenho por quê?
+    verso: A conexão com o banco fica presa durante a chamada externa. Com um pool de 10 conexões e 40 ms de espera, a vazão máxima cai para 250 req/s; acima disso, as requisições esperam o pool e falham com "Connection is not available, request timed out".
+---
+
+Faltam três semanas para a Black Friday. O time de marketing prevê o triplo do tráfego normal no checkout, e alguém pergunta na reunião: "a cotação de frete aguenta?". Silêncio. A suíte tem testes de unidade, de fatia, de integração com Testcontainers e de contrato; todos verdes. Nenhum deles responde à pergunta, porque todos fazem uma requisição por vez. Em produção, o que derruba um sistema quase nunca é uma requisição: são trezentas por segundo disputando as mesmas dez conexões com o banco.
+
+O cenário do ano passado ainda está na memória do time: às 21h da sexta-feira, a cotação passou de 50 ms para 9 segundos, o checkout começou a devolver erro 500 e o painel mostrava CPU a 20% e memória sobrando. Ninguém sabia onde estava o gargalo, e a "correção" foi dobrar o número de máquinas, o que não resolveu nada (o gargalo estava no banco, e mais máquinas significaram mais gente disputando as mesmas conexões).
+
+Nesta aula você vai aprender a responder "aguenta?" com números antes do dia: o vocabulário que os relatórios usam (latência, vazão, percentis), os erros clássicos de medição (a média, a omissão coordenada), os tipos de teste e como definir a meta a partir de um SLO. Na prática, você vai escrever **microbenchmarks com JMH** para comparar duas implementações de um trecho de código e um **teste de carga com Gatling** contra uma API Spring Boot de verdade, ver a API desabar com saídas reais, achar o gargalo e corrigi-lo. No fim, vamos discutir o que muda quando isso vira rotina do time: ambiente, custo, CI e como justificar as decisões.
+
+## A intuição: o caixa do supermercado
+
+Pense nos caixas de um supermercado. Cada caixa atende um cliente em cerca de dois minutos. Com cinco caixas abertos, o mercado atende no máximo **150 clientes por hora** (5 caixas × 30 clientes por hora cada). Isso é a **vazão** máxima. O tempo que cada cliente passa desde que entra na fila até sair com as compras é a **latência**.
+
+Enquanto chegam menos de 150 clientes por hora, a fila é curta e a latência é perto dos dois minutos do atendimento. Quando chegam 160 por hora, a fila **cresce sem parar**: a cada hora sobram dez clientes que não foram atendidos e entram na fila da hora seguinte. A latência não sobe um pouco; ela sobe sem limite, até que as pessoas desistam (no backend, isso é o *timeout*).
+
+Três lições dessa imagem valem para qualquer sistema:
+
+1. **Abaixo da capacidade, a latência é quase constante.** Acima dela, explode. Não há meio-termo suave: um sistema a 95% da capacidade já tem filas grandes.
+2. **O gargalo é o recurso mais escasso, não o mais lento.** Se um dos caixas é rápido mas só há um empacotador para os cinco, quem manda na vazão é o empacotador. No backend, o "empacotador" costuma ser o pool de conexões com o banco, um lock, um limite de threads ou uma API externa.
+3. **Quem mede pela fila engana a si mesmo.** Se o gerente perguntar "quanto tempo levou o seu atendimento?" só a quem chegou ao caixa, e não a quem desistiu na fila, os números parecem ótimos. Guarde essa: é a omissão coordenada, que aparece mais adiante.
+
+## Vocabulário
+
+| Termo | O que é | Unidade |
+|---|---|---|
+| **Latência** (tempo de resposta) | Quanto tempo uma requisição leva, do envio até a resposta completa | ms |
+| **Vazão** (*throughput*) | Quantas requisições o sistema completa por unidade de tempo | req/s |
+| **Concorrência** | Quantas requisições estão em andamento ao mesmo tempo | requisições |
+| **Percentil** (p50, p95, p99) | O p95 é o valor abaixo do qual estão 95% das medições; só 5% foram mais lentas | ms |
+| **Cauda** (*tail latency*) | As medições mais lentas, de p99 para cima | ms |
+| **Taxa de erro** | Fração das requisições que falharam (5xx, timeout, conexão recusada) | % |
+| **Saturação** | O ponto em que um recurso está 100% ocupado e o trabalho começa a esperar em fila | — |
+| **SLI / SLO** | Indicador medido (ex.: p95 da cotação) e objetivo combinado para ele (ex.: p95 abaixo de 200 ms em 99% dos minutos) | — |
+| **Gerador de carga** | Programa que dispara requisições e mede as respostas (Gatling, k6, JMeter) | — |
+| **Microbenchmark** | Medição de um trecho pequeno de código, isolado (um método, uma estrutura de dados) | ns/op |
+
+Uma relação liga as três primeiras linhas: a **Lei de Little**. Em qualquer sistema estável, *concorrência média = vazão × latência média*. Se a API completa 250 requisições por segundo e cada uma leva 0,04 s, há em média 10 requisições em andamento. Ela também funciona ao contrário, e é aí que fica útil: se um recurso comporta no máximo 10 usos simultâneos (um pool de 10 conexões) e cada uso dura 40 ms, a vazão máxima desse recurso é 10 / 0,04 = **250 por segundo**. Você vai ver exatamente esse número aparecer no teste de carga.
+
+### Por que a média engana
+
+A média é o primeiro número que todo mundo calcula e o pior para descrever latência. Considere 100 requisições: 97 levaram 20 ms e 3 levaram 2 segundos (um GC longo, uma consulta que caiu num lock). A média é 79,4 ms, um número que não descreve **ninguém**: nenhum cliente esperou 79 ms. O p95 é 20 ms (95% foram rápidas) e o p99 é 2.000 ms (o 1% mais lento esperou dois segundos). O projeto da aula tem esse exemplo como teste, com a classe `ResumoDeLatencias`, que calcula percentis pelo método do posto mais próximo (o p95 é o valor na posição `ceil(0,95 × n)` da lista ordenada):
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/ResumoDeLatenciasTest.java" destacar="28-40" />
+
+E por que olhar o p99 se ele é "só 1%"? Porque uma página do checkout faz várias chamadas. Se uma tela depende de 10 chamadas independentes, a chance de **pelo menos uma** cair no 1% mais lento é 1 − 0,99¹⁰ ≈ 9,6%. O "1% raro" de cada serviço vira a experiência de quase um em cada dez usuários. Por isso, metas sérias falam de p95 ou p99, e nunca de média.
+
+<Callout tipo="atencao" titulo="Percentis não se somam nem se tiram médias">
+O p95 do serviço A mais o p95 do serviço B **não** é o p95 da chamada que passa pelos dois. E a média dos p99 de cinco máquinas não é o p99 do sistema. Para combinar percentis, é preciso combinar as **distribuições** (histogramas) e calcular o percentil de novo. É por isso que ferramentas como Micrometer e Prometheus exportam histogramas, e não percentis prontos, quando você quer agregar entre instâncias (módulo 14).
+</Callout>
+
+### Omissão coordenada
+
+Esse é o erro de medição mais famoso da área, e o nome é estranho: o gerador de carga **coordena-se** sem querer com o servidor e **omite** justamente as medições ruins.
+
+Funciona assim. Um gerador "fechado" manda uma requisição, espera a resposta e só então manda a próxima. Imagine que ele deveria enviar uma requisição a cada 10 ms, e o servidor responde em 2 ms. De repente, o servidor congela por 3 segundos (uma pausa de GC, um *failover* do banco). O gerador fica parado esperando a resposta da requisição que estava em andamento, e os 300 envios previstos para esses 3 segundos **simplesmente não acontecem**. Ele registra **uma** medição de 3 s e segue a vida. Um usuário real não para de chegar porque o servidor travou: 300 pessoas teriam esperado entre 10 ms e 3 s.
+
+O projeto tem uma simulação determinística disso, sem rede e sem threads, para os números serem sempre os mesmos:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/desempenho/OmissaoCoordenada.java" destacar="39-51, 58-65" />
+
+Rode com o `exec:java` (a classe está em `src/main`):
+
+```bash
+cd java/m10-testes/aulas
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m10.aulas.desempenho.OmissaoCoordenada
+```
+
+```text
+Cliente fechado:     amostras=5700 média=2,5 ms p50=2 ms p95=2 ms p99=2 ms máx=3002 ms
+Horário pretendido:  amostras=6000 média=77,3 ms p50=2 ms p95=2 ms p99=2402 ms máx=3002 ms
+```
+
+O mesmo servidor, a mesma pausa. Medido pelo cliente fechado, o p99 é **2 ms**, e o relatório diria que está tudo ótimo. Medido a partir do horário em que cada requisição **deveria** ter saído, o p99 é **2,4 segundos**. Repare também nas amostras: o cliente fechado "perdeu" 300 requisições. O teste `OmissaoCoordenadaTest` fixa esses números.
+
+Há duas defesas, e as ferramentas modernas usam as duas: gerar carga em **modelo aberto** (a próxima requisição sai na hora marcada, quer a anterior tenha voltado ou não) e, quando o modelo é fechado, **corrigir** a medição contando a latência desde o horário pretendido (o wrk2 e a biblioteca HdrHistogram fazem isso).
+
+<Figura legenda="O mesmo congelamento de 3 s visto por um gerador fechado (uma medição ruim, 300 envios omitidos) e por um gerador aberto (300 medições ruins, como os usuários de verdade sentiriam)">
+<svg viewBox="0 0 760 330" width="760" role="img" aria-labelledby="oc-titulo oc-desc">
+  <title id="oc-titulo">Omissão coordenada: modelo fechado e modelo aberto</title>
+  <desc id="oc-desc">Linha do tempo com o servidor congelado entre 30 e 33 segundos. Na faixa de cima, o gerador fechado envia uma requisição aos 30 segundos, espera até 33 segundos, registra uma única medição de 3 segundos e não envia nada no intervalo. Na faixa de baixo, o gerador aberto continua enviando a cada 10 milissegundos; todas as requisições do intervalo esperam até os 33 segundos, e são registradas 300 medições entre 10 milissegundos e 3 segundos.</desc>
+  <defs><marker id="mk-omissao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="300" y="20" width="200" height="290" rx="8" class="d-accent"/>
+  <text x="400" y="44" text-anchor="middle" class="d-title">servidor congelado</text>
+  <text x="400" y="64" text-anchor="middle" class="d-label">dos 30 s aos 33 s</text>
+  <text x="20" y="104" class="d-title">Fechado</text>
+  <path d="M120 120 L740 120" class="d-line" marker-end="url(#mk-omissao)"/>
+  <path d="M140 120 L140 100 M180 120 L180 100 M220 120 L220 100 M260 120 L260 100 M300 120 L300 100" class="d-line"/>
+  <path d="M300 140 L500 140" class="d-line" marker-end="url(#mk-omissao)"/>
+  <text x="400" y="162" text-anchor="middle" class="d-mono">1 medição: 3002 ms</text>
+  <path d="M540 120 L540 100 M580 120 L580 100 M620 120 L620 100 M660 120 L660 100 M700 120 L700 100" class="d-line"/>
+  <text x="400" y="186" text-anchor="middle" class="d-label">nenhum envio aqui: 300 omitidos</text>
+  <text x="20" y="234" class="d-title">Aberto</text>
+  <path d="M120 250 L740 250" class="d-line" marker-end="url(#mk-omissao)"/>
+  <path d="M140 250 L140 230 M180 250 L180 230 M220 250 L220 230 M260 250 L260 230 M300 250 L300 230 M340 250 L340 230 M380 250 L380 230 M420 250 L420 230 M460 250 L460 230 M500 250 L500 230 M540 250 L540 230 M580 250 L580 230 M620 250 L620 230 M660 250 L660 230 M700 250 L700 230" class="d-line"/>
+  <text x="400" y="278" text-anchor="middle" class="d-mono">300 medições: 3002 … 12 ms</text>
+  <text x="400" y="300" text-anchor="middle" class="d-label">o p99 passa de 2 ms para 2402 ms</text>
+  <text x="620" y="94" text-anchor="middle" class="d-label">envios (a cada 10 ms)</text>
+</svg>
+</Figura>
+
+### Modelo aberto e modelo fechado
+
+A omissão coordenada leva direto à escolha mais importante de um teste de carga: **como a carga chega**.
+
+- **Modelo fechado**: há um número fixo de usuários virtuais (por exemplo, 50), e cada um repete o ciclo "manda, espera a resposta, manda de novo". Se o servidor fica lento, a taxa de chegada **cai sozinha**, porque todo mundo está esperando. Representa bem sistemas em que a população é limitada: um pool de *workers* consumindo uma fila, um sistema interno com 40 atendentes, um *batch* com 8 threads.
+- **Modelo aberto**: define-se a **taxa de chegada** (por exemplo, 300 novas requisições por segundo), e elas chegam no horário, independentemente das anteriores. Se o servidor fica lento, as requisições se acumulam, como acontece na internet: o cliente da Black Friday não sabe que o seu servidor está sofrendo e continua clicando.
+
+Para uma API pública ou um checkout, o modelo aberto é o realista. Testar um sistema aberto com um gerador fechado é a receita para um relatório otimista: quando o servidor engasga, o gerador alivia a carga e esconde o problema. No Gatling, o modelo é explícito na API: `injectOpen(...)` ou `injectClosed(...)`, e a documentação proíbe misturar os dois no mesmo cenário. No k6, o equivalente são os *executors*: `constant-arrival-rate` e `ramping-arrival-rate` são abertos; `constant-vus` e `ramping-vus` são fechados.
+
+### Tipos de teste
+
+"Teste de carga" virou nome genérico, mas cada tipo responde a uma pergunta diferente. Escolher o tipo é escolher a pergunta:
+
+| Tipo | Pergunta que responde | Formato típico da carga |
+|---|---|---|
+| **Carga** (*load*) | Com o tráfego esperado (o pico normal), a API cumpre o SLO? | Rampa até a taxa esperada e patamar de 15–60 min |
+| **Estresse** (*stress*) | Onde ela quebra, e **como** quebra? Recupera sozinha quando a carga baixa? | Degraus crescentes além do esperado até falhar |
+| **Pico** (*spike*) | Um salto repentino (a campanha no ar às 21h) derruba algo? | De 50 para 500 req/s em segundos, depois volta |
+| **Resistência** (*soak*) | Ela se degrada com o tempo (vazamento de memória, conexões, disco)? | Carga normal por 4–24 h |
+| **Capacidade** | Quanto tráfego **uma** instância aguenta dentro do SLO? Quantas instâncias preciso para X? | Degraus pequenos, medindo o ponto em que o SLO deixa de ser cumprido |
+
+Um detalhe que muda o resultado: no teste de estresse, o que interessa não é só o número em que quebrou, é o **modo de falha**. Um sistema que, saturado, rejeita rápido o excesso com 503 e continua atendendo bem o resto é saudável. Um que aceita tudo, enfileira e passa a responder tudo em 9 segundos (inclusive o que poderia ter sido atendido) está doente, e você vai ver exatamente isso na v1 da cotação.
+
+### Metas a partir de SLOs
+
+Uma meta como "a API tem que ser rápida" não é verificável. Uma meta de teste de carga tem quatro partes: **qual operação**, **qual carga**, **qual percentil e limite**, e **qual taxa de erro**. Por exemplo: "a cotação de frete, a 300 req/s por 30 minutos, com p95 abaixo de 200 ms e menos de 1% de erros".
+
+De onde vêm esses números? Do **SLO** (*Service Level Objective*) que o time combinou com o negócio, e não do gosto de quem escreve o teste:
+
+1. **A carga** vem dos dados: o pico de tráfego observado em produção (no ano passado, no último mês), multiplicado pela previsão de crescimento e por uma margem. Se o pico normal é 100 req/s e o marketing prevê o triplo, o teste de carga é a 300 req/s, e o de estresse vai além (450, 600).
+2. **O limite de latência** vem do SLO da operação, e o SLO vem da experiência do usuário: a tela do checkout precisa aparecer em menos de 1 s, ela faz três chamadas em sequência, então cada uma tem um orçamento de cerca de 200 ms no p95.
+3. **A taxa de erro** vem do orçamento de erros (*error budget*): se o SLO de disponibilidade é 99,9%, o teste não pode aceitar 1% de erros como "normal".
+
+Quando ainda não há SLO, o teste de carga é uma ótima forma de começar a conversa: meça a linha de base (*baseline*) atual, mostre ao time de produto e combine a meta a partir dela.
+
+## O código que vamos testar
+
+Tudo o que aparece nesta aula está em `java/m10-testes/aulas`, no pacote `dev.trilhajava.m10.aulas.desempenho`. São duas peças.
+
+**A primeira é uma API de cotação de frete**, uma aplicação Spring Boot 4.1 pequena, com um H2 em memória (o Flyway cria a tabela de faixas de CEP) e um HikariCP de 10 conexões, o tamanho padrão. Para cotar, o serviço consulta a faixa do CEP no banco (menos de 1 ms) e pergunta o prazo à transportadora, uma API externa que leva cerca de 40 ms para responder (simulada com uma espera, para a aula não depender de rede):
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/desempenho/Transportadora.java" destacar="20-26" />
+
+O serviço tem **duas versões da mesma regra**, expostas em `/v1/fretes/cotacao` e `/v2/fretes/cotacao`. Elas devolvem exatamente a mesma cotação; a única diferença é uma anotação:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/desempenho/ServicoDeCotacao.java" destacar="21-23, 32-35" />
+
+Na v1, o `@Transactional(readOnly = true)` abre a transação (e pega uma conexão do pool) **antes** da consulta e só a devolve quando o método termina, **depois** da chamada à transportadora. A conexão fica presa por cerca de 41 ms, dos quais 40 ms são espera por outro sistema. Na v2, sem transação, o `JdbcClient` pega a conexão, faz a consulta e a devolve imediatamente; a espera pela transportadora acontece sem nenhuma conexão presa. Essa é uma das causas mais comuns de "o banco está lento" em produção, e o banco nem está lento.
+
+Pelo que você já sabe da Lei de Little, dá para prever: na v1, 10 conexões presas 0,041 s cada limitam a API a cerca de **240–250 req/s**. Na v2, a conexão fica presa menos de 1 ms, e o limite passa a ser outro (as 200 threads do Tomcat, que dão cerca de 200 / 0,041 ≈ 4.800 req/s). O teste de carga existe para **confirmar ou derrubar** a previsão, porque previsões erram.
+
+Antes de medir desempenho, um teste funcional garante que as duas versões fazem a mesma coisa. Otimização que muda o resultado é bug:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/CotacaoDeFreteTest.java" destacar="17, 24-30" />
+
+Repare em `frete.transportadora.latencia=0ms`: o teste funcional não precisa esperar a transportadora "de mentira". A latência é configurável justamente para isso.
+
+**A segunda peça são os microbenchmarks**, que medem trechos pequenos de código: uma conta de distância (`Distancia`) e a verificação de CEPs com restrição de entrega, que pode ser feita com uma `List` ou com um `HashSet`.
+
+## Mão na massa
+
+Todos os comandos rodam a partir de `java/m10-testes/aulas`. Os números desta aula foram obtidos numa máquina com **Intel Core i5-14400F (10 núcleos), 32 GB de RAM, Windows 11, JDK 25.0.4 (Temurin)**, com outros processos rodando ao mesmo tempo. Os seus serão diferentes, e a variação entre execuções faz parte da lição: compare **proporções e formatos**, não os valores absolutos.
+
+<Callout tipo="info" titulo="Nada disso roda no mvn verify normal">
+Benchmarks e testes de carga são lentos (minutos) e sensíveis ao ambiente. No `pom.xml` do módulo, eles só **compilam** no build normal; para executá-los, você chama explicitamente um *goal* (`exec:exec@jmh`) ou um perfil (`-P carga`). É o mesmo arranjo do PIT na [aula 10.01](../../10-testes/01-por-que-e-como-testar/).
+</Callout>
+
+### Passo 1: as dependências
+
+**O que vamos fazer e por quê.** O JMH (*Java Microbenchmark Harness*) é a ferramenta do próprio OpenJDK para microbenchmarks; a versão atual é a 1.37. O Gatling 3.16 traz a Java DSL para escrever simulações de carga em Java, e o plugin Maven 4.21 as executa. Nenhum dos dois está no BOM do Spring Boot, então as versões ficam em propriedades:
+
+```xml
+<properties>
+  <jmh.version>1.37</jmh.version>
+  <gatling.version>3.16.0</gatling.version>
+  <gatling-maven-plugin.version>4.21.12</gatling-maven-plugin.version>
+  <jmh.filtro>Benchmark</jmh.filtro>
+</properties>
+```
+
+```xml
+<dependency>
+  <groupId>org.openjdk.jmh</groupId>
+  <artifactId>jmh-core</artifactId>
+  <version>${jmh.version}</version>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>io.gatling.highcharts</groupId>
+  <artifactId>gatling-charts-highcharts</artifactId>
+  <version>${gatling.version}</version>
+  <scope>test</scope>
+</dependency>
+```
+
+O JMH gera código a partir das anotações `@Benchmark` com um **processador de anotações**. Desde o JDK 23, o `javac` não executa processadores encontrados no classpath sem que você os declare, então ele vai explícito na compilação dos testes:
+
+```xml
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-compiler-plugin</artifactId>
+  <executions>
+    <execution>
+      <id>default-testCompile</id>
+      <configuration>
+        <annotationProcessorPaths>
+          <path>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>${jmh.version}</version>
+          </path>
+        </annotationProcessorPaths>
+      </configuration>
+    </execution>
+  </executions>
+</plugin>
+```
+
+Para rodar os benchmarks, uma execução do `exec-maven-plugin` chama a classe `org.openjdk.jmh.Main` com o classpath de testes:
+
+```xml
+<execution>
+  <id>jmh</id>
+  <configuration>
+    <executable>${java.home}/bin/java</executable>
+    <classpathScope>test</classpathScope>
+    <arguments>
+      <argument>-classpath</argument>
+      <classpath/>
+      <argument>org.openjdk.jmh.Main</argument>
+      <argument>${jmh.filtro}</argument>
+    </arguments>
+  </configuration>
+</execution>
+```
+
+**O que acabou de acontecer.** Usamos `exec:exec` (que inicia uma JVM nova) e não `exec:java` (que roda dentro da JVM do Maven) porque o JMH precisa iniciar **outras** JVMs, os *forks*, com o mesmo classpath, e só consegue fazer isso se a JVM dele tiver sido iniciada com `-classpath` correto. A documentação do JMH recomenda, para projetos reais, um módulo Maven separado que gera um `benchmarks.jar` executável (há um *archetype* oficial para isso); aqui, por simplicidade, os benchmarks ficam em `src/test/java` do mesmo módulo.
+
+### Passo 2: medindo do jeito ingênuo
+
+**O que vamos fazer e por quê.** Antes do JMH, vamos fazer o que quase todo mundo faz na primeira vez: `System.nanoTime()` em volta de um laço, para ver por que isso não é confiável. A conta é a distância entre o centro de distribuição e o endereço do cliente (a fórmula de haversine, que usa seno, cosseno e raiz). O laço roda 10 vezes seguidas, na mesma JVM:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/MedicaoIngenua.java" semImports />
+
+```bash
+mvn -q test-compile exec:exec@ingenua
+```
+
+Duas execuções seguidas, na mesma máquina:
+
+<Comparar antes="Primeira execução" depois="Segunda execução">
+```text
+Rodada  1:  256,1 ns por cálculo
+Rodada  2:  105,9 ns por cálculo
+Rodada  3:  105,5 ns por cálculo
+Rodada  4:  104,7 ns por cálculo
+Rodada  5:  106,5 ns por cálculo
+Rodada  6:  105,2 ns por cálculo
+Rodada  7:  106,4 ns por cálculo
+Rodada  8:   73,9 ns por cálculo
+Rodada  9:   73,8 ns por cálculo
+Rodada 10:   86,3 ns por cálculo
+```
+
+```text
+Rodada  1:  246,0 ns por cálculo
+Rodada  2:   66,4 ns por cálculo
+Rodada  3:   66,2 ns por cálculo
+Rodada  4:   66,7 ns por cálculo
+Rodada  5:   66,1 ns por cálculo
+Rodada  6:   67,2 ns por cálculo
+Rodada  7:   69,9 ns por cálculo
+Rodada  8:   73,0 ns por cálculo
+Rodada  9:   73,4 ns por cálculo
+Rodada 10:   73,5 ns por cálculo
+```
+</Comparar>
+
+**O que acabou de acontecer.** O mesmo código, na mesma máquina, deu números diferentes em cada rodada e em cada execução. Três efeitos estão misturados:
+
+- **Aquecimento do JIT.** A JVM começa **interpretando** o bytecode. Depois de algumas milhares de chamadas, o compilador C1 gera código nativo rápido de compilar; depois de mais chamadas, o C2 gera código otimizado de verdade (a compilação em camadas, *tiered compilation*). A rodada 1 foi medida em boa parte com código interpretado: 3 a 4 vezes mais lenta. Na primeira execução, dá para ver até um segundo degrau na rodada 8, quando uma compilação mais agressiva entrou.
+- **Ruído do ambiente.** A segunda execução estabilizou em 66 ns, a primeira em 105 ns e depois 74 ns. Frequência da CPU (*turbo*), outros processos, em que núcleo a thread caiu e decisões diferentes do JIT entre uma JVM e outra mudam o resultado. Uma execução só não diz nada.
+- **Nenhuma estatística.** Não sabemos a margem de erro de nenhum desses números.
+
+Se você comparasse duas implementações com esse método, rodando a primeira "a frio" e a segunda depois, a segunda ganharia só por ter rodado com o JIT já aquecido. É exatamente o que o JMH resolve.
+
+### Passo 3: o primeiro benchmark com JMH, List contra HashSet
+
+**O que vamos fazer e por quê.** O checkout confere, antes de cotar, se o CEP está numa área com restrição de entrega. A lista de CEPs restritos fica em memória. Um colega escreveu com `List.contains`; outro sugeriu `HashSet`. "Mas a lista é pequena", diz o primeiro. Qual o tamanho a partir do qual faz diferença? Em vez de opinar, meça:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/RestricaoDeEntregaBenchmark.java" destacar="27-36, 44-51, 54-62" />
+
+```bash
+mvn -q test-compile exec:exec@jmh -Djmh.filtro=RestricaoDeEntrega
+```
+
+O começo da saída descreve o ambiente e a configuração. Guarde-o junto dos resultados; sem ele, o número não pode ser comparado com nada:
+
+```text
+# JMH version: 1.37
+# VM version: JDK 25.0.4.1, OpenJDK 64-Bit Server VM, 25.0.4.1+1-LTS
+# VM invoker: C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot\bin\java.exe
+# VM options: <none>
+# Blackhole mode: compiler (auto-detected, use -Djmh.blackhole.autoDetect=false to disable)
+# Warmup: 3 iterations, 1 s each
+# Measurement: 5 iterations, 1 s each
+# Timeout: 10 min per iteration
+# Threads: 1 thread, will synchronize iterations
+# Benchmark mode: Average time, time/op
+```
+
+E, depois de cerca de três minutos, a tabela final:
+
+```text
+Benchmark                               (quantidadeDeCeps)  Mode  Cnt       Score       Error  Units
+RestricaoDeEntregaBenchmark.comHashSet                  10  avgt   10       3,045 ±     0,028  ns/op
+RestricaoDeEntregaBenchmark.comHashSet                1000  avgt   10       2,544 ±     0,201  ns/op
+RestricaoDeEntregaBenchmark.comHashSet              100000  avgt   10       2,580 ±     0,182  ns/op
+RestricaoDeEntregaBenchmark.comLista                    10  avgt   10      20,667 ±     0,494  ns/op
+RestricaoDeEntregaBenchmark.comLista                  1000  avgt   10    2037,255 ±   932,289  ns/op
+RestricaoDeEntregaBenchmark.comLista                100000  avgt   10  703815,023 ±  43785,361  ns/op
+```
+
+**O que acabou de acontecer, anotação por anotação.**
+
+- `@State(Scope.Benchmark)` diz que os campos da classe são o estado do benchmark, compartilhado entre as threads de medição. O JMH cria a instância; você não usa `new`.
+- `@Param({"10", "1000", "100000"})` repete **todo** o benchmark para cada valor. É assim que se descobre a partir de que tamanho a escolha importa.
+- `@Setup` roda antes das medições (por padrão, uma vez por *trial*, ou seja, por combinação de parâmetro e fork). Montar a lista ali garante que o tempo de montagem não entra na medição.
+- `@Warmup(iterations = 3, time = 1)`: três segundos de aquecimento, **descartados**. `@Measurement(iterations = 5, time = 1)`: cinco segundos medidos. `@Fork(2)`: tudo isso em **duas JVMs novas**, para que uma decisão infeliz do JIT numa JVM não domine o resultado. Por isso `Cnt` é 10 (5 iterações × 2 forks).
+- `@BenchmarkMode(Mode.AverageTime)` com `@OutputTimeUnit(NANOSECONDS)`: tempo médio por chamada, em nanossegundos. Outros modos: `Throughput` (operações por segundo), `SampleTime` (distribuição, com percentis) e `SingleShotTime` (uma chamada a frio, útil para medir inicialização).
+- Os métodos `@Benchmark` **devolvem** o resultado do `contains`. Isso não é detalhe: o passo 4 mostra o que acontece se não devolverem.
+
+**Como ler a tabela.** `Score` é a média e `Error` é a metade do intervalo de confiança de 99,9%. Dois resultados só são diferentes de verdade se os intervalos não se sobrepõem. Então:
+
+- Com **10 CEPs**, a lista leva 21 ns e o conjunto, 3 ns. A diferença existe, mas são 18 **nanossegundos**: numa requisição HTTP de 50 ms, é um milionésimo do tempo. Para 10 elementos, use o que deixar o código mais claro.
+- Com **1.000 CEPs**, a lista já leva cerca de 2 µs, contra 2,5 ns do conjunto: quase mil vezes mais. Repare no `± 932`: o erro é quase metade do valor. A máquina tinha outros processos competindo, e o resultado oscilou entre iterações. Num relatório sério, você rodaria de novo com a máquina ociosa ou com mais forks antes de afirmar o número exato; a **conclusão** (a lista é ordens de grandeza mais lenta) não muda.
+- Com **100.000 CEPs**, a lista leva 0,7 **milissegundo** por consulta. A 300 cotações por segundo, são 21% de um núcleo de CPU só para percorrer a lista. O conjunto continua em 2,6 ns: o `HashSet` não depende do tamanho (O(1) em média), a lista cresce linearmente (O(n)), como você viu no módulo 05. O benchmark confirma a teoria e dá o número que a teoria não dá: **a partir de quantos elementos dói**.
+
+Uma pergunta honesta antes de levar o resultado ao code review: **essa lista aparece no perfil de produção?** Se a cotação leva 50 ms esperando a transportadora, trocar 21 ns por 3 ns não muda nada que o cliente perceba. Microbenchmark responde "qual de duas implementações é mais rápida"; não responde "isso importa". Quem responde isso é o profiler e o teste de carga.
+
+### Passo 4: as armadilhas que o JMH evita (e as que você ainda pode cometer)
+
+**O que vamos fazer e por quê.** O JMH resolve o aquecimento e a estatística, mas o JIT continua mais esperto que o seu benchmark. Vamos medir a mesma conta, a distância numa grade plana (`Distancia.kmNaGrade`, Pitágoras com uma raiz quadrada), de cinco jeitos:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/ArmadilhasDoJitBenchmark.java" destacar="30-39, 47-56" />
+
+```bash
+mvn -q test-compile exec:exec@jmh -Djmh.filtro=ArmadilhasDoJit
+```
+
+```text
+Benchmark                                    Mode  Cnt  Score   Error  Units
+ArmadilhasDoJitBenchmark.comBlackhole        avgt   10  4,211 ± 1,258  ns/op
+ArmadilhasDoJitBenchmark.comConstantes       avgt   10  0,891 ± 0,346  ns/op
+ArmadilhasDoJitBenchmark.metodoVazio         avgt   10  0,485 ± 0,041  ns/op
+ArmadilhasDoJitBenchmark.resultadoDevolvido  avgt   10  3,772 ± 0,305  ns/op
+ArmadilhasDoJitBenchmark.resultadoIgnorado   avgt   10  0,483 ± 0,054  ns/op
+```
+
+**O que acabou de acontecer.**
+
+- **`metodoVazio` é a régua**: 0,49 ns é o custo de o JMH chamar um método que não faz nada. Nenhum benchmark pode ser mais rápido que isso, e qualquer coisa perto disso é suspeita.
+- **`resultadoIgnorado` custou o mesmo que o vazio**: 0,48 ns. A conta não foi feita. Como o resultado não é usado e a conta não tem efeito colateral, o C2 provou que ela é inútil e **apagou** o código. É a **eliminação de código morto** (*dead code elimination*). Se você comparasse duas implementações assim, as duas dariam "0,5 ns" e você concluiria que são iguais.
+- **`comConstantes` custou 0,89 ns**, muito menos que os 3,8 ns da conta real. Como as coordenadas são `static final`, o JIT calculou o resultado **uma vez**, na compilação, e passou a devolver a constante. É o **constant folding**. O benchmark mede "devolver um número pronto". Por isso o estado do benchmark fica em campos comuns (`xCd`, `yCd`...): para o JIT, eles podem mudar a qualquer momento, e a conta precisa ser refeita.
+- **`resultadoDevolvido` (3,77 ns) e `comBlackhole` (4,21 ns)** medem a conta de verdade. Ao devolver o valor, o JMH o entrega a um `Blackhole`, um objeto que "consome" valores de um jeito que o JIT não consegue provar inútil. Quando o método produz **mais de um** valor, receba o `Blackhole` como parâmetro e chame `consume` para cada um. A diferença entre os dois está dentro da margem de erro.
+
+Duas linhas do topo da saída merecem atenção:
+
+```text
+NOTE: Current JVM experimentally supports Compiler Blackholes, and they are in use. Please exercise
+extra caution when trusting the results, look into the generated code to check the benchmark still
+works, and factor in a small probability of new VM bugs.
+```
+
+Nas JVMs recentes, o JMH usa *compiler blackholes*, um recurso do próprio HotSpot que torna o consumo quase gratuito. O aviso é honesto: é um recurso marcado como experimental na JVM, e comparações entre JVMs diferentes podem ser afetadas por ele.
+
+<Callout tipo="atencao" titulo="O JIT não é previsível, e isso também é resultado">
+Na primeira versão deste benchmark, a conta era a haversine (com `sin`, `cos` e `asin`), e o `resultadoIgnorado` **não** foi eliminado: custou o mesmo que a conta de verdade. O JIT não conseguiu provar que as chamadas trigonométricas não tinham efeito. Isso não quer dizer que ignorar o resultado é seguro "às vezes": quer dizer que você não sabe quando o JIT vai apagar o seu código. Devolva sempre o resultado ou use o `Blackhole`, e confira se o tempo medido é plausível comparado com a régua.
+</Callout>
+
+Outras armadilhas que o JMH documenta nos exemplos oficiais (`JMHSample_*`): **laços dentro do benchmark** (o JIT desenrola e otimiza o laço inteiro; deixe o JMH repetir a chamada), **estado compartilhado entre threads** quando você mede com várias threads (`Scope.Thread` dá uma cópia por thread), e **`@Setup(Level.Invocation)`**, que roda antes de cada chamada e adiciona o próprio custo à medição de operações muito curtas.
+
+### Passo 5: a simulação de carga com Gatling
+
+**O que vamos fazer e por quê.** Agora o sistema inteiro: HTTP, Tomcat, Spring, transação, pool, banco e a espera pela transportadora. Uma simulação do Gatling é uma classe Java que estende `Simulation` e descreve três coisas: o **protocolo** (para onde vão as requisições), o **cenário** (o que cada usuário virtual faz) e a **injeção** (como os usuários chegam). Por fim, as **asserções** dizem quando o teste passa:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/desempenho/CotacaoDeFreteSimulation.java" destacar="28-31, 34-38, 42-44, 46-51, 53-61" />
+
+**O que acabou de acontecer, linha a linha.**
+
+- Os parâmetros vêm de propriedades de sistema (`-Dversao=v2 -Dtaxa=300`), para a mesma simulação servir a vários cenários sem recompilar.
+- O *feeder* `listFeeder(...).circular()` entrega a cada usuário virtual um CEP diferente, em rodízio. Testar sempre com o mesmo dado é uma armadilha clássica: tudo cai no mesmo caminho e no mesmo cache, e o resultado sai bom demais.
+- `#{cep}` é a *Gatling Expression Language*: o valor vem da sessão do usuário virtual, preenchida pelo feeder.
+- `check(status().is(200))` transforma qualquer resposta diferente de 200 em falha (KO). Sem esse `check`, um 500 rápido contaria como sucesso rápido.
+- `injectOpen(...)` é o **modelo aberto**. `rampUsersPerSec(1).to(TAXA).during(10 s)` sobe a taxa de chegada de 1 até a taxa alvo em 10 segundos (dá tempo de o JIT do servidor aquecer), e `constantUsersPerSec(TAXA).during(...)` mantém o patamar. Cada "usuário" faz uma requisição e vai embora; a taxa de usuários **é** a taxa de requisições.
+- `shareConnections()` faz os usuários virtuais compartilharem um pool de conexões HTTP com *keep-alive*, como o serviço de checkout faria ao chamar a cotação. Sem isso, cada usuário abriria uma conexão TCP nova, como um navegador (e o passo "Quando dá errado" mostra o que isso causou nesta máquina).
+- As asserções são avaliadas no fim: `global().responseTime().percentile(95.0).lt(200)` exige p95 abaixo de 200 ms, e `global().failedRequests().percent().lt(1.0)`, menos de 1% de falhas. Se alguma falhar, a simulação falha.
+
+### Passo 6: subir a aplicação e disparar a carga pelo Maven
+
+**O que vamos fazer e por quê.** O gerador de carga precisa da aplicação no ar. Você pode subir a aplicação num terminal e o Gatling em outro, mas no CI isso precisa ser um comando só. O perfil `carga` do `pom.xml` faz o mesmo que o Failsafe faz com testes de integração: sobe a aplicação antes, roda a carga e a derruba depois, mesmo que a carga falhe.
+
+```xml
+<profile>
+  <id>carga</id>
+  <properties>
+    <carga.porta>8088</carga.porta>
+    <carga.jmx>9088</carga.jmx>
+    <carga.jvm>-Xmx512m</carga.jvm>
+  </properties>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <mainClass>dev.trilhajava.m10.aulas.desempenho.AplicacaoDeFrete</mainClass>
+          <jvmArguments>${carga.jvm}</jvmArguments>
+          <arguments>
+            <argument>--server.port=${carga.porta}</argument>
+            <!-- A cada 30 s o HikariCP registra "Pool stats": conexões ativas, livres e quem espera. -->
+            <argument>--logging.level.com.zaxxer.hikari.pool.HikariPool=debug</argument>
+          </arguments>
+          <!-- Porta JMX que o plugin usa para saber quando a aplicação subiu e para derrubá-la. -->
+          <jmxPort>${carga.jmx}</jmxPort>
+        </configuration>
+        <executions>
+          <execution>
+            <id>subir-aplicacao</id>
+            <goals>
+              <goal>start</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>derrubar-aplicacao</id>
+            <goals>
+              <goal>stop</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>io.gatling</groupId>
+        <artifactId>gatling-maven-plugin</artifactId>
+        <version>${gatling-maven-plugin.version}</version>
+        <configuration>
+          <simulationClass>dev.trilhajava.m10.aulas.desempenho.CotacaoDeFreteSimulation</simulationClass>
+          <jvmArgs>
+            <jvmArg>-Durl=http://localhost:${carga.porta}</jvmArg>
+          </jvmArgs>
+        </configuration>
+        <executions>
+          <!--
+            Como o Failsafe: a falha das asserções não interrompe o build em integration-test
+            (senão a aplicação ficaria no ar); quem reprova o build é o gatling:verify, depois do stop.
+          -->
+          <execution>
+            <id>teste-de-carga</id>
+            <phase>integration-test</phase>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <failOnError>false</failOnError>
+            </configuration>
+          </execution>
+          <execution>
+            <id>conferir-assercoes</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</profile>
+```
+
+O `spring-boot:start` roda na fase `pre-integration-test` e espera a aplicação ficar pronta (por JMX); o `gatling:test` roda em `integration-test`; o `spring-boot:stop`, em `post-integration-test`; e o `gatling:verify`, em `verify`, reprova o build se as asserções falharam. O `-DskipTests` pula os testes JUnit do módulo, que não interessam aqui.
+
+Primeiro, a v1 com a carga de um dia comum, 100 req/s:
+
+```bash
+mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=100 -Dsegundos=30
+```
+
+Durante a execução, a cada 5 segundos o Gatling mostra o andamento. No fim, o relatório global:
+
+```text
+---- Global Information -------------------------------------------------------------|---Total---|-----OK----|----KO----
+> request count                                                                      |     3,505 |     3,505 |         -
+> min response time (ms)                                                             |        43 |        43 |         -
+> max response time (ms)                                                             |       352 |       352 |         -
+> mean response time (ms)                                                            |        51 |        51 |         -
+> response time std deviation (ms)                                                   |         9 |         9 |         -
+> response time 50th percentile (ms)                                                 |        48 |        48 |         -
+> response time 75th percentile (ms)                                                 |        51 |        51 |         -
+> response time 95th percentile (ms)                                                 |        63 |        63 |         -
+> response time 99th percentile (ms)                                                 |        78 |        78 |         -
+> mean throughput (rps)                                                              |     85.49 |     85.49 |         -
+Global: 95th percentile of response time is less than 200.0 : true (actual : 63.0)
+Global: percentage of failed events is less than 1.0 : true (actual : 0.0)
+[INFO] BUILD SUCCESS
+```
+
+**Como ler.** 3.505 requisições: cerca de 505 na rampa de 10 s mais 3.000 no patamar de 30 s. O mínimo de 43 ms é o piso físico: os 40 ms da transportadora mais o resto. O p50 de 48 ms e o p95 de 63 ms mostram uma distribuição apertada, sem fila. O máximo de 352 ms aconteceu no começo, com a JVM do servidor ainda aquecendo. A vazão média (85 req/s) é menor que 100 porque inclui a rampa. O Gatling também gera um relatório HTML em `target/gatling/cotacaodefretesimulation-<data>/index.html`, com os percentis **ao longo do tempo**, que é onde se enxerga o aquecimento e a degradação.
+
+### Passo 7: a Black Friday, 300 req/s
+
+**O que vamos fazer e por quê.** A previsão do marketing é o triplo: 300 req/s. Pela Lei de Little, a v1 aguenta uns 245 req/s. Vamos ver o que acontece com 20% a mais do que a capacidade:
+
+```bash
+mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=300 -Dsegundos=30
+```
+
+```text
+---- Global Information -------------------------------------------------------------|---Total---|-----OK----|----KO----
+> request count                                                                      |    10,505 |     9,282 |     1,223
+> min response time (ms)                                                             |        45 |        45 |     1,009
+> max response time (ms)                                                             |     8,679 |     8,679 |     8,599
+> mean response time (ms)                                                            |     4,427 |     4,310 |     5,320
+> response time std deviation (ms)                                                   |     2,673 |     2,711 |     2,162
+> response time 50th percentile (ms)                                                 |     4,709 |     4,490 |     5,693
+> response time 75th percentile (ms)                                                 |     6,714 |     6,673 |     6,994
+> response time 95th percentile (ms)                                                 |     8,239 |     8,235 |     8,256
+> response time 99th percentile (ms)                                                 |     8,586 |     8,592 |     8,554
+> mean throughput (rps)                                                              |    214.39 |    189.43 |     24.96
+---- Response Time Distribution ----------------------------------------------------------------------------------------
+> OK: t < 800 ms                                                                                          1,441 (13.72%)
+> OK: 800 ms <= t < 1200 ms                                                                                 326   (3.1%)
+> OK: t >= 1200 ms                                                                                        7,515 (71.54%)
+> KO                                                                                                      1,223 (11.64%)
+---- Errors ------------------------------------------------------------------------------------------------------------
+> status.find.is(200), found 500                                                                          1,223   (100%)
+========================================================================================================================
+Global: 95th percentile of response time is less than 200.0 : false (actual : 8239.0)
+Global: percentage of failed events is less than 1.0 : false (actual : 11.642075202284627)
+[INFO] --- spring-boot:4.1.1:stop (derrubar-aplicacao) @ m10-testes-aulas ---
+[INFO] Stopping application...
+[INFO] --- gatling:4.21.12:verify (conferir-assercoes) @ m10-testes-aulas ---
+[ERROR] Gatling simulation assertions failed!
+[INFO] BUILD FAILURE
+```
+
+**O que acabou de acontecer.** Com 20% de carga acima da capacidade, a API não ficou "20% pior": o p50 foi de 48 ms para **4,7 segundos** e quase 12% das requisições falharam com 500. A lição do supermercado: acima da capacidade, a fila cresce sem limite. Repare que o **mínimo** continua em 45 ms (as primeiras requisições, antes de a fila se formar) e que as falhas têm **mínimo de 1.009 ms**: é o `connection-timeout` de 1 s do HikariCP, que configuramos em `aulas-desempenho.properties`. Os detalhes do diagnóstico vêm no próximo passo.
+
+Repare também na ordem do log: o `spring-boot:stop` derrubou a aplicação **antes** de o `gatling:verify` reprovar o build. Se a falha acontecesse no `gatling:test`, o Maven pararia ali, e a aplicação continuaria no ar, ocupando a porta da próxima execução.
+
+### Passo 8: achar o gargalo
+
+**O que vamos fazer e por quê.** Um teste de carga que só diz "falhou" é metade do trabalho. A outra metade é provar **onde** está o gargalo antes de mexer em qualquer coisa. Há três fontes de evidência, e todas apontam para o mesmo lugar.
+
+**Evidência 1: o log da aplicação.** No log da aplicação (no mesmo terminal, porque o `spring-boot:start` repassa a saída dela), aparecem os erros:
+
+```text
+WARN 30832 --- [io-8088-exec-41] org.hibernate.orm.jdbc.error : HikariPool-1 - Connection is not available, request timed out after 1010ms (total=10, active=10, idle=0, waiting=187)
+```
+
+e o `Servlet.service()` com a causa:
+
+```text
+ERROR 33044 --- [nio-8088-exec-5] o.a.c.c.C.[.[.[/].[dispatcherServlet] : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: org.springframework.transaction.CannotCreateTransactionException: Could not open JPA EntityManager for transaction] with root cause
+java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 1005ms (total=10, active=10, idle=0, waiting=186)
+	at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:714) ~[HikariCP-7.0.2.jar:na]
+```
+
+**Evidência 2: as estatísticas do pool.** Com o nível `debug` em `HikariPool`, o HikariCP registra a cada 30 s o estado do pool:
+
+```text
+DEBUG 30832 --- [l-1:housekeeper] com.zaxxer.hikari.pool.HikariPool : HikariPool-1 - Pool stats (total=10/10, idle=0/10, active=10, waiting=190)
+```
+
+Leia assim: as 10 conexões existem, nenhuma está livre, as 10 estão em uso e **190 threads esperam** por uma. Em produção, o mesmo dado vem das métricas `hikaricp.connections.active`, `hikaricp.connections.pending` e `hikaricp.connections.acquire` que o Spring Boot exporta pelo Micrometer (módulo 14). Saturação de um recurso é exatamente isso: uso em 100% e fila na porta.
+
+**Evidência 3: a conta.** 10 conexões, cada uma presa ~41 ms: no máximo 245 req/s. Pedimos 300. Sobram 55 por segundo, que entram na fila. Por que, então, latências de 8 s se o timeout do pool é de 1 s? Porque há **duas filas**: as 200 threads do Tomcat ficam todas presas esperando o pool (190 esperando, 10 usando), e as requisições que chegam depois esperam na fila de conexões aceitas do Tomcat, antes de qualquer thread pegá-las. O relógio do cliente conta as duas esperas; o timeout do Hikari só conta a segunda.
+
+<Figura legenda="Na v1, cada requisição segura a conexão durante a chamada à transportadora; o pool de 10 conexões vira o gargalo, e as 200 threads do Tomcat ficam paradas na fila do pool">
+<svg viewBox="0 0 780 360" width="780" role="img" aria-labelledby="gargalo-titulo gargalo-desc">
+  <title id="gargalo-titulo">O caminho da requisição e onde ela espera</title>
+  <desc id="gargalo-desc">Da esquerda para a direita: 300 requisições por segundo chegam ao Tomcat, que tem uma fila de conexões e 200 threads. As threads pedem uma conexão ao HikariCP, que tem 10 conexões; 190 threads aguardam. Cada conexão fica presa por 41 milissegundos na versão 1, porque a chamada à transportadora, de 40 milissegundos, acontece dentro da transação. A capacidade é 10 dividido por 0,041 segundo, cerca de 245 requisições por segundo. Na versão 2, a conexão fica presa menos de 1 milissegundo e a transportadora é chamada fora da transação.</desc>
+  <defs><marker id="mk-gargalo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="150" height="80" rx="10" class="d-box"/>
+  <text x="85" y="72" text-anchor="middle" class="d-title">Gatling</text>
+  <text x="85" y="96" text-anchor="middle" class="d-mono">300 req/s</text>
+  <path d="M160 80 L208 80" class="d-line" marker-end="url(#mk-gargalo)"/>
+  <rect x="210" y="20" width="170" height="120" rx="10" class="d-info"/>
+  <text x="295" y="50" text-anchor="middle" class="d-title">Tomcat</text>
+  <text x="295" y="76" text-anchor="middle" class="d-label">fila de conexões</text>
+  <text x="295" y="100" text-anchor="middle" class="d-mono">200 threads</text>
+  <text x="295" y="124" text-anchor="middle" class="d-label">todas ocupadas</text>
+  <path d="M380 80 L428 80" class="d-line" marker-end="url(#mk-gargalo)"/>
+  <rect x="430" y="20" width="170" height="120" rx="10" class="d-accent"/>
+  <text x="515" y="50" text-anchor="middle" class="d-title">HikariCP</text>
+  <text x="515" y="76" text-anchor="middle" class="d-mono">10 conexões</text>
+  <text x="515" y="100" text-anchor="middle" class="d-mono">waiting=190</text>
+  <text x="515" y="124" text-anchor="middle" class="d-label">o gargalo</text>
+  <path d="M600 80 L648 80" class="d-line" marker-end="url(#mk-gargalo)"/>
+  <rect x="650" y="40" width="120" height="80" rx="10" class="d-box"/>
+  <text x="710" y="72" text-anchor="middle" class="d-title">H2</text>
+  <text x="710" y="96" text-anchor="middle" class="d-label">consulta &lt; 1 ms</text>
+  <rect x="210" y="180" width="560" height="70" rx="10" class="d-violet"/>
+  <text x="490" y="208" text-anchor="middle" class="d-title">v1: conexão presa durante a transportadora</text>
+  <text x="490" y="234" text-anchor="middle" class="d-mono">10 ÷ 0,041 s ≈ 245 req/s no máximo</text>
+  <rect x="210" y="270" width="560" height="70" rx="10" class="d-ok"/>
+  <text x="490" y="298" text-anchor="middle" class="d-title">v2: transportadora fora da transação</text>
+  <text x="490" y="324" text-anchor="middle" class="d-mono">conexão presa &lt; 1 ms: o pool deixa de limitar</text>
+</svg>
+</Figura>
+
+<Callout tipo="dica" titulo="Por que CPU a 20% não quer dizer folga">
+O sistema da introdução tinha CPU baixa e memória sobrando, e mesmo assim estava saturado. Threads esperando uma conexão, um lock ou uma resposta de rede **não usam CPU**. Para achar o gargalo, procure o recurso com **fila**: conexões pendentes no pool, threads bloqueadas (um *thread dump* com `jcmd <pid> Thread.print` mostra centenas de threads paradas no mesmo ponto), requisições esperando na fila do servidor. O método USE (*Utilization, Saturation, Errors*), de Brendan Gregg, organiza essa busca: para cada recurso, quanto está em uso, quanto espera e quantos erros produz.
+</Callout>
+
+### Passo 9: corrigir e medir de novo
+
+**O que vamos fazer e por quê.** A correção já existe: a v2, que chama a transportadora fora da transação. A tentação seria aumentar o pool para 30 conexões, e isso até "passaria" no teste, mas cada conexão é um processo ou thread no banco de dados, com memória própria; com 20 instâncias da API, seriam 600 conexões num PostgreSQL que foi dimensionado para 200. A correção certa é **parar de segurar o recurso escasso sem usá-lo**. Mesma carga, v2:
+
+```bash
+mvn -P carga verify -DskipTests -Dversao=v2 -Dtaxa=300 -Dsegundos=30
+```
+
+```text
+---- Global Information -------------------------------------------------------------|---Total---|-----OK----|----KO----
+> request count                                                                      |    10,505 |    10,505 |         -
+> min response time (ms)                                                             |        41 |        41 |         -
+> max response time (ms)                                                             |       614 |       614 |         -
+> mean response time (ms)                                                            |        52 |        52 |         -
+> response time std deviation (ms)                                                   |        31 |        31 |         -
+> response time 50th percentile (ms)                                                 |        48 |        48 |         -
+> response time 75th percentile (ms)                                                 |        49 |        49 |         -
+> response time 95th percentile (ms)                                                 |        57 |        57 |         -
+> response time 99th percentile (ms)                                                 |       144 |       144 |         -
+> mean throughput (rps)                                                              |    256.22 |    256.22 |         -
+Global: 95th percentile of response time is less than 200.0 : true (actual : 57.0)
+Global: percentage of failed events is less than 1.0 : true (actual : 0.0)
+[INFO] BUILD SUCCESS
+```
+
+E o pool, no mesmo momento da carga em que a v1 tinha 190 threads esperando:
+
+```text
+DEBUG 23868 --- [l-1:housekeeper] com.zaxxer.hikari.pool.HikariPool : HikariPool-1 - Pool stats (total=10/10, idle=10/10, active=0, waiting=0)
+```
+
+**O que acabou de acontecer.** Com a mesma carga que derrubou a v1, a v2 manteve o p50 em 48 ms e o p95 em 57 ms, sem nenhum erro. O pool, que era o gargalo, aparece **ocioso** na amostra: as conexões ficam presas tão pouco tempo que a chance de pegá-las em uso é pequena. A mudança foi uma anotação; o ganho, de 245 para alguns milhares de req/s de capacidade teórica nesse recurso.
+
+Os percentis ainda têm uma história a contar: o p99 subiu para 144 ms e o máximo para 614 ms, contra 78 ms e 352 ms na v1 a 100 req/s. A 300 req/s, a cauda engorda por motivos que não são o pool: pausas de GC com mais alocação por segundo, o próprio gerador de carga competindo pela CPU na mesma máquina, o agendamento das threads do Tomcat. Ainda passa na meta, mas é o próximo lugar para olhar se a meta for de p99.
+
+### Passo 10: threads de plataforma contra virtual threads
+
+**O que vamos fazer e por quê.** "Liga as virtual threads que resolve" é uma frase que aparece em toda discussão de desempenho em Java desde o 21. Vamos testar na v1, com o gargalo no pool. A propriedade `spring.threads.virtual.enabled=true` faz o Tomcat atender cada requisição numa virtual thread (módulo 06), o que tira o limite de 200 threads:
+
+```bash
+mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=300 -Dsegundos=30 "-Dcarga.jvm=-Xmx512m -Dspring.threads.virtual.enabled=true"
+```
+
+```text
+> request count                                                                      |    10,505 |     7,951 |     2,554
+> min response time (ms)                                                             |        42 |        42 |     1,001
+> max response time (ms)                                                             |     1,160 |     1,160 |     1,127
+> mean response time (ms)                                                            |       832 |       775 |     1,013
+> response time 50th percentile (ms)                                                 |     1,023 |     1,034 |     1,011
+> response time 95th percentile (ms)                                                 |     1,053 |     1,054 |     1,033
+> response time 99th percentile (ms)                                                 |     1,073 |     1,073 |     1,069
+> mean throughput (rps)                                                              |    250.12 |    189.31 |     60.81
+Global: 95th percentile of response time is less than 200.0 : false (actual : 1053.0)
+Global: percentage of failed events is less than 1.0 : false (actual : 24.312232270347454)
+```
+
+```text
+HikariPool-1 - Pool stats (total=10/10, idle=0/10, active=10, waiting=277)
+```
+
+**O que acabou de acontecer.** O gargalo não mudou de lugar. Com virtual threads, não há mais o limite de 200 threads, então **todas** as requisições chegam ao pool ao mesmo tempo: `waiting=277`, mais do que as 190 de antes. A latência deixou de passar dos 8 s (ninguém espera mais na fila do Tomcat) e ficou presa perto de 1 s, que é o `connection-timeout` do pool: quem consegue uma conexão antes de 1 s é atendido no limite; quem não consegue, falha. A taxa de erro subiu de 12% para 24%, e a vazão de sucesso ficou nas mesmas ~190 req/s: as 10 conexões continuam sendo o teto.
+
+Virtual threads deixam a espera **barata** (milhares de requisições esperando não custam milhares de threads do sistema operacional), mas não criam conexões com o banco. Quando o gargalo é um recurso com limite fixo, elas apenas movem a fila de lugar, e às vezes pioram a situação para o recurso, que passa a receber mais pedidos simultâneos. Onde elas brilham é na v2: muitas requisições esperando I/O (a transportadora) **sem** segurar nada escasso.
+
+## Quando dá errado
+
+As mensagens abaixo são reais, copiadas das execuções desta aula.
+
+### A porta já está em uso
+
+Na primeira tentativa, o perfil usava a porta padrão, 8080, e outro programa da máquina já a ocupava:
+
+```text
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Web server failed to start. Port 8080 was already in use.
+
+[ERROR] Failed to execute goal org.springframework.boot:spring-boot-maven-plugin:4.1.1:start (subir-aplicacao) on project m10-testes-aulas: Failed to connect to MBean server at port 9001: Could not invoke shutdown operation: Error unmarshaling return header; nested exception is:
+[ERROR] 	java.net.SocketException: Connection reset by peer
+```
+
+**Como ler:** a mensagem do Maven fala de MBean e JMX, mas a causa está mais acima, no log da aplicação: a porta. O `spring-boot:start` espera a aplicação avisar por JMX que subiu; como ela morreu, o plugin falha tentando conversar com ela. **Como corrigir:** use portas próprias para o teste de carga, configuráveis (no perfil, `carga.porta` e `carga.jmx`), e no CI garanta que cada job tem as suas.
+
+### A aplicação ficou no ar depois da falha
+
+Na primeira versão do perfil, o `gatling:test` reprovava o build na fase `integration-test`:
+
+```text
+[ERROR] Failed to execute goal io.gatling:gatling-maven-plugin:4.21.12:test (teste-de-carga) on project m10-testes-aulas: Gatling simulation assertions failed !: ForkException -> [Help 1]
+```
+
+O Maven parou ali, o `spring-boot:stop` nunca rodou, e a aplicação continuou ouvindo a porta 8088. A execução seguinte falharia com "porta em uso". **Como corrigir:** `failOnError=false` no `gatling:test` e o `gatling:verify` na fase `verify`, como no passo 6. É o mesmo motivo de o Failsafe ter os *goals* `integration-test` e `verify` separados.
+
+### Erros que vieram do gerador, não do servidor
+
+Antes de a simulação usar `shareConnections()`, a v2 a 300 req/s terminou assim:
+
+```text
+> response time 99th percentile (ms)                                                 |     1,710 |     1,836 |        24
+---- Errors ------------------------------------------------------------------------------------------------------------
+> j.n.ConnectException: Connection refused: getsockopt                                                      454   (100%)
+Global: percentage of failed events is less than 1.0 : false (actual : 4.321751546882437)
+```
+
+e o pool da aplicação, no mesmo período, estava ocioso (`idle=10/10, waiting=0`). Os erros não eram 500: eram **conexões TCP recusadas**, com tempo de resposta de 0 a 30 ms, e todas nos últimos segundos do teste (o andamento mostrava 0 KO até os 35 s e 449 KO aos 40 s). Cada usuário virtual abria uma conexão nova; depois de mais de 10 mil conexões abertas e fechadas em 40 segundos, o sistema operacional da máquina (que também rodava o servidor) começou a recusar novas conexões. O p99 de 1,7 s também veio daí: o cliente TCP tenta de novo depois de uma recusa, e a espera entra na medição.
+
+**Como ler:** antes de culpar a aplicação, olhe o **tipo** de erro. `ConnectException` e tempo de resposta perto de zero apontam para a rede ou para o gerador; 500 e tempo de resposta igual a um timeout apontam para a aplicação. **Como corrigir:** modele a conexão como o cliente real faz (keep-alive entre serviços, conexões novas para navegadores), rode o gerador numa máquina separada do servidor e monitore o gerador também: CPU, memória, portas. Um gerador saturado produz um relatório falso.
+
+### Avisos de `sun.misc.Unsafe` no JDK 25
+
+Ao rodar o JMH 1.37 no JDK 25, aparece:
+
+```text
+WARNING: A terminally deprecated method in sun.misc.Unsafe has been called
+WARNING: sun.misc.Unsafe::objectFieldOffset has been called by org.openjdk.jmh.util.Utils (file:/C:/Users/.../jmh-core-1.37.jar)
+WARNING: Please consider reporting this to the maintainers of class org.openjdk.jmh.util.Utils
+WARNING: sun.misc.Unsafe::objectFieldOffset will be removed in a future release
+```
+
+**Como ler:** não é erro. Desde o JDK 24, a JVM avisa quando uma biblioteca usa os métodos de acesso à memória de `sun.misc.Unsafe` que serão removidos (JEP 498). O JMH 1.37 é de 2023 e ainda os usa; os benchmarks funcionam normalmente. Fique de olho em uma versão nova do JMH quando o JDK de fato remover esses métodos.
+
+### Benchmark que não aparece
+
+Com `-Djmh.filtro=Inexistente`:
+
+```text
+No matching benchmarks. Miss-spelled regexp?
+Use EXTRA verbose mode to debug the pattern matching.
+[ERROR] Command execution failed.
+org.apache.commons.exec.ExecuteException: Process exited with an error: 1 (Exit value: 1)
+```
+
+O filtro é uma expressão regular aplicada ao nome completo dos benchmarks. Se ele está certo e a mensagem aparece mesmo assim, o JMH não encontrou o arquivo `META-INF/BenchmarkList`, que o processador de anotações gera em `target/test-classes`. A causa mais comum: o processador não rodou (sem `annotationProcessorPaths`, no JDK 23+, ele é ignorado em silêncio). Confira se `target/test-classes/META-INF/BenchmarkList` existe depois do `test-compile`.
+
+## Armadilhas e quando NÃO usar
+
+- **Testar contra um ambiente que não se parece com produção.** O H2 em memória desta aula serve para ensinar o gargalo do pool, não para medir o PostgreSQL. Resultados de carga só valem para o ambiente em que foram obtidos: mesmo tamanho de máquina (CPU e memória do container, não do seu notebook), mesma versão do banco, **volume de dados** parecido (uma consulta que leva 1 ms com mil linhas pode levar 2 s com dez milhões, porque o plano de execução muda), mesmas configurações de pool e de JVM, e as dependências externas simuladas com a latência real delas.
+- **Gerador e servidor na mesma máquina.** Foi o que fizemos aqui, por praticidade, e o passo "Quando dá errado" mostrou o custo. Em testes que vão orientar decisões, o gerador roda em outra máquina, com folga de CPU e de rede, e é monitorado.
+- **Dados repetidos e cache quente.** Mil requisições pelo mesmo CEP medem o cache, não o sistema. Use dados variados, com a distribuição real (alguns produtos muito acessados e uma cauda longa, por exemplo).
+- **Teste curto demais.** Trinta segundos mostram o gargalo do pool, mas não mostram um vazamento de memória que leva três horas para aparecer, nem o GC de uma *old generation* cheia. Para isso existe o teste de resistência.
+- **Ignorar os erros e olhar só a latência.** Um sistema que responde 500 em 2 ms tem latência ótima. Sempre ponha taxa de erro nas asserções e confira o status com `check`.
+- **Microbenchmark para decidir arquitetura.** O JMH responde "qual destas duas funções é mais rápida". Não responde se a API aguenta a Black Friday, nem se trocar a `List` muda algo para o usuário. Comece pelo teste de carga e pelo profiler; desça ao microbenchmark quando o profiler apontar um trecho quente.
+- **Otimizar sem medir.** O contrário também é armadilha: reescrever código por intuição de desempenho, sem linha de base e sem medição depois, costuma piorar a legibilidade sem melhorar nada mensurável.
+
+Quando **não** vale o esforço: uma API interna com dez usuários e sem crescimento previsto, um protótipo que vai ser jogado fora, um *batch* noturno que roda em 5 minutos com uma janela de 4 horas. Em todos esses, uma estimativa com a Lei de Little e o monitoramento de produção bastam. Teste de carga custa caro em ambiente e em tempo de gente; ele se paga quando há um evento de risco (lançamento, campanha, migração), um SLO a cumprir ou uma mudança de arquitetura a justificar.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Onde e quando rodar.** Há três lugares, com propósitos diferentes. No **pipeline de cada pull request**, só cabe um teste curto de fumaça de desempenho (um a dois minutos, carga baixa, meta folgada) para pegar regressões grosseiras, como uma consulta N+1 que dobrou a latência. O **teste de carga completo** roda agendado (toda noite ou antes de cada release), num ambiente dedicado, e compara com a linha de base da execução anterior. **Estresse, pico e resistência** rodam antes de eventos (Black Friday, lançamento) e depois de mudanças de arquitetura. Tentar rodar tudo em cada PR torna o pipeline lento e caro, e o time aprende a ignorar os resultados.
+
+**Como evitar a instabilidade no CI.** Um teste de desempenho instável é pior que nenhum: depois do terceiro alarme falso, ninguém mais olha. Para evitar: (1) runners de CI compartilhados variam muito; use máquinas dedicadas, ou pelo menos sempre do mesmo tipo, para o teste completo; (2) aqueça antes de medir (a rampa da simulação) e meça por tempo suficiente; (3) ponha as asserções em **p95** e **taxa de erro**, que são estáveis, e use o p99 como observação, porque com poucas amostras ele oscila muito (o p99 de 3.000 requisições é decidido por 30 delas); (4) dê folga às metas no CI em relação ao SLO (se o SLO é 200 ms, a regressão é "piorou mais de 20% em relação à linha de base", não "passou de 200 ms"); (5) guarde os relatórios como artefatos do job, para comparar ao longo do tempo. O `gatling:verify` separado do `gatling:test` faz o build falhar **depois** de derrubar a aplicação e permite publicar o relatório HTML mesmo quando o teste reprova.
+
+**O custo do ambiente.** Um ambiente representativo custa o mesmo que uma fatia da produção, e testes de carga contra dependências reais (gateway de pagamento, transportadora) podem ser cobrados ou proibidos pelo contrato do fornecedor. O caminho usual: ambiente de *staging* com as mesmas configurações de produção e tamanho reduzido proporcionalmente (meça a capacidade **por instância** e multiplique, com cuidado com recursos compartilhados como o banco), dependências externas substituídas por simuladores com a latência e a taxa de erro reais (WireMock, um serviço *fake*), e o ambiente ligado só durante os testes. **Nunca** rode teste de carga contra produção sem um plano combinado com quem opera, porque um teste que derruba o banco derruba os clientes de verdade.
+
+**Gatling, k6 ou JMeter.** O **Gatling** escreve a simulação em Java (ou Kotlin, Scala, JavaScript), roda pelo Maven ou pelo Gradle e vive no mesmo repositório que a aplicação, com code review e IDE; é uma escolha natural para um time Java. O **k6** usa JavaScript, é um binário único, muito eficiente, com *thresholds* do tipo `http_req_duration: ['p(95)<200']` e integração forte com o ecossistema Grafana; é comum em times de plataforma que testam serviços em várias linguagens. O **JMeter** é o veterano, com interface gráfica e plugins para quase qualquer protocolo, mas planos em XML são difíceis de revisar em pull request. O critério que mais importa não é a ferramenta: é o time conseguir manter os cenários junto com o código. Para microbenchmarks em Java, a resposta é sempre o JMH.
+
+**Achar o gargalo, sistematicamente.** Em ordem: (1) os percentis ao longo do tempo (o relatório HTML do Gatling) mostram **quando** degrada; (2) os erros mostram **o quê** (timeout de pool, 503, conexão recusada); (3) as métricas de saturação mostram **onde**: pool de conexões (`hikaricp.connections.pending`), threads (`tomcat.threads.busy` e *thread dumps*), GC (tempo de pausa e frequência, no log com `-Xlog:gc` ou no JFR), CPU, filas de mensagens; (4) um profiler confirma **qual linha**. O JDK Flight Recorder (`-XX:StartFlightRecording`) é embutido na JVM, tem custo baixo o bastante para rodar durante o teste de carga e mostra, no JDK Mission Control, onde as threads passaram o tempo, inclusive esperando lock e I/O. Mudar uma coisa por vez e medir de novo é o que separa um diagnóstico de um palpite.
+
+**Pool, threads e GC: os três suspeitos de sempre.** Pool de conexões: o tamanho certo não é "o maior possível"; o próprio HikariCP recomenda pools pequenos (a fórmula de partida é próxima de `núcleos do banco × 2`), e o total de conexões de todas as instâncias precisa caber no limite do banco. O mais eficaz é segurar conexões por menos tempo, como na v2: nada de chamada HTTP, `Thread.sleep` ou processamento pesado dentro de `@Transactional`. Threads: com threads de plataforma, o limite do Tomcat (200 por padrão) limita a concorrência e protege os recursos atrás dele; com virtual threads, esse limite some, e você precisa de outro controle de concorrência (o pool, um semáforo, o `@ConcurrencyLimit` do Spring Framework 7) para não afogar o banco. GC: pausas longas aparecem como degraus no p99; o G1 é o padrão e funciona bem para a maioria das APIs; o ZGC geracional reduz as pausas a menos de um milissegundo, em troca de um pouco mais de CPU e memória. A escolha se justifica com o teste de carga, olhando o p99, e não por preferência.
+
+**Comportamento sob sobrecarga é requisito.** A v1 mostrou o pior modo de falha: aceitar tudo e responder tudo devagar. Sistemas maduros **rejeitam cedo** o que não conseguem atender (limite de concorrência, *rate limit*, 503 com `Retry-After`), mantêm um timeout curto e coerente em toda a cadeia (o timeout do pool, do cliente HTTP e do *load balancer* precisam fazer sentido juntos) e se recuperam sozinhos quando a carga baixa. Um teste de estresse bem feito verifica as três coisas, e é esse comportamento que vale defender numa revisão de arquitetura.
+
+**Como justificar para o time.** Desempenho vira prioridade quando se fala em risco e dinheiro, não em milissegundos. "A cotação aguenta 245 req/s; a previsão da Black Friday é 300; acima da capacidade, 12% dos checkouts falham e o resto espera 5 segundos" é uma frase que o produto entende e que justifica uma tarefa no sprint. Junte o relatório antes e depois da correção, o custo (uma anotação, meio dia de teste) e o que fica de proteção (o teste noturno com a meta de p95). E registre a decisão num ADR quando ela mudar a arquitetura (adotar virtual threads, mudar o pool, trocar o GC).
+
+<Callout tipo="entrevista">
+Perguntas que aparecem em entrevistas para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Como você faria um teste de carga de uma API?"** Começo pela pergunta e pela meta: qual operação, qual carga (a partir do pico real e da previsão), qual SLO (p95 e taxa de erro). Escolho o modelo aberto para tráfego de usuários, rampa de aquecimento, dados variados, ambiente representativo, gerador fora da máquina do servidor. Asserções de p95 e erro, relatório comparado com a linha de base.
+- **"Por que não usar a média?"** Esconde a cauda; dou um exemplo numérico, e cito que uma página com várias chamadas transforma o p99 de cada serviço na experiência de muitos usuários. Percentis não se somam nem se tiram médias.
+- **"O que é omissão coordenada?"** O gerador espera a resposta antes de enviar, então para de medir justamente quando o servidor trava. Modelo aberto ou correção pelo horário pretendido.
+- **"A API ficou lenta sob carga, mas a CPU está baixa. Onde você olha?"** Em recursos com fila: pool de conexões (pendentes), threads bloqueadas (*thread dump*), locks, dependências externas, GC. Cito a Lei de Little para estimar a capacidade de um recurso.
+- **"Virtual threads resolvem problemas de desempenho?"** Resolvem o custo de ter muitas threads esperando I/O; não aumentam recursos limitados como conexões com o banco. Sem outro limite de concorrência, podem até aumentar a pressão sobre o banco.
+- **"Como você mede se uma alteração deixou um método mais rápido?"** Com JMH, não com `System.nanoTime()`: aquecimento, forks, intervalo de confiança, resultado consumido para evitar eliminação de código morto e estado em campos para evitar constant folding. E pergunto se o trecho aparece no profiler antes de otimizar.
+</Callout>
+
+## Checkpoint: quanto pool a v1 precisaria?
+
+O time pergunta: "e se, em vez de mexer no código, aumentarmos o pool da v1?". Antes de rodar qualquer teste, responda com a Lei de Little e depois confirme com o Gatling.
+
+1. Calcule o tamanho mínimo do pool para a v1 atender 300 req/s, sabendo que cada requisição segura a conexão por cerca de 41 ms. Some uma folga de 30% (os picos dentro do segundo não são uniformes).
+2. Rode a v1 a 300 req/s com esse pool, passando o tamanho na linha de comando, e confira se as asserções passam.
+3. Responda: por que, mesmo passando no teste, essa não é a correção recomendada?
+
+<Dicas>
+<Dica nivel={1}>
+A Lei de Little dá a concorrência média: vazão × tempo em que o recurso fica preso. Esse é o número de conexões ocupadas, em média, o tempo todo.
+</Dica>
+<Dica nivel={2}>
+O perfil `carga` aceita argumentos da JVM por `-Dcarga.jvm=...`. Propriedades do Spring passadas como `-D` na JVM valem como configuração: `-Dspring.datasource.hikari.maximum-pool-size=...`.
+</Dica>
+<Dica nivel={3}>
+300 × 0,041 ≈ 12,3 conexões em média; com 30% de folga, cerca de 16. O comando fica: `mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=300 "-Dcarga.jvm=-Xmx512m -Dspring.datasource.hikari.maximum-pool-size=16"`.
+</Dica>
+</Dicas>
+
+<details>
+<summary>Solução do checkpoint</summary>
+
+**1. A conta.** Concorrência = vazão × tempo = 300 req/s × 0,041 s ≈ 12,3 conexões ocupadas em média. Com 30% de folga, **16 conexões**. (Com exatamente 12 ou 13, o pool estaria perto de 100% de uso, e a lição do supermercado vale: perto da saturação, as filas já são grandes.)
+
+**2. O teste.**
+
+```bash
+mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=300 -Dsegundos=30 "-Dcarga.jvm=-Xmx512m -Dspring.datasource.hikari.maximum-pool-size=16"
+```
+
+O resultado esperado é passar nas asserções, com o p95 perto dos 60 ms da v2. Os números exatos variam com a máquina; se o p95 ficar perto do limite, a folga de 30% foi pouca para o seu ambiente, o que também é um resultado.
+
+**3. Por que não é a correção recomendada.** Porque ela aumenta o consumo do recurso mais caro e mais compartilhado, o banco, para pagar por um tempo em que a conexão **não está sendo usada**. Com 20 instâncias, são 320 conexões em vez de 200, e o limite do PostgreSQL (`max_connections`, 100 por padrão) e a memória por conexão passam a ser o problema. E a capacidade continua amarrada à latência da transportadora: se ela passar de 40 para 400 ms num dia ruim, a v1 precisa de dez vezes mais conexões, enquanto a v2 nem percebe. A correção de raiz é a v2: não segurar a conexão durante I/O externo. Aumentar o pool é um paliativo aceitável por um dia, com o motivo registrado.
+
+</details>
+
+<Quiz
+  id="10-desempenho-e-carga"
+  questoes={[
+    {
+      pergunta: 'Um relatório mostra média de 80 ms, p95 de 20 ms e p99 de 2.000 ms. O que isso indica?',
+      opcoes: ['Que a API é rápida, porque a média é baixa', 'Que a maioria é rápida, mas uma cauda de cerca de 1–5% das requisições espera segundos; a média não descreve nenhum cliente', 'Que o relatório está errado, porque o p99 não pode ser maior que a média', 'Que o p95 está errado, porque deveria ser próximo da média'],
+      correta: 1,
+      explicacao: 'A média mistura a maioria rápida com a minoria lenta. O p95 baixo e o p99 alto mostram uma cauda pesada, que é onde moram os problemas (GC, locks, filas). Por isso metas usam percentis.',
+    },
+    {
+      pergunta: 'Um gerador de carga com 50 usuários fechados (cada um espera a resposta antes de enviar a próxima) testa uma API pública. O servidor trava por 3 s. O que acontece com a medição?',
+      opcoes: ['Nada; o gerador mede corretamente qualquer travamento', 'O gerador para de enviar durante o travamento e registra poucas medições ruins; o p99 sai melhor do que os usuários reais sentiriam (omissão coordenada)', 'O gerador envia o dobro de requisições para compensar', 'O gerador falha com timeout e o teste é descartado'],
+      correta: 1,
+      explicacao: 'No modelo fechado, quando o servidor trava, os usuários virtuais ficam esperando e os envios previstos não acontecem. Para tráfego aberto, use injeção aberta (injectOpen, constant-arrival-rate) ou corrija a medição pelo horário pretendido.',
+    },
+    {
+      pergunta: 'Um benchmark JMH com `void` que chama `Distancia.kmNaGrade(...)` e descarta o resultado mede 0,48 ns, o mesmo que um método vazio. Qual a explicação?',
+      opcoes: ['A conta é realmente instantânea', 'O JIT eliminou a conta porque o resultado não é usado (eliminação de código morto); devolva o valor ou use o Blackhole', 'O JMH não mede métodos void', 'Faltou @Fork'],
+      correta: 1,
+      explicacao: 'Sem uso do resultado e sem efeito colateral, o C2 pode apagar a conta. Devolver o valor (o JMH o consome) ou chamar `Blackhole.consume` impede a eliminação. A régua do método vazio é o que denuncia o problema.',
+    },
+    {
+      pergunta: 'Um pool de 10 conexões, cada uma presa por 50 ms por requisição. Qual a vazão máxima que esse pool permite?',
+      opcoes: ['10 req/s', '50 req/s', '200 req/s', '500 req/s'],
+      correta: 2,
+      explicacao: 'Pela Lei de Little, vazão = concorrência / tempo = 10 / 0,05 s = 200 req/s. Acima disso, as requisições formam fila no pool.',
+    },
+    {
+      pergunta: 'A v1 da cotação satura o pool a 300 req/s. O time liga as virtual threads. O que se espera?',
+      opcoes: ['Que o problema desapareça, porque virtual threads são mais rápidas', 'Que o gargalo continue no pool: mais requisições esperam por conexão ao mesmo tempo e falham no timeout do pool', 'Que o banco passe a aceitar mais conexões', 'Que a latência caia para o nível da v2'],
+      correta: 1,
+      explicacao: 'Virtual threads tornam a espera barata, mas não criam conexões. Na execução da aula, o pool passou de 190 para 277 esperando e a taxa de erro subiu de 12% para 24%. A correção é não segurar a conexão durante a chamada externa.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Latência** é o tempo de uma requisição; **vazão** é quantas o sistema completa por segundo. A **Lei de Little** (concorrência = vazão × latência) estima a capacidade de qualquer recurso limitado: 10 conexões presas 41 ms dão ~245 req/s.
+- Abaixo da capacidade, a latência é quase constante; acima, a fila cresce sem limite. 20% acima da capacidade levaram o p50 de 48 ms para 4,7 s.
+- Meça com **percentis** (p95, p99) e taxa de erro, nunca com a média. Percentis não se somam nem se tiram médias.
+- **Omissão coordenada**: o gerador fechado para de medir quando o servidor trava. Use **modelo aberto** para tráfego de usuários; fechado, para populações limitadas.
+- Tipos de teste respondem perguntas diferentes: **carga** (cumpre o SLO?), **estresse** (onde e como quebra?), **pico**, **resistência** (degrada com o tempo?) e **capacidade** (quanto aguenta uma instância?). As metas vêm do **SLO**.
+- **JMH** para microbenchmarks: aquecimento, forks, intervalo de confiança, resultado consumido (contra a eliminação de código morto) e estado em campos (contra o constant folding). Compare com a régua do método vazio.
+- **Gatling** (Java DSL) para carga HTTP: protocolo, cenário com feeder, `injectOpen`, `check` de status e asserções de p95 e erro, rodando pelo Maven com a aplicação subida e derrubada pelo `spring-boot:start/stop`.
+- Para achar o gargalo, procure **fila**: pool (`waiting`), threads, GC, dependências externas. CPU baixa não quer dizer folga. Virtual threads não criam conexões.
+- No CI: fumaça curta em cada PR, teste completo agendado num ambiente estável e representativo, metas em p95 com folga em relação à linha de base.
+
+## Próximo passo
+
+Com isso, o módulo de testes está completo: da unidade ao contrato, do banco de verdade à carga. O módulo 11 trata de outro requisito que não aparece num teste funcional e derruba empresas: segurança. Ele começa pelo começo de tudo, a identidade de quem usa o sistema, na aula [Autenticação e armazenamento de senhas](../../11-seguranca/01-autenticacao-e-senhas/): hashing com BCrypt e Argon2id, a política de senhas do NIST e o porquê de um hash lento ser exatamente o que você quer (o único lugar da trilha em que lentidão é um requisito).
+
+## Referências
+
+- [JMH (Java Microbenchmark Harness)](https://github.com/openjdk/jmh), repositório oficial no OpenJDK, com os exemplos `JMHSample_*` (aquecimento, código morto, constant folding, Blackhole).
+- [Gatling: documentação](https://docs.gatling.io/): [injeção de carga (modelo aberto e fechado)](https://docs.gatling.io/concepts/injection/), [asserções](https://docs.gatling.io/concepts/assertions/) e [plugin Maven](https://docs.gatling.io/integrations/build-tools/maven-plugin/).
+- [k6: documentação](https://grafana.com/docs/k6/latest/), em especial *executors* (modelos aberto e fechado) e *thresholds*.
+- [Spring Boot: plugin Maven, testes de integração (`start` e `stop`)](https://docs.spring.io/spring-boot/maven-plugin/integration-tests.html).
+- [Spring Boot: virtual threads](https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html) e a propriedade `spring.threads.virtual.enabled`.
+- [HikariCP: About Pool Sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) e configuração (`maximumPoolSize`, `connectionTimeout`).
+- [JEP 498: avisos sobre os métodos de acesso à memória de `sun.misc.Unsafe`](https://openjdk.org/jeps/498).
+- [JDK Flight Recorder e JDK Mission Control](https://docs.oracle.com/en/java/java-components/jdk-mission-control/).
+- [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/).

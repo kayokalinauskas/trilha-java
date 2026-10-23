@@ -1,0 +1,266 @@
+---
+titulo: IoC, injeção de dependências e beans
+descricao: Por que o Spring existe — inversão de controle, injeção por construtor, como o container descobre e liga os beans, escopos, múltiplas implementações de uma interface, perfis e configuração tipada com @ConfigurationProperties.
+modulo: 08-spring-boot
+ordem: 3
+duracao: 55
+objetivos:
+  - Explicar inversão de controle e injeção de dependências com um exemplo sem framework
+  - Registrar beans com estereótipos e com @Bean, e injetá-los por construtor
+  - Resolver múltiplas implementações de uma interface (List, @Qualifier, @Primary)
+  - Externalizar configuração com @ConfigurationProperties e perfis
+tags: [Spring, IoC, injeção de dependências, beans, configuração]
+flashcards:
+  - frente: O que é inversão de controle (IoC)?
+    verso: Em vez de o objeto criar e buscar suas dependências, alguém de fora (o container) cria os objetos e entrega as dependências prontas. O controle da montagem sai do seu código.
+  - frente: Por que preferir injeção por construtor em vez de @Autowired no campo?
+    verso: Dependências obrigatórias e explícitas, campos final (imutáveis), objeto sempre completo e testável sem Spring (é só chamar new).
+  - frente: Qual o escopo padrão de um bean no Spring e qual cuidado ele exige?
+    verso: Singleton — uma instância para a aplicação toda, compartilhada entre todas as requisições. Não guarde estado mutável de requisição em campos; se guardar estado, ele precisa ser thread-safe.
+  - frente: Como injetar todas as implementações de uma interface?
+    verso: Pedindo List<Interface> (ou Map<String, Interface>) no construtor. O Spring entrega todos os beans daquele tipo.
+  - frente: Qual a vantagem de @ConfigurationProperties sobre @Value?
+    verso: Configuração tipada e agrupada num record, com valores padrão, validação (@Validated) na subida e autocompletar na IDE. @Value é string solta, espalhada pelo código.
+---
+
+Antes do Spring, você já sabe escrever uma aplicação Java inteira. Então por que praticamente toda vaga de backend Java pede Spring? Porque ele resolve, de um jeito padronizado, um problema que cresce junto com a aplicação: **quem cria os objetos e como eles se encontram**.
+
+## O problema: objetos que se montam sozinhos
+
+```java
+public class ServicoDePedidos {
+    private final RepositorioDePedidos repositorio = new RepositorioJdbc(new DataSourceHikari("jdbc:postgresql://..."));
+    private final Notificador notificador = new NotificadorEmail("smtp.empresa.com", 587);
+    // ...
+}
+```
+
+Esse serviço **sabe demais**: qual banco, qual servidor de e-mail, quais portas. Para testá-lo, você precisa de um PostgreSQL e de um SMTP. Para trocar e-mail por WhatsApp, precisa editá-lo. E se dez classes precisam do mesmo `DataSource`, cada uma cria o seu.
+
+## A solução: receber em vez de criar
+
+```java
+public class ServicoDePedidos {
+    private final RepositorioDePedidos repositorio;
+    private final Notificador notificador;
+
+    public ServicoDePedidos(RepositorioDePedidos repositorio, Notificador notificador) {
+        this.repositorio = repositorio;
+        this.notificador = notificador;
+    }
+}
+```
+
+Isso é **injeção de dependências** (DI): a classe declara **do que precisa** (interfaces, de preferência) e alguém de fora entrega. No teste, você passa um repositório em memória e um notificador falso; em produção, os reais. A classe não muda.
+
+Mas agora alguém precisa montar tudo:
+
+```java
+var dataSource = new DataSourceHikari(config.url());
+var repositorio = new RepositorioJdbc(dataSource);
+var notificador = new NotificadorEmail(config.smtp(), config.porta());
+var servico = new ServicoDePedidos(repositorio, notificador);
+var controller = new PedidoController(servico);
+// ... multiplicado por 200 classes
+```
+
+Esse "alguém" é o **container de IoC** do Spring. **Inversão de controle** é exatamente isso: o controle de criar e ligar objetos sai do seu código e vai para o framework.
+
+<Figura legenda="O container lê as definições, cria cada bean uma vez e injeta as dependências pelo construtor">
+<svg viewBox="0 0 680 220" width="680" role="img" aria-label="Classes anotadas e métodos @Bean entram no container, que cria os beans e os liga: controller recebe serviço, serviço recebe repositório e notificador">
+  <defs><marker id="ioc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="170" height="40" rx="8" class="d-box"/><text x="95" y="65" text-anchor="middle" class="d-mono">@Service, @Repository…</text>
+  <rect x="10" y="100" width="170" height="40" rx="8" class="d-box"/><text x="95" y="125" text-anchor="middle" class="d-mono">@Bean em @Configuration</text>
+  <rect x="10" y="160" width="170" height="40" rx="8" class="d-box"/><text x="95" y="185" text-anchor="middle" class="d-mono">application.yml</text>
+  <rect x="220" y="30" width="440" height="180" rx="14" class="d-violet"/>
+  <text x="440" y="54" text-anchor="middle" class="d-title">ApplicationContext (container)</text>
+  <rect x="245" y="80" width="130" height="40" rx="8" class="d-accent"/><text x="310" y="105" text-anchor="middle" class="d-mono">Controller</text>
+  <rect x="400" y="80" width="130" height="40" rx="8" class="d-info"/><text x="465" y="105" text-anchor="middle" class="d-mono">Serviço</text>
+  <rect x="400" y="150" width="120" height="40" rx="8" class="d-ok"/><text x="460" y="175" text-anchor="middle" class="d-mono">Repositório</text>
+  <rect x="535" y="150" width="115" height="40" rx="8" class="d-ok"/><text x="592" y="175" text-anchor="middle" class="d-mono">Notificador</text>
+  <path d="M375 100 H396" class="d-line" marker-end="url(#ioc)"/>
+  <path d="M455 120 V146" class="d-line" marker-end="url(#ioc)"/>
+  <path d="M500 120 L570 146" class="d-line" marker-end="url(#ioc)"/>
+  <path d="M180 60 H216" class="d-line" marker-end="url(#ioc)"/><path d="M180 120 H216" class="d-line" marker-end="url(#ioc)"/><path d="M180 180 H216" class="d-line" marker-end="url(#ioc)"/>
+</svg>
+</Figura>
+
+## Beans: como o Spring descobre o que criar
+
+Um **bean** é um objeto criado e gerenciado pelo container. Há duas formas de declará-los:
+
+**1. Estereótipos + component scan** — para as **suas** classes:
+
+```java
+@Service                     // também: @Component, @Repository, @Controller/@RestController
+public class ServicoDePedidos {
+    public ServicoDePedidos(RepositorioDePedidos repositorio, Notificador notificador) { ... }
+}
+```
+
+O `@SpringBootApplication` liga o *component scan* no pacote da classe principal **e nos subpacotes**. Uma classe fora dessa árvore não é encontrada — erro clássico de iniciante.
+
+**2. Métodos `@Bean`** — para classes que **não são suas** (bibliotecas) ou que exigem montagem:
+
+```java
+@Configuration
+public class ConfiguracaoGeral {
+
+    @Bean
+    Clock clock() {
+        return Clock.systemUTC();
+    }
+
+    @Bean
+    CotacaoClient cotacaoClient(RestClient.Builder builder, CambioProperties props) { ... }
+}
+```
+
+Os parâmetros de um método `@Bean` também são injetados. Com um único construtor, o Spring o usa automaticamente — **não é preciso `@Autowired`**.
+
+<Comparar antes="Injeção em campo" depois="Injeção por construtor">
+```java
+@Service
+public class ServicoDePedidos {
+  @Autowired
+  private RepositorioDePedidos repositorio;
+  @Autowired
+  private Notificador notificador;
+}
+```
+
+```java
+@Service
+public class ServicoDePedidos {
+  private final RepositorioDePedidos repositorio;
+  private final Notificador notificador;
+
+  public ServicoDePedidos(RepositorioDePedidos r,
+                          Notificador n) { ... }
+}
+```
+</Comparar>
+
+Por construtor: dependências **explícitas**, campos **`final`**, objeto nunca "meio montado", e o teste unitário é só `new ServicoDePedidos(fakeRepo, fakeNotificador)`. Um construtor com oito parâmetros é um aviso honesto de que a classe faz coisas demais.
+
+## Escopo e ciclo de vida
+
+| Escopo | Instâncias | Uso |
+|---|---|---|
+| `singleton` (padrão) | uma por aplicação | quase tudo: serviços, repositórios, clientes HTTP |
+| `prototype` | uma por injeção | objetos com estado próprio (raro) |
+| `request` / `session` | uma por requisição/sessão HTTP | raro em APIs stateless |
+
+<Callout tipo="erro" titulo="Singleton com estado de requisição">
+```java
+@Service
+public class ServicoDeCarrinho {
+    private List<Item> itens = new ArrayList<>(); // compartilhado entre TODOS os usuários!
+}
+```
+Um bean singleton atende todas as requisições **ao mesmo tempo**, em threads diferentes (módulo 06). Estado mutável nele é uma race condition e um vazamento de dados entre clientes. Guarde estado no banco, no cache ou em objetos locais do método. Quando o estado é do próprio serviço (um cache, um contador), use estruturas thread-safe — como os exercícios 08.02 e 08.04 fazem.
+</Callout>
+
+Para executar código na subida ou no desligamento, use `@PostConstruct`/`@PreDestroy` ou implemente `ApplicationRunner` — sem gambiarras no construtor.
+
+## Várias implementações da mesma interface
+
+O que acontece se existirem `NotificadorEmail` e `NotificadorSms`, ambos `@Component`, e alguém pedir um `Notificador`? O Spring não adivinha: falha na subida com `NoUniqueBeanDefinitionException`. Você escolhe:
+
+| Quero… | Faça |
+|---|---|
+| **todas** as implementações | peça `List<Notificador>` (ou `Map<String, Notificador>`, chave = nome do bean) |
+| uma **padrão** | `@Primary` numa delas |
+| uma **específica** | `@Qualifier("notificadorSms")` no parâmetro |
+| ligar/desligar por configuração | `@ConditionalOnProperty` (ou perfis) |
+
+Pedir `List<RegraDeComissao>` é o coração do exercício 08.01: um canal novo é só uma classe nova, e a calculadora nunca muda. É o **princípio aberto/fechado** do SOLID (módulo 13), conseguido de graça com DI — e é o padrão **Strategy** sem nenhuma fábrica manual.
+
+## Configuração externa
+
+Nada de URL, senha ou limite de negócio "chumbado" no código. O Spring junta propriedades de várias fontes, em ordem de prioridade (da maior para a menor, simplificando):
+
+1. argumentos de linha de comando (`--cambio.timeout=5s`)
+2. variáveis de ambiente (`CAMBIO_TIMEOUT=5s` — o *relaxed binding* converte o nome)
+3. `application-{perfil}.yml`
+4. `application.yml`
+5. valores padrão no código
+
+### Configuração tipada com `@ConfigurationProperties`
+
+```yaml
+comissao:
+  teto-por-venda: 500.00
+  parceiro:
+    percentual: 2
+```
+
+```java
+@Validated
+@ConfigurationProperties("comissao")
+public record ComissaoProperties(
+        @DefaultValue("500.00") @Positive BigDecimal tetoPorVenda,
+        @DefaultValue @Valid Parceiro parceiro) {
+
+    public record Parceiro(@DefaultValue("2") @PositiveOrZero BigDecimal percentual) {}
+}
+```
+
+Registre com `@ConfigurationPropertiesScan` (ou `@EnableConfigurationProperties`) e injete o record onde precisar. Com `@Validated`, uma configuração inválida **impede a aplicação de subir** — muito melhor do que descobrir em produção que o teto de comissão é negativo. Tipos como `Duration` (`"500ms"`, `"24h"`) e `DataSize` (`"10MB"`) são convertidos sozinhos.
+
+`@Value("${comissao.teto-por-venda}")` também funciona, mas espalha strings pelo código e não valida nada: prefira-o só para um valor isolado.
+
+### Perfis
+
+```yaml
+# application-dev.yml
+cambio:
+  base-url: http://localhost:9090
+# application-prod.yml
+cambio:
+  base-url: https://api.cotacoes.com.br
+```
+
+Ative com `SPRING_PROFILES_ACTIVE=prod`. Beans também podem ser condicionados a um perfil (`@Profile("dev")`). Segredos **não** vão para arquivos versionados: use variáveis de ambiente ou um cofre (módulo 11).
+
+<Callout tipo="entrevista">
+"O que é injeção de dependências e por que usar?" é a pergunta de Spring mais frequente para Júnior. Responda com o **problema** (acoplamento, teste difícil), a **solução** (receber dependências em vez de criá-las, idealmente por construtor) e o **papel do container** (IoC). Pontos extras: explicar que beans são singletons e por isso não guardam estado de requisição, e como resolver duas implementações da mesma interface.
+</Callout>
+
+<Quiz
+  id="08-ioc"
+  questoes={[
+    {
+      pergunta: 'Há dois beans que implementam Notificador e um serviço pede `Notificador` no construtor, sem nenhuma anotação extra. O que acontece?',
+      opcoes: ['O Spring escolhe o primeiro em ordem alfabética', 'A aplicação falha ao subir: bean não é único', 'O Spring injeta null', 'O Spring injeta os dois'],
+      correta: 1,
+      explicacao: 'NoUniqueBeanDefinitionException. Use @Primary, @Qualifier ou peça List<Notificador>.',
+    },
+    {
+      pergunta: 'Por que este campo num @Service é um bug: `private BigDecimal totalDoPedidoAtual;`?',
+      opcoes: ['BigDecimal não pode ser campo', 'O bean é singleton: o valor é compartilhado por todas as requisições simultâneas', 'Falta @Autowired', 'Campos precisam ser static'],
+      correta: 1,
+      explicacao: 'Estado de requisição num singleton vaza entre usuários e gera race conditions.',
+    },
+    {
+      pergunta: 'Qual a forma recomendada de registrar um RestClient configurado (biblioteca de terceiros) como bean?',
+      opcoes: ['Anotar a classe RestClient com @Component', 'Um método @Bean numa classe @Configuration', 'Criar com new em cada serviço', 'Usar @Value'],
+      correta: 1,
+      explicacao: 'Você não pode anotar classes de bibliotecas; métodos @Bean servem exatamente para isso.',
+    },
+    {
+      pergunta: 'Uma propriedade obrigatória foi configurada com valor inválido em produção. Com @ConfigurationProperties + @Validated:',
+      opcoes: ['A aplicação sobe e loga um aviso', 'A aplicação não sobe, com mensagem clara do erro', 'O valor padrão é usado silenciosamente', 'O erro só aparece na primeira requisição'],
+      correta: 1,
+      explicacao: 'Falha rápida: é melhor não subir do que rodar com configuração errada.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **DI**: classes recebem dependências (por **construtor**) em vez de criá-las; o **container** (IoC) cria e liga tudo.
+- Beans vêm de **estereótipos** (suas classes, via component scan) ou de métodos **`@Bean`** (bibliotecas, montagem).
+- O escopo padrão é **singleton**: nada de estado de requisição em campos; estado próprio precisa ser thread-safe.
+- Várias implementações: `List<...>`, `@Primary`, `@Qualifier`, condicionais.
+- Configuração externa e **tipada** com `@ConfigurationProperties` + `@Validated`; perfis por ambiente; segredos fora do Git.

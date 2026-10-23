@@ -1,0 +1,173 @@
+---
+titulo: Busca binária e ordenação
+descricao: O molde de busca binária que não erra os limites, busca em array rotacionado, busca binária na resposta, e o que você precisa saber sobre algoritmos de ordenação.
+modulo: 05-algoritmos
+ordem: 5
+duracao: 55
+objetivos:
+  - Escrever busca binária sem erros de limite, com um molde único
+  - Aplicar busca binária "na resposta" para problemas de otimização
+  - Adaptar a busca a arrays rotacionados
+  - Explicar merge sort, quicksort e a ordenação da JDK
+tags: [busca binária, ordenação, merge sort, divisão e conquista]
+flashcards:
+  - frente: Qual o molde mais seguro de busca binária?
+    verso: "Intervalo [baixo, alto); enquanto baixo < alto: meio = baixo + (alto − baixo)/2; se condição(meio) → alto = meio, senão baixo = meio + 1. Resposta: baixo."
+  - frente: Por que meio = baixo + (alto − baixo) / 2 e não (baixo + alto) / 2?
+    verso: Para evitar overflow de int quando baixo + alto passa de Integer.MAX_VALUE.
+  - frente: O que é busca binária na resposta?
+    verso: Buscar o menor valor que satisfaz uma condição monotônica (se vale para x, vale para x+1), testando a condição em O(n) a cada passo.
+  - frente: Quais algoritmos a JDK usa para ordenar?
+    verso: Dual-Pivot Quicksort para arrays de primitivos; TimSort (estável, derivado do merge sort) para objetos e List.sort.
+  - frente: O que é uma ordenação estável?
+    verso: Uma ordenação que mantém a ordem relativa original dos elementos considerados iguais.
+---
+
+Busca binária é o algoritmo mais simples de entender e um dos mais fáceis de errar: um `<=` no lugar de `<`, um `meio + 1` esquecido, e o laço fica infinito ou pula a resposta. Esta aula dá um **molde** que funciona sempre e mostra como ele resolve problemas que nem parecem de busca.
+
+## A ideia
+
+Num array **ordenado** de 1 bilhão de elementos, olhe o do meio. Se o alvo é maior, descarte a metade esquerda inteira. Em cerca de **30 passos**, você acha qualquer elemento: O(log n).
+
+## Um molde para tudo
+
+Em vez de decorar várias versões, pense sempre assim:
+
+> Existe uma condição que é **falsa, falsa, …, falsa, verdadeira, verdadeira, …** ao longo do intervalo. Quero o **primeiro verdadeiro**.
+
+```java
+int baixo = 0, alto = n;                    // intervalo [baixo, alto): alto NÃO está incluído
+while (baixo < alto) {
+    int meio = baixo + (alto - baixo) / 2;   // sem overflow
+    if (condicao(meio)) {
+        alto = meio;                         // meio pode ser a resposta: mantém
+    } else {
+        baixo = meio + 1;                    // meio não é: descarta
+    }
+}
+return baixo;                                // primeiro índice em que a condição vale (ou n)
+```
+
+Exemplos de condição:
+
+| Problema | `condicao(meio)` |
+|---|---|
+| Posição de inserção de `x` (primeiro ≥ x) | `v[meio] >= x` |
+| Primeira ocorrência de `x` | `v[meio] >= x`, e depois confira se `v[baixo] == x` |
+| Primeira versão com bug | `temBug(meio)` |
+| Menor capacidade que entrega em D dias | `diasNecessarios(meio) <= D` |
+
+<Callout tipo="erro" titulo="O bug de overflow que passou anos na JDK">
+`(baixo + alto) / 2` estoura quando a soma passa de `Integer.MAX_VALUE`, e o índice vira negativo. Esse bug existiu no `Arrays.binarySearch` da JDK por anos, até ser descoberto e corrigido em 2006. Use sempre `baixo + (alto - baixo) / 2`.
+</Callout>
+
+## Busca binária na resposta
+
+Às vezes você não busca num array, e sim num **espaço de respostas possíveis**.
+
+> Pacotes com pesos `[1..10]` precisam ser entregues **em ordem** em 5 dias. Qual a **menor capacidade** do caminhão?
+
+- A resposta está entre `max(pesos)` (senão o maior pacote não cabe) e `soma(pesos)` (tudo em um dia).
+- A condição "com capacidade C, cabe em D dias?" é **monotônica**: se cabe com C, cabe com C+1.
+- Então busque o **primeiro C** para o qual a condição é verdadeira. Cada teste custa O(n); o total é O(n log S), com S = soma dos pesos.
+
+```java
+int baixo = max(pesos), alto = soma(pesos);
+while (baixo < alto) {
+    int meio = baixo + (alto - baixo) / 2;
+    if (diasNecessarios(pesos, meio) <= dias) alto = meio;
+    else baixo = meio + 1;
+}
+return baixo;
+```
+
+O mesmo raciocínio resolve "menor tempo para processar N tarefas com K workers", "maior distância mínima entre servidores"… Sempre que você ouvir "o **menor** X tal que…", pense em busca binária na resposta.
+
+## Array rotacionado
+
+> `[15, 18, 22, 3, 7, 9, 12]`: estava ordenado, mas foi "girado". Ache o 7 em O(log n).
+
+Em cada passo, **pelo menos uma das metades está ordenada**. Descubra qual (compare `v[baixo]` com `v[meio]`), verifique se o alvo está dentro dela e descarte a outra:
+
+```java
+if (v[baixo] <= v[meio]) {                   // esquerda ordenada
+    if (alvo >= v[baixo] && alvo < v[meio]) alto = meio - 1;
+    else baixo = meio + 1;
+} else {                                     // direita ordenada
+    if (alvo > v[meio] && alvo <= v[alto]) baixo = meio + 1;
+    else alto = meio - 1;
+}
+```
+
+Aqui o intervalo é fechado (`[baixo, alto]`, com `while (baixo <= alto)`), porque procuramos um valor exato. Os dois estilos estão certos — o erro é **misturá-los**.
+
+## Ordenação: o que você precisa saber
+
+Você quase nunca vai implementar uma ordenação no trabalho: `list.sort(comparator)` resolve. Mas entrevistas perguntam **como** funcionam e **quanto custam**.
+
+| Algoritmo | Tempo médio | Pior caso | Memória | Estável? |
+|---|---|---|---|---|
+| Bubble / Insertion sort | O(n²) | O(n²) | O(1) | sim |
+| **Merge sort** | O(n log n) | O(n log n) | O(n) | **sim** |
+| **Quicksort** | O(n log n) | O(n²) | O(log n) | não |
+| Heap sort | O(n log n) | O(n log n) | O(1) | não |
+
+### Merge sort: divisão e conquista
+
+1. Divida o array ao meio.
+2. Ordene cada metade (recursivamente).
+3. **Intercale** as duas metades ordenadas com dois ponteiros.
+
+```java
+static void mergeSort(int[] v, int ini, int fim, int[] aux) {
+    if (fim - ini < 2) return;               // 0 ou 1 elemento: já ordenado
+    int meio = (ini + fim) >>> 1;
+    mergeSort(v, ini, meio, aux);
+    mergeSort(v, meio, fim, aux);
+    int i = ini, j = meio, k = ini;
+    while (i < meio && j < fim) aux[k++] = v[i] <= v[j] ? v[i++] : v[j++];   // <= mantém estável
+    while (i < meio) aux[k++] = v[i++];
+    while (j < fim) aux[k++] = v[j++];
+    System.arraycopy(aux, ini, v, ini, fim - ini);
+}
+```
+
+São log n níveis de divisão, e cada nível faz O(n) de intercalação: O(n log n).
+
+### O que a JDK usa
+
+- **Arrays de primitivos** (`Arrays.sort(int[])`): *Dual-Pivot Quicksort* — rápido, não estável (para números, estabilidade não importa).
+- **Objetos e listas** (`List.sort`, `Arrays.sort(Object[])`): **TimSort**, um híbrido de merge sort com insertion sort, **estável** e ótimo com dados parcialmente ordenados.
+
+**Estabilidade** importa quando você ordena por um critério e quer preservar uma ordem anterior: ordenar pedidos por cliente mantendo, dentro de cada cliente, a ordem por data que já existia.
+
+<Quiz
+  id="05-busca-binaria"
+  questoes={[
+    {
+      pergunta: 'No molde [baixo, alto), se `condicao(meio)` é verdadeira, o que fazer?',
+      opcoes: ['baixo = meio + 1', 'alto = meio', 'alto = meio − 1', 'return meio'],
+      correta: 1,
+      explicacao: 'meio pode ser o primeiro verdadeiro, então ele fica no intervalo: alto = meio.',
+    },
+    {
+      pergunta: '"Menor capacidade para entregar em D dias" é resolvido com busca binária porque…',
+      opcoes: ['Os pesos estão ordenados', 'A condição "cabe em D dias" é monotônica na capacidade', 'O problema pede um índice', 'Toda otimização usa busca binária'],
+      correta: 1,
+      explicacao: 'Se cabe com C, cabe com qualquer capacidade maior: falso…falso, verdadeiro…verdadeiro.',
+    },
+    {
+      pergunta: 'Por que List.sort usa um algoritmo estável?',
+      opcoes: ['Porque é mais rápido', 'Para preservar a ordem relativa de elementos iguais, útil em ordenações encadeadas', 'Porque objetos não podem ser trocados de lugar', 'Não é estável'],
+      correta: 1,
+      explicacao: 'TimSort é estável: elementos que o comparator considera iguais mantêm a ordem original.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Busca binária = achar o **primeiro verdadeiro** de uma condição monotônica. Um molde, `[baixo, alto)`, `meio` sem overflow.
+- **Busca na resposta**: "o menor X tal que…" com uma checagem O(n) por passo.
+- Array rotacionado: sempre uma metade está ordenada.
+- Merge sort (estável, O(n log n), O(n) de memória) × quicksort (rápido, pior caso O(n²)). A JDK usa Dual-Pivot Quicksort para primitivos e TimSort para objetos.

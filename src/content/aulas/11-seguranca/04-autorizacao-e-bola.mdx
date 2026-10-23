@@ -1,0 +1,855 @@
+---
+titulo: Autorização, RBAC e BOLA
+descricao: "Os três níveis de autorização (rota, método e objeto), RBAC, permissões finas, ABAC e ReBAC, method security no Spring Security 7 com beans no SpEL e AuthorizationManager próprio, BOLA, BFLA e mass assignment do OWASP API Top 10, 404 × 403, multi-tenant com consulta escopada e Row-Level Security do PostgreSQL, matriz de testes parametrizada e auditoria das negações."
+modulo: 11-seguranca
+ordem: 4
+duracao: 120
+objetivos:
+  - Separar as checagens de rota, de método e de objeto e dizer qual delas cada regra de negócio exige
+  - Demonstrar um BOLA com um teste e corrigi-lo com consulta escopada pelo tenant e uma função de regra única
+  - Usar @EnableMethodSecurity, @PreAuthorize com um bean no SpEL, @HandleAuthorizationDenied e um AuthorizationManager de rota
+  - Decidir entre 404 e 403 para cada situação e garantir com teste que as respostas não vazam a existência do recurso
+  - Bloquear mass assignment com DTOs de entrada e exposição de campos com DTOs de saída
+  - Escrever a matriz de autorização (papel × recurso × dono) como teste parametrizado e auditar as negações
+  - Explicar quando RLS do PostgreSQL, Hibernate filters ou um motor de políticas (OPA, Cedar, OpenFGA) valem o custo
+tags: [autorização, RBAC, ABAC, ReBAC, BOLA, IDOR, PreAuthorize, multi-tenant, RLS, OWASP API]
+flashcards:
+  - frente: O que é BOLA (ou IDOR)?
+    verso: "Broken Object Level Authorization: a API confere que a pessoa está autenticada, mas não que o objeto pedido (o prontuário 1001) é acessível a ela. Trocar o id na URL dá acesso aos dados de outra pessoa. É o API1 do OWASP API Security Top 10 (2023)."
+  - frente: Quando responder 404 em vez de 403?
+    verso: Quando a pessoa não pode nem saber que o recurso existe (o prontuário de outro paciente). 403 fica para quando ela já vê o recurso, mas não pode fazer aquela operação, ou para uma regra de papel que vale para qualquer id.
+  - frente: Usar UUID em vez de id sequencial resolve BOLA?
+    verso: Não. Dificulta adivinhar ids, mas ids vazam (logs, links, respostas de outras rotas, histórico do navegador). A defesa é verificar o acesso em cada operação sobre o objeto.
+  - frente: O que é mass assignment (parte do BOPLA, API3)?
+    verso: A API aceita no corpo campos que o cliente não deveria controlar (clinicaId, papel, saldo, id) porque converte o JSON direto na entidade. A defesa são DTOs de entrada só com os campos permitidos; o resto vem do token ou do servidor.
+  - frente: Por que preferir findByIdAndClinicaId a buscar por id e checar depois?
+    verso: O escopo na consulta é a regra aplicada por construção. Checar depois depende de alguém lembrar do if em cada caminho, e listagens carregadas para filtrar em memória quebram paginação e desempenho.
+  - frente: O que faz @HandleAuthorizationDenied?
+    verso: Troca o comportamento padrão de uma negação de method security (lançar AuthorizationDeniedException, que vira 403). O MethodAuthorizationDeniedHandler pode devolver um valor substituto ou lançar outra exceção, como a de "não encontrado" (404).
+  - frente: Em que o Row-Level Security do PostgreSQL ajuda na autorização multi-tenant?
+    verso: É defesa em profundidade. Com uma política por clinica_id e o tenant declarado na transação (set_config local), até uma consulta sem WHERE só vê as linhas do tenant. Atenção - o dono da tabela e superusuários ignoram a política, então a aplicação conecta com outro papel.
+  - frente: Como testar autorização de forma sistemática?
+    verso: Com uma matriz parametrizada - cada linha é usuário (papel, tenant, dono ou não) × operação × recurso → status esperado. Inclua ids inexistentes, outros tenants e operações proibidas, e compare os corpos de 404.
+---
+
+Uma rede de clínicas lançou o aplicativo de prontuários. Login com senha forte, token JWT validado do jeito certo, HTTPS em tudo, testes verdes. Na segunda semana, um paciente curioso abriu as ferramentas de desenvolvedor do navegador e viu a chamada `GET /prontuarios/1002`. Trocou para `1001`. Na tela apareceu a queixa e as anotações clínicas de outra pessoa: "Suspeita de enxaqueca; pedir ressonância". Trocou para `1003`, e veio um prontuário de outra clínica da rede. Ninguém invadiu nada. O token era dele, válido, assinado. A API só nunca perguntou se **aquele** prontuário era dele.
+
+Esse é o BOLA (*Broken Object Level Authorization*), o primeiro item do OWASP API Security Top 10 desde a primeira edição, e continua no topo na de 2023. Não é um bug exótico: é o resultado natural de um código que confere quem você é e esquece de conferir o que você pode tocar. Nesta aula você vai construir a API de prontuários duas vezes. Primeiro, a versão ingênua, com o BOLA e um mass assignment provados por teste. Depois, a versão corrigida, com os três níveis de autorização (rota, método e objeto), method security do Spring Security 7, isolamento por clínica (o *tenant*), uma matriz de testes que cobre cada combinação de papel, dono e operação, e Row-Level Security no PostgreSQL como última linha de defesa.
+
+## A intuição: o crachá do hospital
+
+Pense em como um hospital controla o acesso. Na portaria, o segurança olha o crachá: funcionário ou visitante? Isso decide se você entra no prédio. Na porta da ala de cirurgia, outro leitor confere o **papel** no crachá: só equipe cirúrgica. Até aqui, ninguém olhou para nenhum paciente específico. Mas a pergunta que importa para a privacidade é outra: este enfermeiro pode abrir **a ficha deste paciente**? A resposta depende do enfermeiro e do paciente ao mesmo tempo: ele está na equipe que cuida desse paciente? O paciente está internado nesta unidade ou em outra do grupo?
+
+As três perguntas são diferentes e moram em lugares diferentes:
+
+- **A portaria** não sabe nada de pacientes. Ela decide com o que está no crachá. No backend, é a autorização por **rota**, no `SecurityFilterChain`.
+- **A porta da ala** decide pelo papel, qualquer que seja o paciente lá dentro. No backend, é a autorização por **função** ou **método**, com `@PreAuthorize("hasRole('MEDICO')")`.
+- **A ficha** só pode ser decidida quando se sabe qual ficha é. No backend, é a autorização por **objeto**, e ela precisa do dado: quem é o paciente, quem é o médico responsável, de qual clínica é o prontuário.
+
+O BOLA é a portaria excelente com as fichas numa mesa aberta no corredor. Frameworks resolvem bem as duas primeiras perguntas; a terceira é sua, porque nenhuma anotação genérica sabe a quem um prontuário pertence.
+
+## Vocabulário
+
+| Termo | O que significa | No exemplo da aula |
+|---|---|---|
+| **Autenticação** | Descobrir quem está pedindo | O JWT validado diz que é `pac-bruno` |
+| **Autorização** | Decidir se quem pede pode fazer aquilo naquele recurso | Bruno pode ler o prontuário 1001? |
+| **RBAC** (*Role-Based Access Control*) | Permissões ligadas a papéis | `MEDICO` anota, `ATENDENTE` cadastra |
+| **Permissão fina** (*authority*, *scope*) | Permissões menores que um papel, combinadas por papel | `prontuario:ler`, `exame:ler` |
+| **ABAC** (*Attribute-Based Access Control*) | Decisão por atributos do usuário, do recurso e do contexto | mesma clínica, horário de plantão |
+| **ReBAC** (*Relationship-Based Access Control*) | Decisão pela relação entre usuário e objeto | Carla é médica responsável do prontuário 1001 |
+| **Tenant** | Cada cliente isolado de um sistema compartilhado (SaaS) | As clínicas `sol` e `lua` |
+| **BOLA / IDOR** | Falta de checagem no nível do objeto (API1) | `GET /v0/prontuarios/1001` funciona para qualquer paciente |
+| **BFLA** | Falta de checagem no nível da função (API5) | Paciente consegue chamar o cadastro, que é da recepção |
+| **BOPLA / mass assignment** | Falta de checagem no nível da propriedade (API3) | O JSON escolhe a `clinicaId` e as `anotacoes` |
+| **PDP e PEP** | *Policy Decision Point* decide; *Policy Enforcement Point* aplica | `RegrasDeProntuario` decide; o serviço aplica |
+| **Negar por padrão** | Tudo que não foi liberado explicitamente é proibido | `anyRequest().authenticated()` e regras explícitas |
+| **Falhar fechado** | Na dúvida ou no erro, nega | RLS sem tenant declarado não devolve nenhuma linha |
+
+**IDOR** (*Insecure Direct Object Reference*) é o nome antigo do mesmo problema; o OWASP API Top 10 rebatizou como BOLA para deixar claro que o defeito está na **autorização**, não no id direto, que é normal em REST. E separar PDP de PEP é o que permite trocar uma função Java por um motor de políticas sem reescrever a aplicação.
+
+## Três níveis de autorização
+
+| Nível | Pergunta | Onde mora | Ferramenta no Spring | Depende do dado? |
+|---|---|---|---|---|
+| **Rota** | quem pode chamar `POST /prontuarios`? | antes do controller | `SecurityFilterChain`, `AuthorizationManager` de requisição | não (no máximo, de variáveis do caminho) |
+| **Função / método** | quem pode executar `atualizarAnotacoes()`? | na entrada do caso de uso | `@PreAuthorize("hasRole('MEDICO')")` | não |
+| **Objeto** | **este** prontuário pode ser lido por quem pede? | no caso de uso e na consulta | código Java testável, consulta escopada, bean no SpEL | **sim** |
+
+Os dois primeiros níveis são RBAC clássico. São baratos, declarativos e não precisam de banco. O terceiro precisa carregar algo (o dono, a clínica, o médico responsável) e, por isso, mora perto dos dados. Uma quarta camada, opcional, fica **no banco**: o Row-Level Security do PostgreSQL filtra as linhas pelo tenant mesmo se o código esquecer. Ela não substitui as outras; ela pega o esquecimento.
+
+<Figura legenda="As camadas de autorização da API de prontuários. Cada uma responde a uma pergunta diferente; a de objeto é a única que conhece o dado, e o banco é a rede de proteção">
+<svg viewBox="0 0 680 500" width="680" role="img" aria-labelledby="camadas-titulo camadas-desc">
+  <title id="camadas-titulo">Camadas de autorização, da requisição ao banco</title>
+  <desc id="camadas-desc">Uma requisição com JWT passa por quatro camadas, de cima para baixo. Rota: o SecurityFilterChain exige autenticação e, nas rotas de clínica, compara a clínica do caminho com a do token; nega com 403. Método: @PreAuthorize com hasRole, por exemplo MEDICO para anotar; nega com 403. Objeto: a consulta escopada pela clínica e a RegrasDeProntuario decidem se este prontuário é visível; se não for, responde 404 igual a inexistente. Banco: Row-Level Security filtra as linhas pela clínica declarada na transação, mesmo numa consulta sem WHERE.</desc>
+  <defs><marker id="mk-camadas-aut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="150" y="10" width="300" height="46" rx="10" class="d-box"/>
+  <text x="300" y="39" text-anchor="middle" class="d-title">Requisição com JWT válido</text>
+  <path d="M300 56 L300 80" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <rect x="20" y="82" width="460" height="84" rx="10" class="d-info"/>
+  <text x="40" y="108" class="d-title">1. Rota</text>
+  <text x="40" y="132" class="d-mono">SecurityFilterChain</text>
+  <text x="40" y="154" class="d-label">autenticado? clínica do caminho = clínica do token?</text>
+  <path d="M300 166 L300 190" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <rect x="20" y="192" width="460" height="84" rx="10" class="d-violet"/>
+  <text x="40" y="218" class="d-title">2. Método (função)</text>
+  <text x="40" y="242" class="d-mono">@PreAuthorize("hasRole('MEDICO')")</text>
+  <text x="40" y="264" class="d-label">o papel permite esta operação, para qualquer id?</text>
+  <path d="M300 276 L300 300" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <rect x="20" y="302" width="460" height="84" rx="10" class="d-accent"/>
+  <text x="40" y="328" class="d-title">3. Objeto</text>
+  <text x="40" y="352" class="d-mono">porIdNaClinica + regras.podeVer</text>
+  <text x="40" y="374" class="d-label">este prontuário é visível para quem pede?</text>
+  <path d="M300 386 L300 410" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <rect x="20" y="412" width="460" height="78" rx="10" class="d-ok"/>
+  <text x="40" y="438" class="d-title">4. Banco (defesa em profundidade)</text>
+  <text x="40" y="462" class="d-mono">Row-Level Security por clinica_id</text>
+  <text x="40" y="482" class="d-label">pega o WHERE esquecido</text>
+  <path d="M480 124 L528 124" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <text x="536" y="129" class="d-text">nega: 403</text>
+  <path d="M480 234 L528 234" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <text x="536" y="239" class="d-text">nega: 403</text>
+  <path d="M480 344 L528 344" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <text x="536" y="340" class="d-text">não visível:</text>
+  <text x="536" y="360" class="d-text">404</text>
+  <path d="M480 450 L528 450" class="d-line" marker-end="url(#mk-camadas-aut)"/>
+  <text x="536" y="446" class="d-text">zero linhas</text>
+  <text x="536" y="466" class="d-text">ou erro</text>
+</svg>
+</Figura>
+
+Repare nas saídas à direita: as camadas 1 e 2 negam com **403**, porque a regra delas não depende do objeto e, portanto, a negação não revela nada sobre ele. A camada 3 nega com **404**, porque ali a negação é sobre um objeto específico. Essa diferença é o assunto da seção "404 ou 403?".
+
+## Modelos de autorização: de RBAC a ReBAC
+
+Saber que existem três níveis não diz **como** expressar as regras. Há quatro modelos que você vai encontrar em produção, e eles se somam mais do que competem.
+
+**RBAC.** Cada usuário tem papéis; cada papel libera operações. É simples de auditar ("só `MEDICO` anota") e barato de verificar (está no token). Com o crescimento, os papéis se multiplicam para expressar exceções (`MEDICO_PLANTONISTA_SEM_PRESCRICAO`), a chamada explosão de papéis. E "médico" nunca diz **quais** prontuários.
+
+**Permissões finas.** O código checa permissões pequenas (`hasAuthority('prontuario:anotar')`) e o papel vira um agrupamento configurado fora do código; com OAuth 2.0, os *scopes* viram autoridades `SCOPE_...` (aula 03). Criar um papel novo não exige deploy. Regra prática: **verifique permissões no código, atribua papéis na administração**.
+
+**ABAC.** A decisão usa atributos: do usuário (clínica, especialidade, nível), do recurso (clínica, sigilo, status) e do contexto (horário, rede, dispositivo). "Médicos veem prontuários da própria clínica, exceto os marcados como sigilosos, salvo se forem os responsáveis" é ABAC. A regra `podeVer` desta aula, que compara a clínica do token com a do prontuário, já é um ABAC pequeno escrito em Java.
+
+**ReBAC.** A decisão segue relações: "Carla é responsável pelo prontuário 1001", "o prontuário 1001 pertence à clínica Sol", "Diego é membro da equipe de cardiologia, que tem acesso de leitura à pasta X". É o modelo do Google Docs e do GitHub (dono, editor, leitor, herdados de pastas, times e organizações). O artigo que popularizou o modelo é o do **Zanzibar**, o sistema de autorização do Google (USENIX ATC 2019), que armazena tuplas `objeto#relação@usuário` e responde "este usuário tem esta relação com este objeto?" com consistência e baixa latência em escala global.
+
+Quando as regras saem do tamanho de algumas funções Java, aparecem os **motores de política**, que fazem o papel de PDP fora do código da aplicação:
+
+| Projeto | Modelo | Ideia central |
+|---|---|---|
+| **OPA** (Open Policy Agent, CNCF) | ABAC geral | Políticas na linguagem Rego; a aplicação envia um JSON com usuário, ação e recurso e recebe a decisão. Muito usado também fora de APIs (Kubernetes, CI) |
+| **Cedar** (AWS, código aberto) | ABAC e RBAC | Linguagem de políticas com sintaxe legível e análise formal; é a base do Amazon Verified Permissions |
+| **OpenFGA** (CNCF) e **SpiceDB** | ReBAC no estilo Zanzibar | Um modelo de tipos e relações e um banco de tuplas; a pergunta é `check(usuário, relação, objeto)` e também "liste os objetos que o usuário pode ver" |
+
+Esta aula fica no código Java, conceitualmente. A seção "Visão de pleno e sênior" discute quando vale a pena trocar a função `podeVer` por um desses motores e o que se perde no caminho.
+
+## BOLA: o bug mais comum de API
+
+```http
+GET /v0/prontuarios/1001
+Authorization: Bearer <token válido do paciente pac-bruno>
+```
+
+```json
+{"id":1001,"clinicaId":"sol","pacienteId":"pac-ana","medicoId":"med-carla",
+ "queixa":"Dor de cabeça recorrente","anotacoes":"Suspeita de enxaqueca; pedir ressonância."}
+```
+
+O código por trás é exatamente o que um tutorial de CRUD ensina: buscar por id e devolver. A autenticação está funcionando; o token do Bruno é válido. O que falta é uma linha de raciocínio: "o prontuário 1001 é visível para o Bruno?".
+
+O BOLA lidera a lista do OWASP porque reúne três características ruins:
+
+- **É fácil de explorar.** Não precisa de ferramenta: basta trocar um número. Ids sequenciais tornam a enumeração trivial (um laço de 1 a 1.000.000), mas ids aleatórios também vazam: em links compartilhados, em logs, em respostas de outras rotas, no histórico do navegador, em capturas de tela de suporte.
+- **É difícil de ver em revisão.** O código vulnerável parece correto: tem autenticação, validação, tratamento de erro e teste. O teste, aliás, quase sempre usa um usuário só, o dono, e passa.
+- **O impacto é vazamento em massa.** Um único endpoint com BOLA expõe todos os registros daquele tipo.
+
+Os casos públicos mais citados seguem esse roteiro. Em 2019, a First American Financial, do setor imobiliário dos EUA, expôs centenas de milhões de documentos de clientes porque bastava alterar um número sequencial na URL de um documento compartilhado. Em 2018, uma API do Serviço Postal dos EUA (USPS) permitia que qualquer usuário logado consultasse dados de contas de outros usuários, alterando parâmetros de busca. Em 2021, pesquisadores mostraram que a API da Peloton devolvia dados de perfil de qualquer usuário, inclusive de perfis marcados como privados, para quem tivesse um token qualquer. Em todos, a autenticação funcionava. Faltava a autorização por objeto.
+
+Três defesas **não** resolvem BOLA, e aparecem em entrevistas como armadilha:
+
+1. **UUID no lugar de id sequencial.** Dificulta a enumeração, mas não é controle de acesso. É uma camada útil, não a correção.
+2. **Esconder o id na interface.** O cliente é do atacante; ele vê todas as requisições.
+3. **Validar o token com mais rigor.** O token do atacante é legítimo. O problema não é quem ele é, é o que ele pode tocar.
+
+A única correção é verificar o acesso **a cada operação sobre o objeto**: leitura, edição, exclusão, sub-recursos (`/prontuarios/1001/exames`) e listagens.
+
+## Os primos do BOLA: BFLA e BOPLA
+
+**BFLA** (*Broken Function Level Authorization*, API5) é a falha no nível da função. A rota de cadastro foi pensada para a recepção, mas ninguém configurou a regra de papel. O paciente descobre a rota (na documentação OpenAPI pública, no código do aplicativo, num palpite: se existe `GET /prontuarios`, talvez exista `POST /prontuarios`) e cria prontuários. Rotas administrativas são o alvo clássico: `DELETE /usuarios/{id}`, `POST /admin/reprocessar`. A defesa tem duas partes: **negar por padrão** no `SecurityFilterChain` (`anyRequest().authenticated()` no fim, e nunca `permitAll()` genérico) e uma regra de papel explícita **no caso de uso**, que vale por qualquer porta de entrada (REST, fila, job agendado).
+
+**BOPLA** (*Broken Object Property Level Authorization*, API3) junta duas falhas de nível de propriedade que, até 2019, eram itens separados:
+
+- **Mass assignment** (escrita): o cliente consegue escrever propriedades que não deveria, porque o JSON é convertido direto na entidade. Na versão ingênua desta aula, a recepção da clínica Lua envia `"clinicaId": "sol"` e cria um prontuário dentro de outra clínica; envia `"id": 1002` e **sobrescreve** o prontuário verdadeiro do Bruno; envia `"anotacoes"` e escreve um texto clínico que só um médico poderia escrever.
+- **Exposição excessiva de dados** (leitura): a resposta traz propriedades que a pessoa não deveria ver, contando com o front-end para escondê-las. A recepção precisa ver que a Ana tem consulta com a Carla, mas não as anotações clínicas.
+
+A defesa do BOPLA é a mesma nos dois sentidos: **DTOs explícitos**. Um DTO de entrada por operação, só com os campos que quem chama pode escolher; o resto (tenant, dono, id, carimbos de data) vem do token ou do servidor. E DTOs de saída escolhidos pelo serviço conforme quem pede, em vez de um "DTO completo" que alguém um dia devolve por engano.
+
+## 404 ou 403?
+
+| Situação | Resposta | Por quê |
+|---|---|---|
+| o prontuário de **outro paciente** | **404** | um 403 confirmaria que o id existe; com 404, "não é seu" e "não existe" são indistinguíveis |
+| prontuário de **outra clínica** | **404** | o tenant vizinho não pode nem saber quantos prontuários existem |
+| a recepção **vê** o prontuário, mas tenta anotar | **403** | ela já sabe que o recurso existe; falta a permissão para **aquela** operação |
+| um paciente tenta anotar **qualquer** id | **403** | a regra é de papel, igual para todos os ids: a resposta não depende do objeto e não vaza nada |
+| a recepção da Sol pede `/clinicas/lua/relatorios/...` | **403** | o tenant do caminho não é segredo; o que falta é pertencer a ele |
+
+A regra geral: **a resposta de uma negação não pode depender de informação que a pessoa não tem o direito de saber**. Daí saem duas consequências práticas:
+
+- **Ordem das checagens.** Primeiro "pode ver?" (404), depois "pode fazer?" (403). Se a ordem for invertida, um médico de outra equipe que tenta anotar o prontuário 1001 recebe 403, enquanto para o 9999 recebe 404: a diferença revela que o 1001 existe.
+- **Corpos idênticos.** O 404 de "não é seu" e o de "não existe" precisam ter o mesmo corpo, os mesmos cabeçalhos e, idealmente, o mesmo tempo de resposta. Uma mensagem como "Prontuário pertence a outra clínica" é um vazamento, mesmo com status 404.
+
+<Figura legenda="A ordem das perguntas decide o status. Quem não pode ver recebe exatamente a resposta de 'não existe'">
+<svg viewBox="0 0 700 270" width="700" role="img" aria-labelledby="status-titulo status-desc">
+  <title id="status-titulo">Fluxo de decisão entre 404, 403 e 200</title>
+  <desc id="status-desc">Primeira pergunta: o prontuário existe na clínica do token e é visível para quem pede? Se não, a resposta é 404, com o mesmo corpo de um id inexistente. Se sim, segunda pergunta: quem pede pode fazer esta operação? Se não, 403. Se sim, 200.</desc>
+  <defs><marker id="mk-status-aut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="250" height="84" rx="10" class="d-info"/>
+  <text x="135" y="48" text-anchor="middle" class="d-title">Existe na clínica</text>
+  <text x="135" y="70" text-anchor="middle" class="d-title">e é visível</text>
+  <text x="135" y="92" text-anchor="middle" class="d-label">para quem pede?</text>
+  <path d="M260 62 L330 62" class="d-line" marker-end="url(#mk-status-aut)"/>
+  <text x="295" y="54" text-anchor="middle" class="d-label">sim</text>
+  <rect x="332" y="20" width="220" height="84" rx="10" class="d-violet"/>
+  <text x="442" y="56" text-anchor="middle" class="d-title">Pode fazer esta</text>
+  <text x="442" y="80" text-anchor="middle" class="d-title">operação?</text>
+  <path d="M552 62 L610 62" class="d-line" marker-end="url(#mk-status-aut)"/>
+  <text x="581" y="54" text-anchor="middle" class="d-label">sim</text>
+  <rect x="612" y="38" width="78" height="48" rx="10" class="d-ok"/>
+  <text x="651" y="68" text-anchor="middle" class="d-title">200</text>
+  <path d="M135 104 L135 170" class="d-line" marker-end="url(#mk-status-aut)"/>
+  <text x="145" y="142" class="d-label">não</text>
+  <rect x="10" y="172" width="250" height="84" rx="10" class="d-accent"/>
+  <text x="135" y="202" text-anchor="middle" class="d-title">404</text>
+  <text x="135" y="224" text-anchor="middle" class="d-label">mesmo corpo de</text>
+  <text x="135" y="242" text-anchor="middle" class="d-label">"id inexistente"</text>
+  <path d="M442 104 L442 170" class="d-line" marker-end="url(#mk-status-aut)"/>
+  <text x="452" y="142" class="d-label">não</text>
+  <rect x="332" y="172" width="220" height="84" rx="10" class="d-box"/>
+  <text x="442" y="206" text-anchor="middle" class="d-title">403</text>
+  <text x="442" y="230" text-anchor="middle" class="d-label">ela já sabe que existe</text>
+</svg>
+</Figura>
+
+O 404 não é dogma. Em APIs internas entre serviços, ou quando o recurso é público por natureza (o perfil público de um médico), o 403 é mais honesto e facilita o diagnóstico. A decisão é de produto e de risco; o que não pode é ser inconsistente entre rotas.
+
+## Onde colocar a checagem
+
+Há duas formas de fazer a checagem de objeto, e a diferença entre elas é maior do que parece.
+
+<Comparar antes="Buscar e checar depois" depois="Consulta escopada">
+
+```java
+Prontuario p = repositorio.porId(id)
+        .orElseThrow(() -> naoEncontrado(id));
+if (!p.clinicaId().equals(quem.clinicaId())
+        || !regras.podeVer(quem, p)) {
+    throw naoEncontrado(id);
+}
+```
+
+```java
+Prontuario p = repositorio
+        .porIdNaClinica(id, quem.clinicaId())
+        .filter(x -> regras.podeVer(quem, x))
+        .orElseThrow(() -> naoEncontrado(id));
+// SQL: WHERE id = ? AND clinica_id = ?
+```
+
+</Comparar>
+
+As duas funcionam hoje. A da direita é melhor por quatro motivos:
+
+1. **A regra mais importante (o tenant) está na consulta.** Não há como "esquecer o if": o método do repositório que existe exige a clínica. Se o projeto nem oferecer um `findById` sem escopo para essa entidade, o BOLA entre tenants fica difícil de escrever por acidente.
+2. **Listagens não têm alternativa.** Carregar tudo e filtrar em memória quebra a paginação (a página 1 tem 3 itens em vez de 20), o total (`totalElements` conta itens que a pessoa não vê, vazando volume) e o desempenho. Em listagens, o filtro **tem** de ir para o `WHERE`.
+3. **O "não existe" e o "não é seu" saem do mesmo lugar**, com a mesma exceção.
+4. **O índice ajuda.** Um índice em `(clinica_id, paciente_id)` atende a consulta e a regra.
+
+O `filter` continua necessário para a parte da regra que não cabe num `WHERE` simples (papel, responsável).
+
+E **em que camada**? No caso de uso (o serviço), não no controller. O controller traduz o token num objeto simples (`Solicitante`) e o passa explicitamente. Assim a regra vale para qualquer entrada (REST, mensageria, job), fica testável sem HTTP e não depende de `SecurityContextHolder` espalhado pelo código.
+
+<Callout tipo="erro" titulo="Uma armadilha do JPA ao verificar o acesso antes de um lock">
+Num serviço de transferências, a primeira versão fazia `contas.buscar(origem)` para verificar a posse e, em seguida, `buscarParaAtualizar(origem)` (com `SELECT ... FOR UPDATE`). Sob concorrência, choveram erros 500. A primeira consulta colocou a `Conta` no contexto de persistência; a consulta com lock **travou a linha**, mas o Hibernate devolveu a **mesma instância, com o saldo antigo**, e o `@Version` rejeitou a gravação.
+
+A correção foi verificar a posse com uma consulta que **não carrega a entidade**: `existsByIdAndDono(id, usuario)`, ou fazer a própria consulta com lock já escopada pelo dono. Regra geral: não carregue antes do lock uma entidade que você vai travar.
+</Callout>
+
+## Autorização multi-tenant
+
+Num SaaS, o tenant é a fronteira de autorização mais importante: um vazamento entre pacientes da mesma clínica é grave; um vazamento entre clínicas que são **clientes diferentes** é um incidente que encerra contratos. Quatro decisões tornam o isolamento robusto:
+
+- **O tenant vem do token, nunca do corpo nem de um parâmetro escolhido pelo cliente.** O emissor de tokens coloca a clínica numa claim (`"clinica": "sol"`); a API confia nela porque a assinatura foi validada. Quando o tenant aparece no caminho (`/clinicas/{clinicaId}/...`), ele é **conferido** contra o token, não usado no lugar dele.
+- **Toda consulta filtra pelo tenant.** Sem exceção, inclusive em relatórios, exportações e jobs. É aqui que o padrão `findByIdAndClinicaId` deixa de ser estilo e vira política do projeto.
+- **Ids de outro tenant respondem como inexistentes.** Nem 403, nem mensagem diferente.
+- **Uma camada abaixo pega o esquecimento.** Duas opções comuns:
+  - **Hibernate**: o `@TenantId` (multitenancy por coluna discriminadora, desde o Hibernate 6) preenche e filtra a coluna do tenant a partir de um `CurrentTenantIdentifierResolver`; os *filters* (`@FilterDef` e `@Filter`) acrescentam um critério às consultas quando ativados na sessão. Cuidado: pela documentação do Hibernate, filtros valem para consultas de entidade, **não** para a busca direta por id (`find`), e não valem para SQL nativo.
+  - **PostgreSQL Row-Level Security (RLS)**: uma política na tabela (`USING (clinica_id = current_setting('app.clinica_id', true))`) faz o próprio banco filtrar as linhas. Vale para qualquer SQL que chegue com aquele papel de banco: JPA, nativo, relatório feito à mão. O passo 10 mostra RLS funcionando num PostgreSQL 18 real.
+
+A camada de banco é **defesa em profundidade**: a regra do código continua sendo a principal; o RLS garante que um `SELECT * FROM prontuario` escrito amanhã num relatório novo não vaza entre clínicas.
+
+## Testando autorização: a matriz
+
+Autorização se testa com uma **matriz**: cada combinação relevante de quem pede, operação e recurso, com o resultado esperado. A maior parte dos bugs de autorização não está no caso feliz (o dono lendo o próprio prontuário), e sim nas células que ninguém escreveu: o médico da mesma clínica que não é o responsável, a recepção tentando anotar, o paciente pedindo os exames de outra pessoa, o id que não existe.
+
+As dimensões que a matriz desta aula cobre:
+
+- **Papel**: paciente, médico, recepção.
+- **Relação com o objeto**: dono ou responsável, mesma clínica sem relação, outra clínica.
+- **Existência**: id existente, id inexistente (para comparar com o 404 de "não é seu").
+- **Operação**: ler, anotar, ver exames. E, no checkpoint, listar.
+
+Em qualquer API, não podem faltar: dono × outro usuário × outro tenant em **todas** as rotas com id (inclusive sub-recursos), existe × não existe com o **corpo** do 404 comparado, a listagem filtrada (e o total também) e os campos proibidos no corpo.
+
+Com `@ParameterizedTest`, cada célula vira uma linha de texto, e uma falha aparece com o número da linha e a descrição da regra. O passo 8 mostra a matriz e o passo de "Quando dá errado" mostra o que ela pega. No [exercício 11.03](../../../exercicios/11-seguranca/03-autorizacao-por-dono/), você aplica a mesma ideia numa API de RH, com regras diferentes das desta aula.
+
+## O código que vamos construir
+
+Todo o código está em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.autorizacao`, e roda no CI. A API é de prontuários de uma rede de clínicas, com dois tenants e sete usuários:
+
+| Usuário | Clínica | Papel | Relação com os prontuários |
+|---|---|---|---|
+| `pac-ana` | sol | PACIENTE | dona do 1001 |
+| `pac-bruno` | sol | PACIENTE | dono do 1002 |
+| `med-carla` | sol | MEDICO | responsável pelo 1001 |
+| `med-diego` | sol | MEDICO | responsável pelo 1002 |
+| `atd-elisa` | sol | ATENDENTE | recepção da Sol |
+| `med-heitor` | lua | MEDICO | responsável pelo 1003 |
+| `atd-iara` | lua | ATENDENTE | recepção da Lua |
+
+As regras de negócio:
+
+| Operação | Quem pode | Se não pode |
+|---|---|---|
+| Ler `GET /prontuarios/{id}` | paciente dono, médico responsável, recepção da clínica (sem anotações) | 404 |
+| Listar `GET /prontuarios` | cada um vê o que leria um a um | lista filtrada |
+| Cadastrar `POST /prontuarios` | só recepção; clínica vem do token | 403 (papel) ou 422 (médico ou paciente de fora) |
+| Anotar `PUT /prontuarios/{id}/anotacoes` | só o médico responsável | 403 (papel) ou 404 (não vê) |
+| Exames `GET /prontuarios/{id}/exames` | paciente dono e médico responsável | 404 |
+| Relatório `GET /clinicas/{clinicaId}/relatorios/...` | recepção da própria clínica | 403 |
+
+A autenticação é a da aula 03: um *resource server* que valida JWT. A claim `sub` é o usuário, `clinica` é o tenant e `papeis` vira autoridades `ROLE_...`. Nos testes, o `jwt()` do `spring-security-test` monta o token já validado e passa pelo mesmo conversor de papéis da aplicação:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/Tokens.java" semImports />
+
+## Mão na massa
+
+Os comandos rodam a partir da pasta do módulo:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test -Dtest=BolaNaVersaoIngenuaTest   # uma classe
+mvn test                                   # o módulo inteiro (inclui as outras aulas do módulo 11)
+```
+
+### Passo 1: o modelo e um repositório com duas consultas
+
+**O que vamos fazer e por quê.** O prontuário é um `record` com a clínica, o paciente e o médico responsável: os três atributos de que a autorização precisa. O repositório é em memória (para a aula rodar sem banco), mas com os nomes que um repositório do Spring Data teria. O ponto do passo é ter, lado a lado, uma consulta **sem escopo** e uma **escopada**.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/Prontuario.java" />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/RepositorioDeProntuarios.java" semImports />
+
+**O que acabou de acontecer.** `porId` devolve o prontuário de qualquer clínica. `porIdNaClinica` é o equivalente a `findByIdAndClinicaId` do Spring Data, que gera `WHERE id = ? AND clinica_id = ?`. As listagens (`doPaciente`, `doMedico`, `daClinica`) também recebem a clínica. Num projeto real, a política mais segura é **não ter** o `porId` sem escopo no repositório dessa entidade; aqui ele existe só porque a versão vulnerável precisa dele.
+
+### Passo 2: a versão ingênua e o exploit provado por teste
+
+**O que vamos fazer e por quê.** Antes de corrigir, vamos provar o problema. A versão `/v0` tem autenticação (exige JWT válido) e nada mais: busca por id sem escopo e recebe o corpo direto na entidade.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/ProntuarioControllerIngenuo.java" semImports />
+
+Os testes desta classe **passam porque a falha existe**: cada um descreve, em código, o que um atacante autenticado consegue fazer. É uma forma útil de registrar um achado de pentest antes da correção.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/BolaNaVersaoIngenuaTest.java" semImports />
+
+```bash
+mvn test -Dtest=BolaNaVersaoIngenuaTest
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 6.775 s -- in v0 (vulnerável)
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** Três ataques funcionaram:
+
+- o paciente Bruno leu as anotações da Ana trocando o id (BOLA dentro do tenant);
+- um médico da clínica Lua leu um prontuário da Sol (BOLA entre tenants, o pior caso num SaaS);
+- a recepção da Lua criou um registro com `"clinicaId": "sol"`, escreveu anotações clínicas e, como mandou `"id": 1002`, **sobrescreveu** o prontuário verdadeiro do Bruno (mass assignment).
+
+Agora o teste que um time deveria ter escrito desde o início, "outro paciente não lê o prontuário da Ana", rodado contra a versão vulnerável. Para gerar esta saída, um teste temporário (já removido do projeto) pediu o 1001 como `pac-bruno` e esperou 404:
+
+```text
+[ERROR] TemporarioTest.outroPacienteNaoLe -- Time elapsed: 1.235 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+[HTTP status code]
+expected: 404
+ but was: 200
+```
+
+**Como ler:** o teste de autorização tem **dois usuários**: um dono do dado e outro que tenta acessá-lo. Uma suíte que só usa o dono nunca vê essa linha vermelha. Se o seu projeto não tem nenhum teste com um segundo usuário tentando acessar o recurso do primeiro, você não sabe se tem BOLA.
+
+### Passo 3: o Solicitante e as regras num lugar só
+
+**O que vamos fazer e por quê.** O primeiro passo da correção é dar nome a quem pede e às regras. O `Solicitante` traduz o token em três campos simples; a `RegrasDeProntuario` concentra **todas** as decisões. Listagem, busca, edição e exames vão chamar as mesmas funções. Se cada rota tivesse sua cópia da regra, a primeira mudança deixaria uma delas para trás, e é exatamente assim que o BOLA volta depois de corrigido.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/Solicitante.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/RegrasDeProntuario.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `Solicitante.de` aceita só um `JwtAuthenticationToken` e falha alto (exceção) se faltar a clínica ou o papel. Um token sem tenant é um erro de configuração do emissor, e a resposta certa é recusar, não supor uma clínica padrão: é o **falhar fechado**.
+- Em `podeVer`, a **clínica vem antes de tudo**. Nenhum papel atravessa o tenant. Depois, o `switch` sobre o `enum` é exaustivo: se alguém acrescentar um papel `ENFERMEIRO`, o compilador obriga a decidir o que ele vê, em vez de cair num `default` permissivo.
+- `veAnotacoes` e `podeEditarAnotacoes` reaproveitam `podeVer`. Ninguém edita o que não vê.
+- `podeVerExames(Authentication, long)` é a versão da regra para ser chamada de uma expressão SpEL, no passo 5. O nome do bean, `@Component("regras")`, é o que a expressão usa.
+
+As regras se testam sem Spring, sem HTTP e sem token, em milissegundos:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/RegrasDeProntuarioTest.java" semImports />
+
+```bash
+mvn test -Dtest=RegrasDeProntuarioTest
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in dev.trilhajava.m11.aulas.autorizacao.RegrasDeProntuarioTest
+[INFO] BUILD SUCCESS
+```
+
+O segundo teste merece atenção: um usuário `pac-ana` com token da clínica Lua **não** vê o prontuário da `pac-ana` da Sol. Num SaaS, o identificador do usuário só é único **dentro** do tenant, a menos que o emissor garanta o contrário. Por isso a identidade completa é o par (clínica, usuário).
+
+### Passo 4: o serviço, com consulta escopada, 404 e 403
+
+**O que vamos fazer e por quê.** O serviço aplica as regras na ordem certa e escolhe o DTO de saída. É o PEP: o lugar onde a decisão vira efeito.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/ServicoDeProntuarios.java" semImports destacar="28-35, 52-60, 63-70" />
+
+**O que acabou de acontecer, por trecho.**
+
+- **`listar`** escolhe a consulta pelo papel, todas escopadas pela clínica do token. Não existe "buscar todos e filtrar".
+- **`visivel`** é o coração do BOLA corrigido: consulta escopada pelo tenant, `filter` com a regra do objeto e **uma única** exceção para os dois casos. Ela também registra a negação na auditoria (passo 9).
+- **`atualizarAnotacoes`** mostra as três camadas num método só: `@PreAuthorize("hasRole('MEDICO')")` (função, 403 para qualquer id), `visivel` (objeto, 404) e `podeEditarAnotacoes` (operação sobre o objeto visível, 403). Hoje, todo médico que vê um prontuário é o responsável, então o terceiro `if` nunca dispara; ele está ali porque as regras mudam (um médico plantonista que vê, mas não anota) e, quando mudarem, a ordem 404 → 403 já está garantida.
+- **`criar`** pega a clínica do token, nunca do corpo, e valida que o médico e o paciente pertencem a ela. A mesma resposta (422) para "médico não existe" e "médico é de outra clínica": a recepção da Lua não deve conseguir descobrir quem trabalha na Sol.
+- **`resposta`** escolhe entre `completo` e `resumo`. O DTO de saída tem duas fábricas e nenhum construtor "completo" usado por aí:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/ProntuarioResposta.java" />
+
+O controller corrigido só traduz HTTP: tira a identidade do `Authentication` e repassa ao serviço.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/ProntuarioController.java" semImports />
+
+E o tratador de erros transforma as exceções em Problem Details (RFC 9457). O corpo do 404 é **fixo**: nada nele depende de o prontuário existir.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/TratadorDeErros.java" semImports />
+
+Os testes da API corrigida repetem os ataques do passo 2:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/ProntuarioApiTest.java" semImports destacar="55-67" />
+
+```bash
+mvn test -Dtest=ProntuarioApiTest
+```
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in mass assignment
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in BOLA
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in method security com bean e AuthorizationManager de rota
+[INFO] Tests run: 0, Failures: 0, Errors: 0, Skipped: 0 -- in API corrigida
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.** O teste `outroPacienteRecebe404Identico` compara o corpo do 404 do prontuário da Ana com o de um id inexistente. Na primeira versão deste teste, a comparação era byte a byte, e ela **falhou**: o Problem Details do Spring inclui o campo `instance` com o caminho pedido (`/prontuarios/1001` num, `/prontuarios/9999` no outro). Esse campo ecoa o que o próprio cliente pediu e não revela nada, então o teste passou a comparar `type`, `title`, `status` e `detail`. O teste de "respostas idênticas" obriga você a decidir, campo a campo, o que pode vazar.
+
+### Passo 5: method security com bean no SpEL
+
+**O que vamos fazer e por quê.** O Spring Security tem um segundo mecanismo de autorização, além das rotas: o **method security**, ligado com `@EnableMethodSecurity`. Ele intercepta chamadas a métodos de beans do Spring (por proxy, via AOP) e avalia anotações:
+
+| Anotação | Quando avalia | Uso típico |
+|---|---|---|
+| `@PreAuthorize` | antes de executar o método | papel, permissão, regra com os argumentos (`#id`) |
+| `@PostAuthorize` | depois, com acesso a `returnObject` | regra que depende do que foi carregado |
+| `@PreFilter` | antes, filtrando uma coleção recebida | raro |
+| `@PostFilter` | depois, filtrando a coleção devolvida (`filterObject`) | listas pequenas e não paginadas |
+
+As expressões são SpEL (*Spring Expression Language*). Além de `hasRole` e `hasAuthority`, elas podem referenciar **beans** com `@nomeDoBean.metodo(...)`, receber o `authentication` e os argumentos do método por nome (`#prontuarioId`, o que exige compilar com `-parameters`, como este projeto faz). É assim que uma regra de objeto escrita em Java aparece declarada na assinatura do método:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/ServicoDeExames.java" semImports />
+
+O problema: quando o `@PreAuthorize` nega, o padrão é lançar `AuthorizationDeniedException` (uma `AccessDeniedException`), que vira **403**. Para uma regra de objeto, isso confirma que o prontuário existe. O `@HandleAuthorizationDenied` troca esse comportamento por um `MethodAuthorizationDeniedHandler`, que pode devolver um valor substituto ou lançar outra exceção:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/NegacaoViraNaoEncontrado.java" semImports />
+
+**O que acabou de acontecer.** Na chamada `exames(1001)` feita pelo Bruno, o proxy avalia `@regras.podeVerExames(authentication, 1001)`, recebe `false`, chama o handler, e o handler lança `ProntuarioNaoEncontradoException`, que o tratador de erros transforma no mesmo 404 do passo 4. O teste `examesComBeanNoSpel` confere os três casos (dona 200, outro paciente 404, inexistente 404). O handler é um `@Component`: o Spring Security procura um bean daquela classe no contexto antes de instanciar um novo, o que permite injetar dependências nele.
+
+Compare as duas formas de fazer a mesma regra de objeto:
+
+| | Regra no corpo do serviço (passo 4) | Regra no `@PreAuthorize` (passo 5) |
+|---|---|---|
+| Onde se lê a regra | no código, junto da consulta | na assinatura do método |
+| Custo | uma consulta (já escopada) | duas: a do bean e a do método |
+| 404 × 403 | natural | exige `@HandleAuthorizationDenied` |
+| Erros de digitação | o compilador pega | só em tempo de execução (ver "Quando dá errado") |
+| Chamadas internas (`this.metodo()`) | protegidas | **não** passam pelo proxy |
+
+Uma divisão que funciona bem: **papéis e permissões no `@PreAuthorize`**, regras de objeto em Java chamado pelo serviço, e beans no SpEL quando o time quer a regra na assinatura e aceita a consulta extra. O `@PostAuthorize` roda **depois** do método (nunca em métodos com efeito colateral), e o `@PostFilter` filtra em memória, quebrando paginação e totais.
+
+<Callout tipo="dica" titulo="Anotações com nome de negócio">
+Expressões repetidas viram meta-anotações: uma `@interface PodeAnotar` anotada com `@PreAuthorize("hasRole('MEDICO')")` funciona como a própria `@PreAuthorize`. Com um bean `AnnotationTemplateExpressionDefaults`, a meta-anotação aceita parâmetros (`@PreAuthorize("hasRole('{value}')")`). O ganho é legibilidade e um único lugar para mudar a expressão.
+</Callout>
+
+### Passo 6: um AuthorizationManager de rota para o tenant
+
+**O que vamos fazer e por quê.** Algumas rotas carregam o tenant no caminho: `/clinicas/{clinicaId}/relatorios/atendimentos-por-medico`. A checagem "a clínica do caminho é a do token" não depende de banco e pode ser feita **antes** de qualquer controller rodar, no `SecurityFilterChain`. Para isso, escrevemos um `AuthorizationManager`: a interface central de decisão do Spring Security, que recebe a autenticação e o objeto protegido e devolve um `AuthorizationResult`.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/MesmaClinicaDaRota.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/SegurancaDosProntuarios.java" semImports destacar="32-42" />
+
+**O que acabou de acontecer.**
+
+- `requestMatchers("/clinicas/{clinicaId}/**")` extrai a variável do caminho, e o `RequestAuthorizationContext.getVariables()` a entrega ao nosso manager.
+- `AuthorizationManagers.allOf(...)` combina dois managers: o papel `ATENDENTE` **e** a mesma clínica. Os dois precisam conceder.
+- `anyRequest().authenticated()` no fim é o "negar por padrão" contra BFLA: uma rota nova sem regra exige, no mínimo, autenticação, e a regra de papel fica no caso de uso.
+- `@EnableMethodSecurity` liga `@PreAuthorize`, `@PostAuthorize`, `@PreFilter` e `@PostFilter`. O starter de segurança do Spring Boot **não** liga o method security sozinho: sem essa anotação, os `@PreAuthorize` do projeto viram comentário. O "Quando dá errado" mostra o efeito.
+- O bean `AuthorizationEventPublisher` faz o Spring Security publicar um `AuthorizationDeniedEvent` a cada negação de rota ou de método (passo 9).
+
+Os testes `relatorioDaPropriaClinica`, `relatorioDeOutraClinica` e `relatorioSemPapel` cobrem as três combinações: a recepção da Sol vê o relatório da Sol (200 com `{"med-carla": 1, "med-diego": 1}`), a mesma pessoa pedindo o da Lua recebe 403, e uma médica da Sol, sem o papel, também recebe 403.
+
+<Callout tipo="info" titulo="authorize, não check">
+No Spring Security 7, o método a implementar é `authorize(...)`, que devolve `AuthorizationResult`; o antigo `check(...)`, que devolvia `AuthorizationDecision`, foi descontinuado e aparece em muitos exemplos antigos da internet. O `AuthorizationDecision` continua existindo como implementação simples de `AuthorizationResult`.
+</Callout>
+
+### Passo 7: mass assignment barrado por DTO
+
+**O que vamos fazer e por quê.** O cadastro recebe um DTO que só tem o que a recepção pode escolher: paciente, médico e queixa. `id`, `clinicaId` e `anotacoes` simplesmente não existem nele.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/NovoProntuario.java" />
+
+O teste `camposProibidosIgnorados` repete o ataque do passo 2: a recepção da Lua manda `"id": 1002`, `"clinicaId": "sol"` e `"anotacoes": "Alta definitiva."`. O resultado:
+
+- **201**, com o corpo `{"id": 1004, "pacienteId": "pac-julia", "medicoId": "med-heitor", "queixa": "Retorno"}`: id gerado pelo servidor, sem anotações;
+- o prontuário salvo é da clínica **lua** (a do token);
+- o prontuário 1002 do Bruno continua com `LDL 190 mg/dL; iniciar estatina.`.
+
+**O que acabou de acontecer.** Os campos extras foram **ignorados em silêncio**: a configuração do Jackson do Spring Boot não falha com propriedades desconhecidas. Isso é seguro, porque o DTO não tem onde guardar esses campos, mas esconde do cliente que ele mandou algo errado. Se você preferir rejeitar (400) qualquer campo desconhecido, ligue a opção `FAIL_ON_UNKNOWN_PROPERTIES` do Jackson na configuração da aplicação. Rejeitar detecta clientes mal escritos; ignorar facilita a evolução da API. Escolha uma política e documente no contrato.
+
+O teste `medicoDeOutraClinica` mostra a validação de relações: a recepção da Lua tenta cadastrar um prontuário com `med-carla` (da Sol) e recebe **422**. E `pacienteNaoCadastra` é o BFLA barrado: o `@PreAuthorize("hasRole('ATENDENTE')")` do serviço responde 403 para a paciente.
+
+### Passo 8: a matriz parametrizada
+
+**O que vamos fazer e por quê.** Agora a seção "Testando autorização: a matriz" vira código. Cada linha é uma célula: usuário, operação, prontuário, status esperado e a regra em português.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/MatrizDeAutorizacaoTest.java" semImports />
+
+```bash
+mvn test -Dtest=MatrizDeAutorizacaoTest
+```
+
+```text
+[INFO] Tests run: 18, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.929 s -- in dev.trilhajava.m11.aulas.autorizacao.MatrizDeAutorizacaoTest
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@CsvSource(textBlock = ...)` com `delimiter = '|'` deixa a matriz legível como uma tabela. Linhas que começam com `#` são comentários do JUnit, por isso o cabeçalho não vira um caso de teste.
+- A quinta coluna (a regra) entra na asserção com `.as(regra)`: quando uma linha falha, a mensagem diz **qual regra** quebrou.
+- Repare nas linhas de `ANOTAR`: o paciente recebe **403** para o 1001 e também receberia para qualquer outro id, porque a regra de papel vem antes. Já o `med-diego` recebe **404** tanto para o 1001 quanto para o 9999. As duas respostas são consistentes: nenhuma delas varia com a existência do prontuário.
+- A matriz não precisa ser combinatória; precisa cobrir as **classes de equivalência** (dono, mesma clínica sem relação, outra clínica, inexistente) para cada papel e operação.
+
+### Passo 9: auditoria das negações
+
+**O que vamos fazer e por quê.** Em dados de saúde (dado pessoal sensível na LGPD), não basta negar: é preciso **saber** quem tentou acessar o quê. Uma sequência de 404 do mesmo usuário em ids variados é a assinatura de alguém enumerando prontuários. A auditoria tem duas fontes: as negações que o serviço decide (404 e 403 de objeto) e as que o Spring Security decide (rota e `@PreAuthorize`), que chegam como `AuthorizationDeniedEvent`.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/autorizacao/RegistroDeNegacoes.java" semImports />
+
+Rodando a matriz, o log mostra as duas fontes (trecho real, com o prefixo de data e processo encurtado para `WARN ...`):
+
+```text
+WARN ... auditoria.autorizacao: negado usuario=pac-bruno clinica=sol operacao=ler recurso=prontuario/1001 resultado=404
+WARN ... auditoria.autorizacao: negado usuario=pac-bruno clinica=sol operacao=ler recurso=prontuario/9999 resultado=404
+WARN ... auditoria.autorizacao: negado usuario=med-diego clinica=sol operacao=ler recurso=prontuario/1001 resultado=404
+WARN ... auditoria.autorizacao: negado usuario=med-heitor clinica=lua operacao=ler recurso=prontuario/1001 resultado=404
+WARN ... auditoria.autorizacao: negado usuario=atd-iara clinica=lua operacao=ler recurso=prontuario/1001 resultado=404
+WARN ... auditoria.autorizacao: negado usuario=pac-ana clinica=? operacao=spring-security recurso=metodo/atualizarAnotacoes resultado=NEGADO
+WARN ... auditoria.autorizacao: negado usuario=pac-bruno clinica=? operacao=spring-security recurso=metodo/atualizarAnotacoes resultado=NEGADO
+WARN ... auditoria.autorizacao: negado usuario=med-diego clinica=sol operacao=editar-anotacoes recurso=prontuario/1001 resultado=404
+...
+WARN ... auditoria.autorizacao: negado usuario=atd-elisa clinica=? operacao=spring-security recurso=metodo/exames resultado=NEGADO
+WARN ... auditoria.autorizacao: negado usuario=med-heitor clinica=? operacao=spring-security recurso=metodo/exames resultado=NEGADO
+```
+
+Repare que as duas primeiras linhas, a do prontuário da Ana e a do id inexistente, são iguais para o cliente (404 com o mesmo corpo), mas a auditoria registra cada tentativa: é ela, e não a resposta HTTP, que ajuda o suporte e a segurança a entender o que aconteceu.
+
+**O que acabou de acontecer.**
+
+- As linhas com `resultado=404` vêm do serviço, com a clínica e a operação de negócio.
+- As linhas `spring-security` vêm do evento: `metodo/atualizarAnotacoes` é o `@PreAuthorize` de papel; `metodo/exames` é o `@PreAuthorize` com bean, **mesmo** quando o `@HandleAuthorizationDenied` transforma a resposta em 404. Para uma negação de rota, o recurso aparece como `rota/clinicas/lua/relatorios/atendimentos-por-medico` (o teste `relatorioDeOutraClinica` confere a linha exata).
+- O registro tem **quem, o quê, qual recurso e o resultado**. Nunca o conteúdo: nada de anotações, queixa ou corpo da requisição no log de auditoria.
+
+Em produção, esse registro vai para um destino separado dos logs de aplicação (um índice de auditoria, imutável, com retenção definida), e um alerta dispara quando um mesmo usuário acumula negações acima de um limite em poucos minutos. O módulo de observabilidade mostra como montar esse tipo de alerta.
+
+### Passo 10: Row-Level Security no PostgreSQL
+
+**O que vamos fazer e por quê.** A última camada fica no banco. O teste abaixo usa Testcontainers (aula 10.05) para subir um PostgreSQL 18, cria a tabela com uma política RLS e conecta como um papel de aplicação, separado do dono da tabela.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/RlsNoPostgresTest.java" semImports />
+
+```bash
+mvn test -Dtest=RlsNoPostgresTest
+```
+
+Com o Docker rodando, o resultado esperado é `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0`: cada teste confere uma propriedade da política (as asserções estão no código acima). Sem Docker, o `@EnabledIfDockerAvailable` pula a classe em vez de falhar, e a saída fica assim:
+
+```text
+[WARNING] Tests run: 5, Failures: 0, Errors: 0, Skipped: 5, Time elapsed: 0.010 s -- in RLS no PostgreSQL
+[INFO] BUILD SUCCESS
+```
+
+Um `Skipped` não é um verde: no CI, garanta que o Docker existe, ou a camada de banco fica sem teste sem ninguém perceber.
+
+**O que acabou de acontecer, peça por peça.**
+
+- `ENABLE ROW LEVEL SECURITY` liga o mecanismo na tabela. Sem nenhuma política, um papel comum não veria **nenhuma** linha: RLS falha fechado.
+- `CREATE POLICY ... USING (...)` define quais linhas existentes ficam visíveis (para `SELECT`, `UPDATE` e `DELETE`); `WITH CHECK (...)` define quais linhas novas ou alteradas podem ser gravadas (`INSERT` e `UPDATE`).
+- `current_setting('app.clinica_id', true)` lê uma variável de configuração da sessão. O segundo argumento, `true`, faz a função devolver `NULL` em vez de erro quando a variável não foi definida; `clinica_id = NULL` nunca é verdadeiro, então a consulta não vê nada.
+- `set_config('app.clinica_id', ?, true)` define a variável **só para a transação atual** (o terceiro argumento é o `is_local`). O teste `semClinicaNaoVeNada` prova que, depois do `commit`, a mesma conexão volta a não ver nada. Isso é essencial com pool de conexões: com `is_local = false`, a clínica de uma requisição ficaria grudada na conexão e seria herdada pela próxima requisição, de outro tenant.
+- O `UPDATE` de uma linha de outra clínica afeta **zero** linhas, sem erro: para aquele papel, a linha não existe. O `INSERT` com a clínica errada, por outro lado, é rejeitado com erro, por causa do `WITH CHECK`.
+- O dono da tabela (aqui, o superusuário do container) **ignora** a política. Superusuários e papéis com o atributo `BYPASSRLS` sempre ignoram; o dono ignora a menos que a tabela tenha `FORCE ROW LEVEL SECURITY`. Por isso a aplicação conecta com `app_clinicas`, que não é dono nem superusuário, e as migrations rodam com outro papel.
+
+Na aplicação Spring, o `set_config` é feito no começo de cada transação, com a claim `clinica` do token (por exemplo, num aspecto em volta dos métodos `@Transactional`). O contrato: **sem tenant declarado, zero linhas**.
+
+### Passo 11: a suíte inteira
+
+```bash
+mvn test
+```
+
+O trecho desta aula (aqui, numa máquina sem Docker; tempos removidos):
+
+```text
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in v0 (vulnerável)
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.autorizacao.CheckpointListagemTest
+[INFO] Tests run: 18, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.autorizacao.MatrizDeAutorizacaoTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in mass assignment
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in BOLA
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in method security com bean e AuthorizationManager de rota
+[INFO] Tests run: 0, Failures: 0, Errors: 0, Skipped: 0 -- in API corrigida
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in dev.trilhajava.m11.aulas.autorizacao.RegrasDeProntuarioTest
+[WARNING] Tests run: 5, Failures: 0, Errors: 0, Skipped: 5 -- in RLS no PostgreSQL
+[WARNING] Tests run: 48, Failures: 0, Errors: 0, Skipped: 5
+[INFO] BUILD SUCCESS
+```
+
+São 48 testes: 3 que documentam a falha da `/v0`, 12 da API corrigida, 18 da matriz, 7 do checkpoint (não abra `CheckpointListagemTest` ainda), 3 das regras puras e 5 de RLS no PostgreSQL. Os de RLS são pulados (`Skipped`) quando o Docker não está disponível, graças ao `@EnabledIfDockerAvailable`.
+
+## Quando dá errado
+
+As mensagens abaixo são reais: foram geradas quebrando o código de propósito e rodando a suíte.
+
+### O teste com dois usuários falha: expected 404, but was 200
+
+É a saída do passo 2: o Bruno pediu o prontuário da Ana e recebeu 200.
+
+```text
+org.opentest4j.AssertionFailedError:
+[HTTP status code]
+expected: 404
+ but was: 200
+```
+
+**Como ler:** a API devolveu um objeto que não pertence a quem pediu. **Como corrigir:** procure, no caminho dessa rota, a consulta por id. Se ela não recebe o tenant e não passa por uma função de regra, é BOLA. Troque por uma consulta escopada (`findByIdAndClinicaId`) seguida da regra única de visibilidade, e acrescente a linha correspondente na matriz.
+
+### Esqueceram o @EnableMethodSecurity
+
+Para gerar esta saída, a anotação `@EnableMethodSecurity` foi comentada em `SegurancaDosProntuarios` e a matriz foi rodada:
+
+```text
+[ERROR] Tests run: 18, Failures: 3, Errors: 0, Skipped: 0 <<< FAILURE! -- in dev.trilhajava.m11.aulas.autorizacao.MatrizDeAutorizacaoTest
+[ERROR] ...MatrizDeAutorizacaoTest.matriz(String, String, long, int, String)[10] <<< FAILURE!
+expected: 403
+ but was: 404
+[ERROR] ...MatrizDeAutorizacaoTest.matriz(String, String, long, int, String)[17] <<< FAILURE!
+expected: 404
+ but was: 200
+[ERROR] ...MatrizDeAutorizacaoTest.matriz(String, String, long, int, String)[18] <<< FAILURE!
+expected: 404
+ but was: 200
+```
+
+**Como ler:** a aplicação subiu sem erro nenhum. Os `@PreAuthorize` continuaram no código, mas ninguém os avaliava. As linhas 17 e 18 da matriz mostram o estrago: a recepção (`atd-elisa`) e um médico de **outra clínica** (`med-heitor`) leram os exames do prontuário 1001, porque a única regra dos exames era a do `@PreAuthorize`. A linha 10 é mais sutil: o paciente Bruno, que deveria receber 403 pela regra de papel, recebeu 404 porque a checagem de objeto no corpo do serviço pegou. Ou seja, **a regra de objeto em código Java sobreviveu**, e a regra que só existia na anotação, não. **Como corrigir:** volte a anotação. E aprenda a lição de projeto: uma regra de objeto que mora **apenas** numa anotação depende de configuração para existir; a matriz é o que garante que alguém percebe.
+
+### O nome do bean no SpEL está errado
+
+Trocando `@regras` por `@regra` no `ServicoDeExames`:
+
+```text
+[ERROR] ProntuarioApiTest.examesComBeanNoSpel -- Time elapsed: 2.456 s <<< FAILURE!
+Request failed unexpectedly:
+ jakarta.servlet.ServletException: Request processing failed: java.lang.IllegalArgumentException: Failed to evaluate expression '@regra.podeVerExames(authentication, #prontuarioId)'
+ Caused by: org.springframework.expression.spel.SpelEvaluationException: EL1058E: A problem occurred when trying to resolve bean 'regra': 'Could not resolve bean reference against BeanFactory'
+```
+
+**Como ler:** a aplicação **subiu normalmente**. A expressão é uma string, e o Spring só a avalia quando o método é chamado. O erro aparece na primeira requisição, como 500. **Como corrigir:** acerte o nome do bean (`@Component("regras")`). Para prevenir: todo método com `@PreAuthorize` com bean precisa de ao menos um teste que o chame, e expressões repetidas devem virar meta-anotações, para existir um único lugar onde o nome está escrito.
+
+### RLS recusa a gravação
+
+O `INSERT` de uma linha da clínica Sol numa transação declarada como Lua termina numa `SQLException` cuja mensagem contém `violates row-level security policy` e o nome da tabela; é exatamente o trecho que o teste `naoGravaEmOutraClinica` confere com `hasMessageContaining`.
+
+**Como ler:** a política tem `WITH CHECK`, e a linha nova não passa nele. Em produção, isso aparece como 500 e, se acontecer, é sinal de um bug grave no código (o tenant do registro veio de algum lugar que não o token). **Como corrigir:** descubra de onde veio a clínica errada; não "conserte" a política.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Regra espalhada e escrita por rota" depois="Uma função de regra, consultas escopadas">
+
+```java
+// ProntuarioController
+if (!p.pacienteId().equals(usuario)) throw ...;
+// ExameController
+if (!p.pacienteId().equals(usuario)
+        && !p.medicoId().equals(usuario)) throw ...;
+// RelatorioJob
+repositorio.todos(); // ninguém lembrou do tenant
+```
+
+```java
+// todas as rotas, filas e jobs
+repositorio.porIdNaClinica(id, quem.clinicaId())
+        .filter(p -> regras.podeVer(quem, p))
+        .orElseThrow(() -> naoEncontrado(id));
+// e uma matriz que testa cada rota
+```
+
+</Comparar>
+
+As armadilhas que mais aparecem em revisão e em pentest:
+
+- **Confiar no front-end.** "O botão de editar só aparece para o médico" não é autorização. Toda regra vale no servidor.
+- **Identidade vinda do cliente.** `GET /prontuarios?pacienteId=pac-ana` com o filtro aplicado como veio, ou `X-Clinica-Id` num cabeçalho escolhido pelo cliente: o atacante só troca o valor. A identidade e o tenant vêm do token validado.
+- **Checar o pai e esquecer o filho.** `/prontuarios/1001` está protegido, mas `/prontuarios/1001/exames` ou `/exames/77` (com o exame carregando o prontuário) não. Cada rota que recebe um id precisa da sua linha na matriz.
+- **Listagem que vaza pelo total ou pela busca.** A página vem filtrada, mas o `totalElements` conta todos; ou a busca por nome devolve "nenhum resultado" num caso e 403 em outro, revelando quem existe.
+- **`@PostAuthorize` em método com efeito colateral.** O método já executou (e gravou, e notificou) quando a checagem nega.
+- **Chamadas internas que pulam o proxy.** `this.exames(id)` dentro do mesmo bean não passa pelo `@PreAuthorize`. Se a regra precisa valer em chamadas internas, ela não pode morar só na anotação.
+- **Cache que ignora quem pede.** Um `@Cacheable("prontuarios")` com chave só no id devolve, para o Bruno, a resposta que foi calculada para a Ana. A chave precisa incluir quem pede, ou o cache fica abaixo da autorização (no repositório, antes da regra).
+
+**Quando NÃO usar cada ferramenta:**
+
+- **Não use `@PreAuthorize` com bean para toda regra de objeto** só porque fica bonito na assinatura. Em métodos chamados em laço (uma exportação de mil prontuários), a consulta extra por chamada vira mil consultas extras.
+- **Não use `@PostFilter` em listagens paginadas ou grandes.** Filtrar em memória o que o banco devolveu quebra paginação e totais e carrega dados que a pessoa não pode ver.
+- **Não comece com um motor de políticas** (OPA, Cedar, OpenFGA) num serviço com cinco regras e um time. O custo de operação e de latência só se paga quando as regras são muitas, mudam com frequência ou precisam ser compartilhadas entre serviços.
+- **Não use RLS como a regra principal.** Ele não conhece papel, responsável, nem a diferença entre 404 e 403. É a rede de proteção, não o trapézio.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Onde a regra mora é uma decisão de arquitetura.** Há três lugares possíveis para o PDP: no código de cada serviço (funções como `podeVer`), numa biblioteca compartilhada entre serviços, ou num serviço de autorização externo (OPA como sidecar, OpenFGA ou Cedar como serviço). No código, a regra é rápida, tipada, testável com JUnit e fácil de depurar, mas cada serviço reimplementa e as regras divergem. Num serviço externo, a regra é única e auditável, muda sem deploy dos consumidores e pode ser analisada (o Cedar, por exemplo, foi desenhado para permitir verificação formal de políticas). O preço é real: uma chamada de rede no caminho de cada requisição (latência, que se combate com cache e com o motor rodando ao lado da aplicação), um novo ponto de falha (e a decisão de falhar fechado quando ele cai, o que derruba a funcionalidade junto), e a necessidade de **sincronizar dados**: o motor ReBAC só sabe que a Carla é responsável pelo 1001 se alguém gravar essa tupla, e manter o banco da aplicação e o banco de tuplas consistentes é um problema de mensageria e consistência eventual (módulo 12). A recomendação de base: comece com as regras no código, numa classe única por agregado, com a matriz de testes; extraia para um motor quando aparecerem os sinais (dezenas de regras, compartilhamento entre muitos serviços, regras editadas por quem não programa, exigência de auditoria das próprias políticas).
+
+**Listagens separam os modelos.** "O Bruno pode ver o 1001?" é fácil em qualquer motor; "liste, paginados, os prontuários que o Bruno pode ver" é difícil quando a regra mora fora do banco. Antes de adotar um motor, prototipe a listagem mais importante do produto.
+
+**Multi-tenant: escolha o isolamento pelo risco e pelo custo.** Três modelos: coluna discriminadora (todas as clínicas na mesma tabela, `clinica_id` em toda linha), esquema por tenant e banco por tenant. A coluna é a mais barata e a que exige mais disciplina: um `WHERE` esquecido vaza tudo, e é por isso que RLS e `@TenantId` existem. Banco por tenant isola de verdade (inclusive desempenho e backup por cliente), mas multiplica migrations, conexões e custo; costuma ser oferecido só a clientes grandes ou regulados. Muitos SaaS usam a coluna para a maioria e banco dedicado como produto premium. Em qualquer modelo, o tenant vem do token e é conferido em toda consulta.
+
+**RLS em produção tem detalhes de operação.** Toda consulta precisa rodar numa transação que declarou o tenant (fora dela, não vê nada: falha fechada, mas aparece como bug funcional). As políticas entram no plano de execução, então um índice que comece por `clinica_id` evita varreduras. E jobs legítimos que cruzam tenants (o faturamento da plataforma) usam um papel separado, com acesso auditado.
+
+**Como justificar para o time.** O argumento que convence é de risco e custo de incidente, não de elegância. Um vazamento de prontuários é incidente de segurança com dado sensível, comunicação à ANPD e aos titulares, e dano de reputação; um BOLA é o achado número um de qualquer pentest de API. Frente a isso, o custo das defesas é pequeno: uma convenção de repositório (só consultas escopadas), uma classe de regras por agregado, uma matriz parametrizada no CI e uma política RLS por tabela. Coloque a matriz como **critério de pronto** de qualquer rota nova que receba id: sem as linhas de outro usuário e outro tenant, a história não fecha.
+
+**Auditoria é requisito, não enfeite.** Em saúde e finanças, também o acesso **concedido** a dados sensíveis costuma ser registrado ("quem leu o prontuário da Ana"). Muitas negações seguidas do mesmo usuário são enumeração em andamento: alerte, e combine com o limite de requisições (aula 06).
+
+**Quando trocar de abordagem.** Regras configuráveis por cliente, delegação (o paciente compartilha o prontuário com um médico de fora) e hierarquias profundas apontam para ReBAC. SQL nativo, ferramentas de BI no banco ou um histórico de `WHERE` esquecido apontam para RLS.
+
+<Callout tipo="entrevista">
+**"Como você evitaria que um usuário acesse o recurso de outro?"** Não responda "com Spring Security". Uma boa resposta separa autenticação de autorização e os três níveis: rota e papel resolvem quem pode chamar; o objeto exige checagem no caso de uso, em toda operação por id, com consulta escopada pelo tenant e pelo dono, uma função de regra única e 404 com corpo idêntico ao de "não existe". Cite BOLA como API1 do OWASP API Top 10 e diga como testa: matriz com dois usuários e dois tenants.
+
+**"404 ou 403?"** O que a pessoa não pode saber que existe recebe 404; a operação proibida num recurso visível, ou uma regra de papel que vale para qualquer id, recebe 403. Ordem: primeiro "pode ver", depois "pode fazer".
+
+**"@PreAuthorize ou regra no código?"** Papéis e permissões na anotação; regra de objeto em código Java testável, ou num bean chamado pelo SpEL, sabendo que a negação padrão é 403 (`@HandleAuthorizationDenied` muda isso), que chamadas internas pulam o proxy e que a expressão só é avaliada em tempo de execução. Bônus: lembrar que `@EnableMethodSecurity` não vem ligado.
+
+**"Como garantir isolamento entre clientes num SaaS?"** Tenant na claim do token, filtro em toda consulta, ids de outro tenant como inexistentes, e RLS ou `@TenantId` como defesa em profundidade.
+
+**"Quando usar OPA, Cedar ou OpenFGA?"** Quando as regras crescem, são compartilhadas ou envolvem relações e delegação, aceitando latência, disponibilidade e sincronização de dados como custo.
+</Callout>
+
+## Checkpoint
+
+A matriz do passo 8 cobre ler, anotar e ver exames, mas não cobre a **listagem**. Um bug comum é a listagem do médico usar `daClinica` em vez de `doMedico`: todos os médicos passariam a ver os prontuários de toda a clínica, e nenhum teste atual perceberia.
+
+**O desafio:** escreva `MinhaMatrizDeListagemTest`, um teste parametrizado em que cada linha tem um usuário e os ids que ele deve ver em `GET /prontuarios`, na ordem. Cubra os sete usuários. Rode e, para conferir que o teste pega o bug, troque temporariamente `doMedico` por `daClinica` no `ServicoDeProntuarios` e veja quais linhas falham (desfaça a troca depois).
+
+<details>
+<summary>Solução</summary>
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/autorizacao/CheckpointListagemTest.java" semImports />
+
+```bash
+mvn test -Dtest=CheckpointListagemTest
+```
+
+```text
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.257 s -- in dev.trilhajava.m11.aulas.autorizacao.CheckpointListagemTest
+```
+
+**Por que assim.** Cada linha é uma classe de equivalência: paciente (vê o seu), médico (vê os que acompanha), recepção (vê a clínica inteira) e, para cada papel, a outra clínica. Com o bug do `daClinica`, falham as linhas de `med-carla` e `med-diego` (veriam `1001 1002`); as de Lua continuam passando, porque `med-heitor` é o único médico de lá. Esse é o motivo de ter **dois** médicos na mesma clínica nos dados de teste: com um só, o bug passaria. `containsExactly` confere também que não há itens extras, que é exatamente o vazamento.
+
+**Alternativa.** Em vez de ids fixos, a matriz poderia derivar o esperado chamando `regras.podeVer` para cada prontuário. Fica mais curta, mas deixa de testar a regra: se `podeVer` estiver errado, o teste concorda com o erro. Em testes de autorização, prefira o esperado escrito à mão.
+
+</details>
+
+<Quiz
+  id="11-autorizacao"
+  questoes={[
+    {
+      pergunta: '`GET /prontuarios/{id}` valida o JWT e devolve o prontuário buscado por id. Qual a falha?',
+      opcoes: ['Nenhuma: o token foi validado', 'BOLA: falta verificar se aquele prontuário é visível para quem pede', 'BFLA: falta um papel na rota', 'CSRF'],
+      correta: 1,
+      explicacao: 'Autenticação não é autorização. Cada operação sobre um objeto precisa verificar o acesso àquele objeto, de preferência com uma consulta escopada pelo tenant e uma função de regra única.',
+    },
+    {
+      pergunta: 'Um médico que não é responsável pelo prontuário 1001 tenta anotá-lo. Qual resposta não vaza informação?',
+      opcoes: ['403, porque ele é médico', '404, o mesmo de um id inexistente, porque ele não pode ver o 1001', '401', '200 sem alterar nada'],
+      correta: 1,
+      explicacao: 'Primeiro "pode ver?", depois "pode fazer?". Ele não vê o 1001, então recebe o 404 de "não existe". Um 403 aqui confirmaria que o prontuário existe.',
+    },
+    {
+      pergunta: 'O cadastro converte o JSON direto na entidade `Prontuario`, que tem `clinicaId`. Qual o risco e a defesa?',
+      opcoes: ['Nenhum, se o token for válido', 'Mass assignment: o cliente escolhe a clínica (e o id); a defesa é um DTO de entrada sem esses campos, com a clínica vinda do token', 'SQL injection; usar PreparedStatement', 'Exposição de dados; usar @JsonIgnore na saída'],
+      correta: 1,
+      explicacao: 'Mass assignment é a parte de escrita do BOPLA (API3). O DTO só tem o que o cliente pode escolher; tenant, id e anotações vêm do servidor.',
+    },
+    {
+      pergunta: 'Um `@PreAuthorize("@regras.podeVerExames(authentication, #prontuarioId)")` nega o acesso. Sem nenhuma configuração extra, o que o cliente recebe?',
+      opcoes: ['404', '403, porque a negação lança AuthorizationDeniedException; para responder 404 é preciso @HandleAuthorizationDenied ou tratar a exceção', '500', 'Uma lista vazia'],
+      correta: 1,
+      explicacao: 'O padrão do method security é lançar uma AccessDeniedException, que vira 403. Um MethodAuthorizationDeniedHandler pode lançar a exceção de "não encontrado" ou devolver um valor substituto.',
+    },
+    {
+      pergunta: 'A tabela tem RLS com política por `clinica_id`, mas um relatório ainda mostra linhas de todas as clínicas. Qual a causa mais provável?',
+      opcoes: ['RLS não funciona com SELECT', 'A aplicação conecta como dono da tabela ou como superusuário, que ignoram a política', 'Falta um índice em clinica_id', 'O set_config foi feito com is_local = true'],
+      correta: 1,
+      explicacao: 'Superusuários e papéis com BYPASSRLS sempre ignoram RLS, e o dono da tabela também, a menos que haja FORCE ROW LEVEL SECURITY. A aplicação deve usar um papel próprio, sem esses privilégios.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Autenticação** diz quem é; **autorização** decide o que pode, em três níveis: **rota** (`SecurityFilterChain`), **método** (`@PreAuthorize`) e **objeto** (caso de uso e consulta). Só o último conhece o dado, e é onde as APIs falham.
+- **BOLA** (API1) é a falha número um: verifique o acesso em **toda** operação por id, inclusive sub-recursos e listagens. UUID não é controle de acesso.
+- Prefira **consulta escopada** (`findByIdAndClinicaId`) a "buscar e checar depois", e uma **função de regra única** reaproveitada por todas as rotas.
+- **404** para o que a pessoa não pode saber que existe, com corpo idêntico ao de "não existe"; **403** para a operação proibida num recurso visível ou para regra de papel. Primeiro "pode ver", depois "pode fazer".
+- **BFLA** (API5): negar por padrão e papel explícito no caso de uso. **BOPLA** (API3): DTOs de entrada sem campos sensíveis e DTOs de saída escolhidos pelo serviço.
+- **Method security** exige `@EnableMethodSecurity`; beans no SpEL trazem a regra para a assinatura, a negação padrão é 403 (`@HandleAuthorizationDenied` muda), chamadas internas pulam o proxy e erros de expressão só aparecem em execução. `AuthorizationManager` próprio implementa `authorize`.
+- **Multi-tenant**: tenant na claim do token, filtro em toda consulta, e **RLS** do PostgreSQL ou `@TenantId` do Hibernate como defesa em profundidade.
+- Teste com uma **matriz parametrizada** (papel × relação × tenant × operação) e **audite** as negações sem registrar conteúdo sensível.
+- RBAC e permissões finas resolvem a maioria dos casos; **ABAC** e **ReBAC**, com motores como OPA, Cedar e OpenFGA, entram quando as regras crescem, são compartilhadas ou envolvem relações e delegação.
+
+## Próximo passo
+
+Autorização quebrada é o primeiro item também do OWASP Top 10 geral. Na próxima aula, [OWASP Top 10](../../11-seguranca/05-owasp-top-10/), você vê a lista de 2025 inteira, com injeção, falhas de configuração, cadeia de suprimentos e o tratamento de condições excepcionais, e onde cada defesa mora numa API Spring. Depois, no [exercício 11.03](../../../exercicios/11-seguranca/03-autorizacao-por-dono/), você implementa a autorização por objeto de uma API de RH, com a sua própria matriz de papéis, recursos e operações.
+
+## Referências
+
+- OWASP API Security Top 10 (2023): [API1 — Broken Object Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/), [API3 — Broken Object Property Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/), [API5 — Broken Function Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/)
+- OWASP Cheat Sheet Series: [Authorization](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html), [Mass Assignment](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html) e [Insecure Direct Object Reference Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html)
+- Spring Security: [Method Security](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html), [Authorize HttpServletRequests](https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html), [Authorization Architecture](https://docs.spring.io/spring-security/reference/servlet/authorization/architecture.html), [Authorization Events](https://docs.spring.io/spring-security/reference/servlet/authorization/events.html) e [Testing OAuth 2.0 / JWT](https://docs.spring.io/spring-security/reference/servlet/test/mockmvc/oauth2.html)
+- PostgreSQL 18: [Row Security Policies](https://www.postgresql.org/docs/18/ddl-rowsecurity.html), [CREATE POLICY](https://www.postgresql.org/docs/18/sql-createpolicy.html) e [Configuration Settings Functions (set_config, current_setting)](https://www.postgresql.org/docs/18/functions-admin.html#FUNCTIONS-ADMIN-SET)
+- Hibernate ORM: [User Guide — Multitenancy e Filters](https://docs.jboss.org/hibernate/orm/7.0/userguide/html_single/Hibernate_User_Guide.html)
+- Zanzibar: [Google's Consistent, Global Authorization System (USENIX ATC 2019)](https://www.usenix.org/conference/atc19/presentation/pang)
+- [Open Policy Agent](https://www.openpolicyagent.org/docs/latest/), [Cedar](https://docs.cedarpolicy.com/) e [OpenFGA](https://openfga.dev/docs)

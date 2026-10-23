@@ -1,0 +1,178 @@
+---
+titulo: Grafos, BFS, DFS e intervalos
+descricao: Representar redes como listas de adjacência, BFS para o menor número de passos, DFS para componentes, ordenação topológica para dependências e o padrão "ordenar e varrer" para intervalos.
+modulo: 05-algoritmos
+ordem: 6
+duracao: 60
+objetivos:
+  - Modelar redes e dependências como grafos (lista de adjacência)
+  - Usar BFS para caminhos com menos passos e DFS para componentes
+  - Ordenar dependências com o algoritmo de Kahn e detectar ciclos
+  - Resolver problemas de intervalos ordenando e varrendo
+tags: [grafos, BFS, DFS, ordenação topológica, intervalos]
+flashcards:
+  - frente: Quando usar BFS e quando usar DFS?
+    verso: BFS para o menor número de passos em grafos sem peso (visita em camadas). DFS para explorar tudo, componentes conexos, detecção de ciclos e caminhos com backtracking.
+  - frente: Qual estrutura a BFS usa? E a DFS iterativa?
+    verso: BFS usa uma fila; DFS usa uma pilha (ou a pilha de chamadas, na versão recursiva).
+  - frente: Qual a complexidade de BFS/DFS com lista de adjacência?
+    verso: O(V + E) — cada vértice e cada aresta são visitados uma vez.
+  - frente: Como o algoritmo de Kahn detecta um ciclo?
+    verso: Se ao final a ordem produzida tem menos vértices que o grafo, os que sobraram nunca chegaram a grau de entrada zero — estão em um ciclo (ou dependem dele).
+  - frente: Qual o primeiro passo de quase todo problema de intervalos?
+    verso: Ordenar os intervalos pelo início; depois, uma varredura linear.
+  - frente: Como calcular o mínimo de salas de reunião?
+    verso: Ordene por início e use uma PriorityQueue com os términos das salas ocupadas; o tamanho máximo do heap é a resposta.
+---
+
+Grafos modelam qualquer coisa com **conexões**: rotas entre centros de distribuição, dependências entre módulos de um build, seguidores numa rede social, microsserviços que chamam uns aos outros. Esta aula cobre os três algoritmos que resolvem a maioria dos problemas de grafo em entrevistas — BFS, DFS e ordenação topológica — e fecha o módulo com intervalos.
+
+## Representando um grafo
+
+A forma mais comum é a **lista de adjacência**: para cada vértice, a lista de vizinhos.
+
+```java
+Map<String, List<String>> vizinhos = new HashMap<>();
+for (List<String> trecho : trechos) {
+    String a = trecho.get(0), b = trecho.get(1);
+    vizinhos.computeIfAbsent(a, k -> new ArrayList<>()).add(b);
+    vizinhos.computeIfAbsent(b, k -> new ArrayList<>()).add(a);   // não direcionado: mão dupla
+}
+```
+
+Em grafos **direcionados** (A depende de B, mas não o contrário), adicione só uma direção.
+
+## BFS: o menor número de passos
+
+A **busca em largura** visita o grafo em **camadas**: primeiro os vizinhos diretos, depois os vizinhos dos vizinhos… Por isso, a primeira vez que ela alcança o destino é pelo caminho com **menos arestas**.
+
+<Figura legenda="BFS a partir de Santos: camada 1 (SP), camada 2 (Campinas), camada 3 (Ribeirão), camada 4 (Franca)">
+<svg viewBox="0 0 680 200" width="680" role="img" aria-label="Grafo Santos–SP–Campinas–Ribeirão–Franca com camadas de distância 0 a 4; BH–Contagem é outro componente">
+  <g class="d-line"><path d="M90 100 H190"/><path d="M250 100 H330"/><path d="M400 100 H480"/><path d="M550 100 H600"/></g>
+  <circle cx="60" cy="100" r="30" class="d-accent"/><text x="60" y="104" text-anchor="middle" class="d-label">Santos</text>
+  <circle cx="220" cy="100" r="30" class="d-info"/><text x="220" y="104" text-anchor="middle" class="d-label">SP</text>
+  <circle cx="365" cy="100" r="34" class="d-info"/><text x="365" y="104" text-anchor="middle" class="d-label">Campinas</text>
+  <circle cx="515" cy="100" r="34" class="d-info"/><text x="515" y="104" text-anchor="middle" class="d-label">Ribeirão</text>
+  <circle cx="630" cy="100" r="30" class="d-ok"/><text x="630" y="104" text-anchor="middle" class="d-label">Franca</text>
+  <text x="60" y="152" text-anchor="middle" class="d-mono">0</text><text x="220" y="152" text-anchor="middle" class="d-mono">1</text><text x="365" y="152" text-anchor="middle" class="d-mono">2</text><text x="515" y="152" text-anchor="middle" class="d-mono">3</text><text x="630" y="152" text-anchor="middle" class="d-mono">4</text>
+  <text x="340" y="188" text-anchor="middle" class="d-label">camada = distância em trechos a partir da origem</text>
+</svg>
+</Figura>
+
+```java
+Map<String, String> veioDe = new HashMap<>();
+veioDe.put(origem, null);
+Deque<String> fila = new ArrayDeque<>(List.of(origem));
+while (!fila.isEmpty()) {
+    String atual = fila.poll();
+    if (atual.equals(destino)) return reconstruir(veioDe, destino);
+    for (String proximo : vizinhos.get(atual)) {
+        if (!veioDe.containsKey(proximo)) {        // marca ao ENFILEIRAR
+            veioDe.put(proximo, atual);
+            fila.offer(proximo);
+        }
+    }
+}
+```
+
+- O mapa `veioDe` serve ao mesmo tempo de **conjunto de visitados** e de **trilha** para reconstruir o caminho de trás para frente.
+- **Marque ao enfileirar**, não ao tirar da fila: senão o mesmo vértice entra na fila várias vezes.
+- Complexidade: **O(V + E)** (vértices + arestas).
+- Com **pesos** nas arestas (distâncias em km), BFS não serve: use Dijkstra, que é uma BFS com `PriorityQueue`.
+
+## DFS: explorar tudo
+
+A **busca em profundidade** vai o mais fundo possível antes de voltar. Ela serve para **explorar** o grafo inteiro: contar regiões desconectadas, detectar ciclos, listar todos os caminhos.
+
+```java
+int regioes = 0;
+Set<String> visitados = new HashSet<>();
+for (String inicio : vizinhos.keySet()) {
+    if (!visitados.add(inicio)) continue;       // já pertence a uma região contada
+    regioes++;
+    Deque<String> pilha = new ArrayDeque<>(List.of(inicio));
+    while (!pilha.isEmpty()) {
+        for (String v : vizinhos.get(pilha.pop())) {
+            if (visitados.add(v)) pilha.push(v);
+        }
+    }
+}
+```
+
+A versão recursiva é mais curta, mas lembre-se da aula 1: grafos grandes podem estourar a pilha de chamadas. A versão com `ArrayDeque` explícita não tem esse limite.
+
+## Ordenação topológica: a ordem das dependências
+
+> Os módulos `app`, `infra`, `dominio`, `cli` e `docs` têm dependências entre si. Em que ordem compilar?
+
+Uma **ordenação topológica** lista os vértices de um grafo direcionado de modo que cada um apareça **depois de todas as suas dependências**. É o que Maven, Gradle, npm e o próprio Spring (ao criar beans) fazem.
+
+O **algoritmo de Kahn**:
+
+1. Calcule o **grau de entrada** de cada vértice (quantas dependências ainda faltam).
+2. Coloque numa fila todos os de grau **zero** (prontos).
+3. Tire um da fila, adicione à ordem e "libere" quem dependia dele (grau − 1). Quem chegar a zero entra na fila.
+4. Se ao final a ordem tiver **menos vértices** que o grafo, há um **ciclo**: os que sobraram nunca ficaram prontos.
+
+Usar uma `PriorityQueue` em vez de uma fila comum dá uma ordem **determinística** (alfabética entre os prontos) — útil para builds reproduzíveis e para testes.
+
+<Callout tipo="info" titulo="Ciclos na vida real">
+Ciclos de dependência são um problema de design: no Spring, dois beans que dependem um do outro pelo construtor impedem a aplicação de subir (`BeanCurrentlyInCreationException`). A correção raramente é técnica — quase sempre é separar uma responsabilidade que está no lugar errado.
+</Callout>
+
+## Intervalos: ordenar e varrer
+
+Problemas com intervalos (reuniões, reservas, janelas de manutenção) seguem quase sempre o mesmo padrão: **ordenar pelo início** e fazer **uma passada**.
+
+**Mesclar intervalos sobrepostos:**
+
+```java
+List<Intervalo> ordenados = intervalos.stream().sorted(comparingInt(Intervalo::inicio)).toList();
+for (Intervalo atual : ordenados) {
+    if (!resultado.isEmpty() && atual.inicio() <= resultado.getLast().fim()) {
+        Intervalo ultimo = resultado.removeLast();
+        resultado.add(new Intervalo(ultimo.inicio(), Math.max(ultimo.fim(), atual.fim())));
+    } else {
+        resultado.add(atual);
+    }
+}
+```
+
+**Mínimo de salas de reunião:** percorra as reuniões por início, com uma `PriorityQueue` dos **términos** das salas ocupadas. Se a sala que libera mais cedo já está livre quando a reunião começa, reaproveite-a; senão, abra outra. O tamanho do heap no final é o número de salas.
+
+Os dois são O(n log n), dominados pela ordenação.
+
+<Callout tipo="entrevista">
+"Number of Islands" (DFS), "Course Schedule" (ordenação topológica), "Merge Intervals" e "Meeting Rooms II" estão entre os problemas mais pedidos em entrevistas de empresas de tecnologia. Os exercícios 05.05 e 05.06 os trazem em cenários de logística, build e agenda.
+</Callout>
+
+<Quiz
+  id="05-grafos"
+  questoes={[
+    {
+      pergunta: 'Qual algoritmo encontra o caminho com MENOS conexões entre dois aeroportos (sem considerar distância)?',
+      opcoes: ['DFS', 'BFS', 'Ordenação topológica', 'Busca binária'],
+      correta: 1,
+      explicacao: 'BFS visita em camadas de distância crescente; a primeira chegada é pelo menor número de arestas.',
+    },
+    {
+      pergunta: 'No algoritmo de Kahn, o que indica um ciclo?',
+      opcoes: ['A fila nunca fica vazia', 'A ordem final tem menos vértices que o grafo', 'Algum vértice tem grau zero', 'O grafo é não direcionado'],
+      correta: 1,
+      explicacao: 'Vértices em ciclo nunca chegam a grau de entrada zero e ficam fora da ordem.',
+    },
+    {
+      pergunta: 'Qual o primeiro passo para mesclar intervalos sobrepostos?',
+      opcoes: ['Usar um HashMap', 'Ordenar pelo início', 'Ordenar pelo tamanho', 'BFS'],
+      correta: 1,
+      explicacao: 'Com os intervalos ordenados pelo início, basta comparar cada um com o último mesclado.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Grafo = **lista de adjacência** (`Map<V, List<V>>`).
+- **BFS** (fila): menor número de passos. **DFS** (pilha): explorar, componentes, ciclos. Ambos O(V + E).
+- **Ordenação topológica** (Kahn): ordem de dependências; sobra de vértices = ciclo.
+- **Intervalos**: ordene pelo início e varra; `PriorityQueue` de términos para contar salas.

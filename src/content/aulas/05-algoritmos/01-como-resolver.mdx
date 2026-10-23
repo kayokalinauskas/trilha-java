@@ -1,0 +1,152 @@
+---
+titulo: Como resolver um problema de entrevista
+descricao: Um roteiro de 6 passos para live coding, como estimar tempo e memória, recursão e o custo da pilha, e como pensar em voz alta sem travar.
+modulo: 05-algoritmos
+ordem: 1
+duracao: 45
+objetivos:
+  - Seguir um roteiro para problemas de algoritmos sob pressão
+  - Estimar complexidade de tempo e de memória de uma solução
+  - Entender o custo de recursão (pilha) e quando evitá-la
+  - Comunicar o raciocínio durante o live coding
+tags: [entrevista, Big-O, recursão, live coding]
+flashcards:
+  - frente: Quais os 6 passos para resolver um problema em entrevista?
+    verso: 1) entender e perguntar, 2) exemplos e casos de borda, 3) força bruta, 4) otimizar (padrão), 5) codar, 6) testar com os exemplos.
+  - frente: Por que propor primeiro a força bruta?
+    verso: Mostra que você entendeu o problema, garante uma solução e cria a base para discutir a otimização.
+  - frente: Qual o custo de memória de uma recursão com profundidade n?
+    verso: O(n) na pilha de chamadas — e profundidades muito grandes causam StackOverflowError.
+  - frente: Como estimar se O(n²) cabe no tempo?
+    verso: Regra prática — computadores fazem ~10^8 operações simples por segundo. n = 10^5 → O(n²) = 10^10, lento demais; O(n log n) ≈ 2 × 10^6, ok.
+---
+
+Entrevistas técnicas no Brasil e, principalmente, em empresas internacionais costumam ter uma etapa de **algoritmos**: um problema a resolver em 30 a 45 minutos, compartilhando a tela ou num editor online. O objetivo do entrevistador **não** é ver se você decorou a resposta — é ver **como você pensa**. Este módulo treina os padrões que resolvem a maioria desses problemas, e esta primeira aula dá o método.
+
+## O roteiro em 6 passos
+
+<Figura legenda="Resolver em voz alta, nesta ordem, evita o erro mais comum: sair codando antes de entender">
+<svg viewBox="0 0 700 120" width="700" role="img" aria-label="Seis passos: entender, exemplos, força bruta, otimizar, codar, testar">
+  <defs><marker id="r1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="5" y="35" width="100" height="50" rx="10" class="d-info"/><text x="55" y="65" text-anchor="middle" class="d-text">1 Entender</text>
+  <rect x="122" y="35" width="100" height="50" rx="10" class="d-info"/><text x="172" y="65" text-anchor="middle" class="d-text">2 Exemplos</text>
+  <rect x="239" y="35" width="105" height="50" rx="10" class="d-box"/><text x="291" y="65" text-anchor="middle" class="d-text">3 Força bruta</text>
+  <rect x="361" y="35" width="100" height="50" rx="10" class="d-accent"/><text x="411" y="65" text-anchor="middle" class="d-text">4 Otimizar</text>
+  <rect x="478" y="35" width="100" height="50" rx="10" class="d-ok"/><text x="528" y="65" text-anchor="middle" class="d-text">5 Codar</text>
+  <rect x="595" y="35" width="100" height="50" rx="10" class="d-ok"/><text x="645" y="65" text-anchor="middle" class="d-text">6 Testar</text>
+  <path d="M105 60 H118" class="d-line" marker-end="url(#r1)"/><path d="M222 60 H235" class="d-line" marker-end="url(#r1)"/><path d="M344 60 H357" class="d-line" marker-end="url(#r1)"/><path d="M461 60 H474" class="d-line" marker-end="url(#r1)"/><path d="M578 60 H591" class="d-line" marker-end="url(#r1)"/>
+</svg>
+</Figura>
+
+1. **Entender e perguntar (2–5 min).** Repita o problema com suas palavras. Pergunte: a entrada pode ser vazia? Tem números negativos? Repetidos? Qual o tamanho máximo? Posso modificar a entrada? O que devolver se não houver resposta?
+2. **Exemplos e bordas.** Monte um exemplo pequeno à mão e calcule a resposta esperada. Liste casos de borda: vazio, um elemento, tudo igual, o maior tamanho.
+3. **Força bruta.** Descreva a solução óbvia, mesmo que lenta, e diga a complexidade: "testar todos os pares, O(n²)". Isso garante que você tem *algo* e mostra que entendeu.
+4. **Otimizar.** Pergunte-se: qual trabalho estou repetindo? Que estrutura evitaria isso? É aqui que entram os **padrões** deste módulo (hash, dois ponteiros, janela, pilha, busca binária, BFS). Combine a abordagem com o entrevistador **antes** de codar.
+5. **Codar.** Nomes claros, funções auxiliares, sem otimizações prematuras. Fale o que está fazendo.
+6. **Testar.** Percorra o código com o exemplo, linha por linha. Depois, as bordas. Encontre seus próprios bugs antes do entrevistador.
+
+<Callout tipo="dica" titulo="Silêncio é o pior sinal">
+Se você travar, diga o que está pensando: "estou tentando evitar o laço duplo; se eu guardasse o que já vi num HashMap…". Um entrevistador consegue ajudar quem pensa em voz alta — e muitas vezes a nota vem mais do raciocínio que do código final.
+</Callout>
+
+## Estimando complexidade
+
+Você já viu Big-O no módulo 03. Em entrevistas, use-o para **decidir** antes de codar. Uma regra prática: um computador faz na ordem de **10⁸ operações simples por segundo**.
+
+| Tamanho de n | Complexidade viável |
+|---|---|
+| até ~20 | O(2ⁿ), O(n!) — combinações, permutações |
+| até ~10³ | O(n²) |
+| até ~10⁵ – 10⁶ | O(n log n) |
+| até ~10⁸ | O(n) |
+| qualquer | O(log n), O(1) |
+
+Se o problema diz "até 100 mil elementos", uma solução O(n²) (10¹⁰ operações) não serve, e você já sabe que precisa de O(n log n) ou O(n).
+
+### Não esqueça a memória
+
+Complexidade de **espaço** também conta. Um `HashSet` com todos os elementos é O(n) de memória. Às vezes a otimização troca memória por tempo — e vale dizer isso explicitamente: "fica O(n) de tempo, mas O(n) de memória extra; se memória for crítica, dá para ordenar e usar dois ponteiros, O(n log n) de tempo e O(1) extra".
+
+## Recursão
+
+Uma função **recursiva** chama a si mesma para resolver versões menores do problema. Precisa de um **caso base** (quando parar) e de um **passo** que se aproxima do caso base:
+
+```java
+static long fatorial(int n) {
+    if (n <= 1) return 1;          // caso base
+    return n * fatorial(n - 1);    // passo: problema menor
+}
+```
+
+Cada chamada ocupa um espaço na **pilha de chamadas** até retornar. Profundidade n = O(n) de memória, e com profundidade grande demais (dezenas de milhares, dependendo do tamanho da pilha), a JVM lança `StackOverflowError`. Em Java, não há otimização de recursão de cauda.
+
+<Comparar antes="Recursão exponencial" depois="Iterativo, O(n)">
+```java
+static long fib(int n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+// fib(50): bilhões de chamadas repetidas
+```
+
+```java
+static long fib(int n) {
+    long a = 0, b = 1;
+    for (int i = 0; i < n; i++) {
+        long prox = a + b;
+        a = b;
+        b = prox;
+    }
+    return a;
+}
+```
+</Comparar>
+
+A versão da esquerda recalcula os mesmos valores exponencialmente. Guardar resultados já calculados (**memoização**) ou resolver de baixo para cima (**programação dinâmica**) resolve. Use recursão quando ela deixa a solução mais clara (árvores, grafos, divisão e conquista) e a profundidade é controlada.
+
+## Os padrões deste módulo
+
+| Padrão | Sinal no enunciado | Aula |
+|---|---|---|
+| Hashing | "existe um par…", "já apareceu?", "contar ocorrências" | 2 |
+| Dois ponteiros | array **ordenado**, "par que soma X", "remover duplicatas no lugar" | 2 |
+| Janela deslizante | "subarray/substring **contíguo** mais longo/curto que…" | 3 |
+| Pilha | parênteses, "próximo maior", desfazer, expressões | 4 |
+| Busca binária | array ordenado, "o menor valor que satisfaz…" | 5 |
+| Ordenação + varredura | intervalos, "mesclar", "sobreposição" | 6 |
+| BFS / DFS | redes, dependências, "menor número de passos" | 6 |
+
+<Callout tipo="entrevista">
+Em entrevistas internacionais, espera-se que você **fale em inglês** enquanto resolve. Frases úteis: *"Let me make sure I understand the problem…"*, *"A brute-force approach would be… which is O(n²)"*, *"Can I assume the input fits in memory?"*, *"Let me walk through an example"*. Treine-as em voz alta com os exercícios deste módulo.
+</Callout>
+
+<Quiz
+  id="05-como-resolver"
+  questoes={[
+    {
+      pergunta: 'O enunciado diz "n até 200.000". Qual complexidade você deve mirar?',
+      opcoes: ['O(n²)', 'O(n log n) ou melhor', 'O(2ⁿ)', 'Qualquer uma serve'],
+      correta: 1,
+      explicacao: 'O(n²) daria 4 × 10¹⁰ operações — minutos. O(n log n) fica na casa de milhões.',
+    },
+    {
+      pergunta: 'Qual o primeiro passo ao receber o problema?',
+      opcoes: ['Começar a codar para ganhar tempo', 'Confirmar o entendimento e perguntar sobre entradas e bordas', 'Escrever os testes', 'Escolher a estrutura de dados'],
+      correta: 1,
+      explicacao: 'Codar a coisa errada é o erro mais caro. Perguntas sobre bordas também mostram maturidade.',
+    },
+    {
+      pergunta: 'Uma recursão com profundidade n = 1.000.000 em Java provavelmente…',
+      opcoes: ['Roda normalmente', 'Lança StackOverflowError', 'É otimizada pelo compilador', 'Usa O(1) de memória'],
+      correta: 1,
+      explicacao: 'Cada chamada ocupa a pilha; Java não elimina recursão de cauda. Prefira uma versão iterativa.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Roteiro: **entender → exemplos → força bruta → otimizar → codar → testar**, sempre em voz alta.
+- Use o tamanho de n para escolher a complexidade-alvo; diga tempo **e** memória.
+- Recursão precisa de caso base, custa pilha e pode explodir exponencialmente sem memoização.
+- A maioria dos problemas cai em um punhado de **padrões** — o resto do módulo treina cada um.

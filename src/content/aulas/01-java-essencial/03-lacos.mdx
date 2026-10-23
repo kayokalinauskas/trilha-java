@@ -1,0 +1,179 @@
+---
+titulo: Laços sem medo (for, while e o erro de um)
+descricao: for clássico, for-each, while e do-while, break e continue, e como evitar o erro mais comum de todos — o off-by-one.
+modulo: 01-java-essencial
+ordem: 3
+duracao: 40
+objetivos:
+  - Escolher entre for, for-each, while e do-while
+  - Controlar o fluxo com break e continue sem perder a legibilidade
+  - Evitar erros de limite (off-by-one) e laços infinitos
+tags: [for, while, laços]
+flashcards:
+  - frente: Quando usar for-each em vez do for clássico?
+    verso: Quando você só precisa visitar cada elemento, sem usar o índice nem modificar a estrutura durante a iteração.
+  - frente: Qual a diferença entre while e do-while?
+    verso: while testa a condição antes (pode executar zero vezes); do-while testa depois (executa pelo menos uma vez).
+  - frente: O que é um erro off-by-one?
+    verso: Errar o limite do laço por uma unidade, por exemplo usar <= length em vez de < length, gerando ArrayIndexOutOfBoundsException ou pulando o último elemento.
+  - frente: O que continue faz dentro de um laço?
+    verso: Pula o restante da iteração atual e vai para a próxima.
+---
+
+Processar uma lista de pedidos, somar as parcelas de um financiamento, tentar reconectar ao banco até três vezes: laços estão em todo lugar. A sintaxe é simples; os bugs, nem tanto.
+
+## `for` clássico
+
+```java
+for (int i = 0; i < 5; i++) {
+    System.out.println("Parcela " + (i + 1));
+}
+```
+
+As três partes: **inicialização** (roda uma vez), **condição** (testada antes de cada volta) e **atualização** (roda depois de cada volta). Use o `for` clássico quando você **precisa do índice**: para comparar um elemento com o anterior, percorrer de trás para frente ou andar de dois em dois.
+
+```java
+double[] precos = {10.0, 12.5, 11.0, 15.0};
+for (int i = 1; i < precos.length; i++) {
+    if (precos[i] > precos[i - 1]) {
+        System.out.println("Alta no dia " + i);
+    }
+}
+```
+
+Repare que o laço começa em `1`: o elemento `0` não tem anterior. Pensar no **primeiro** e no **último** passo antes de escrever o laço é o hábito que evita a maioria dos bugs.
+
+## `for-each`: quando o índice não importa
+
+```java
+List<Pedido> pedidos = buscarPedidosDoDia();
+BigDecimal total = BigDecimal.ZERO;
+for (Pedido pedido : pedidos) {
+    total = total.add(pedido.valor());
+}
+```
+
+Leia como "para cada pedido em pedidos". Sem índice, não há como errar o limite. **É a forma preferida** sempre que você só precisa visitar os elementos. Funciona com arrays e com qualquer coleção (`List`, `Set`…).
+
+<Callout tipo="erro" titulo="Não modifique a lista enquanto a percorre">
+Remover itens de uma `List` dentro de um for-each lança `ConcurrentModificationException`. Use `lista.removeIf(p -> p.cancelado())` ou um `Iterator` explícito. Você vai entender o motivo no módulo 03.
+</Callout>
+
+## `while` e `do-while`
+
+Use `while` quando **não se sabe de antemão quantas voltas** serão necessárias:
+
+```java
+int tentativas = 0;
+boolean conectado = false;
+while (!conectado && tentativas < 3) {
+    conectado = tentarConectar();
+    tentativas++;
+}
+```
+
+O `do-while` testa a condição **depois**, então o corpo roda **pelo menos uma vez**. É útil em menus e em validação de entrada:
+
+```java
+String opcao;
+do {
+    opcao = IO.readln("Escolha (1-3): ");
+} while (!opcao.matches("[1-3]"));
+```
+
+## `break` e `continue`
+
+- **`break`** sai do laço imediatamente.
+- **`continue`** pula para a próxima iteração.
+
+```java
+for (Pedido p : pedidos) {
+    if (p.cancelado()) {
+        continue;                  // ignora e segue para o próximo
+    }
+    if (p.valor().compareTo(LIMITE_FRAUDE) > 0) {
+        alertarFraude(p);
+        break;                     // para tudo no primeiro suspeito
+    }
+    processar(p);
+}
+```
+
+Usados com moderação, deixam o laço mais claro — o `continue` funciona como uma *guard clause* dentro do laço. Se você precisa de vários `break` e `continue` no mesmo laço, provavelmente ele deveria virar um método separado.
+
+## O erro de um (off-by-one)
+
+É tão comum que tem nome próprio. Os índices de um array vão de `0` a `length - 1`:
+
+```java
+int[] notas = {7, 8, 9};
+
+for (int i = 0; i <= notas.length; i++) {   // <= : vai até 3!
+    System.out.println(notas[i]);           // ArrayIndexOutOfBoundsException: Index 3 out of bounds for length 3
+}
+```
+
+<Figura legenda="Um array de tamanho 3 tem índices 0, 1 e 2 — o índice 3 não existe">
+<svg viewBox="0 0 520 130" width="520" role="img" aria-label="Array com três posições de índice 0 a 2 e uma quarta posição inexistente marcada em vermelho">
+  <rect x="20" y="30" width="100" height="56" rx="8" class="d-box"/><text x="70" y="64" text-anchor="middle" class="d-mono">7</text>
+  <rect x="130" y="30" width="100" height="56" rx="8" class="d-box"/><text x="180" y="64" text-anchor="middle" class="d-mono">8</text>
+  <rect x="240" y="30" width="100" height="56" rx="8" class="d-box"/><text x="290" y="64" text-anchor="middle" class="d-mono">9</text>
+  <rect x="350" y="30" width="100" height="56" rx="8" fill="none" stroke="var(--danger)" stroke-width="1.5" stroke-dasharray="6 5"/><text x="400" y="64" text-anchor="middle" class="d-mono" fill="var(--danger)">✕</text>
+  <text x="70" y="110" text-anchor="middle" class="d-label">[0]</text>
+  <text x="180" y="110" text-anchor="middle" class="d-label">[1]</text>
+  <text x="290" y="110" text-anchor="middle" class="d-label">[2] = length - 1</text>
+  <text x="400" y="110" text-anchor="middle" class="d-label">[3] não existe</text>
+</svg>
+</Figura>
+
+Três hábitos que evitam o problema:
+
+1. Prefira **for-each** quando possível.
+2. No `for` clássico, use o padrão **`i < tamanho`**, nunca `i <= tamanho`.
+3. **Teste as bordas**: coleção vazia, com um elemento e com dois. A maioria dos bugs de laço aparece aí — por isso os testes dos exercícios sempre incluem esses casos.
+
+## Laços infinitos
+
+```java
+int i = 0;
+while (i < 10) {
+    System.out.println(i);
+    // esqueceu o i++ — roda para sempre
+}
+```
+
+Todo laço precisa de uma condição de parada que **de fato muda** a cada volta. Em sistemas de backend, um laço infinito consome 100% de uma CPU e pode derrubar o serviço. Se precisar de um laço "eterno" (um consumidor de fila, por exemplo), ele deve ter uma forma explícita de parar.
+
+<Callout tipo="entrevista">
+Em *live coding*, antes de escrever um laço, diga em voz alta: "vou percorrer de 0 até n-1; no caso vazio o laço não executa e retorno X". Esse tipo de raciocínio sobre as **bordas** é exatamente o que o entrevistador quer ver.
+</Callout>
+
+<Quiz
+  id="01-lacos"
+  questoes={[
+    {
+      pergunta: 'Quantas vezes o corpo executa: `for (int i = 0; i < 10; i += 3)`?',
+      opcoes: ['3', '4', '10', '9'],
+      correta: 1,
+      explicacao: 'i vale 0, 3, 6 e 9 (4 execuções). Quando vira 12, a condição falha.',
+    },
+    {
+      pergunta: 'Você precisa ler entradas do usuário até ele digitar "sair", mas precisa pedir pelo menos uma vez. Qual laço combina melhor?',
+      opcoes: ['for', 'for-each', 'do-while', 'Nenhum, use recursão'],
+      correta: 2,
+      explicacao: 'do-while executa o corpo antes de testar a condição, garantindo a primeira leitura.',
+    },
+    {
+      pergunta: 'O que causa `ArrayIndexOutOfBoundsException: Index 5 out of bounds for length 5`?',
+      opcoes: ['O array está vazio', 'O laço usou `<=` em vez de `<` no limite', 'O array é null', 'O tipo do array está errado'],
+      correta: 1,
+      explicacao: 'Com tamanho 5 os índices vão de 0 a 4. Acessar o índice 5 é o clássico erro de um.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **for-each** para visitar elementos; **for clássico** quando o índice importa; **while** quando o número de voltas é desconhecido; **do-while** quando precisa rodar ao menos uma vez.
+- `continue` como guarda dentro do laço; `break` para sair cedo — com moderação.
+- Índices vão de `0` a `length - 1`: use `i < length` e teste vazio, um e dois elementos.

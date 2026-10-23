@@ -1,0 +1,39 @@
+---
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import { url } from '../lib/url';
+---
+
+<Base title="Página não encontrada">
+  <div class="container-narrow nf">
+    <pre class="st" aria-hidden="true">Exception in thread "main" java.lang.PageNotFoundException
+	at dev.trilhajava.Site.navegar(Site.java:404)</pre>
+    <h1>Esta página não existe (ainda)</h1>
+    <p class="lead">Talvez o link esteja errado, ou o conteúdo faça parte de um módulo que ainda não foi publicado.</p>
+    <div class="row">
+      <a class="btn btn-primary" href={url('')}><Icon name="map" size={16} /> Voltar ao mapa</a>
+      <button type="button" class="btn" data-abrir-busca><Icon name="search" size={16} /> Buscar</button>
+    </div>
+  </div>
+</Base>
+
+<style>
+  .nf {
+    padding-block: 80px;
+    display: grid;
+    gap: 16px;
+  }
+  .st {
+    padding: 16px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--danger);
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    overflow-x: auto;
+  }
+  h1 {
+    font-size: var(--step-3);
+  }
+</style>

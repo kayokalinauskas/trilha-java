@@ -1,0 +1,80 @@
+---
+import { url } from '../lib/url';
+const ano = new Date().getFullYear();
+---
+
+<footer class="site-footer">
+  <div class="container inner">
+    <div>
+      <p class="title">Trilha<strong>Java</strong> Backend</p>
+      <p class="muted small">
+        Do básico à vaga Júnior/Pleno. Conteúdo revisado para Java 25 LTS e Spring Boot 4.
+        Seu progresso fica salvo só no seu navegador.
+      </p>
+    </div>
+    <nav aria-label="Rodapé">
+      <ul>
+        <li><a href={url('')}>Mapa da trilha</a></li>
+        <li><a href={url('exercicios')}>Exercícios</a></li>
+        <li><a href={url('projetos')}>Projetos de portfólio</a></li>
+        <li><a href={url('entrevista')}>Simulador de entrevista</a></li>
+        <li><a href={url('flashcards')}>Flashcards</a></li>
+        <li><a href={url('painel')}>Painel e backup</a></li>
+        <li><a href={url('sobre')}>Sobre e metodologia</a></li>
+        <li><a href="https://github.com/kayokalinauskas/trilha-java">Código no GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+  <div class="container legal muted small">© {ano} · Feito para estudar de verdade: tente antes de abrir a solução.</div>
+</footer>
+
+<style>
+  .site-footer {
+    margin-top: 64px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-soft);
+    padding-block: 40px 28px;
+  }
+  .inner {
+    display: grid;
+    gap: 28px;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  }
+  .title {
+    font-family: var(--font-display);
+    font-size: 1.2rem;
+    margin-bottom: 8px;
+  }
+  .title strong {
+    color: var(--accent);
+  }
+  .small {
+    font-size: 0.88rem;
+    max-width: 46ch;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 20px;
+  }
+  a {
+    color: var(--text-2);
+    text-decoration: none;
+    font-size: 0.92rem;
+  }
+  a:hover {
+    color: var(--accent);
+  }
+  .legal {
+    margin-top: 28px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+  }
+  @media (max-width: 700px) {
+    .inner {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

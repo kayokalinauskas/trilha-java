@@ -1,0 +1,266 @@
+---
+titulo: "LLM para devs backend: tokens, contexto, custo e quando não usar"
+descricao: O que um modelo de linguagem é do ponto de vista de quem integra - tokens, janela de contexto, papéis das mensagens (system, user, assistant, tool), temperatura, não determinismo, alucinação, custo por token e latência, provedores (OpenAI, Anthropic, Gemini, Ollama) e os casos em que um LLM é a ferramenta errada.
+modulo: 16-ia-backend
+ordem: 1
+duracao: 50
+objetivos:
+  - Explicar tokens, janela de contexto e papéis das mensagens numa chamada de chat
+  - Estimar custo e latência de uma funcionalidade baseada em LLM antes de construí-la
+  - Tratar a resposta do modelo como entrada não confiável, validando e oferecendo alternativa
+  - Decidir quando um LLM é adequado e quando a regra deve ser código determinístico
+tags: [LLM, tokens, janela de contexto, prompt, temperatura, alucinação, custo, OpenAI, Anthropic, Gemini, Ollama]
+flashcards:
+  - frente: O que é um token?
+    verso: O pedaço de texto que o modelo lê e gera - uma palavra, parte de uma palavra ou pontuação. Preço, limite de contexto e latência são medidos em tokens, não em caracteres. Português costuma gastar mais tokens por palavra que inglês.
+  - frente: O que é a janela de contexto?
+    verso: O limite de tokens que cabem numa chamada, somando entrada (system, histórico, documentos) e saída. O modelo não lembra de nada entre chamadas - o histórico da conversa é reenviado a cada requisição e paga de novo.
+  - frente: Para que serve cada papel de mensagem?
+    verso: system - instruções e regras do desenvolvedor. user - o que o usuário escreveu. assistant - o que o modelo respondeu antes (histórico). tool - o resultado de uma ferramenta que o modelo pediu para chamar.
+  - frente: O que a temperatura controla?
+    verso: O quanto a escolha do próximo token é aleatória. Baixa (perto de 0) - respostas mais previsíveis, boa para classificar e extrair. Alta - mais variação, boa para texto criativo. Temperatura 0 NÃO garante resposta idêntica sempre.
+  - frente: O que é alucinação?
+    verso: O modelo gerar com confiança algo falso - uma taxa, uma cláusula, um método de API que não existe. Ele prevê texto plausível, não consulta fatos. Mitigação - dar o contexto certo (RAG), pedir para admitir quando não sabe, validar a saída.
+  - frente: Por que não calcular juros ou saldo com um LLM?
+    verso: O resultado precisa ser exato, reprodutível e auditável. O LLM é probabilístico, pode errar aritmética e não explica de forma verificável. Regra de negócio determinística fica em código Java com BigDecimal e testes.
+  - frente: Quais são os dois custos principais de uma chamada a LLM?
+    verso: Dinheiro (tokens de entrada + tokens de saída, a saída costuma ser mais cara) e latência (de centenas de milissegundos a dezenas de segundos, crescendo com o tamanho da resposta).
+---
+
+O time de produto da fintech quer duas coisas: **classificar automaticamente** a descrição das transações do extrato (`PAG*IFOOD 0923` vira *alimentação*) e um **assistente** que responda dúvidas de clientes com base no FAQ. Nos dois casos, a resposta não cabe num `if`: o texto é livre, bagunçado e muda o tempo todo. É aí que um **LLM** (*large language model*) entra no backend.
+
+Para você, dev backend, um LLM é **mais uma dependência externa**: uma API HTTP lenta, cara, que às vezes erra e que nunca devolve exatamente a mesma coisa. Esta aula dá o vocabulário para integrar esse serviço com os mesmos cuidados que você já teve com um gateway de pagamento (módulo 13): timeout, validação, alternativa quando falha e custo sob controle.
+
+## Intuição: um autocompletar muito bom
+
+Um LLM é treinado para uma tarefa só: dado um texto, **prever o próximo pedaço**. Ele gera a resposta um pedaço por vez, e cada pedaço gerado entra na entrada do passo seguinte. Não há banco de dados de fatos por trás, nem execução de lógica: há uma distribuição de probabilidades sobre o que "costuma vir depois". Isso explica quase tudo de bom e de ruim que você vai ver: a fluência, a flexibilidade com texto bagunçado e também as invenções confiantes.
+
+## Tokens
+
+O modelo não lê caracteres nem palavras, lê **tokens**: pedaços de texto definidos pelo *tokenizador* de cada modelo. "transação" pode virar dois ou três tokens; um espaço e uma vírgula também contam. Como regra grosseira, em inglês um token tem cerca de 4 caracteres; em português, a mesma frase costuma gastar **mais** tokens. Para uma estimativa real, use o contador de tokens do provedor.
+
+Tokens importam porque **tudo é medido neles**: o preço, o limite de contexto e o tempo de geração.
+
+## A chamada de chat: papéis das mensagens
+
+Uma chamada de chat é uma lista de mensagens, cada uma com um **papel**:
+
+| Papel | Quem escreve | Exemplo na fintech |
+|---|---|---|
+| `system` | você, o desenvolvedor | "Você classifica transações em uma destas categorias: ... Responda só com a categoria." |
+| `user` | o usuário (ou seu código, com dados dele) | `PAG*IFOOD 0923` |
+| `assistant` | o modelo, em turnos anteriores | "ALIMENTACAO" |
+| `tool` | seu código, com o resultado de uma ferramenta | o saldo que o método `consultarSaldo` devolveu |
+
+<Figura legenda="Uma chamada de chat: o backend monta as mensagens, o provedor devolve a próxima mensagem do assistant e o uso de tokens">
+<svg viewBox="0 0 680 260" width="680" role="img" aria-label="O backend envia mensagens system, user e o histórico assistant ao provedor; o provedor devolve uma mensagem assistant e a contagem de tokens de entrada e saída">
+  <defs><marker id="m1601" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="250" height="170" rx="10" class="d-box"/>
+  <text x="135" y="44" text-anchor="middle" class="d-title">Seu backend monta</text>
+  <rect x="25" y="58" width="220" height="34" rx="6" class="d-violet"/><text x="135" y="80" text-anchor="middle" class="d-mono">system: regras e formato</text>
+  <rect x="25" y="100" width="220" height="34" rx="6" class="d-info"/><text x="135" y="122" text-anchor="middle" class="d-mono">assistant/user: histórico</text>
+  <rect x="25" y="142" width="220" height="34" rx="6" class="d-ok"/><text x="135" y="164" text-anchor="middle" class="d-mono">user: pergunta atual</text>
+  <path d="M260 90 H410" class="d-line" marker-end="url(#m1601)"/>
+  <text x="335" y="80" text-anchor="middle" class="d-label">tokens de entrada</text>
+  <rect x="415" y="50" width="255" height="80" rx="10" class="d-accent"/>
+  <text x="542" y="80" text-anchor="middle" class="d-title">Provedor do LLM</text>
+  <text x="542" y="104" text-anchor="middle" class="d-label">gera token a token</text>
+  <path d="M542 130 V160 H270" class="d-line" marker-end="url(#m1601)"/>
+  <text x="440" y="178" text-anchor="middle" class="d-label">assistant: resposta + uso (entrada, saída)</text>
+  <text x="10" y="222" class="d-label">O modelo não guarda estado: tudo à esquerda vai de novo a cada chamada.</text>
+  <text x="10" y="244" class="d-label">Histórico longo = mais tokens, mais custo e mais latência.</text>
+</svg>
+</Figura>
+
+Dois pontos que surpreendem quem chega agora:
+
+1. **O modelo não tem memória.** "Lembrar" da conversa é o seu backend reenviar o histórico em toda chamada. Conversa longa custa cada vez mais.
+2. **O `system` não é uma barreira de segurança.** Ele tem mais peso que o `user`, mas um texto do usuário (ou de um documento) pode tentar sobrescrevê-lo: é o *prompt injection*. Autorização continua no seu código, nunca "o prompt manda não mostrar dados de outro cliente".
+
+## Janela de contexto
+
+A **janela de contexto** é o máximo de tokens por chamada, somando entrada e saída. Os modelos atuais aceitam de dezenas de milhares a mais de um milhão de tokens, mas caber não significa funcionar bem: com contexto muito grande, o modelo tende a dar menos atenção a trechos do meio, e você paga por tudo que enviou. Para o assistente de FAQ, em vez de mandar o FAQ inteiro, você manda só os trechos relevantes para a pergunta: é a ideia do **RAG**, tema de uma aula adiante.
+
+Também há um limite de **saída** (`max tokens`). Se a resposta bater nele, ela vem **cortada**, e um JSON cortado não é JSON. O provedor informa o motivo do fim (*finish reason*): confira.
+
+## Temperatura e não determinismo
+
+A cada passo o modelo tem uma lista de próximos tokens prováveis. A **temperatura** controla o quanto a escolha é aleatória: perto de `0`, ele quase sempre pega o mais provável; valores altos espalham a escolha.
+
+- Classificar, extrair campos, gerar JSON: temperatura **baixa**.
+- Reescrever um e-mail de cobrança com tom mais gentil: temperatura moderada.
+
+<Callout tipo="atencao" titulo="Temperatura 0 não é determinismo">
+Mesmo com temperatura 0, a mesma entrada pode gerar saídas diferentes: detalhes de execução no provedor, versões de modelo trocadas por trás do mesmo nome e a própria ordem de operações numéricas no hardware. Alguns modelos nem aceitam ajustar a temperatura. Projete como se a resposta **pudesse variar** sempre: valide o formato e não escreva teste que compare o texto exato vindo do modelo real.
+</Callout>
+
+## Alucinação
+
+O modelo produz texto **plausível**, não texto **verdadeiro**. Pergunte ao assistente a tarifa do TED sem dar o FAQ e ele pode responder "R$ 8,50" com toda a confiança, número tirado do padrão estatístico de outros bancos. Para código, é o método de biblioteca que não existe.
+
+Mitigações, da mais eficaz para a menos:
+
+- **Dar o contexto**: os trechos do FAQ vigente vão no prompt, e o `system` diz para responder **só** com base neles.
+- **Permitir o "não sei"**: instrua a responder "não encontrei essa informação" e encaminhar para o atendimento humano.
+- **Validar a saída**: categoria tem que estar no `enum`, valor tem que vir de uma fonte sua, JSON tem que passar no schema.
+- **Não deixar o modelo decidir o que é irreversível**: estornar, bloquear cartão e aprovar crédito passam por regra de negócio e, quando for o caso, por uma pessoa.
+
+## A resposta do modelo é entrada não confiável
+
+Trate o texto que volta do LLM como trata um JSON vindo da internet: valide antes de usar. Um classificador de transações robusto:
+
+```java
+public enum Categoria { ALIMENTACAO, TRANSPORTE, MORADIA, SAUDE, LAZER, OUTROS }
+
+public final class ClassificadorDeTransacoes {
+
+    private final ClienteLlm llm;   // interface sua: isola o provedor e facilita o teste
+
+    public ClassificadorDeTransacoes(ClienteLlm llm) {
+        this.llm = llm;
+    }
+
+    public Categoria classificar(String descricao) {
+        String instrucoes = "Classifique a descrição de uma transação bancária. "
+                + "Responda APENAS com uma destas palavras: "
+                + Arrays.toString(Categoria.values());
+        try {
+            String resposta = llm.completar(instrucoes, descricao).strip().toUpperCase(Locale.ROOT);
+            return Categoria.valueOf(resposta);             // lança se o modelo inventar categoria
+        } catch (IllegalArgumentException | ProvedorIndisponivelException e) {
+            return Categoria.OUTROS;                          // alternativa segura: o extrato nunca quebra
+        }
+    }
+}
+
+public interface ClienteLlm {
+    String completar(String system, String user);
+}
+
+public class ProvedorIndisponivelException extends RuntimeException {
+    public ProvedorIndisponivelException(String mensagem, Throwable causa) { super(mensagem, causa); }
+}
+```
+
+O modelo pode responder "Alimentação.", "ALIMENTACAO (restaurante)" ou nada: o `valueOf` filtra, e a funcionalidade degrada para `OUTROS` em vez de derrubar o extrato. Na próxima aula, a saída estruturada do Spring AI substitui esse parse manual, mas a validação continua sendo sua.
+
+## Custo e latência
+
+Os provedores cobram **por milhão de tokens**, com preço separado para entrada e para saída (a saída costuma custar várias vezes mais). Faça a conta antes de construir. Com preços **ilustrativos** de US$ 0,50 por milhão de tokens de entrada e US$ 2,00 por milhão de saída:
+
+| Funcionalidade | Tokens por chamada | Chamadas por mês | Custo aproximado |
+|---|---|---|---|
+| Classificar transação | 150 entrada + 5 saída | 30 milhões | US$ 2.250 + US$ 300 = US$ 2.550 |
+| Assistente de FAQ | 3.000 entrada + 300 saída | 200 mil | US$ 300 + US$ 120 = US$ 420 |
+
+A tabela ensina duas coisas: volume alto com prompt pequeno também sai caro, e o `system` longo repetido em toda chamada pesa (muitos provedores oferecem *prompt caching* com desconto para prefixos repetidos). Às vezes a resposta certa é classificar com regra simples os 80% óbvios ("UBER" é transporte) e mandar só o resto ao modelo, ou guardar o resultado por descrição normalizada num cache (aula de cache do módulo 15).
+
+**Latência:** a primeira parte da resposta chega em centenas de milissegundos a alguns segundos, e cada token de saída acrescenta tempo. Consequências práticas:
+
+- Nunca chame o LLM dentro de uma transação de banco aberta nem no caminho crítico do pagamento.
+- Configure **timeout** e trate a falha (limite de taxa, `429`, indisponibilidade) com a mesma resiliência de qualquer serviço externo: retry com backoff só onde fizer sentido, circuit breaker, alternativa.
+- Para respostas longas ao usuário, use **streaming**: o texto aparece enquanto é gerado.
+- Classificação em massa não precisa ser síncrona: uma fila (módulo 12) processa em segundo plano.
+
+## Quando NÃO usar um LLM
+
+<Comparar antes="Tarefa para LLM" depois="Tarefa para código determinístico">
+
+```text
+- entender texto livre e bagunçado
+  ("PAG*IFOOD 0923" -> alimentação)
+- responder dúvidas com base no FAQ
+- resumir uma reclamação para o atendente
+- extrair campos de um comprovante em texto
+```
+
+```text
+- calcular juros, IOF, parcelas, saldo
+- decidir se a transferência é autorizada
+- validar CPF, limite, horário do PIX
+- qualquer regra com resposta exata,
+  auditável e reprodutível
+```
+
+</Comparar>
+
+<Callout tipo="erro" titulo="Nunca peça ao modelo para fazer a conta">
+"Calcule o valor da parcela de R$ 3.000 em 12x a 2,49% ao mês" parece funcionar na demonstração e erra em produção: o modelo prevê dígitos, não faz aritmética com `BigDecimal`. Além disso, um regulador ou auditor vai perguntar **como** o valor foi obtido, e "o modelo respondeu isso" não é resposta. Se o usuário perguntar sobre parcelas, o LLM pode entender a pergunta e chamar **o seu** método de cálculo (tool calling, aula adiante), mas o número vem do código.
+</Callout>
+
+Outros sinais de que LLM é a ferramenta errada: a regra cabe numa tabela ou num `switch`; o erro custa caro e não há como validar a resposta; a latência precisa ser de milissegundos; ou os dados não podem sair da sua infraestrutura e não há modelo local viável.
+
+## Provedores
+
+| Provedor | Modelos | Observação |
+|---|---|---|
+| **OpenAI** | família GPT | API de chat e de embeddings; muito usado como referência |
+| **Anthropic** | família Claude | API de mensagens; `system` é um campo separado das mensagens |
+| **Google** | família Gemini | via Google AI ou Vertex AI |
+| **Ollama** | modelos abertos (Llama, Mistral, Qwen e outros) rodando na sua máquina ou servidor | sem custo por token e sem dado saindo da rede; exige hardware e os modelos pequenos erram mais |
+
+Cada provedor tem sua API, seus nomes de modelo e seus preços, e tudo isso muda rápido: confira sempre a página oficial de modelos e preços. É por isso que, no código, vale depender de uma **abstração** (a interface `ClienteLlm` acima, ou o `ChatClient` do Spring AI na próxima aula) e não do SDK de um provedor espalhado pelo sistema. Para desenvolvimento local e testes de integração, o Ollama evita gastar créditos.
+
+<Callout tipo="atencao" titulo="Dado pessoal e chave de API">
+Enviar o extrato de um cliente para um provedor externo é **compartilhar dado pessoal** com um terceiro: pela LGPD, isso precisa de base legal e de contrato com o provedor (retenção, uso para treinamento, região). Mande o mínimo necessário (a descrição da transação, não o CPF nem o nome). E a **chave de API** é segredo: vem de variável de ambiente ou cofre de segredos, nunca do código nem do repositório.
+</Callout>
+
+<Callout tipo="entrevista">
+"Você usaria IA para tal funcionalidade?" Uma boa resposta não é "sim, é só chamar a API". Mostre critério:
+
+1. **Encaixe**: é problema de linguagem natural, ou regra exata? Cálculo financeiro e autorização ficam em código.
+2. **Riscos**: alucinação e não determinismo; como a saída é **validada** e qual é a **alternativa** quando o modelo erra ou está fora do ar.
+3. **Custo e latência**: estimativa em tokens × volume; síncrono ou em fila; cache.
+4. **Dados**: o que sai para o provedor, LGPD, prompt injection, chave em segredo.
+5. **Qualidade**: como medir se está acertando (um conjunto de exemplos rotulados, avaliado a cada mudança de prompt ou de modelo).
+</Callout>
+
+<Quiz
+  id="16-llm-para-devs"
+  questoes={[
+    {
+      pergunta: 'Um chat com o cliente já tem 40 mensagens. O que acontece com o custo da próxima pergunta?',
+      opcoes: ['É igual ao da primeira, o modelo guarda o histórico', 'É maior, porque o histórico é reenviado como tokens de entrada', 'É menor, por causa do cache do modelo', 'Não há custo para mensagens de histórico'],
+      correta: 1,
+      explicacao: 'O modelo não tem estado entre chamadas. O backend reenvia o histórico, e cada token de entrada é cobrado de novo.',
+    },
+    {
+      pergunta: 'Com temperatura 0, o que você pode assumir?',
+      opcoes: ['A resposta será sempre idêntica para a mesma entrada', 'As escolhas ficam mais previsíveis, mas a saída ainda pode variar e precisa ser validada', 'O modelo não alucina', 'A latência cai para zero'],
+      correta: 1,
+      explicacao: 'Temperatura baixa reduz a variação, mas não garante determinismo nem veracidade.',
+    },
+    {
+      pergunta: 'Qual tarefa NÃO deve ser delegada a um LLM?',
+      opcoes: ['Sugerir a categoria de uma transação a partir da descrição', 'Resumir uma reclamação para o atendente', 'Calcular o valor da parcela de um empréstimo', 'Responder dúvidas com base no FAQ fornecido'],
+      correta: 2,
+      explicacao: 'Cálculo financeiro precisa ser exato, reprodutível e auditável: é código com BigDecimal e testes.',
+    },
+    {
+      pergunta: 'O modelo respondeu "Alimentação." quando o enum espera ALIMENTACAO. Qual é o tratamento adequado?',
+      opcoes: ['Deixar a exceção derrubar a requisição', 'Validar a resposta contra as categorias válidas e cair numa alternativa segura se não bater', 'Aumentar a temperatura', 'Salvar o texto como veio'],
+      correta: 1,
+      explicacao: 'A resposta do modelo é entrada não confiável: valide o formato e tenha uma alternativa.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Um LLM prevê o próximo **token**; preço, contexto e latência são medidos em tokens.
+- A chamada é uma lista de mensagens com papéis **system**, **user**, **assistant** e **tool**; o modelo não guarda estado e o `system` não é barreira de segurança.
+- A **janela de contexto** soma entrada e saída; resposta cortada no limite quebra JSON.
+- **Temperatura** baixa para classificar e extrair; nem assim a saída é determinística.
+- **Alucinação**: dê o contexto, permita o "não sei" e **valide** a saída; tenha alternativa.
+- Estime **custo** (tokens × volume) e trate **latência** como a de qualquer serviço externo: timeout, resiliência, streaming, fila.
+- Regra de negócio determinística e **cálculo financeiro** ficam em código.
+- Provedores: OpenAI, Anthropic, Gemini, e Ollama para modelos locais; dependa de uma abstração.
+
+## Referências
+
+- OpenAI — *API reference* e página de *Pricing* (platform.openai.com/docs)
+- Anthropic — *Messages API*, *Prompt engineering overview* e *Pricing* (docs.anthropic.com)
+- Google — *Gemini API documentation* (ai.google.dev)
+- Ollama — documentação e biblioteca de modelos (ollama.com)
+- OWASP — *Top 10 for Large Language Model Applications* (genai.owasp.org)
+- Autoridade Nacional de Proteção de Dados — Lei Geral de Proteção de Dados (gov.br/anpd)

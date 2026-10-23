@@ -1,0 +1,138 @@
+---
+titulo: Relatórios de vendas (JOIN, GROUP BY, HAVING)
+codigo: "07.02"
+resumo: Escreva as cinco consultas que o time comercial de uma loja de cafés pede toda semana — com as pegadinhas reais de status, preço praticado, média no nível errado e anti-join.
+modulo: 07-sql
+ordem: 2
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [JOIN, LEFT JOIN, GROUP BY, HAVING, NOT EXISTS, subconsulta]
+aulas: [07-sql/03-consultas-e-joins, 07-sql/04-agregacoes-e-janelas]
+java:
+  modulo: m07-sql
+  teste: RelatoriosVendasTest
+---
+
+## Contexto
+
+Uma loja online de cafés exporta os relatórios para planilhas e monta tudo à mão, e os números nunca batem entre o comercial e o financeiro. Você vai escrever as consultas oficiais. O banco é pequeno de propósito: dá para conferir cada resultado com lápis e papel.
+
+## A base de dados
+
+```sql
+cliente     (id, nome, cidade)
+produto     (id, nome, categoria, preco)                      -- preco = preço ATUAL de tabela
+pedido      (id, cliente_id, data, status)                    -- status: PAGO, CANCELADO, PENDENTE
+item_pedido (pedido_id, produto_id, quantidade, preco_unitario)  -- preço PRATICADO na venda
+```
+
+O script completo, com os dados, está em `java/m07-sql/testes/dev/trilhajava/m07/DadosVendas.java`. São 6 clientes, 6 produtos, 10 pedidos (8 pagos, 1 cancelado, 1 pendente) e 14 itens.
+
+## Onde escrever
+
+Cada consulta tem seu arquivo em `java/m07-sql/starter/src/main/resources/sql/0702/`. Substitua o `SELECT 'todo'` pela sua consulta. O teste confere **as colunas, os valores e a ordem** das linhas.
+
+## Requisitos
+
+| Arquivo | Pergunta | Colunas | Ordem |
+|---|---|---|---|
+| `q1-faturamento-por-categoria.sql` | Quanto cada categoria faturou em pedidos **pagos**? | `categoria`, `faturamento` | faturamento, do maior para o menor |
+| `q2-clientes-sem-pedido.sql` | Quais clientes **nunca** fizeram pedido (de qualquer status)? | `nome` | nome |
+| `q3-clientes-recorrentes.sql` | Quais clientes têm **2 ou mais** pedidos pagos, e quantos? | `nome`, `pedidos_pagos` | pedidos, decrescente; empate por nome |
+| `q4-ticket-medio-por-cidade.sql` | Qual o **valor médio por pedido pago** em cada cidade? | `cidade`, `ticket_medio` (2 casas) | cidade |
+| `q5-produtos-parados.sql` | Quais produtos **nunca** foram vendidos num pedido pago? | `nome` | nome |
+
+## Regras
+
+- **Faturamento** é `quantidade × preco_unitario` do item, não o `preco` atual do produto. Preços mudam, descontos existem; o que vale é o preço da venda.
+- Só pedidos com `status = 'PAGO'` entram em faturamento, contagens e médias (exceto na q2, que é sobre "nunca ter pedido").
+- **Ticket médio** é a média do **total de cada pedido**, não a média dos itens.
+
+## Resultados esperados
+
+| Consulta | Resultado |
+|---|---|
+| q1 | Eletro 850 · Mercearia 205 · Casa 160 |
+| q2 | Fábio |
+| q3 | Ana 3 · Carla 3 |
+| q4 | Curitiba 360.00 · Recife 103.33 · São Paulo 136.25 |
+| q5 | Bule |
+
+<Callout tipo="dica" titulo="Confira à mão antes de confiar">
+Pegue a q4 e calcule o ticket de Recife no papel: Carla tem 3 pedidos pagos, de 205, 80 e 25. A média é 310 ÷ 3 = 103,33. O pedido pendente do Davi não entra. Fazer isso uma vez ensina mais que dez consultas que "deram certo".
+</Callout>
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `RelatoriosVendasTest` passam.
+- [ ] Nenhuma consulta usa `NOT IN` com subconsulta.
+- [ ] Os JOINs usam `JOIN ... ON` explícito (nada de vírgula no `FROM`).
+- [ ] As consultas estão formatadas e legíveis: um revisor entende cada uma em 30 segundos.
+
+## Desafios opcionais
+
+- Reescreva a q2 de duas formas (`LEFT JOIN ... IS NULL` e `NOT EXISTS`) e compare os planos com `EXPLAIN` num PostgreSQL.
+- q1 com `LEFT JOIN`: mostre também as categorias sem venda, com faturamento `0` (dica: `COALESCE`, e o filtro de status vai no `ON`).
+- Ranking de produtos por quantidade vendida, com o percentual de cada um sobre o total.
+
+<Dicas>
+<Dica nivel={1}>
+Monte cada consulta em etapas: primeiro o `FROM` com os `JOIN`s, depois o `WHERE`, rode e olhe as linhas. Só então agrupe. Lembre a ordem lógica: `WHERE` filtra linhas antes do `GROUP BY`; condições sobre `COUNT(*)` vão no `HAVING`.
+</Dica>
+<Dica nivel={2}>
+- **q2** e **q5** são "quem não tem": `NOT EXISTS (SELECT 1 FROM ... WHERE ...)`. Na q5, a subconsulta precisa juntar `item_pedido` com `pedido` para olhar o status.
+- **q4** tem duas etapas: some cada pedido numa subconsulta (`GROUP BY pedido_id`) e só então tire a média por cidade.
+</Dica>
+<Dica nivel={3}>
+Esqueleto da q4:
+
+```sql
+SELECT c.cidade, ROUND(AVG(t.total), 2) AS ticket_medio
+  FROM (SELECT pedido_id, SUM(quantidade * preco_unitario) AS total
+          FROM item_pedido GROUP BY pedido_id) t
+  JOIN pedido p  ON ...
+  JOIN cliente c ON ...
+ WHERE p.status = 'PAGO'
+ GROUP BY c.cidade
+ ORDER BY c.cidade;
+```
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="q1">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0702/q1-faturamento-por-categoria.sql" />
+</Tab>
+<Tab rotulo="q2">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0702/q2-clientes-sem-pedido.sql" />
+</Tab>
+<Tab rotulo="q3">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0702/q3-clientes-recorrentes.sql" />
+</Tab>
+<Tab rotulo="q4">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0702/q4-ticket-medio-por-cidade.sql" />
+</Tab>
+<Tab rotulo="q5">
+<CodigoJava caminho="m07-sql/solucao/src/main/resources/sql/0702/q5-produtos-parados.sql" />
+</Tab>
+</Tabs>
+
+### As pegadinhas, uma por uma
+
+- **q1: preço praticado.** Usando `produto.preco`, o Moedor do pedido 6 (vendido por 180) e a Cafeteira do pedido 10 (vendida por 320) contariam pelo preço de tabela, e Eletro daria 900 em vez de 850. O financeiro recebeu 850.
+- **q2: `LEFT JOIN` ou `NOT EXISTS`.** Os dois funcionam. Um `INNER JOIN` nunca devolveria quem não tem pedido, e um `NOT IN` quebraria se `cliente_id` pudesse ser `NULL`.
+- **q3: `WHERE` × `HAVING`.** O status é filtrado **antes** de agrupar (`WHERE`), e a contagem **depois** (`HAVING COUNT(*) >= 2`). O Bruno tem 2 pedidos, mas um foi cancelado: fica de fora. Agrupar por `c.id, c.nome` evita juntar dois clientes homônimos.
+- **q4: média no nível certo.** `AVG` direto nos itens daria a média por **item**. Em Recife, isso seria (180 + 25 + 80 + 25) ÷ 4 = 77,50, um número que não significa nada para o negócio.
+- **q5: o status mora em outra tabela.** O Moedor aparece num pedido cancelado e num pago, então não está parado. O filtro de status precisa estar **dentro** do `NOT EXISTS`, junto com o `JOIN` em `pedido`.
+
+### Avalie sua solução
+
+- Suas consultas continuariam corretas se a loja tivesse dois clientes chamados "Ana"?
+- Se entrar um novo status (`ESTORNADO`), quais consultas mudariam de resultado sem você perceber?
+- Você conferiu pelo menos um resultado à mão?
+
+</Solucao>

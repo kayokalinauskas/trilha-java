@@ -1,0 +1,308 @@
+---
+titulo: O relay do transactional outbox
+codigo: "12.03"
+resumo: Implemente o coração do padrão outbox — o relay que publica os eventos pendentes em lotes, na ordem de criação, sem deixar um evento passar à frente de outro do mesmo agregado, com backoff exponencial, eventos mortos, reprocessamento manual e limpeza. Java puro, com um relógio que você controla, e um programa que reproduz uma queda do broker passo a passo.
+modulo: 12-mensageria
+ordem: 3
+dificuldade: medio
+tempo: 2–3h
+conceitos: [transactional outbox, relay, ordem por agregado, backoff exponencial, Clock, at-least-once]
+aulas: [12-mensageria/04-transactional-outbox]
+java:
+  modulo: m12-mensageria
+  arquivos:
+    - src/main/java/dev/trilhajava/m12/outbox/RelayDoOutbox.java
+---
+
+## Contexto
+
+O time de um banco digital já grava os eventos de conta (depósito, transferência, tarifa) numa tabela de **outbox**, na mesma transação da mudança de saldo. Assim, ou o saldo muda e o evento fica registrado, ou nenhum dos dois acontece. Falta o **relay**: o processo que lê os eventos pendentes e os publica no broker, para o extrato, a antifraude e as notificações consumirem.
+
+O relay parece um `for` simples. É nele, porém, que moram os bugs de ordem e de eventos perdidos que ninguém percebe até o dia em que um cliente vê no extrato uma tarifa cobrada **antes** do depósito que a originou, ou um depósito que nunca aparece.
+
+Para você testar sem banco e sem broker, tudo está atrás de interfaces, e o tempo vem de um `Clock`.
+
+## O que você vai praticar
+
+- **O padrão transactional outbox.** O evento é gravado no banco, junto com a mudança de negócio, e um processo separado o publica depois. A garantia é "pelo menos uma vez" (*at-least-once*): se o relay cair entre publicar e marcar como publicado, o evento sai de novo, e os consumidores precisam tolerar a duplicata. Veja [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/).
+- **Ordem por agregado.** *Agregado* é a entidade de negócio que origina os eventos (aqui, a conta). Eventos de agregados diferentes podem sair em qualquer ordem; eventos do mesmo agregado, nunca fora de ordem. Mesma aula.
+- **Backoff exponencial.** Depois de uma falha, esperar antes de tentar de novo, dobrando a espera a cada falha, até um teto. Isso dá tempo ao broker para voltar e evita martelar um serviço que já está com problema.
+- **Tempo injetável.** Com um `Clock` no construtor, um teste (ou o programa do **Experimente**) avança o tempo à vontade, sem `Thread.sleep`.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m12.outbox` (não precisa mudar):
+
+- `EventoDeSaida`, um record imutável com `id`, `agregado`, `tipo`, `payload`, `criadoEm`, `status` (`PENDENTE`, `PUBLICADO`, `MORTO`), `tentativas`, `proximaTentativa`, `publicadoEm` e `ultimoErro`. Ele cria eventos e devolve cópias no novo estado:
+
+  | Método | Devolve |
+  |---|---|
+  | `EventoDeSaida.novo(agregado, tipo, payload, agora)` | `PENDENTE`, 0 tentativas, `proximaTentativa = agora` |
+  | `publicado(agora)` | `PUBLICADO`, com `publicadoEm = agora` |
+  | `falhou(erro, proxima)` | `PENDENTE`, tentativas + 1, `proximaTentativa = proxima`, `ultimoErro = erro` |
+  | `morto(erro)` | `MORTO`, tentativas + 1, `ultimoErro = erro` |
+  | `reativado(agora)` | `PENDENTE`, 0 tentativas, `proximaTentativa = agora` |
+
+- `RepositorioDeSaida`, a tabela de outbox, e a implementação `RepositorioDeSaidaEmMemoria`: `pendentes(limite)` (os `PENDENTE`, do mais antigo para o mais novo), `agregadosComEventoMorto()`, `buscar(id)`, `salvar(evento)` (insere ou substitui pelo `id`), `todos()` e `remover(id)`;
+- `Publicador`, com `void publicar(EventoDeSaida evento)`. Ele só retorna depois da confirmação do broker; **qualquer** `RuntimeException` significa "não foi publicado";
+- `ConfiguracaoDoRelay(int tamanhoDoLote, int maxTentativas, Duration atrasoInicial, Duration atrasoMaximo)`, com `ConfiguracaoDoRelay.padrao()` = 100, 10, 1 s e 5 min;
+- `Resultado(int publicados, int falhas, int adiados)`.
+
+### O que você implementa
+
+A classe `RelayDoOutbox`, já criada e vazia, com esta API pública (fixa):
+
+```java
+public RelayDoOutbox(RepositorioDeSaida repositorio, Publicador publicador, Clock relogio, ConfiguracaoDoRelay config)
+public Resultado executar()                 // regras 1 a 8
+public void reprocessar(UUID id)            // regras 9 e 10
+public int limpar(Duration retencao)        // regra 11
+```
+
+Numa aplicação Spring, `executar()` rodaria num `@Scheduled` a cada poucos segundos; aqui, quem chama é você.
+
+## Regras
+
+**`executar()`**
+
+1. **Lê um lote, na ordem de criação.** Até `tamanhoDoLote` pendentes, com `repositorio.pendentes(...)`. Exemplo: com lote 2 e cinco pendentes, uma execução publica os 2 mais antigos e a seguinte, os próximos 2.
+2. **Publica e marca.** Para cada evento, na ordem: `publicador.publicar(evento)` e, se não houve exceção, salva `evento.publicado(agora)`. O que já está `PUBLICADO` não volta a ser publicado. `agora` é `relogio.instant()`, lido uma vez por execução.
+3. **Falha conta, guarda o erro e agenda.** Se o publicador lançar qualquer `RuntimeException`, salve `evento.falhou(erro, proxima)`, com `erro` contendo a mensagem da exceção (por exemplo, `"IllegalStateException: broker recusou A1"`) e `proxima = agora + espera`. O relay **não** para: segue para o próximo evento.
+4. **Backoff exponencial com teto.** A espera depois da n-ésima falha é `atrasoInicial × 2^(n−1)`, limitada a `atrasoMaximo`. Com o padrão (1 s, teto 5 min): 1 s, 2 s, 4 s, 8 s, 16 s, 32 s, 64 s, 128 s, 256 s, 300 s, 300 s…
+5. **Antes da hora, não tenta.** Um pendente cuja `proximaTentativa` ainda não chegou é **adiado**: não é publicado nem conta tentativa.
+6. **Na última tentativa permitida, vira MORTO.** Se a falha que acabou de acontecer é a de número `maxTentativas` (ou seja, `tentativas + 1 >= maxTentativas`), salve `evento.morto(erro)` em vez de `falhou(...)`. Um evento morto não é mais tentado.
+7. **Um agregado travado não anda.** Durante a execução, um agregado fica **travado** quando um evento dele falha ou é adiado, ou quando ele tem um evento `MORTO` (`repositorio.agregadosComEventoMorto()`). Todo evento seguinte de um agregado travado é **adiado**. Exemplo: com `A1` e `A2` da conta A e `B1` da conta B, e o broker recusando a conta A: `A1` falha, `A2` é adiado (publicá-lo passaria à frente do `A1`) e `B1` é publicado.
+8. **Devolve as contagens.** `Resultado(publicados, falhas, adiados)`, em que `falhas` inclui a que tornou o evento `MORTO`. No exemplo da regra 7: `Resultado[publicados=1, falhas=1, adiados=1]`.
+
+**`reprocessar(id)` e `limpar(retencao)`**
+
+9. **Reprocessar devolve um evento morto à fila.** Depois que alguém corrigiu a causa, `reprocessar(id)` salva `evento.reativado(agora)`: `PENDENTE`, com as tentativas zeradas. O agregado destrava, e a ordem se mantém: o evento reprocessado sai antes dos que ficaram atrás dele.
+10. **Reprocessar só vale para eventos mortos que existem.** `id` inexistente → `IllegalArgumentException`; evento que não está `MORTO` → `IllegalStateException`, com uma mensagem que diga o status atual. Exemplo: `"só eventos MORTOS podem ser reprocessados; este está PUBLICADO"`.
+11. **Limpar apaga só publicados antigos.** Remove os `PUBLICADO` com `publicadoEm` anterior a `agora − retencao` e devolve quantos removeu. Pendentes e mortos **nunca** são apagados, por mais antigos que sejam.
+
+## Passo a passo sugerido
+
+1. **O caminho feliz (regras 1, 2 e 8).** Um `for` sobre o lote que publica e salva. Rode o programa do **Experimente** com o `broker` aceitando tudo (comente a linha `recusados.add(...)`): os três eventos saem na primeira execução.
+2. **A falha (regras 3 e 4).** O `catch (RuntimeException ...)`, o `falhou(...)` e o cálculo da espera. Escreva o cálculo num método separado, para conferir a sequência 1, 2, 4… 256, 300.
+3. **O agendamento (regra 5).** Compare `proximaTentativa` com `agora`.
+4. **A trava por agregado (regra 7).** Um `Set<String>` local à execução, que começa com os agregados que têm evento morto. Agora o passo 1 do **Experimente** mostra `A2` adiado.
+5. **Mortos, reprocessamento e limpeza (regras 6, 9, 10 e 11).**
+6. **Rode o programa inteiro** e compare com a saída abaixo, linha a linha.
+
+## Experimente
+
+O programa abaixo monta o relay com o repositório em memória, um "broker" que recusa os agregados de uma lista e um **relógio manual**, que só anda quando o programa manda. A configuração é pequena para tudo acontecer em poucas execuções: 4 tentativas, espera de 1 s dobrando até 5 s. Ele grava `A1` e `A2` (conta A) e `B1` (conta B), derruba o broker para a conta A, avança o tempo, devolve o broker, reprocessa e limpa. Depois de cada execução, imprime o `Resultado` e o estado de cada evento: `t2, +2000ms` quer dizer "2 tentativas, próxima daqui a 2 s".
+
+Salve-o em `src/main/java/dev/trilhajava/m12/outbox/DemonstracaoDoRelay.java`, no starter:
+
+```java
+package dev.trilhajava.m12.outbox;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class DemonstracaoDoRelay {
+
+    /** Um relógio que só anda quando você manda: o programa controla o tempo, sem Thread.sleep. */
+    static final class RelogioManual extends Clock {
+        private Instant agora = Instant.parse("2026-10-01T12:00:00Z");
+
+        void avancar(Duration quanto) {
+            agora = agora.plus(quanto);
+        }
+
+        @Override
+        public Instant instant() {
+            return agora;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zona) {
+            return this;
+        }
+    }
+
+    static final RelogioManual relogio = new RelogioManual();
+    static final RepositorioDeSaidaEmMemoria repositorio = new RepositorioDeSaidaEmMemoria();
+    static final Set<String> recusados = new HashSet<>(); // agregados que o "broker" recusa
+    static final List<String> publicados = new ArrayList<>(); // a ordem em que o "broker" recebeu
+
+    public static void main(String[] args) {
+        Publicador broker = evento -> {
+            if (recusados.contains(evento.agregado())) {
+                throw new IllegalStateException("broker recusou " + evento.tipo());
+            }
+            publicados.add(evento.tipo());
+        };
+        // Lote de 100, 4 tentativas, espera de 1 s dobrando até 5 s: números pequenos para ver tudo acontecer.
+        var config = new ConfiguracaoDoRelay(100, 4, Duration.ofSeconds(1), Duration.ofSeconds(5));
+        var relay = new RelayDoOutbox(repositorio, broker, relogio, config);
+
+        EventoDeSaida a1 = gravar("conta-A", "A1");
+        gravar("conta-A", "A2");
+        gravar("conta-B", "B1");
+        recusados.add("conta-A");
+
+        rodar(relay, "1. broker recusa a conta-A");
+        relogio.avancar(Duration.ofMillis(500));
+        rodar(relay, "2. +0,5 s (antes da hora)");
+        relogio.avancar(Duration.ofMillis(500));
+        rodar(relay, "3. +1 s (2ª falha)");
+        relogio.avancar(Duration.ofSeconds(2));
+        rodar(relay, "4. +2 s (3ª falha)");
+        relogio.avancar(Duration.ofSeconds(4));
+        rodar(relay, "5. +4 s (4ª falha: MORTO)");
+
+        recusados.clear();
+        relogio.avancar(Duration.ofMinutes(10));
+        rodar(relay, "6. broker normal, A1 morto");
+
+        relay.reprocessar(a1.id());
+        rodar(relay, "7. depois de reprocessar(A1)");
+        System.out.println("ordem no broker: " + publicados);
+
+        try {
+            relay.reprocessar(a1.id());
+        } catch (IllegalStateException erro) {
+            System.out.println("reprocessar de novo: " + erro.getMessage());
+        }
+
+        relogio.avancar(Duration.ofHours(1));
+        System.out.println("limpar(30 min): " + relay.limpar(Duration.ofMinutes(30)) + " removidos, "
+                + repositorio.todos().size() + " restantes");
+    }
+
+    static EventoDeSaida gravar(String agregado, String tipo) {
+        relogio.avancar(Duration.ofMillis(1)); // cada evento criado um instante depois do anterior
+        EventoDeSaida evento = EventoDeSaida.novo(agregado, tipo, "{}", relogio.instant());
+        repositorio.salvar(evento);
+        return evento;
+    }
+
+    static void rodar(RelayDoOutbox relay, String passo) {
+        Resultado resultado = relay.executar();
+        StringBuilder estados = new StringBuilder();
+        for (EventoDeSaida e : repositorio.todos()) {
+            estados.append(" ").append(e.tipo()).append('=').append(e.status());
+            if (e.status() == EventoDeSaida.Status.PENDENTE && e.tentativas() > 0) {
+                long espera = Duration.between(relogio.instant(), e.proximaTentativa()).toMillis();
+                estados.append("(t").append(e.tentativas()).append(", +").append(espera).append("ms)");
+            } else if (e.status() == EventoDeSaida.Status.MORTO) {
+                estados.append("(t").append(e.tentativas()).append(')');
+            }
+        }
+        System.out.printf("%-30s %s%n%30s%s%n", passo, resultado, "", estados);
+    }
+}
+```
+
+Rode pelo ▶ do IntelliJ ou, na pasta do starter (não precisa de Docker):
+
+```bash
+mvn -q compile exec:java "-Dexec.mainClass=dev.trilhajava.m12.outbox.DemonstracaoDoRelay"
+```
+
+Com a sua solução pronta, a saída é exatamente esta (foi gerada com a solução de referência):
+
+```text
+1. broker recusa a conta-A     Resultado[publicados=1, falhas=1, adiados=1]
+                               A1=PENDENTE(t1, +1000ms) A2=PENDENTE B1=PUBLICADO
+2. +0,5 s (antes da hora)      Resultado[publicados=0, falhas=0, adiados=2]
+                               A1=PENDENTE(t1, +500ms) A2=PENDENTE B1=PUBLICADO
+3. +1 s (2ª falha)             Resultado[publicados=0, falhas=1, adiados=1]
+                               A1=PENDENTE(t2, +2000ms) A2=PENDENTE B1=PUBLICADO
+4. +2 s (3ª falha)             Resultado[publicados=0, falhas=1, adiados=1]
+                               A1=PENDENTE(t3, +4000ms) A2=PENDENTE B1=PUBLICADO
+5. +4 s (4ª falha: MORTO)      Resultado[publicados=0, falhas=1, adiados=1]
+                               A1=MORTO(t4) A2=PENDENTE B1=PUBLICADO
+6. broker normal, A1 morto     Resultado[publicados=0, falhas=0, adiados=1]
+                               A1=MORTO(t4) A2=PENDENTE B1=PUBLICADO
+7. depois de reprocessar(A1)   Resultado[publicados=2, falhas=0, adiados=0]
+                               A1=PUBLICADO A2=PUBLICADO B1=PUBLICADO
+ordem no broker: [B1, A1, A2]
+reprocessar de novo: só eventos MORTOS podem ser reprocessados; este está PUBLICADO
+limpar(30 min): 3 removidos, 0 restantes
+```
+
+A acentuação pode aparecer trocada num terminal do Windows que não esteja em UTF-8; o texto da exceção na penúltima linha é o da sua mensagem.
+
+Como ler a saída quando algo está errado:
+
+- **Passo 1 com `publicados=2` e `A2=PUBLICADO`:** a trava por agregado não existe. A ordem de A quebrou: `A2` saiu antes de `A1`.
+- **Passo 2 com `falhas=1`:** o relay não respeita a `proximaTentativa`.
+- **Passo 2 com `adiados=1` (só o `A1`):** o adiamento não trava o agregado, e o `A2` foi publicado à frente.
+- **Esperas diferentes de 1000, 2000 e 4000 ms:** o expoente do backoff está errado (o mais comum é começar dobrando já na primeira falha).
+- **`A1=PENDENTE(t4, …)` no passo 5:** a comparação com `maxTentativas` está deslocada de um.
+- **Passo 6 com `A2=PUBLICADO`:** o evento morto não trava o agregado.
+- **Uma exceção interrompendo o programa:** algum `catch` está pegando uma exceção específica demais, ou falta.
+
+## Critérios de aceite
+
+- [ ] A saída do **Experimente** é idêntica à indicada.
+- [ ] Nenhum `Thread.sleep`, `Instant.now()` ou `System.currentTimeMillis()` no relay: o tempo vem do `Clock`.
+- [ ] Uma exceção de um evento nunca interrompe o relay nem os eventos de outros agregados.
+- [ ] Você aponta, no seu código, a linha que garante "pelo menos uma vez", e explica o que aconteceria se `publicar` e `salvar` trocassem de lugar.
+
+## Desafios opcionais
+
+- Implemente um `RepositorioDeSaida` com JDBC e `FOR UPDATE SKIP LOCKED` (o exercício 10.03 tem a base), e rode o relay em duas threads ao mesmo tempo.
+- Com o lote cheio de eventos de um agregado travado, os outros agregados esperam a próxima execução. Como você evitaria essa "fome"?
+- Adicione *jitter* (uma variação aleatória) ao backoff sem perder a reprodutibilidade (dica: injete a fonte de aleatoriedade).
+- Escreva a sua própria suíte de testes com JUnit, um `Clock` controlado e um publicador falso, transformando cada passo do **Experimente** num teste.
+
+<Dicas>
+<Dica nivel={1}>
+Mantenha um `Set<String>` de agregados travados **durante a execução**. Comece com `repositorio.agregadosComEventoMorto()`. Todo evento adiado ou que falhou acrescenta o seu agregado ao conjunto.
+</Dica>
+<Dica nivel={2}>
+- Backoff: comece com `atrasoInicial` e dobre `tentativas − 1` vezes, parando no teto. `Duration.multipliedBy(2)` e `compareTo` fazem o trabalho.
+- O `catch` é de `RuntimeException`, e não de uma exceção específica: um `NullPointerException` no serializador também não pode derrubar o relay.
+</Dica>
+<Dica nivel={3}>
+Decida entre `falhou(...)` e `morto(...)` olhando para `evento.tentativas() + 1` (a tentativa que acabou de falhar) comparado com `maxTentativas`. E lembre que `EventoDeSaida` é imutável: cada mudança é um `repositorio.salvar(evento.novoEstado(...))`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m12-mensageria/solucao/src/main/java/dev/trilhajava/m12/outbox/RelayDoOutbox.java" />
+
+A solução de referência tem uma suíte de testes, em `java/m12-mensageria/solucao/src/test`, que cobre as mesmas regras.
+
+### Por que assim
+
+- **O conjunto de travados é local à execução.** O estado persistente (tentativas, próxima tentativa, morto) está no repositório; o "quem não pode andar agora" é recalculado a cada rodada, a partir dele.
+- **Adiado também trava.** Se A1 ainda está esperando o backoff, publicar A2 seria passar à frente. Essa é a regra que os relays ingênuos esquecem.
+- **Morto trava até alguém agir.** Pular o evento morto e seguir com o próximo do agregado parece pragmático, mas entrega um extrato sem uma transferência no meio. Travar e alertar é a escolha segura; o `reprocessar` é a porta de saída depois da correção.
+- **`catch (RuntimeException)`.** O relay é infraestrutura crítica: um bug em um evento não pode parar a publicação dos outros.
+- **Publicar antes de marcar.** Se o processo cair entre as duas linhas, o evento sai de novo na próxima execução: duplicado, mas nunca perdido. Na ordem inversa, uma queda no meio perderia o evento para sempre.
+
+### Alternativas e trade-offs
+
+- **Travar o lote inteiro na primeira falha** (o que o marco 5 faz): mais simples, e quase sempre certo, porque quando o broker cai, tudo falha junto. Mas um evento com problema próprio (payload grande demais para o tópico) seguraria todos os agregados.
+- **Não travar nunca** (e aceitar desordem): serve para eventos independentes (métricas, logs), nunca para saldo.
+- **Change Data Capture** (Debezium lendo o log do banco) no lugar do relay por polling: menos latência e nenhuma consulta periódica, ao custo de mais uma peça de infraestrutura para operar.
+
+### Avalie sua solução
+
+- Onde exatamente, no seu código, está a garantia "pelo menos uma vez"? E onde seria possível perder um evento, se você invertesse duas linhas?
+- Com 10 instâncias rodando o relay, o que muda no `pendentes(limite)`?
+- Quem fica sabendo que um evento morreu? Que métrica ou alerta você exporia?
+
+</Solucao>

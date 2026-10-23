@@ -1,0 +1,8 @@
+---
+interface Props {
+  rotulo: string;
+}
+const { rotulo } = Astro.props;
+---
+
+<div data-tab={rotulo}><slot /></div>

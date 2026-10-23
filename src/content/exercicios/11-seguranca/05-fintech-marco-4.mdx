@@ -1,0 +1,406 @@
+---
+titulo: "Fintech Core — Marco 4: autenticação, JWT e contas com dono"
+codigo: "11.05"
+resumo: A Fintech Core ganha usuários, login com JWT e dono em cada conta. Cadastro com senha em BCrypt, tokens HS256 validados pelo Resource Server, administrador semeado por variáveis de ambiente — e nenhuma conta, extrato ou transferência visível para quem não é o dono.
+modulo: 11-seguranca
+ordem: 5
+marco: 4
+dificuldade: dificil
+tempo: 8–10h
+conceitos: [projeto integrador, Spring Security 7, JWT, OAuth2 Resource Server, BOLA, BCrypt, Flyway, portas e adaptadores]
+aulas: [11-seguranca/01-autenticacao-e-senhas, 11-seguranca/02-spring-security-7, 11-seguranca/03-jwt-e-resource-server, 11-seguranca/04-autorizacao-e-bola]
+java:
+  modulo: projeto-integrador
+---
+
+## Contexto
+
+A Fintech Core vai abrir para os primeiros clientes. Até aqui, qualquer pessoa que soubesse o id de uma conta podia consultar o saldo, sacar e transferir: a API não sabe **quem** está chamando. Num pentest de rotina, isso aparece no topo do relatório como *Broken Object Level Authorization* (BOLA), a falha mais comum em APIs, e o lançamento fica bloqueado até ela ser corrigida.
+
+O marco 4 fecha a porta: **cada pessoa se cadastra, faz login, recebe um token e só enxerga o que é dela**. Um administrador, criado na subida a partir de variáveis de ambiente, enxerga tudo. E as regras dos marcos anteriores (idempotência, locks, Problem Details, a arquitetura em camadas verificada pelo ArchUnit) continuam valendo: segurança que quebra a concorrência ou a arquitetura não é entregue.
+
+## O que você vai praticar
+
+- **Senhas com hash adaptativo.** A senha nunca é guardada nem devolvida: guarda-se um hash lento e com sal (BCrypt), calculado pelo `PasswordEncoder`. O `DelegatingPasswordEncoder` prefixa o hash com o algoritmo (`{bcrypt}$2a$10$...`), o que permite trocar de algoritmo no futuro sem invalidar as senhas antigas. No login, e-mail inexistente e senha errada dão **a mesma** resposta, no mesmo tempo. Veja [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/).
+- **Spring Security 7.** Toda requisição passa pela cadeia de filtros (`SecurityFilterChain`) antes de chegar ao controller. Você declara o que é público e o que exige autenticação, desliga a sessão (a API é stateless) e escreve os `401` e `403` no formato Problem Details, porque eles nascem nos filtros e o `@RestControllerAdvice` não os vê. Veja [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/).
+- **JWT e Resource Server.** O login emite um JWT assinado com HS256 (`JwtEncoder`); nas outras rotas, o Resource Server valida assinatura, algoritmo, expiração e emissor (`JwtDecoder`) e transforma o claim `roles` em autoridades. Um token só é aceito se **tudo** confere. Veja [JWT e Resource Server](../../../aulas/11-seguranca/03-jwt-e-resource-server/).
+- **Autorização por dono (BOLA).** Estar autenticado não basta: a pergunta é "esta conta é sua?". A verificação fica no caso de uso, com o solicitante recebido como parâmetro, e a conta de outra pessoa responde `404`, igual a uma conta inexistente, para não confirmar que o id existe. Veja [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/).
+- **Portas e adaptadores aplicados à segurança.** A aplicação sabe *que* precisa emitir um token; *como* (JWT, HS256, Nimbus) é detalhe da infraestrutura. Uma porta `EmissorDeTokens` em `aplicacao` e o adaptador em `infra` mantêm o `Marco3ArquiteturaTest` verde.
+
+## Requisitos
+
+### O que já existe
+
+O seu Fintech Core ao fim do marco 3 (o da solução de referência do marco 3, em `java/projeto-integrador/solucao-marco-3`, serve de base, se você preferir partir dele):
+
+- **`dominio`**: `Conta` (com `@Version`), `Transferencia`, `Movimento`, `Cpf`, as exceções de negócio e as interfaces `RepositorioDeContas`, `RepositorioDeMovimentos` e `RepositorioDeTransferencias`;
+- **`aplicacao`**: `ServicoDeContas` (`abrir`, `buscar`, `listar`, `depositar`, `sacar`, `extrato`) e `ServicoDeTransferencias` (`transferir(chave, origem, destino, valor)`, que trava as contas da menor para a maior com `buscarParaAtualizar`, e `buscar(id)`);
+- **`api`**: `ContaController`, `TransferenciaController` e o `TratadorDeErros` (Problem Details com `type` em `https://fintech.dev/problemas/`);
+- **`infra`**: os adaptadores JPA, as migrações Flyway `V1` e `V2` e o `compose.yaml` com o PostgreSQL 18;
+- a sua suíte de testes do marco 3 (domínio, Mockito, fatias web e JPA, Testcontainers, ArchUnit, JaCoCo).
+
+Se o seu código usar outros nomes, adapte: o que importa são os comportamentos das regras abaixo.
+
+### O que você implementa
+
+**Dependências.** Acrescente ao `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security-test</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+**Contrato HTTP novo.**
+
+| Rota | Acesso | Corpo | Resposta de sucesso |
+|---|---|---|---|
+| `POST /usuarios` | pública | `{"nome", "email", "senha"}` | `201` com `{"id", "nome", "email", "papel"}` |
+| `POST /auth/token` | pública | `{"email", "senha"}` | `200` com `{"accessToken", "tokenType": "Bearer", "expiresIn"}` |
+| `GET /v3/api-docs`, `/docs` | pública | — | a documentação OpenAPI |
+| todas as outras | `Authorization: Bearer <token>` | como nos marcos anteriores | como nos marcos anteriores, filtradas pelo dono |
+
+```json
+// POST /usuarios
+{"nome": "Ana Souza", "email": "Ana@Exemplo.com", "senha": "tapioca de coco no domingo"}
+
+// 201 Created
+{"id": "be650fd2-0572-41ab-b9c3-96364a92bb6e", "nome": "Ana Souza", "email": "ana@exemplo.com", "papel": "CLIENTE"}
+
+// POST /auth/token
+{"email": "ana@exemplo.com", "senha": "tapioca de coco no domingo"}
+
+// 200 OK
+{"accessToken": "eyJ...", "tokenType": "Bearer", "expiresIn": 900}
+```
+
+**Erros novos** (Problem Details, mesma base `https://fintech.dev/problemas/`):
+
+| Situação | Status | `type` |
+|---|---|---|
+| sem token, token malformado, expirado, de outro emissor, assinado com outro segredo ou com `alg: none` | `401`, com header `WWW-Authenticate: Bearer ...` | `nao-autenticado` |
+| login com e-mail inexistente ou senha errada (a **mesma** resposta) | `401` | `credenciais-invalidas` |
+| e-mail já cadastrado | `409` | `usuario-duplicado` |
+| senha fora de 12–64 caracteres, e-mail inválido, campo em branco | `400` | `dados-invalidos` |
+
+**Configuração.** Três grupos de propriedades com estes nomes exatos (os testes de aceitação dos marcos dependem deles):
+
+```yaml
+fintech:
+  jwt:
+    segredo: ${FINTECH_JWT_SEGREDO:segredo-de-desenvolvimento-troque-em-producao!!}
+    emissor: fintech-core
+    validade: 15m
+  admin:
+    email: ${FINTECH_ADMIN_EMAIL:}
+    senha: ${FINTECH_ADMIN_SENHA:}
+```
+
+**Banco.** Uma migração `V3` com a tabela `usuario` (a senha na coluna **`senha_hash`**) e a coluna `dono_id` em `conta`.
+
+**Peças sugeridas** (os nomes são livres; a separação em camadas, não):
+
+```java
+// aplicacao: quem está pedindo, extraído do token pela camada web
+public record Solicitante(UUID usuario, boolean admin) {
+    public boolean podeAcessar(Conta conta) { ... }   // admin || conta.pertenceA(usuario)
+}
+
+// aplicacao: porta para emitir tokens; o adaptador com JwtEncoder fica em infra
+public interface EmissorDeTokens {
+    TokenEmitido emitir(Usuario usuario);
+}
+public record TokenEmitido(String valor, Duration validade) { }
+
+// os casos de uso passam a receber o solicitante
+Conta buscar(Solicitante quem, UUID id);
+Resultado transferir(Solicitante quem, String chave, UUID origem, UUID destino, BigDecimal valor);
+```
+
+## Regras
+
+Os exemplos usam Ana (`ana@exemplo.com`, dona da conta `A` com `300.00`), Bruno (`bruno@exemplo.com`, dono da conta `B`) e Carla (cliente sem relação com as duas).
+
+**Cadastro** (`POST /usuarios`)
+
+1. **Rota pública, `201` com o usuário e nunca com a senha.** O corpo de resposta tem `id`, `nome`, `email` e `papel`; nem a senha nem o hash aparecem (nem um campo `senha`, nem algo começando com `$2`). Exemplo: o cadastro da Ana devolve `{"id": "...", "nome": "Ana Souza", "email": "ana@exemplo.com", "papel": "CLIENTE"}`.
+2. **O e-mail é normalizado: sem espaços nas pontas e em minúsculas.** `"Ana@Exemplo.com"` é gravado e devolvido como `"ana@exemplo.com"`. Toda comparação de e-mail (duplicidade, login) usa o valor normalizado.
+3. **O papel é sempre `CLIENTE`.** O corpo da requisição não tem campo de papel; se alguém mandar `"papel": "ADMIN"`, o campo é ignorado e a resposta continua `201` com `"papel": "CLIENTE"`. Promover alguém a ADMIN por JSON é o ataque de *mass assignment*.
+4. **Dados inválidos → `400 dados-invalidos`, com a lista de campos.** Senha com menos de 12 caracteres (`"curta-11ch"`) ou mais de 64 (`"x"` repetido 65 vezes), e-mail sem formato de e-mail (`"caio-sem-arroba"`), nome, e-mail ou senha em branco. Exemplo: a senha curta devolve `"erros": [{"campo": "senha", "mensagem": "tamanho deve ser entre 12 e 64"}]`.
+5. **E-mail já cadastrado, sem diferenciar maiúsculas → `409 usuario-duplicado`.** Com a Ana cadastrada, `POST /usuarios` com `"ANA@exemplo.com"` → `409`. A constraint `UNIQUE (email)` do banco cobre a corrida de dois cadastros simultâneos: a violação também vira `409`.
+6. **A senha é guardada com hash adaptativo na coluna `usuario.senha_hash`.** O valor começa com `{bcrypt}` (ou `{argon2@SpringSecurity_v5_8}` ou `{pbkdf2@SpringSecurity_v5_8}`) e não contém a senha. Exemplo: `{bcrypt}$2a$10$...`. Use `PasswordEncoderFactories.createDelegatingPasswordEncoder()`.
+
+**Login** (`POST /auth/token`)
+
+7. **Credenciais certas → `200` com o token.** `{"accessToken": "<jwt>", "tokenType": "Bearer", "expiresIn": 900}`, com `expiresIn` em segundos (900 = 15 minutos). O e-mail do login também não diferencia maiúsculas: `"ANA@EXEMPLO.COM"` com a senha certa → `200`.
+8. **O token é um JWT HS256 com estes claims:** `iss` = `"fintech-core"`; `sub` = o **id** do usuário (não o e-mail, que pode mudar e é dado pessoal); `roles` = `["CLIENTE"]` ou `["ADMIN"]`; `iat` e `exp`. A validade fica entre 1 minuto e 1 hora. Exemplo de payload decodificado: `{"iss": "fintech-core", "sub": "be650fd2-...", "exp": 1791193691, "iat": 1791192791, "roles": ["CLIENTE"]}`. A senha nunca vai no token: o payload é só Base64, qualquer um lê.
+9. **E-mail inexistente e senha errada dão a mesma resposta.** Os dois → `401 credenciais-invalidas` com o **mesmo** `detail` (`"E-mail ou senha inválidos"`). E no mesmo tempo: quando o e-mail não existe, compare a senha com um hash fictício, para que a resposta não volte mais rápido e revele quais e-mails têm cadastro.
+
+**Tokens nas rotas protegidas**
+
+10. **Só o cadastro, o login e a documentação são públicos.** `POST /usuarios`, `POST /auth/token`, `/v3/api-docs/**`, `/docs/**` e o Swagger UI respondem sem token; `GET /v3/api-docs` sem token → `200`. Todas as outras rotas exigem `Authorization: Bearer <token>`.
+11. **Qualquer token inválido → `401 nao-autenticado`, em Problem Details, com `WWW-Authenticate`.** O header começa com `Bearer`. Vale para os seis casos:
+    - sem header `Authorization` (`GET /contas`);
+    - token malformado (`isto.nao.e-um-jwt`);
+    - assinado com outro segredo, mesmo com `roles: ["ADMIN"]`;
+    - expirado (`exp` no passado);
+    - de outro emissor (`iss: "outro-sistema"`);
+    - sem assinatura (`alg: none`).
+
+    O corpo é `{"type": "https://fintech.dev/problemas/nao-autenticado", "title": "Não autenticado", "status": 401, "detail": "...", "instance": "/contas"}`, com `Content-Type: application/problem+json`.
+12. **A API é stateless.** Nenhuma sessão HTTP nem cookie: cada requisição traz o seu token. Por isso o CSRF pode ser desligado: sem cookie de sessão, não há credencial que um site malicioso consiga usar de carona.
+
+**Contas com dono**
+
+13. **Quem abre a conta é o dono dela.** O `POST /contas` grava o `sub` do token como dono. A Ana abre a conta `A`; o dono de `A` é o id da Ana.
+14. **A conta de outra pessoa é tratada como inexistente: `404 conta-nao-encontrada`.** Com o token do Bruno: `GET /contas/A`, `GET /contas/A/extrato`, `POST /contas/A/depositos` e `POST /contas/A/saques` → `404`, com o mesmo corpo de uma conta que não existe (só o id muda). O saldo de `A` continua `300.00`. Um `403` confirmaria que o id existe.
+15. **A listagem mostra só as contas de quem pede.** `GET /contas` com o token do Bruno → `itens` só com `B` e `totalItens` = `1`. O filtro é feito na consulta ao banco (não em memória depois de paginar), senão a página e o total saem errados.
+16. **A transferência exige que a origem seja de quem pede; o destino pode ser de qualquer pessoa.** Ana transfere `50.00` de `A` para `B` → `201`, e o Bruno vê `50.00` em `B`. Bruno tenta transferir de `A` para `B` → `404 conta-nao-encontrada`, e nenhum centavo se move (`A` continua com `300.00`).
+17. **A posse da origem é verificada antes da idempotência e sem carregar a conta.** Antes: assim, uma chave de idempotência conhecida não serve para obter a transferência de outra pessoa. Sem carregar: verifique com uma consulta de existência (`existsByIdAndDono`), não com `buscar(origem)`. Uma `Conta` carregada antes do `SELECT ... FOR UPDATE` fica no contexto de persistência com o saldo antigo; o lock devolve a **mesma** instância, e o `@Version` rejeita a gravação. Exemplo: as transferências simultâneas dos marcos 2 e 3 (10 × `201` e 10 × `422` numa conta com `100.00`) continuam dando esse resultado, e não `500`.
+18. **A transferência é visível para quem enviou e para quem recebeu.** Depois da transferência de Ana para Bruno, `GET /transferencias/{id}` → `200` para a Ana e para o Bruno; para a Carla → `404 transferencia-nao-encontrada`.
+
+**Administrador**
+
+19. **O primeiro ADMIN é criado na subida, a partir de `fintech.admin.email` e `fintech.admin.senha`.** Se as duas propriedades estiverem definidas e o e-mail ainda não existir, crie o usuário com papel `ADMIN`; se já existir, não faça nada (reiniciar a aplicação não duplica nem falha). Sem as propriedades, nenhum administrador é criado. Nada de usuário fixo no código ou numa migração SQL. Exemplo: com `FINTECH_ADMIN_EMAIL=admin@fintech.dev`, o login desse e-mail devolve um token com `roles: ["ADMIN"]`.
+20. **O ADMIN enxerga e movimenta todas as contas.** Com o token do ADMIN: `GET /contas/A` e `GET /contas/B` → `200`; `GET /contas` lista as contas de todos. Contas abertas antes deste marco ficam com `dono_id` nulo: só o ADMIN as enxerga.
+
+**Configuração e arquitetura**
+
+21. **Segredos fora do repositório.** O segredo do JWT e a senha do admin vêm de variáveis de ambiente (`FINTECH_JWT_SEGREDO`, `FINTECH_ADMIN_SENHA`); o `application.yml` versionado só tem um valor de desenvolvimento para o segredo e nenhum para a senha. Um segredo HS256 com menos de 32 bytes (256 bits) é fraco: recuse-o na subida. Exemplo: `FINTECH_JWT_SEGREDO=curto` → a aplicação não inicia.
+22. **A segurança respeita as camadas.** O `Marco3ArquiteturaTest` (ou o seu `ArquiteturaTest`) continua verde: `SecurityFilterChain`, `JwtEncoder`/`JwtDecoder` e o adaptador do `EmissorDeTokens` ficam em `infra`; a conversão de `Authentication` em `Solicitante` fica em `api`; a regra de posse fica em `aplicacao`/`dominio`; o domínio continua sem Spring.
+23. **A sua suíte cobre as regras novas.** Pelo menos: no `ServicoDeTransferenciasTest`, origem de outra pessoa → `ContaNaoEncontradaException` sem tocar em `buscarParaAtualizar` nem no repositório de transferências, e o ADMIN transferindo de qualquer conta; na fatia web, `POST /transferencias` sem token → `401 nao-autenticado` sem chamar o serviço, e com um token simulado (`jwt()` do `spring-security-test`) o `Solicitante` chega ao serviço com o `sub` certo.
+
+## Passo a passo sugerido
+
+Três frentes, nesta ordem. Depois de cada passo, rode a aplicação e os cenários correspondentes de **Experimente**, e rode a sua suíte: ela tem de continuar verde.
+
+1. **Monte o jeito de experimentar.** Acrescente as dependências e suba a aplicação (`mvn spring-boot:run`). Repare que, só com o starter de segurança no classpath, **todas** as rotas passam a exigir autenticação: é a cadeia de filtros padrão do Spring Boot, que protege tudo até você declarar a sua. Os seus testes de fatia web também deixam de passar: adapte-os no passo 5.
+2. **Usuários (regras 1 a 6).** A entidade `Usuario` e o enum `Papel` em `dominio`, a migração `V3`, o `RepositorioDeUsuarios` e o adaptador JPA, o `ServicoDeUsuarios` com o `PasswordEncoder`, e o `UsuarioController`. Libere `POST /usuarios` numa primeira `SecurityFilterChain`. Confira o hash no banco: `select email, senha_hash from usuario;`.
+3. **Login e tokens (regras 7 a 12).** `JwtProperties` (`@ConfigurationProperties("fintech.jwt")`), a chave HS256, o `JwtEncoder` e o `JwtDecoder` com o validador de emissor, o `EmissorDeTokens` com o adaptador, o `ServicoDeAutenticacao` e o `AuthController`. Depois, o `oauth2ResourceServer` na cadeia, o conversor de `roles` em autoridades e uma classe que implementa `AuthenticationEntryPoint` e escreve o `401` em Problem Details. Teste os seis tokens inválidos da regra 11.
+4. **Posse (regras 13 a 20).** `dono_id` na `Conta`, o `Solicitante`, os casos de uso recebendo quem pede, a listagem filtrada no banco, a verificação da origem com `existsByIdAndDono`, a visibilidade da transferência e o `AdministradorInicial` (um `ApplicationRunner`). Rode de novo os cenários de concorrência dos marcos anteriores.
+5. **A sua suíte (regras 22 e 23).** Atualize os testes que quebraram com as novas assinaturas, importe a configuração de segurança na fatia web (`@Import`), use `jwt()` nas requisições e escreva os testes novos. Rode o ArchUnit.
+6. **Revise a configuração (regra 21).** Procure o segredo e a senha do admin no repositório (`git grep`); suba com um segredo curto e veja a aplicação recusar.
+
+## Experimente
+
+Suba o PostgreSQL e a aplicação com o administrador definido. No Bash (Git Bash no Windows):
+
+```bash
+cd java/projeto-integrador/starter
+FINTECH_ADMIN_EMAIL=admin@fintech.dev FINTECH_ADMIN_SENHA='Admin#2026-seguro' mvn spring-boot:run
+```
+
+No PowerShell, defina antes `$env:FINTECH_ADMIN_EMAIL="admin@fintech.dev"` e `$env:FINTECH_ADMIN_SENHA="Admin#2026-seguro"`. Com o `spring-boot-docker-compose` do marco 2, o PostgreSQL do `compose.yaml` sobe sozinho.
+
+Em outro terminal:
+
+```bash
+API=http://localhost:8080
+
+# cadastro e login da Ana (o jq só extrai o campo; sem ele, copie o token à mão)
+curl -s -X POST $API/usuarios -H 'Content-Type: application/json' \
+  -d '{"nome": "Ana Souza", "email": "Ana@Exemplo.com", "senha": "tapioca de coco no domingo"}'
+ANA=$(curl -s -X POST $API/auth/token -H 'Content-Type: application/json' \
+  -d '{"email": "ana@exemplo.com", "senha": "tapioca de coco no domingo"}' | jq -r .accessToken)
+
+# o Bruno, do mesmo jeito
+curl -s -X POST $API/usuarios -H 'Content-Type: application/json' \
+  -d '{"nome": "Bruno Lima", "email": "bruno@exemplo.com", "senha": "cuscuz com ovo e cafe"}'
+BRUNO=$(curl -s -X POST $API/auth/token -H 'Content-Type: application/json' \
+  -d '{"email": "bruno@exemplo.com", "senha": "cuscuz com ovo e cafe"}' | jq -r .accessToken)
+
+# a Ana abre a conta e deposita; o Bruno abre a dele do mesmo jeito (CPF 11144477735) e guarda o id em B
+A=$(curl -s -X POST $API/contas -H "Authorization: Bearer $ANA" -H 'Content-Type: application/json' \
+  -d '{"titular": "Ana Souza", "cpf": "52998224725", "tipo": "CORRENTE"}' | jq -r .id)
+curl -s -X POST $API/contas/$A/depositos -H "Authorization: Bearer $ANA" -H 'Content-Type: application/json' \
+  -d '{"valor": 300.00}'
+
+# o Bruno tenta ler a conta da Ana
+curl -s -i $API/contas/$A -H "Authorization: Bearer $BRUNO"
+
+# sem token
+curl -s -i $API/contas
+
+# o payload do token (só Base64: qualquer um lê)
+echo $ANA | cut -d. -f2 | base64 -d 2>/dev/null; echo
+```
+
+O que você deve ver (conferido contra a solução de referência):
+
+| Cenário | Resultado |
+|---|---|
+| cadastro da Ana com `"Ana@Exemplo.com"` | `201`, `"email": "ana@exemplo.com"`, `"papel": "CLIENTE"`, sem senha nem hash |
+| cadastro com `"papel": "ADMIN"` no corpo | `201` com `"papel": "CLIENTE"` |
+| cadastro com `"ANA@exemplo.com"` de novo | `409`, `type` … `/usuario-duplicado`, `detail` `"Já existe um usuário com este e-mail"` |
+| senha `"curta-11ch"` | `400`, `type` … `/dados-invalidos`, `erros` com `campo` `senha` |
+| e-mail `"caio-sem-arroba"` | `400` `dados-invalidos`, `erros` com `campo` `email` |
+| login da Ana | `200`, `"tokenType": "Bearer"`, `"expiresIn": 900` |
+| payload do token da Ana | `iss` `fintech-core`, `sub` = o `id` do cadastro, `roles` `["CLIENTE"]`, `exp` − `iat` = 900 |
+| login com senha errada **e** com e-mail inexistente | os dois: `401`, `type` … `/credenciais-invalidas`, `detail` `"E-mail ou senha inválidos"` |
+| `GET /contas` sem token | `401`, `Content-Type: application/problem+json`, `type` … `/nao-autenticado`, header `WWW-Authenticate: Bearer resource_metadata="..."` |
+| `GET /contas` com `Authorization: Bearer isto.nao.e-um-jwt` | `401` `nao-autenticado`; o `WWW-Authenticate` traz `error="invalid_token"` |
+| `GET /v3/api-docs` sem token | `200` |
+| Bruno: `GET /contas/A`, `/contas/A/extrato`, depósito e saque em `A` | `404` `conta-nao-encontrada`, igual ao de um id que não existe; saldo de `A` continua `300.00` |
+| Bruno: `GET /contas` | só a conta `B`, `"totalItens": 1` |
+| Bruno: transferir de `A` para `B` | `404` `conta-nao-encontrada`; `A` continua com `300.00` |
+| Ana: transferir `50.00` de `A` para `B` | `201`; `B` passa a ter `50.00` e `A`, `250.00` |
+| `GET /transferencias/{id}` dessa transferência | Ana e Bruno: `200`; Carla: `404` `transferencia-nao-encontrada` |
+| login do admin; `GET /contas` e `GET /contas/A` com o token dele | `roles: ["ADMIN"]`; a lista traz `A` e `B`; `GET /contas/A` → `200` |
+| reiniciar a aplicação com as mesmas variáveis | sobe normalmente; continua um único admin |
+| subir com `FINTECH_JWT_SEGREDO=curto` | a aplicação não inicia (a causa no log aponta o segredo curto) |
+
+Variam a cada execução: os ids, o token, `iat`/`exp`, as datas e o endereço em `resource_metadata` (o Spring Security 7 acrescenta esse parâmetro ao `WWW-Authenticate`). O cabeçalho do token pode ter um `kid` além de `"alg": "HS256"`.
+
+<Callout tipo="atencao" titulo="Os testes de aceitação dos marcos anteriores">
+Se o seu projeto ainda roda as classes `Marco1…` a `Marco3…`, elas passam a receber `401` assim que a segurança entra. O apoio delas (`ApiDeTeste`) faz login como administrador em `POST /auth/token` com as propriedades `fintech.admin.email`, `fintech.admin.senha` e `fintech.jwt.segredo` que a anotação `@TesteDeAceitacao` define. Por isso esses três nomes fazem parte do contrato: com a regra 19 implementada, elas voltam a passar sem mudança. Para rodar só a sua suíte: `mvn verify "-Dtest=!Marco*"`.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] Os cenários de **Experimente** dão o resultado indicado.
+- [ ] Os seis tokens inválidos da regra 11 recebem `401 nao-autenticado` em Problem Details, com `WWW-Authenticate`.
+- [ ] Nenhuma conta, extrato, depósito, saque ou transferência de outra pessoa é acessível: a resposta é `404`, idêntica à de um recurso inexistente, e nada muda no banco.
+- [ ] As transferências simultâneas dos marcos 2 e 3 continuam dando exatamente 10 × `201` e 10 × `422`, sem nenhum `500`.
+- [ ] O `mvn verify` termina com `BUILD SUCCESS`, com a sua suíte (incluindo os testes novos da regra 23) e a verificação de arquitetura verdes.
+- [ ] `git grep` não encontra o segredo de produção nem a senha do admin no repositório.
+- [ ] Você sabe explicar por que a conta de outra pessoa responde `404` e não `403`, e por que `sub` é o id e não o e-mail.
+
+## Desafios opcionais
+
+- **Refresh token**: `POST /auth/refresh`, com o refresh token guardado no banco (só o hash), rotacionado a cada uso e revogado no logout. Um refresh token reutilizado revoga a família inteira.
+- **Limite de tentativas** no `POST /auth/token`, com o token bucket do [exercício 11.04](../../11-seguranca/04-limite-de-requisicoes/), por e-mail e por IP.
+- **Autorização por papel**: um `GET /admin/usuarios` só para ADMIN, com `@PreAuthorize("hasRole('ADMIN')")`; um CLIENTE recebe `403 acesso-negado` em Problem Details (o `AccessDeniedHandler`).
+- **Auditoria**: registre login com falha, acesso negado e transferências acima de R$ 10.000 como eventos estruturados (sem senha nem token no log).
+- **RS256 com JWKS**: troque o segredo compartilhado por um par de chaves e publique a chave pública; ou troque o emissor próprio por um **Keycloak** no `compose.yaml`, e a Fintech Core vira só Resource Server.
+
+<Dicas>
+<Dica nivel={1}>
+Três frentes independentes, nesta ordem:
+
+1. **Usuários**: a entidade, a migração `V3`, o cadastro e o hash da senha.
+2. **Tokens**: `SecurityFilterChain`, `JwtEncoder`/`JwtDecoder`, o login e o `AuthenticationEntryPoint` que escreve Problem Details. É o [exercício 11.02](../../11-seguranca/02-api-com-jwt/) com outra roupa.
+3. **Posse**: o dono na conta e a verificação em cada caso de uso, como no [exercício 11.03](../../11-seguranca/03-autorizacao-por-dono/).
+
+Termine uma frente, confira os cenários dela e só então passe para a próxima.
+</Dica>
+<Dica nivel={2}>
+- Arquitetura: a aplicação precisa **emitir** um token no login, mas JWT é detalhe de infraestrutura. Crie a porta `EmissorDeTokens` em `aplicacao` e a implementação com `JwtEncoder` em `infra`. A `SecurityFilterChain` também fica em `infra`.
+- Posse: o `record Solicitante(UUID usuario, boolean admin)` é montado no controller a partir do `Authentication` (com JWT, `getName()` é o `sub`; o admin é quem tem a autoridade `ROLE_ADMIN`) e passado para os serviços. A regra fica testável com Mockito, sem HTTP.
+- Papéis: um `JwtGrantedAuthoritiesConverter` com `setAuthoritiesClaimName("roles")` e `setAuthorityPrefix("ROLE_")`, dentro de um `JwtAuthenticationConverter`.
+- Decoder: `NimbusJwtDecoder.withSecretKey(chave).macAlgorithm(MacAlgorithm.HS256).build()` e `setJwtValidator(JwtValidators.createDefaultWithIssuer("fintech-core"))`. O validador padrão confere `exp`; o de emissor, o `iss`.
+- `ALTER TABLE conta ADD COLUMN dono_id UUID REFERENCES usuario (id)`: contas antigas ficam sem dono, e só o ADMIN as vê.
+</Dica>
+<Dica nivel={3}>
+O `401` com Problem Details e `WWW-Authenticate`: delegue o header ao `BearerTokenAuthenticationEntryPoint` e escreva o corpo depois.
+
+```java
+@Override
+public void commence(HttpServletRequest requisicao, HttpServletResponse resposta, AuthenticationException erro)
+        throws IOException {
+    bearer.commence(requisicao, resposta, erro);   // status 401 + WWW-Authenticate: Bearer ...
+    escrever(requisicao, resposta, 401, "nao-autenticado", "Não autenticado", "Envie um token válido...");
+}
+```
+
+A solução registra o mesmo objeto em `.oauth2ResourceServer(s -> s.authenticationEntryPoint(...))` **e** em `.exceptionHandling(...)`, para que os dois caminhos usem a mesma resposta: o token inválido, recusado pelo filtro do Resource Server, e a requisição sem token, recusada mais adiante na cadeia.
+
+E cuidado com a transferência: se você verificar a posse da origem com `contas.buscar(origem)` e depois travar com `buscarParaAtualizar(origem)`, o Hibernate devolve a entidade **já carregada**, com o saldo de antes do lock. Sob concorrência, o `@Version` rejeita a gravação e as transferências simultâneas começam a falhar com `500`. Verifique a posse com uma consulta que não carrega a entidade: `boolean existsByIdAndDono(UUID id, UUID dono)` no repositório Spring Data.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução de referência
+
+Está em `java/projeto-integrador/solucao-marco-4`: o marco 3, mais usuários, segurança e posse, com os testes próprios atualizados. O build da solução roda também os testes de aceitação dos marcos 1 a 4.
+
+<Tabs>
+<Tab rotulo="Segurança">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/infra/SegurancaConfig.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/infra/RespostasDeSeguranca.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/infra/JwtProperties.java" />
+</Tab>
+<Tab rotulo="Login">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeAutenticacao.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/EmissorDeTokens.java" titulo="aplicacao/EmissorDeTokens.java (porta)" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/infra/EmissorDeTokensJwt.java" titulo="infra/EmissorDeTokensJwt.java (adaptador)" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/api/AuthController.java" />
+</Tab>
+<Tab rotulo="Cadastro">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeUsuarios.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/api/NovoUsuarioRequest.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/AdministradorInicial.java" />
+</Tab>
+<Tab rotulo="Posse">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/Solicitante.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/api/Solicitantes.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeContas.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferencias.java" />
+</Tab>
+<Tab rotulo="Migração e configuração">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/main/resources/db/migration/V3__cria_usuarios_e_dono_da_conta.sql" />
+
+```yaml
+# application.yml (trecho)
+fintech:
+  jwt:
+    # Em produção o segredo vem de uma variável de ambiente alimentada por um cofre (Vault, AWS Secrets
+    # Manager...). O valor padrão abaixo só serve para desenvolvimento local — nunca versione o real.
+    segredo: ${FINTECH_JWT_SEGREDO:segredo-de-desenvolvimento-troque-em-producao!!}
+    emissor: fintech-core
+    validade: 15m
+  admin:
+    # Sem estas variáveis, nenhum administrador é criado.
+    email: ${FINTECH_ADMIN_EMAIL:}
+    senha: ${FINTECH_ADMIN_SENHA:}
+```
+</Tab>
+<Tab rotulo="Testes">
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/test/java/dev/trilhajava/fintech/aplicacao/ServicoDeTransferenciasTest.java" />
+<CodigoJava caminho="projeto-integrador/solucao-marco-4/src/test/java/dev/trilhajava/fintech/api/TransferenciaControllerTest.java" />
+<CodigoJava caminho="projeto-integrador/testes/dev/trilhajava/fintech/Marco4SegurancaTest.java" titulo="testes/Marco4SegurancaTest.java (aceitação do marco 4, roda no build da solução)" />
+</Tab>
+</Tabs>
+
+### O que deu errado no caminho
+
+A primeira versão da solução verificava a posse da origem com `contas.buscar(origem).filter(quem::podeAcessar)`. Todos os cenários do marco 4 passaram, mas os testes de **concorrência** dos marcos 2 e 3 começaram a devolver `500`. A `Conta` carregada na verificação ficava no contexto de persistência. O `SELECT ... FOR UPDATE` seguinte travava a linha, mas o Hibernate devolvia **aquela mesma instância**, com o saldo de antes. Na gravação, o `@Version` detectava a versão velha.
+
+A correção, `existsByIdAndDono`, é uma linha. Encontrar o problema só foi possível porque os testes dos marcos anteriores continuam rodando: **a suíte acumulada é o que protege o sistema de regressões**.
+
+### Por que assim
+
+- **Porta `EmissorDeTokens`.** A aplicação sabe que precisa de um token; o JWT, o HS256 e o Nimbus ficam na infra. Trocar por um provedor externo mexe num adaptador só, e o ArchUnit continua verde.
+- **`Solicitante` explícito.** Os casos de uso recebem quem pede como parâmetro, em vez de ler o `SecurityContextHolder`. A regra de posse é testada com Mockito, sem HTTP (`ServicoDeTransferenciasTest`), e nenhum caso de uso esquece de checar: sem solicitante, o código não compila.
+- **404 para o que não é seu.** Consulta, extrato, depósito, saque e transferência usam o mesmo `filter(quem::podeAcessar)`, que transforma "não é seu" em "não existe".
+- **A listagem filtra no banco** (`findByDono`), e não em memória. O total da paginação vem certo, e uma página nunca vem "vazia pela metade".
+- **O papel nunca vem do JSON.** `NovoUsuarioRequest` não tem o campo `papel`: o cadastro público só cria `CLIENTE`.
+- **Validações na subida.** `JwtProperties` recusa segredos com menos de 32 bytes e validades fora do intervalo de 1 minuto a 1 hora. Uma configuração perigosa impede a aplicação de subir, em vez de passar despercebida.
+- **Timing no login.** O `ServicoDeAutenticacao` compara com um hash fictício quando o e-mail não existe, como no [exercício 11.01](../../11-seguranca/01-senhas/). E senhas acima de 72 bytes são recusadas antes do BCrypt, que só considera os 72 primeiros.
+- **`toString` sem senha.** `NovoUsuarioRequest` e `LoginRequest` sobrescrevem o `toString`: um log de depuração não vaza a senha.
+
+### Alternativas e trade-offs
+
+- **HS256 × RS256.** Com HS256, quem valida também consegue emitir: serve enquanto a Fintech Core é a única API. Com outros serviços validando tokens, um par de chaves (RS256 ou ES256) com a pública publicada via JWKS evita espalhar o segredo.
+- **Emissor próprio × provedor de identidade (Keycloak, Auth0, Cognito).** O emissor próprio é pouco código e ensina o mecanismo; um provedor traz MFA, recuperação de senha, bloqueio por tentativas e login social prontos, ao custo de mais uma peça para operar ou pagar.
+- **`@PreAuthorize` com SpEL × verificação no caso de uso.** `@PreAuthorize("@posse.podeAcessar(#id)")` deixa a regra visível na assinatura, mas espalha consultas e esconde a lógica numa string. No caso de uso, a regra é Java comum, testada sem Spring.
+- **403 × 404.** O `403` é mais honesto para depurar, mas confirma que o recurso existe (enumeração de ids). Para dados financeiros, o `404` é o padrão; o `403` fica para "você é cliente e esta rota é de administrador".
+
+### Avalie sua solução
+
+- Um token emitido antes de uma pessoa ser promovida a ADMIN continua com `roles: ["CLIENTE"]` até expirar. Isso é aceitável? E o contrário, um ADMIN rebaixado que mantém o token por até 15 minutos?
+- Se o segredo do JWT vazar, o que acontece com todos os tokens emitidos, e como você faria a rotação sem derrubar quem está logado?
+- O admin inicial só é criado se o e-mail não existir. E se alguém se cadastrar como cliente com esse e-mail antes da primeira subida?
+- Se amanhã a Fintech Core tiver um app mobile e um painel web, o que muda? (Pense em refresh tokens, BFF e CORS.)
+
+</Solucao>

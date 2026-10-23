@@ -1,0 +1,183 @@
+---
+titulo: "Decisão de arquitetura: monólito modular ou microsserviços? (ADR)"
+codigo: "13.05"
+resumo: Uma startup de benefícios corporativos vai reescrever o produto, e o CTO quer microsserviços desde o início. Analise o cenário e escreva o ADR — contexto, opções, decisão, consequências e gatilhos de reavaliação — como você apresentaria para o time e para a diretoria.
+modulo: 13-arquitetura
+ordem: 5
+dificuldade: medio
+tempo: 1h30
+conceitos: [ADR, microsserviços, monólito modular, bounded context, lei de Conway, trade-offs, comunicação técnica]
+aulas: [13-arquitetura/04-monolito-modular, 13-arquitetura/05-microsservicos]
+---
+
+## Contexto
+
+A **Vale+** é uma startup de benefícios corporativos (vale-refeição, vale-alimentação, auxílio home office) com 18 meses de vida. O produto atual é um monólito Rails que cresceu sem cuidado, e a empresa acabou de captar uma rodada para reescrevê-lo em Java.
+
+O que você sabe:
+
+- **Time**: 9 pessoas de engenharia (6 backend, 2 frontend, 1 SRE), com planos de chegar a 20 em um ano.
+- **Domínios**: cadastro de empresas e colaboradores; recarga mensal dos cartões (um lote grande no dia 1º e no dia 15); autorização de compras nos estabelecimentos (tempo real, pico no almoço, precisa responder em menos de 200 ms); extrato e app do colaborador; faturamento e notas fiscais para as empresas.
+- **Carga**: 300 mil colaboradores; 1,5 milhão de autorizações por dia, 40% delas entre 11h30 e 13h30; a recarga do dia 1º processa 300 mil cartões em lote.
+- **Regulação**: o arranjo de pagamentos exige trilha de auditoria e disponibilidade alta na autorização.
+- **Opinião do CTO**: "Vamos fazer microsserviços desde o começo, um por domínio. Todo mundo faz assim, e não quero reescrever de novo em dois anos."
+- **Opinião do SRE**: "Hoje eu sozinho mantenho um servidor. Com cinco serviços, vou manter cinco pipelines, cinco bancos e um Kafka."
+
+## O que você vai praticar
+
+- **ADR (Architecture Decision Record).** Um registro curto de **uma** decisão de arquitetura: o contexto em que ela foi tomada, as opções, a escolha e o que ela custa. Fica versionado junto com o código, para quem chegar daqui a dois anos entender **por que** o sistema é assim. Veja [Microsserviços](../../../aulas/13-arquitetura/05-microsservicos/).
+- **Critério em vez de moda.** Separar um serviço tem custo (rede, deploy, banco, observabilidade, consistência eventual). O critério que se sustenta é: quais partes têm requisitos **diferentes o bastante** (carga, latência, disponibilidade, ritmo de mudança, time) para pagar esse custo.
+- **Monólito modular como opção séria.** Fronteiras verificadas e eventos entre módulos deixam a porta aberta para extrair um serviço depois. Veja [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/).
+- **Lei de Conway.** A arquitetura tende a copiar a estrutura de comunicação do time. Nove pessoas e um SRE não sustentam a mesma arquitetura que cinco squads.
+- **Escrever para dois públicos.** O time quer saber o que muda no dia a dia; a diretoria, o risco e o custo. O mesmo texto precisa servir aos dois.
+
+## O que entregar
+
+Um **ADR** em Markdown, como se fosse entrar no repositório (`docs/adr/001-estilo-de-arquitetura.md`), com:
+
+1. **Título e status** (proposta).
+2. **Contexto**: os fatos que importam para a decisão, em poucas linhas, sem repetir o enunciado inteiro.
+3. **Opções consideradas**: pelo menos três (por exemplo: monólito modular; microsserviços por domínio; monólito modular com um serviço separado para a autorização).
+4. **Decisão**, e o **porquê**, amarrado aos fatos do contexto.
+5. **Consequências**: positivas e negativas, incluindo o que o time precisa passar a fazer.
+6. **Gatilhos de reavaliação**: sinais concretos e mensuráveis de que a decisão deve ser revista.
+
+Limite: uma página e meia (algo entre 400 e 700 palavras). Um ADR longo não é lido.
+
+Um esqueleto para começar:
+
+```markdown
+# ADR 001 — <a decisão, em poucas palavras>
+
+- Status: proposta (<data>)
+- Decisores: <quem aprova>
+
+## Contexto
+## Opções consideradas
+## Decisão
+## Consequências
+## Reavaliar quando
+```
+
+## Critérios de avaliação
+
+Cada critério vale de 0 a 2 pontos. Um ADR pronto para ir ao repositório soma pelo menos 8 dos 12, sem nenhum zero.
+
+| Critério | 0 | 1 | 2 |
+|---|---|---|---|
+| **1. Decisão amarrada aos fatos** | "é o padrão do mercado", "é mais moderno" | cita fatos, mas a decisão não sai deles | cada argumento da decisão aponta para um fato do contexto: tamanho do time, pico da autorização, latência, regulação |
+| **2. Contexto enxuto** | repete o enunciado inteiro, ou falta o time | lista fatos sem separar o que importa | só os fatos que mudam a decisão, em até 8 linhas, com os números (9 pessoas, 1 SRE, 200 ms, 40% em 2 horas) |
+| **3. Alternativas honestas** | uma opção só, ou opções "espantalho" | três opções, mas as rejeitadas só têm defeitos | três ou mais opções, cada uma com vantagens reais e custos reais |
+| **4. Consequências negativas** | nenhuma | genéricas ("mais complexidade") | concretas e com dono: o que o time passa a fazer, operar ou aceitar |
+| **5. Gatilhos mensuráveis** | "quando crescer", "se precisar" | mensuráveis, mas sem ligação com a decisão | dois a quatro sinais com número e unidade, ligados aos motivos da decisão (time, latência, tempo de build, conflitos de deploy) |
+| **6. Respeito às duas vozes** | desqualifica o CTO ou o SRE | responde a um só | responde ao medo do CTO (reescrever em dois anos) e ao do SRE (operar cinco de tudo) com algo concreto |
+
+## Teste o seu ADR
+
+Sem testes automáticos aqui. Antes de comparar com a solução, faça estas verificações:
+
+1. **A frase da decisão.** Escreva a decisão numa frase só, com o motivo: "Escolhemos X porque Y". Se o Y não for um fato do seu contexto, volte ao critério 1.
+2. **Troque o cenário.** Leia a sua decisão imaginando 60 pessoas de engenharia em 8 squads. Ela mudaria? Deveria: se não muda, ela não depende do contexto. Os seus gatilhos de reavaliação teriam disparado?
+3. **Leia como o CTO.** Ele encontra no texto um caminho concreto para não reescrever tudo em dois anos? Leia como o SRE: quantos deploys, bancos e pipelines ele vai operar no primeiro ano? O número está escrito?
+4. **Procure o custo.** Marque cada consequência negativa. Se não houver pelo menos duas, o ADR está vendendo a decisão, não registrando.
+5. **Conte as palavras.** Mais de 700? Corte o contexto primeiro.
+6. **Cinco minutos.** Peça para alguém ler em cinco minutos e explicar de volta o que foi decidido e quando a decisão deve ser revista.
+
+<Dicas>
+<Dica nivel={1}>
+Olhe para as **diferenças de carga e de requisito** entre os domínios. Algum deles é muito diferente dos outros (latência, pico, disponibilidade)? Isso é um motivo mais forte para separar do que "um serviço por domínio".
+</Dica>
+<Dica nivel={2}>
+A preocupação do CTO ("não quero reescrever em dois anos") tem mérito. O que, numa arquitetura monolítica, deixa a porta aberta para extrair serviços depois? (Aula 4: fronteiras verificadas, eventos como contrato, banco por módulo.)
+</Dica>
+<Dica nivel={3}>
+Uma estrutura possível para a decisão: "monólito modular para cadastro, recarga, extrato e faturamento; a autorização como serviço separado desde o início, porque tem requisitos de latência, pico e disponibilidade diferentes do resto". Mas outras decisões são defensáveis. O que conta é o raciocínio.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### Um ADR de referência
+
+Não existe uma resposta única. Este é **um** ADR bem fundamentado; compare o raciocínio, não as palavras.
+
+```markdown
+# ADR 001 — Estilo de arquitetura da nova plataforma
+
+- Status: proposta (2026-09-29)
+- Decisores: CTO, time de engenharia
+
+## Contexto
+
+- 9 pessoas de engenharia (6 backend), 1 SRE; meta de 20 pessoas em 12 meses (~3 squads).
+- Cinco domínios: cadastro, recarga, autorização, extrato/app e faturamento.
+- A AUTORIZAÇÃO é diferente de todo o resto: tempo real (< 200 ms), 40% do volume
+  diário em 2 horas, e exigência regulatória de alta disponibilidade.
+- A RECARGA é um lote pesado 2 vezes por mês.
+- O produto atual virou uma bola de lama por falta de fronteiras, não por ser monolítico.
+
+## Opções consideradas
+
+1. Microsserviços por domínio (5 serviços, Kafka, banco por serviço).
+   + autonomia máxima quando houver vários times; escala independente
+   - com 6 pessoas de backend, quase 1 serviço por pessoa; 5 pipelines, 5 bancos e
+     tracing distribuído para 1 SRE; transações entre recarga e extrato viram sagas
+2. Monólito modular (Spring Modulith), um deploy.
+   + simples de operar; transações locais; fronteiras verificadas no CI
+   - o pico da autorização obriga a escalar tudo junto; um bug no faturamento
+     pode derrubar a autorização
+3. Monólito modular + serviço de autorização separado.
+   + isola o domínio com requisitos diferentes (latência, pico, disponibilidade)
+   + mantém o resto simples
+   - 2 deploys, 2 bancos, e integração por eventos entre eles (Kafka ou outbox)
+
+## Decisão
+
+Opção 3. O motivo para separar um serviço é ele ter requisitos DIFERENTES, e só a
+autorização tem: latência, pico concentrado e disponibilidade regulada. Os outros
+quatro domínios têm carga e ciclo de mudança parecidos, e um time pequeno.
+
+O monólito terá módulos por domínio (cadastro, recarga, extrato, faturamento),
+verificados com Spring Modulith, integrados por eventos com o registro de
+publicações. Cada módulo usa só as suas tabelas.
+
+## Consequências
+
++ 2 unidades de deploy em vez de 5: viável para 1 SRE.
++ A autorização escala sozinha no almoço, e falhas no resto não a derrubam.
++ Extrair outro módulo depois é trocar eventos internos por eventos no Kafka
+  (@Externalized); as fronteiras já existem.
+- Precisamos de um broker desde o início (a autorização publica transações para o
+  extrato e o faturamento): outbox + Kafka gerenciado.
+- A disciplina de módulos precisa ser mantida: o teste de verificação dos módulos
+  roda no CI e bloqueia o merge.
+- Consultas que cruzam a autorização e o resto usam projeções (eventual), não JOIN.
+
+## Reavaliar quando
+
+- houver 3 ou mais squads e mais de 2 conflitos de deploy por semana no monólito;
+- a recarga do dia 1º passar de 2 horas ou degradar o p99 do extrato acima de 1 s;
+- o p99 da autorização passar de 150 ms no pico do almoço por 2 semanas seguidas
+  (rever o desenho do serviço, não necessariamente o resto);
+- o tempo de build + testes do monólito passar de 15 minutos.
+```
+
+### O que torna este ADR bom
+
+- **A decisão sai dos fatos.** "Separar o que tem requisitos diferentes" é um critério que qualquer pessoa pode aplicar de novo daqui a um ano.
+- **Respeita as duas preocupações.** O CTO ganha um caminho explícito para extrair serviços (fronteiras e eventos); o SRE ganha 2 deploys em vez de 5.
+- **Tem consequências negativas.** Um ADR sem custos é propaganda.
+- **Os gatilhos são mensuráveis.** "3 squads", "p99 de 150 ms", "15 minutos de build": dá para saber quando a hora chegou, e cada gatilho volta a um motivo da decisão.
+
+### Como este ADR pontua
+
+Na grade dos critérios, ele soma 12: a decisão sai de um critério explícito (requisitos diferentes); o contexto tem os números que importam; as três opções têm prós e contras; as consequências negativas têm dono (broker desde o início, disciplina de módulos no CI, consultas por projeção); os gatilhos têm número e unidade; e o CTO e o SRE recebem respostas concretas. Compare o seu com a grade antes de comparar com o texto.
+
+### Erros comuns
+
+- Decidir por moda ("todo mundo faz") ou por aversão ("microsserviços são modinha").
+- Esquecer o **time**: a mesma arquitetura é boa para 50 pessoas e ruim para 6.
+- Tratar "um serviço por domínio" como regra. A pergunta certa é: **quais partes têm requisitos diferentes o bastante para justificar o custo da rede?**
+- ADRs de cinco páginas. O leitor de 2028 precisa entender em cinco minutos.
+
+</Solucao>

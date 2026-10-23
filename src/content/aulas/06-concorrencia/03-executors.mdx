@@ -1,0 +1,126 @@
+---
+titulo: Executors e pools de threads
+descricao: Por que não criar threads à mão, ExecutorService, Future e Callable, como dimensionar pools para CPU e para I/O, e como encerrar executores corretamente.
+modulo: 06-concorrencia
+ordem: 3
+duracao: 45
+objetivos:
+  - Submeter tarefas a um ExecutorService e obter resultados com Future
+  - Dimensionar pools para tarefas CPU-bound e I/O-bound
+  - Encerrar executores sem perder tarefas nem vazar threads
+  - Coordenar threads com CountDownLatch
+tags: [ExecutorService, Future, thread pool, CountDownLatch]
+flashcards:
+  - frente: Por que usar ExecutorService em vez de new Thread?
+    verso: Reaproveita threads (criar é caro), limita a quantidade, oferece Future para resultados e exceções, e centraliza o ciclo de vida (shutdown).
+  - frente: Qual a diferença entre Runnable e Callable?
+    verso: Runnable não devolve valor nem lança exceção checked; Callable<T> devolve T e pode lançar Exception.
+  - frente: Como dimensionar um pool para tarefas CPU-bound?
+    verso: Aproximadamente o número de núcleos (Runtime.getRuntime().availableProcessors()); mais threads só aumentam a troca de contexto.
+  - frente: O que Future.get() faz quando a tarefa lançou exceção?
+    verso: Lança ExecutionException, com a exceção original como causa (getCause()).
+  - frente: Para que serve CountDownLatch?
+    verso: Para uma ou mais threads esperarem até um contador chegar a zero — por exemplo, "todos prontos" ou "largada simultânea" em testes.
+---
+
+Criar uma thread do sistema operacional é caro (memória para a pilha, chamadas ao kernel), e criar uma por tarefa sem limite derruba a máquina sob carga. A solução clássica é o **pool de threads**: um conjunto fixo de threads que pega tarefas de uma fila.
+
+## `ExecutorService`
+
+```java
+try (ExecutorService pool = Executors.newFixedThreadPool(8)) {     // Java 19+: AutoCloseable
+    Future<BigDecimal> frete = pool.submit(() -> transportadora.cotar(cep, peso));   // Callable
+    pool.submit(() -> auditoria.registrar(evento));                                   // Runnable
+
+    BigDecimal valor = frete.get(2, TimeUnit.SECONDS);   // espera o resultado (com timeout)
+}   // close(): não aceita novas tarefas e espera as pendentes terminarem
+```
+
+- **`Runnable`**: não devolve nada. **`Callable<T>`**: devolve `T` e pode lançar exceção.
+- **`Future<T>`** representa o resultado futuro: `get()` bloqueia até ficar pronto; `get(timeout)` desiste depois do prazo; `cancel(true)` tenta interromper.
+- Se a tarefa lançar exceção, `get()` lança **`ExecutionException`** com a original em `getCause()`. Exceções de tarefas **não somem**, mas só aparecem se alguém chamar `get()`.
+
+### As fábricas de `Executors`
+
+| Fábrica | Comportamento | Uso |
+|---|---|---|
+| `newFixedThreadPool(n)` | n threads, fila **ilimitada** | trabalho previsível |
+| `newCachedThreadPool()` | cria threads sob demanda, sem limite | tarefas curtas e raras (cuidado sob carga!) |
+| `newScheduledThreadPool(n)` | execução agendada/periódica | jobs, retries |
+| `newVirtualThreadPerTaskExecutor()` | uma virtual thread por tarefa (Java 21+) | I/O — aula 5 |
+
+<Callout tipo="atencao" titulo="Filas ilimitadas escondem problemas">
+`newFixedThreadPool` usa uma fila sem limite: se as tarefas chegam mais rápido do que são processadas, a fila cresce até faltar memória. Em produção, é comum criar um `ThreadPoolExecutor` com **fila limitada** e uma política de rejeição explícita — e expor métricas do pool (o Micrometer faz isso, módulo 14).
+</Callout>
+
+## Quantas threads?
+
+- **CPU-bound** (cálculo, compressão, criptografia): ≈ **número de núcleos**. Mais threads só aumentam a troca de contexto.
+- **I/O-bound** (banco, HTTP, arquivos): as threads passam a maior parte do tempo **esperando**, então cabem muito mais. Uma estimativa clássica: `núcleos × (1 + tempoDeEspera / tempoDeCPU)`.
+
+Esse cálculo é exatamente a dor que as **virtual threads** resolvem: com elas, você não precisa mais adivinhar o tamanho de um pool para I/O.
+
+## Encerrando corretamente
+
+Threads de um executor não encerrado mantêm a JVM viva (e vazam em testes). Desde o Java 19, `ExecutorService` é `AutoCloseable`: use **try-with-resources**, e `close()` espera as tarefas pendentes. Antes disso:
+
+```java
+pool.shutdown();                                    // não aceita novas; termina as atuais
+if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+    pool.shutdownNow();                             // interrompe as que restaram
+}
+```
+
+`shutdownNow` **interrompe** as threads: uma tarefa bem-comportada verifica `Thread.interrupted()` ou trata `InterruptedException` e para.
+
+<Callout tipo="erro" titulo="Engolir InterruptedException">
+`catch (InterruptedException e) {}` apaga o pedido de parada. O mínimo é restaurar a flag: `Thread.currentThread().interrupt();` — e, em geral, encerrar a tarefa.
+</Callout>
+
+## Coordenando: `CountDownLatch`
+
+```java
+CountDownLatch largada = new CountDownLatch(1);
+for (int i = 0; i < 16; i++) {
+    pool.submit(() -> {
+        largada.await();          // todas esperam aqui
+        disputarRecurso();
+        return null;
+    });
+}
+largada.countDown();              // solta todas ao mesmo tempo
+```
+
+É o truque usado nos testes dos exercícios 06.01 e 06.02 para **maximizar a disputa** e revelar race conditions. Outros sincronizadores úteis: `Semaphore` (limitar acessos simultâneos — aula 5), `CyclicBarrier` e `Phaser`.
+
+<Quiz
+  id="06-executors"
+  questoes={[
+    {
+      pergunta: 'Uma tarefa submetida lança IllegalStateException. O que `future.get()` faz?',
+      opcoes: ['Devolve null', 'Lança ExecutionException com a IllegalStateException como causa', 'Lança IllegalStateException diretamente', 'Nada, a exceção se perde'],
+      correta: 1,
+      explicacao: 'A exceção original fica em getCause() da ExecutionException.',
+    },
+    {
+      pergunta: 'Qual tamanho de pool para compactar 10 mil imagens (CPU-bound) numa máquina de 8 núcleos?',
+      opcoes: ['1', '≈ 8', '10.000', '500'],
+      correta: 1,
+      explicacao: 'Trabalho de CPU não ganha nada com mais threads que núcleos.',
+    },
+    {
+      pergunta: 'O que fazer ao capturar InterruptedException numa tarefa?',
+      opcoes: ['Ignorar', 'Restaurar a flag com Thread.currentThread().interrupt() e encerrar a tarefa', 'Chamar System.exit', 'Relançar como Error'],
+      correta: 1,
+      explicacao: 'Interrupção é um pedido de parada; engolir impede o encerramento correto do executor.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Use **executores**, não `new Thread`: reaproveitamento, limite e ciclo de vida.
+- `Callable` + `Future` para resultados; exceções chegam via `ExecutionException`.
+- Pool CPU ≈ núcleos; pool de I/O maior (ou virtual threads).
+- Encerre com try-with-resources ou `shutdown`/`awaitTermination`; respeite interrupções.
+- `CountDownLatch` coordena "todos prontos" e largadas simultâneas.

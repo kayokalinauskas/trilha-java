@@ -1,0 +1,89 @@
+---
+/** Moldura para diagramas SVG inline, com legenda. */
+interface Props {
+  legenda?: string;
+  largura?: string;
+}
+const { legenda, largura = '100%' } = Astro.props;
+// px vira rem para o diagrama crescer junto com a fonte em telas grandes
+const px = /^(\d+(?:\.\d+)?)px$/.exec(largura);
+const maxLargura = px ? `${Number(px[1]) / 16}rem` : largura;
+---
+
+<figure class="figura">
+  <div class="fig-box" style={`max-width:${maxLargura}`}><slot /></div>
+  {legenda && <figcaption>{legenda}</figcaption>}
+</figure>
+
+<style>
+  .figura {
+    margin-block: 1.8em;
+  }
+  .fig-box {
+    margin-inline: auto;
+    padding: clamp(12px, 3vw, 24px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-l);
+    background:
+      radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 80%, transparent) 1px, transparent 0) 0 0 / 18px 18px,
+      var(--surface);
+    overflow-x: auto;
+  }
+  .fig-box :global(svg) {
+    margin-inline: auto;
+    height: auto;
+    font-family: var(--font-sans);
+  }
+  /* classes utilitárias para os SVGs dos diagramas */
+  .fig-box :global(.d-box) {
+    fill: var(--surface-2);
+    stroke: var(--border-strong);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-accent) {
+    fill: var(--accent-soft);
+    stroke: var(--accent);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-ok) {
+    fill: var(--ok-soft);
+    stroke: var(--ok);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-info) {
+    fill: var(--info-soft);
+    stroke: var(--info);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-violet) {
+    fill: var(--violet-soft);
+    stroke: var(--violet);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-line) {
+    fill: none;
+    stroke: var(--text-3);
+    stroke-width: 1.5;
+  }
+  .fig-box :global(.d-text) {
+    fill: var(--text);
+    font-size: 14px;
+  }
+  .fig-box :global(.d-label) {
+    fill: var(--text-2);
+    font-size: 12px;
+  }
+  .fig-box :global(.d-mono) {
+    fill: var(--text);
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .fig-box :global(.d-title) {
+    fill: var(--text);
+    font-size: 15px;
+    font-weight: 700;
+  }
+  .fig-box :global(.d-arrow) {
+    fill: var(--text-3);
+  }
+</style>

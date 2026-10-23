@@ -1,0 +1,60 @@
+# Fintech Core completo em containers: aplicação + PostgreSQL + Kafka (marco 6).
+# O compose.yaml ao lado continua sendo o de desenvolvimento (só a infraestrutura, para o spring-boot:run).
+#
+#   mvn -B verify
+#   export POSTGRES_PASSWORD=... FINTECH_JWT_SEGREDO=...   (32+ caracteres)
+#   docker compose -f compose.producao.yaml up --build
+#   curl localhost:8080/actuator/health/readiness
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORTA:-8080}:8080"     # APP_PORTA=18080 se a 8080 da sua máquina estiver ocupada
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fintech
+      SPRING_DATASOURCE_USERNAME: fintech
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_DOCKER_COMPOSE_ENABLED: "false"   # dentro do container não há docker compose para gerenciar
+      FINTECH_JWT_SEGREDO: ${FINTECH_JWT_SEGREDO:?defina FINTECH_JWT_SEGREDO}
+      FINTECH_ADMIN_EMAIL: ${FINTECH_ADMIN_EMAIL:-}
+      FINTECH_ADMIN_SENHA: ${FINTECH_ADMIN_SENHA:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: fintech
+      POSTGRES_USER: fintech
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fintech -d fintech"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - dados:/var/lib/postgresql
+
+  kafka:
+    image: apache/kafka:4.2.1
+    environment:
+      # KRaft com um nó que é broker e controller. O listener anunciado é "kafka:9092": o nome do serviço
+      # na rede do compose (o padrão da imagem, localhost:9092, não funcionaria a partir do container da app).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+volumes:
+  dados:

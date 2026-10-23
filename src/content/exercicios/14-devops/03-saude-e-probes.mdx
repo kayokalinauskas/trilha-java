@@ -1,0 +1,156 @@
+---
+titulo: Liveness, readiness e o modo de manutenção
+codigo: "14.03"
+resumo: Escreva o health indicator de um provedor de pagamentos (latência, lentidão e falha sem vazar detalhes), decida o que entra na readiness e o que fica fora da liveness, e crie um modo de manutenção que tira a instância do balanceador sem reiniciá-la, publicando um AvailabilityChangeEvent.
+modulo: 14-devops
+ordem: 3
+dificuldade: medio
+tempo: 1h30–2h
+conceitos: [Actuator, HealthIndicator, liveness, readiness, probes, Kubernetes, AvailabilityChangeEvent, grupos de health]
+aulas: [14-devops/05-observabilidade, 14-devops/06-kubernetes-e-cloud]
+java:
+  modulo: m14-devops
+  teste: SaudeTest
+---
+
+## Contexto
+
+Numa sexta à noite, o provedor de pagamentos ficou fora por 20 minutos. A aplicação tinha um único health check, que incluía o provedor. O Kubernetes viu o `/actuator/health` responder `DOWN` e fez o que foi configurado para fazer: **reiniciou todos os pods**. Os pods voltaram, o provedor continuava fora, o health continuava `DOWN`, e os pods entraram num ciclo de reinício. Quando o provedor voltou, a aplicação ainda estava subindo, e o que era uma queda parcial (só pagamentos) virou uma queda total (tudo).
+
+A correção é separar as duas perguntas que o orquestrador faz:
+
+| Probe | Pergunta | Se falhar |
+|---|---|---|
+| **liveness** | "este processo está vivo, ou travou?" | o pod é **reiniciado** |
+| **readiness** | "consigo atender requisições agora?" | o pod sai do **balanceador**, mas continua rodando |
+
+Uma dependência externa fora do ar é um problema de **readiness**. Reiniciar o pod não conserta o provedor.
+
+## O que já existe
+
+Em `dev.trilhajava.m14.saude` (a `SaudeApplication`, que ativa o perfil `saude`):
+
+- `ProvedorDePagamentos`, com `Duration ping()`: devolve a latência medida ou lança exceção. Nos testes, um mock;
+- `ProvedorSimulado`, a implementação de desenvolvimento;
+- `ProvedorHealthIndicator` (esboço), um `HealthIndicator`. O Spring tira o sufixo `HealthIndicator` do nome do bean, então ele aparece como o componente **`provedor`**;
+- `ManutencaoController` (esboço): `POST /admin/manutencao` com `{"ativo": true}` ou `{"ativo": false}`.
+
+Você implementa o `ProvedorHealthIndicator`, o `ManutencaoController` e o `src/main/resources/application-saude.properties`.
+
+## Os requisitos
+
+**1. O health do provedor.**
+
+| Situação | Status | Detalhes |
+|---|---|---|
+| `ping()` responde em até 1 s | `UP` | `latenciaMs`: a latência em milissegundos |
+| `ping()` responde em mais de 1 s | `DOWN` | `latenciaMs` |
+| `ping()` lança exceção | `DOWN` | `erro`: o **nome simples** da classe da exceção (`IllegalStateException`) |
+
+A mensagem da exceção **nunca** aparece: `conexão recusada em 10.0.3.7:8443` entrega a topologia da rede interna para quem consultar o endpoint.
+
+**2. O que entra em cada probe** (no perfil `saude`):
+
+- `/actuator/health/readiness` inclui o estado de readiness da aplicação **e o `provedor`**, e mostra os detalhes (`show-details=always` nesse grupo);
+- `/actuator/health/liveness` **não** inclui o provedor;
+- `/actuator/health` (o geral, público) mostra **só** o status: nada de `components` nem `details`.
+
+**3. O modo de manutenção.** `POST /admin/manutencao` responde **204** e:
+
+- com `"ativo": true`, muda a readiness para `REFUSING_TRAFFIC`: a readiness passa a responder 503, com o componente `readinessState` em `OUT_OF_SERVICE`, e a liveness continua 200;
+- com `"ativo": false`, volta para `ACCEPTING_TRAFFIC`.
+
+É o que se usa para tirar uma instância do balanceador antes de uma investigação ou de uma migração, sem matar o processo.
+
+<Callout tipo="novidade" titulo="Spring Boot 4: as probes já vêm ligadas">
+No Spring Boot 4, `management.endpoint.health.probes.enabled` é `true` por padrão: `/actuator/health/liveness` e `/actuator/health/readiness` existem mesmo fora do Kubernetes. Você não precisa ligá-las; precisa só dizer **o que entra** em cada grupo.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] `SaudeTest` passa (8 testes).
+- [ ] Com o provedor fora do ar, a readiness responde 503 e a liveness responde 200.
+- [ ] O IP da mensagem de erro não aparece em nenhuma resposta.
+- [ ] `/actuator/env` e `/actuator/beans` respondem 404.
+
+O último critério usa a configuração de exposição do `application.properties` (`health,prometheus`), que é do exercício 14.02. Se você está fazendo o 14.03 primeiro, configure a exposição agora.
+
+## Desafios opcionais
+
+- Escreva o `deployment.yaml` do Kubernetes com `livenessProbe` e `readinessProbe` apontando para os dois endpoints (porta 8080). Que `initialDelaySeconds`, `periodSeconds` e `failureThreshold` você escolheria, e por quê?
+- O `ping()` real pode demorar 30 s. Um health check que demora 30 s trava o endpoint. Limite o tempo (um timeout no cliente, ou um cache do último resultado por alguns segundos).
+- Proteja o `/admin/manutencao` com o Spring Security do módulo 11 (só `ROLE_ADMIN`).
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo indicador, que é Java puro: um `try` com o `ping()`, comparando a latência com `Duration.ofSeconds(1)`, e um `catch` para a exceção. Depois as propriedades (grupos de health) e, por último, o controller.
+</Dica>
+<Dica nivel={2}>
+- `Health.up()` e `Health.down()` devolvem um `Health.Builder`: `.withDetail("latenciaMs", latencia.toMillis()).build()`. No Spring Boot 4 essas classes estão em `org.springframework.boot.health.contributor`.
+- Grupos: `management.endpoint.health.group.readiness.include=...` define **exatamente** quem entra no grupo. Lembre de manter o `readinessState` na lista, senão o modo de manutenção deixa de ter efeito.
+- Detalhes por grupo: `management.endpoint.health.group.readiness.show-details=always`. Para o geral: `management.endpoint.health.show-details=never`.
+</Dica>
+<Dica nivel={3}>
+- `management.endpoint.health.group.readiness.include=readinessState,provedor`.
+- No controller, injete um `ApplicationEventPublisher` e chame `AvailabilityChangeEvent.publish(eventos, this, ReadinessState.REFUSING_TRAFFIC)` (ou `ACCEPTING_TRAFFIC`). O Spring Boot guarda o estado no `ApplicationAvailability`, e o componente `readinessState` passa a responder `OUT_OF_SERVICE`.
+- `return ResponseEntity.noContent().build();`
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="ProvedorHealthIndicator">
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/saude/ProvedorHealthIndicator.java" />
+</Tab>
+<Tab rotulo="ManutencaoController">
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/saude/ManutencaoController.java" />
+</Tab>
+</Tabs>
+
+```properties
+# application-saude.properties
+management.endpoint.health.group.readiness.include=readinessState,provedor
+management.endpoint.health.group.readiness.show-details=always
+management.endpoint.health.show-details=never
+```
+
+O que cada endpoint responde com o provedor fora do ar:
+
+```jsonc
+// GET /actuator/health/readiness → 503
+{
+  "status": "DOWN",
+  "components": {
+    "provedor": { "status": "DOWN", "details": { "erro": "IllegalStateException" } },
+    "readinessState": { "status": "UP" }
+  }
+}
+
+// GET /actuator/health/liveness → 200
+{ "status": "UP" }
+```
+
+### Passo a passo
+
+1. **O indicador não lança exceção.** Ele **traduz** a exceção em `DOWN`. Um indicador que lança exceção também vira `DOWN`, mas com o Spring decidindo o que mostrar, e é aí que mensagens com IP e usuário vazam.
+2. **Lento é quebrado.** Um provedor que responde em 1,5 s está tecnicamente vivo, mas cada pagamento vai estourar o timeout do cliente. Para quem decide se manda tráfego, isso é `DOWN`. A latência continua nos detalhes para quem investiga.
+3. **Readiness com o provedor, liveness sem.** A liveness deve falhar só quando reiniciar resolve: *deadlock*, memória esgotada, estado interno corrompido. O `livenessState` padrão do Spring cobre esses casos.
+4. **O health geral é público.** Balanceadores e monitores externos só precisam do status. Os detalhes ficam no grupo de readiness, que em produção normalmente fica numa porta de gerenciamento separada (`management.server.port`), fora da internet.
+5. **Manutenção é um evento, não um `if`.** `AvailabilityChangeEvent` é o mesmo mecanismo que o Spring Boot usa no desligamento gracioso: ao receber o SIGTERM, ele passa a readiness para `REFUSING_TRAFFIC` antes de parar. Seu endpoint reaproveita esse fluxo.
+
+### Alternativas e trade-offs
+
+- **Provedor fora de todas as probes**, só num alerta: se o provedor atende só uma parte da aplicação (pagamentos), tirar o pod do balanceador derruba também o que funcionaria (consultas, cadastro). É a escolha certa quando a dependência não é essencial para **toda** requisição. Aqui o serviço é de pagamentos, então o provedor é essencial.
+- **Circuit breaker em vez de health check** (13.04): o circuito protege cada chamada; a readiness protege o balanceamento. Os dois se complementam.
+- **Estado de manutenção num banco ou num *feature flag*** em vez de por instância: desliga todas as instâncias de uma vez, mas o endpoint deste exercício permite tirar **uma** instância específica, que é o caso de uso de investigação.
+
+### Avalie sua solução
+
+- Se o **banco de dados** da aplicação cair, ele deve entrar na readiness, na liveness ou em nenhuma? E se o banco for só de relatórios?
+- Com 10 pods e o provedor fora, todos saem do balanceador ao mesmo tempo. O que o usuário vê? Isso é melhor ou pior do que deixar as requisições falharem com uma mensagem clara?
+- O Kubernetes chama a readiness a cada 10 s em cada pod. Quantas chamadas `ping()` por minuto o provedor recebe com 50 pods? Isso muda o seu desenho?
+
+</Solucao>

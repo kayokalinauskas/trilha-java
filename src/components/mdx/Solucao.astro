@@ -1,0 +1,205 @@
+---
+/**
+ * Solução de referência escondida. Só aparece depois de uma confirmação explícita,
+ * e fica fora do índice de busca para não "vazar" por acidente.
+ */
+import Icon from '../Icon.astro';
+
+interface Props {
+  titulo?: string;
+}
+const { titulo = 'Solução de referência comentada' } = Astro.props;
+---
+
+<section class="solucao" id="solucao" data-solucao data-pagefind-ignore="all" aria-label="Solução">
+  <div class="sol-gate">
+    <span class="sol-lock"><Icon name="lock" size={22} /></span>
+    <div class="sol-gate-text">
+      <h2 class="sol-title">{titulo}</h2>
+      <p>
+        A solução está guardada. Olhar cedo demais tira de você a parte que mais ensina: travar e destravar sozinho.
+        Rode os testes, use as dicas e só então compare.
+      </p>
+    </div>
+    <button type="button" class="btn" data-pedir-solucao><Icon name="unlock" size={16} /> Quero ver a solução</button>
+  </div>
+
+  <div class="sol-content" hidden tabindex="-1">
+    <p class="sol-banner"><Icon name="unlock" size={16} /> Solução revelada · compare com a sua, não copie</p>
+    <slot />
+  </div>
+
+  <dialog class="sol-dialog" aria-labelledby="sol-confirm-title">
+    <div class="sol-form">
+      <h3 id="sol-confirm-title">Antes de abrir…</h3>
+      <ul class="sol-check">
+        <li><Icon name="check" size={16} /> Tentei resolver por pelo menos 30 minutos</li>
+        <li><Icon name="check" size={16} /> Li as dicas progressivas</li>
+        <li><Icon name="check" size={16} /> Rodei os testes e li as mensagens de falha</li>
+      </ul>
+      <p class="muted">Sem problema se não fez tudo — só fica registrado no seu painel que você viu a solução.</p>
+      <div class="sol-actions">
+        <button type="button" class="btn btn-ghost" data-cancelar>Vou tentar mais um pouco</button>
+        <button type="button" class="btn btn-primary" data-revelar>Mostrar solução</button>
+      </div>
+    </div>
+  </dialog>
+</section>
+
+<script>
+  import { registrarSolucaoVista } from '../../lib/progresso';
+
+  document.querySelectorAll<HTMLElement>('[data-solucao]').forEach((bloco) => {
+    const gate = bloco.querySelector<HTMLElement>('.sol-gate')!;
+    const conteudo = bloco.querySelector<HTMLElement>('.sol-content')!;
+    const dialog = bloco.querySelector<HTMLDialogElement>('.sol-dialog')!;
+    const exercicio = bloco.closest<HTMLElement>('[data-exercicio]')?.dataset.exercicio;
+
+    bloco.querySelector('[data-pedir-solucao]')!.addEventListener('click', () => dialog.showModal());
+    bloco.querySelector('[data-cancelar]')!.addEventListener('click', () => dialog.close());
+    bloco.querySelector('[data-revelar]')!.addEventListener('click', () => {
+      dialog.close();
+      gate.hidden = true;
+      conteudo.hidden = false;
+      conteudo.focus();
+      if (exercicio) registrarSolucaoVista(exercicio);
+    });
+    dialog.addEventListener('click', (e) => {
+      if (e.target === dialog) dialog.close(); // clique fora fecha
+    });
+  });
+</script>
+
+<style>
+  .solucao {
+    margin-block: 2.4em;
+  }
+  .sol-gate {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 18px;
+    align-items: start;
+    padding: clamp(20px, 3vw, 28px);
+    border-radius: var(--radius-l);
+    background:
+      repeating-linear-gradient(135deg, transparent 0 12px, color-mix(in srgb, var(--border) 45%, transparent) 12px 13px),
+      var(--surface);
+    border: 1px solid var(--border);
+  }
+  .sol-lock {
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 14px;
+    background: var(--surface-3);
+    color: var(--text-2);
+    grid-row: span 2;
+  }
+  .sol-title {
+    font-size: 1.15rem !important;
+    margin: 0 0 4px !important;
+    padding: 0 !important;
+  }
+  .sol-gate-text p {
+    margin: 0 !important;
+    font-size: 0.93rem;
+    color: var(--text-3);
+    max-width: 58ch;
+  }
+  .sol-gate .btn {
+    grid-column: 2;
+    justify-self: start;
+    margin-top: 10px;
+  }
+  .sol-content {
+    padding: clamp(18px, 3vw, 28px);
+    border-radius: var(--radius-l);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: var(--surface);
+    animation: abrir 0.35s var(--ease);
+  }
+  .sol-content:focus {
+    outline: none;
+  }
+  .sol-content > :global(* + *) {
+    margin-top: 1.1em;
+  }
+  @keyframes abrir {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+  .sol-banner {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .sol-form {
+    padding: 24px;
+  }
+  .sol-dialog {
+    width: min(480px, calc(100vw - 32px));
+    padding: 0;
+    border-radius: var(--radius-l);
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow-lift);
+    margin: auto;
+  }
+  .sol-dialog::backdrop {
+    background: rgb(10 8 6 / 0.6);
+    backdrop-filter: blur(3px);
+  }
+  .sol-dialog h3 {
+    font-size: 1.25rem;
+    margin-bottom: 14px;
+  }
+  .sol-check {
+    list-style: none;
+    padding: 0 !important;
+    display: grid;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .sol-check li {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    color: var(--text-2);
+    margin: 0 !important;
+  }
+  .sol-check :global(.icon) {
+    color: var(--ok);
+    flex-shrink: 0;
+  }
+  .sol-dialog .muted {
+    font-size: 0.87rem;
+  }
+  .sol-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 20px;
+  }
+  @media (max-width: 520px) {
+    .sol-gate {
+      grid-template-columns: 1fr;
+    }
+    .sol-lock {
+      grid-row: auto;
+    }
+    .sol-gate .btn {
+      grid-column: 1;
+    }
+  }
+</style>

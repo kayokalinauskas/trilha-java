@@ -1,0 +1,223 @@
+---
+titulo: Arrays, Strings e StringBuilder
+descricao: Arrays e a classe Arrays, String imutável e seus métodos mais úteis, comparação correta, text blocks, formatação e quando usar StringBuilder.
+modulo: 01-java-essencial
+ordem: 5
+duracao: 55
+objetivos:
+  - Criar, percorrer, copiar e ordenar arrays
+  - Explicar por que String é imutável e o que isso implica
+  - Usar os métodos de String mais comuns em backend
+  - Montar textos com eficiência usando StringBuilder, formatted e text blocks
+tags: [arrays, String, StringBuilder, text blocks]
+flashcards:
+  - frente: Por que String é imutável em Java?
+    verso: Segurança (não muda depois de validada), pode ser compartilhada entre threads e cacheada (string pool) e ser usada como chave de HashMap com hash estável.
+  - frente: Quando usar StringBuilder?
+    verso: Ao montar texto em laços ou em muitas etapas. Concatenar String com + em laço cria um objeto novo a cada volta.
+  - frente: Qual a diferença entre isEmpty() e isBlank()?
+    verso: isEmpty() é true só para "". isBlank() também é true para strings só com espaços em branco.
+  - frente: Como copiar um array?
+    verso: array.clone() ou Arrays.copyOf(array, tamanho). Atribuir (b = a) só copia a referência.
+  - frente: O que são text blocks?
+    verso: Strings multilinha delimitadas por três aspas (Java 15+), com indentação comum removida automaticamente. Ótimas para JSON, SQL e mensagens.
+---
+
+Texto é o formato mais comum de dado em backend: JSON que chega de uma API, linhas de um CSV, parâmetros de URL, mensagens de log. E, antes das coleções que você vai ver no módulo 03, os **arrays** são a estrutura mais básica para guardar vários valores.
+
+## Arrays
+
+Um array tem **tamanho fixo**, definido na criação, e guarda elementos de um único tipo:
+
+```java
+int[] estoque = new int[3];              // [0, 0, 0] — valores padrão
+String[] dias = {"seg", "ter", "qua"};   // tamanho 3, já preenchido
+
+estoque[0] = 12;
+System.out.println(dias.length);         // 3 (atributo, sem parênteses)
+```
+
+Valores padrão ao criar com `new`: `0` para números, `false` para `boolean` e **`null` para objetos**. Um `new String[3]` é `[null, null, null]`, e chamar um método em um desses elementos dá `NullPointerException`.
+
+### A classe utilitária `Arrays`
+
+```java
+import java.util.Arrays;
+
+int[] notas = {7, 3, 9, 5};
+Arrays.sort(notas);                       // [3, 5, 7, 9] — ordena NO LUGAR
+System.out.println(Arrays.toString(notas)); // "[3, 5, 7, 9]"
+int pos = Arrays.binarySearch(notas, 7);  // 2 (só em array ordenado)
+int[] copia = Arrays.copyOf(notas, notas.length);
+boolean iguais = Arrays.equals(notas, copia); // true
+```
+
+<Callout tipo="erro" titulo="Imprimir um array direto">
+`System.out.println(notas)` imprime algo como `[I@1b6d3586` (tipo + hash), não o conteúdo. Use `Arrays.toString(notas)`.
+</Callout>
+
+### Copiar não é atribuir
+
+```java
+int[] original = {1, 2, 3};
+int[] mesmo = original;          // mesma referência!
+mesmo[0] = 99;
+System.out.println(original[0]); // 99
+
+int[] copia = original.clone();  // novo array
+copia[0] = 0;
+System.out.println(original[0]); // continua 99
+```
+
+É a mesma ideia da aula anterior: variáveis de objeto guardam **referências**. Se um método não deve alterar o array recebido, ele **não pode escrever nele** — ou deve trabalhar numa cópia. Um dos testes do exercício 01.03 verifica exatamente isso.
+
+### Arrays ou listas?
+
+No código de aplicação moderno, você vai usar muito mais `List` (módulo 03), que cresce sozinha e tem uma API rica. Arrays aparecem em código de desempenho crítico, em algumas APIs da JDK (`String.split` devolve `String[]`) e em entrevistas de algoritmos.
+
+## `String`: imutável por design
+
+Um objeto `String` **nunca muda depois de criado**. Todo método que parece alterar uma String, na verdade, **devolve uma nova**:
+
+```java
+String nome = "  ana  ";
+nome.strip();                    // devolve "ana", mas o resultado foi jogado fora
+System.out.println(nome);        // "  ana  "
+
+nome = nome.strip();             // agora sim
+```
+
+Esse é um dos bugs mais comuns de iniciante, e o compilador não avisa.
+
+Por que imutável? Porque Strings são usadas como chaves de `HashMap`, nomes de arquivo, URLs e credenciais. Se pudessem mudar depois de validadas, abririam brechas de segurança e bugs muito difíceis de rastrear. A imutabilidade também permite o **string pool**: literais iguais compartilham o mesmo objeto na memória.
+
+### Os métodos que você mais vai usar
+
+| Método | Exemplo | Resultado |
+|---|---|---|
+| `length()` | `"café".length()` | `4` |
+| `strip()` | `"  a b  ".strip()` | `"a b"` |
+| `isBlank()` / `isEmpty()` | `"   ".isBlank()` / `"   ".isEmpty()` | `true` / `false` |
+| `toUpperCase(Locale)` | `"pix".toUpperCase(Locale.ROOT)` | `"PIX"` |
+| `equalsIgnoreCase` | `"Pix".equalsIgnoreCase("PIX")` | `true` |
+| `contains` / `startsWith` | `"ERRO: x".startsWith("ERRO")` | `true` |
+| `indexOf` | `"a@b.com".indexOf('@')` | `1` (ou `-1`) |
+| `substring(i, f)` | `"01310100".substring(0, 5)` | `"01310"` (f é exclusivo) |
+| `replace` | `"1.234,56".replace(".", "")` | `"1234,56"` |
+| `split(regex)` | `"a;b;c".split(";")` | `["a", "b", "c"]` |
+| `charAt(i)` | `"java".charAt(0)` | `'j'` |
+| `repeat(n)` | `"-".repeat(10)` | `"----------"` |
+| `String.join` | `String.join(", ", "a", "b")` | `"a, b"` |
+
+<Callout tipo="atencao" titulo="split recebe uma expressão regular">
+`"1.2.3".split(".")` devolve um array **vazio**, porque `.` em regex significa "qualquer caractere". Escape: `split("\\.")`. O mesmo vale para `|`, `+`, `*`, `?` e outros caracteres especiais.
+</Callout>
+
+### Comparando Strings
+
+```java
+String digitado = IO.readln("Perfil: ");
+if (digitado == "admin") { ... }        // ERRADO: compara referências
+if ("admin".equals(digitado)) { ... }    // certo e seguro contra null
+if ("admin".equalsIgnoreCase(digitado.strip())) { ... } // mais tolerante
+```
+
+## Montando texto
+
+### Concatenação com `+`
+
+Para juntar poucas partes, `+` é perfeito e legível. O problema aparece em **laços**:
+
+<Comparar antes="Cria um objeto novo a cada volta" depois="Reaproveita um buffer">
+```java
+String csv = "";
+for (Pedido p : pedidos) {
+    csv += p.id() + ";" + p.total() + "\n";
+}
+```
+
+```java
+StringBuilder csv = new StringBuilder();
+for (Pedido p : pedidos) {
+    csv.append(p.id()).append(';')
+       .append(p.total()).append('\n');
+}
+String resultado = csv.toString();
+```
+</Comparar>
+
+Como `String` é imutável, cada `+=` cria uma String nova e copia todo o conteúdo anterior. Com 10 mil pedidos, isso significa copiar dados milhões de vezes (custo quadrático). O **`StringBuilder`** é mutável: vai acrescentando num buffer que cresce conforme precisa. Ele também tem `insert`, `reverse`, `setLength` e `deleteCharAt`.
+
+### Formatação
+
+```java
+String linha = String.format("%-10s | %5d | %8.2f", "Café", 3, 25.9);
+// "Café       |     3 |    25,90"  ← em pt-BR a vírgula aparece!
+
+String msg = "Pedido %d de %s".formatted(42, "Ana");   // Java 15+
+```
+
+Os códigos mais usados: `%s` (texto), `%d` (inteiro), `%.2f` (decimal com 2 casas), `%n` (quebra de linha do sistema), e `-`/números para alinhar. A formatação respeita o **`Locale` padrão da máquina**: em pt-BR, `%.2f` usa vírgula. Para um resultado previsível (logs, arquivos, testes), passe o `Locale` explicitamente: `String.format(Locale.US, ...)`.
+
+### Text blocks
+
+Desde o Java 15, textos multilinha podem ser escritos com três aspas:
+
+```java
+String json = """
+        {
+          "cliente": "%s",
+          "total": %s
+        }
+        """.formatted(nome, total);
+
+String sql = """
+        SELECT id, total
+          FROM pedido
+         WHERE status = 'PAGO'
+        """;
+```
+
+A indentação comum às linhas é removida automaticamente (a referência é a posição do `"""` de fechamento). É ideal para JSON em testes, SQL e mensagens longas.
+
+<Callout tipo="entrevista">
+"Por que `String` é imutável?" e "qual a diferença entre `String`, `StringBuilder` e `StringBuffer`?" são clássicas. `StringBuffer` é a versão antiga e sincronizada do `StringBuilder`. Hoje, use `StringBuilder`: sincronizar um objeto local é custo sem benefício.
+</Callout>
+
+<Quiz
+  id="01-arrays-strings"
+  questoes={[
+    {
+      pergunta: 'O que imprime: `String s = "java"; s.toUpperCase(); System.out.println(s);`?',
+      opcoes: ['JAVA', 'java', 'Java', 'Erro de compilação'],
+      correta: 1,
+      explicacao: 'String é imutável: `toUpperCase()` devolve uma nova String, que foi descartada. `s` continua "java".',
+    },
+    {
+      pergunta: 'Qual o resultado de `"10.5".split(".").length`?',
+      opcoes: ['2', '1', '0', '3'],
+      correta: 2,
+      explicacao: 'O ponto é "qualquer caractere" em regex: tudo vira separador e as strings vazias do final são descartadas. Use `split("\\\\.")`.',
+    },
+    {
+      pergunta: 'Depois de `int[] a = {1,2}; int[] b = a; b[0] = 5;`, quanto vale `a[0]`?',
+      opcoes: ['1', '5', '0', 'Erro'],
+      correta: 1,
+      explicacao: '`b = a` copia a referência: os dois nomes apontam para o mesmo array.',
+    },
+    {
+      pergunta: 'Qual a melhor forma de montar um relatório com 50 mil linhas?',
+      opcoes: ['Concatenar com += em um laço', 'StringBuilder com append', 'String.format em cada linha e += no total', 'Um array de char'],
+      correta: 1,
+      explicacao: 'StringBuilder evita criar e copiar uma String nova a cada linha (custo quadrático).',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Arrays têm tamanho fixo e índices de 0 a `length - 1`; use a classe `Arrays` para ordenar, imprimir e copiar.
+- Atribuir um array (ou qualquer objeto) copia a referência, não o conteúdo.
+- `String` é imutável: **sempre use o valor devolvido** pelos métodos.
+- Compare Strings com `equals` (constante na frente); cuidado com `split`, que recebe regex.
+- `StringBuilder` em laços; `formatted`/`String.format` com `Locale` explícito; text blocks para textos multilinha.

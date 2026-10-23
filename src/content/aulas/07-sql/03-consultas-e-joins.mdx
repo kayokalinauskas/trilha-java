@@ -1,0 +1,162 @@
+---
+titulo: Consultas e JOINs
+descricao: SELECT, WHERE e ORDER BY, a ordem lógica de execução de uma consulta, INNER e LEFT JOIN, anti-join com NOT EXISTS e as armadilhas do NULL.
+modulo: 07-sql
+ordem: 3
+duracao: 50
+objetivos:
+  - Escrever consultas com filtros, ordenação e paginação
+  - Entender a ordem lógica de execução do SELECT
+  - Escolher entre INNER JOIN, LEFT JOIN e NOT EXISTS
+  - Evitar as armadilhas do NULL (comparação, NOT IN, contagem)
+tags: [SELECT, JOIN, "NULL", NOT EXISTS]
+flashcards:
+  - frente: Qual a ordem lógica de execução de um SELECT?
+    verso: FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT/OFFSET.
+  - frente: Qual a diferença entre INNER JOIN e LEFT JOIN?
+    verso: INNER traz só as linhas com correspondência nos dois lados; LEFT traz todas da esquerda, com NULL nas colunas da direita quando não há correspondência.
+  - frente: Como encontrar clientes que nunca fizeram pedido?
+    verso: LEFT JOIN pedido ... WHERE p.id IS NULL, ou WHERE NOT EXISTS (SELECT 1 FROM pedido p WHERE p.cliente_id = c.id).
+  - frente: Por que NOT IN com subconsulta é perigoso?
+    verso: Se a subconsulta devolver algum NULL, NOT IN resulta em desconhecido para todas as linhas e a consulta volta vazia. Prefira NOT EXISTS.
+  - frente: Como comparar com NULL?
+    verso: Com IS NULL / IS NOT NULL. "coluna = NULL" nunca é verdadeiro.
+---
+
+SQL é **declarativo**: você diz **o que** quer, e o banco decide **como** buscar. Isso é poderoso e é também a fonte de confusões — principalmente sobre a **ordem** em que as partes de uma consulta são avaliadas.
+
+Os exemplos usam a base de vendas dos exercícios 07.02 e 07.03: `cliente`, `produto`, `pedido` e `item_pedido`.
+
+## O básico
+
+```sql
+SELECT id, nome, cidade
+  FROM cliente
+ WHERE cidade IN ('São Paulo', 'Recife')
+   AND nome ILIKE 'a%'              -- ILIKE: sem diferenciar maiúsculas (PostgreSQL)
+ ORDER BY nome
+ LIMIT 20 OFFSET 40;                -- terceira página de 20
+```
+
+## A ordem lógica de execução
+
+Você **escreve** `SELECT … FROM … WHERE …`, mas o banco **avalia** em outra ordem:
+
+<Figura legenda="A ordem lógica explica por que um alias do SELECT não pode ser usado no WHERE">
+<svg viewBox="0 0 700 110" width="700" role="img" aria-label="FROM e JOIN, depois WHERE, GROUP BY, HAVING, SELECT, ORDER BY e LIMIT">
+  <defs><marker id="q1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="5" y="30" width="95" height="44" rx="8" class="d-info"/><text x="52" y="57" text-anchor="middle" class="d-mono">FROM/JOIN</text>
+  <rect x="120" y="30" width="80" height="44" rx="8" class="d-box"/><text x="160" y="57" text-anchor="middle" class="d-mono">WHERE</text>
+  <rect x="220" y="30" width="95" height="44" rx="8" class="d-box"/><text x="267" y="57" text-anchor="middle" class="d-mono">GROUP BY</text>
+  <rect x="335" y="30" width="80" height="44" rx="8" class="d-box"/><text x="375" y="57" text-anchor="middle" class="d-mono">HAVING</text>
+  <rect x="435" y="30" width="80" height="44" rx="8" class="d-accent"/><text x="475" y="57" text-anchor="middle" class="d-mono">SELECT</text>
+  <rect x="535" y="30" width="90" height="44" rx="8" class="d-box"/><text x="580" y="57" text-anchor="middle" class="d-mono">ORDER BY</text>
+  <rect x="640" y="30" width="55" height="44" rx="8" class="d-box"/><text x="667" y="57" text-anchor="middle" class="d-mono">LIMIT</text>
+  <path d="M100 52 H116" class="d-line" marker-end="url(#q1)"/><path d="M200 52 H216" class="d-line" marker-end="url(#q1)"/><path d="M315 52 H331" class="d-line" marker-end="url(#q1)"/><path d="M415 52 H431" class="d-line" marker-end="url(#q1)"/><path d="M515 52 H531" class="d-line" marker-end="url(#q1)"/><path d="M625 52 H636" class="d-line" marker-end="url(#q1)"/>
+</svg>
+</Figura>
+
+Consequências práticas:
+
+- um **alias** criado no `SELECT` (`AS faturamento`) **não existe** no `WHERE` — mas existe no `ORDER BY`;
+- o `WHERE` filtra **linhas**, antes de agrupar; o `HAVING` filtra **grupos**, depois;
+- *window functions* (aula 4) são calculadas no `SELECT`, então também não podem ir no `WHERE`.
+
+## JOINs
+
+```sql
+-- INNER JOIN: só pedidos que têm cliente correspondente (todos, graças à FK)
+SELECT p.id, c.nome, p.data
+  FROM pedido p
+  JOIN cliente c ON c.id = p.cliente_id;
+
+-- LEFT JOIN: TODOS os clientes; quem não tem pedido aparece com colunas de pedido NULL
+SELECT c.nome, p.id AS pedido_id
+  FROM cliente c
+  LEFT JOIN pedido p ON p.cliente_id = c.id;
+```
+
+| JOIN | Resultado |
+|---|---|
+| `[INNER] JOIN` | só linhas com correspondência |
+| `LEFT [OUTER] JOIN` | todas da esquerda + correspondências (ou `NULL`) |
+| `RIGHT JOIN` | o espelho do LEFT (raro; reescreva como LEFT) |
+| `FULL JOIN` | todas dos dois lados |
+| `CROSS JOIN` | todas as combinações (produto cartesiano) |
+
+<Callout tipo="erro" titulo="O filtro que transforma LEFT em INNER">
+`LEFT JOIN pedido p ON p.cliente_id = c.id WHERE p.status = 'PAGO'` descarta os clientes sem pedido, porque `NULL = 'PAGO'` não é verdadeiro. Se a intenção é "todos os clientes, com seus pedidos pagos", coloque a condição **no `ON`**: `LEFT JOIN pedido p ON p.cliente_id = c.id AND p.status = 'PAGO'`.
+</Callout>
+
+## "Quem não tem…": anti-join
+
+```sql
+-- clientes que nunca fizeram pedido
+SELECT c.nome
+  FROM cliente c
+ WHERE NOT EXISTS (SELECT 1 FROM pedido p WHERE p.cliente_id = c.id);
+
+-- equivalente com LEFT JOIN
+SELECT c.nome
+  FROM cliente c
+  LEFT JOIN pedido p ON p.cliente_id = c.id
+ WHERE p.id IS NULL;
+```
+
+`EXISTS`/`NOT EXISTS` expressam a intenção diretamente e o otimizador do PostgreSQL costuma transformá-los em *semi-join*/*anti-join* eficientes.
+
+## NULL: a lógica de três valores
+
+`NULL` significa **"desconhecido"**. Qualquer comparação com ele resulta em **desconhecido** (nem verdadeiro, nem falso):
+
+```sql
+WHERE email = NULL          -- nunca verdadeiro! Use: WHERE email IS NULL
+WHERE email <> 'x@y.com'    -- NÃO traz as linhas com email NULL
+COUNT(*)                    -- conta linhas
+COUNT(email)                -- conta só os valores NÃO nulos
+COALESCE(desconto, 0)       -- primeiro valor não nulo
+```
+
+E a armadilha mais famosa:
+
+```sql
+SELECT nome FROM cliente
+ WHERE id NOT IN (SELECT cliente_id FROM indicacao);   -- se ALGUM cliente_id for NULL, volta VAZIO
+```
+
+`x NOT IN (1, 2, NULL)` vira `x <> 1 AND x <> 2 AND x <> NULL` → o último termo é desconhecido, e o resultado nunca é verdadeiro. **Use `NOT EXISTS`.**
+
+<Callout tipo="entrevista">
+"Diferença entre INNER e LEFT JOIN" é certa em entrevista Júnior. Para se destacar: mostre o filtro no `WHERE` que "anula" o LEFT JOIN, prefira `NOT EXISTS` a `NOT IN` explicando o caso do `NULL`, e cite a ordem lógica (`WHERE` antes de `GROUP BY`, `HAVING` depois).
+</Callout>
+
+<Quiz
+  id="07-joins"
+  questoes={[
+    {
+      pergunta: 'Por que `SELECT preco * 2 AS dobro FROM produto WHERE dobro > 100` dá erro?',
+      opcoes: ['Multiplicação não é permitida', 'O WHERE é avaliado antes do SELECT, então o alias ainda não existe', 'Falta GROUP BY', 'dobro é palavra reservada'],
+      correta: 1,
+      explicacao: 'Repita a expressão no WHERE ou use uma subconsulta/CTE.',
+    },
+    {
+      pergunta: 'Quantas linhas `SELECT * FROM cliente WHERE email <> \'ana@x.com\'` traz para clientes com email NULL?',
+      opcoes: ['Todas', 'Nenhuma', 'Metade', 'Lança erro'],
+      correta: 1,
+      explicacao: 'NULL <> valor é desconhecido; a linha não passa no filtro.',
+    },
+    {
+      pergunta: 'Qual a forma mais segura de listar produtos que nunca foram vendidos?',
+      opcoes: ['WHERE id NOT IN (SELECT produto_id FROM item_pedido)', 'WHERE NOT EXISTS (SELECT 1 FROM item_pedido i WHERE i.produto_id = p.id)', 'INNER JOIN item_pedido', 'WHERE produto_id IS NULL'],
+      correta: 1,
+      explicacao: 'NOT EXISTS não sofre com NULLs na subconsulta e expressa a intenção diretamente.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Ordem lógica: `FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT`.
+- `INNER` só correspondências; `LEFT` preserva a esquerda — filtros da direita vão no `ON`.
+- "Quem não tem" → `NOT EXISTS` (ou `LEFT JOIN … IS NULL`); evite `NOT IN` com subconsulta.
+- `NULL` = desconhecido: `IS NULL`, `COALESCE`, `COUNT(coluna)` ignora nulos.

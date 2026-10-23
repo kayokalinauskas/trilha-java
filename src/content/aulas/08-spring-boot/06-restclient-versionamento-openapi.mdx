@@ -1,0 +1,253 @@
+---
+titulo: RestClient, versionamento e OpenAPI
+descricao: Consumir outras APIs com RestClient e com clientes declarativos (@HttpExchange), sem esquecer timeouts, erros e cache; versionar a sua API com o suporte nativo do Spring 7; e documentá-la com OpenAPI gerado do código.
+modulo: 08-spring-boot
+ordem: 6
+duracao: 60
+objetivos:
+  - Chamar APIs externas com RestClient e com HTTP interfaces
+  - Configurar timeouts e tratar falhas de integração com fallback
+  - Versionar endpoints com o suporte nativo do Spring Framework 7
+  - Documentar a API com OpenAPI e Swagger UI via springdoc
+tags: [RestClient, HttpExchange, versionamento, OpenAPI, integração]
+flashcards:
+  - frente: Por que toda chamada HTTP externa precisa de timeout?
+    verso: Sem timeout, uma API lenta prende as threads da sua aplicação indefinidamente; quando todas estão presas, a sua aplicação para — a falha do fornecedor vira a sua.
+  - frente: O que é uma HTTP interface (@HttpExchange)?
+    verso: Uma interface Java anotada que descreve os endpoints de uma API; o Spring gera a implementação que faz as chamadas (como um repositório do Spring Data, mas para HTTP).
+  - frente: Que exceção o RestClient lança para um 404 da API chamada?
+    verso: HttpClientErrorException.NotFound (subclasse de HttpClientErrorException, 4xx). Erros 5xx lançam HttpServerErrorException; falhas de rede/timeout, ResourceAccessException.
+  - frente: O que é OpenAPI?
+    verso: Uma especificação (JSON/YAML) que descreve uma API HTTP — endpoints, parâmetros, corpos, respostas. Gera documentação interativa (Swagger UI), clientes e testes de contrato.
+  - frente: Como o Spring 7 permite versionar endpoints?
+    verso: Com o atributo version nos mapeamentos (@GetMapping(version = "2")) e uma estratégia configurada (header, parâmetro, caminho ou media type), por exemplo spring.mvc.apiversion.use.header=API-Version.
+---
+
+Nenhum backend vive sozinho: você vai consumir gateways de pagamento, APIs de CEP, de câmbio, de antifraude — e outros microsserviços da sua empresa. E, do outro lado, alguém vai consumir a **sua** API e precisa de documentação e de estabilidade. Esta aula cobre os dois lados.
+
+## RestClient: o cliente HTTP do Spring
+
+O `RestClient` (Spring 6.1+) é a API fluente e síncrona que substitui o `RestTemplate` em código novo. O Spring Boot fornece um `RestClient.Builder` pré-configurado (com o Jackson da aplicação e observabilidade).
+
+```java
+@Component
+public class ClienteDeCep {
+
+    private final RestClient http;
+
+    public ClienteDeCep(RestClient.Builder builder) {
+        this.http = builder.baseUrl("https://viacep.com.br/ws").build();
+    }
+
+    public Endereco buscar(String cep) {
+        return http.get()
+                .uri("/{cep}/json/", cep)
+                .retrieve()                  // 4xx/5xx viram exceção
+                .body(Endereco.class);       // JSON → record
+    }
+}
+```
+
+| Situação | O que o `RestClient` faz |
+|---|---|
+| 2xx | converte o corpo |
+| 4xx | lança `HttpClientErrorException` (`.NotFound`, `.BadRequest`…) |
+| 5xx | lança `HttpServerErrorException` |
+| timeout, conexão recusada | lança `ResourceAccessException` |
+| quer tratar você mesmo | `.onStatus(HttpStatusCode::is4xxClientError, (req, resp) -> …)` ou `.exchange(...)` |
+
+Todas herdam de `RestClientException`, o que permite um `catch` para "qualquer falha de integração".
+
+## HTTP interfaces: declare, não implemente
+
+Para APIs com vários endpoints, escrever chamadas à mão fica repetitivo. Com uma **HTTP interface**, você declara o contrato e o Spring gera o cliente:
+
+```java
+@HttpExchange(accept = "application/json")
+public interface CotacaoClient {
+
+    @GetExchange("/cotacoes/{moeda}")
+    Cotacao buscar(@PathVariable String moeda);
+
+    @PostExchange("/alertas")
+    void criarAlerta(@RequestBody NovoAlerta alerta);
+}
+```
+
+Duas formas de transformá-la num bean:
+
+**Montagem explícita** (usada no exercício 08.04, para você ver cada peça):
+
+```java
+@Bean
+CotacaoClient cotacaoClient(RestClient.Builder builder, CambioProperties props) {
+    var requestFactory = new JdkClientHttpRequestFactory(
+            HttpClient.newBuilder().connectTimeout(props.timeout()).build());
+    requestFactory.setReadTimeout(props.timeout());
+
+    RestClient restClient = builder.baseUrl(props.baseUrl().toString()).requestFactory(requestFactory).build();
+    return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(restClient))
+            .build()
+            .createClient(CotacaoClient.class);
+}
+```
+
+**Registro por grupo** (Spring 7 + Boot 4), com configuração em propriedades:
+
+```java
+@Configuration
+@ImportHttpServices(group = "cambio", types = CotacaoClient.class)
+class ClientesHttp { }
+```
+
+```yaml
+spring:
+  http:
+    serviceclient:
+      cambio:
+        base-url: https://api.cotacoes.dev
+        connect-timeout: 2s
+        read-timeout: 2s
+```
+
+<Callout tipo="novidade" titulo="Spring 7: grupos de HTTP services">
+`@ImportHttpServices` registra os clientes de um grupo como beans, cada grupo com seu `RestClient` configurável por propriedades (`spring.http.serviceclient.<grupo>.*`) ou por um `RestClientHttpServiceGroupConfigurer`. Em sistemas com muitos microsserviços, isso elimina dezenas de métodos `@Bean` quase iguais.
+</Callout>
+
+## Integrações que não derrubam você
+
+Uma API externa **vai** ficar lenta ou fora do ar. Desenhe para isso desde o primeiro dia:
+
+1. **Timeouts sempre** (conexão e leitura). Sem eles, 200 requisições esperando um fornecedor travado esgotam as threads do Tomcat, e a **sua** API cai.
+2. **Diferencie os erros**: 404 de "moeda desconhecida" é um erro do **pedido** (não adianta repetir); 503 e timeout são **transitórios**.
+3. **Cache** quando o dado permite: cotações, CEPs e listas de bancos mudam pouco. O exercício 08.04 guarda a cotação por 60 s — e usa um `Clock` injetado para testar a validade sem esperar.
+4. **Fallback** (degradação elegante): se a API falhou e há uma cotação de até 24 h, use-a e **sinalize** isso (`fonte = CACHE_EXPIRADO`). Às vezes a resposta certa é "não sei" — decida com o negócio.
+5. **Retry com backoff** só para erros transitórios e operações idempotentes, e **circuit breaker** para parar de insistir num serviço que caiu: com Resilience4j, no módulo 13.
+
+<Figura legenda="O fluxo de decisão do conversor de moedas do exercício 08.04">
+<svg viewBox="0 0 680 220" width="680" role="img" aria-label="Cache válido responde direto; senão chama a API; sucesso atualiza o cache; 404 vira moeda não suportada; outras falhas usam cache de até 24 horas ou lançam cotação indisponível">
+  <defs><marker id="fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="85" width="130" height="44" rx="8" class="d-accent"/><text x="75" y="112" text-anchor="middle" class="d-mono">cache ≤ 60s?</text>
+  <rect x="10" y="165" width="130" height="40" rx="8" class="d-ok"/><text x="75" y="190" text-anchor="middle" class="d-mono">CACHE</text>
+  <rect x="190" y="85" width="120" height="44" rx="8" class="d-info"/><text x="250" y="112" text-anchor="middle" class="d-mono">chama a API</text>
+  <rect x="360" y="15" width="140" height="40" rx="8" class="d-ok"/><text x="430" y="40" text-anchor="middle" class="d-mono">200 → API</text>
+  <rect x="360" y="85" width="140" height="44" rx="8" class="d-box"/><text x="430" y="112" text-anchor="middle" class="d-mono">404</text>
+  <rect x="360" y="160" width="140" height="44" rx="8" class="d-box"/><text x="430" y="180" text-anchor="middle" class="d-mono">5xx / timeout</text><text x="430" y="196" text-anchor="middle" class="d-label">cache ≤ 24h?</text>
+  <rect x="540" y="85" width="130" height="44" rx="8" class="d-box"/><text x="605" y="104" text-anchor="middle" class="d-mono">MoedaNão</text><text x="605" y="120" text-anchor="middle" class="d-mono">Suportada</text>
+  <rect x="540" y="140" width="130" height="36" rx="8" class="d-ok"/><text x="605" y="163" text-anchor="middle" class="d-mono">CACHE_EXPIRADO</text>
+  <rect x="540" y="184" width="130" height="30" rx="8" class="d-box"/><text x="605" y="204" text-anchor="middle" class="d-label">CotaçãoIndisponível</text>
+  <path d="M75 129 V161" class="d-line" marker-end="url(#fx)"/><text x="82" y="150" class="d-label">sim</text>
+  <path d="M140 107 H186" class="d-line" marker-end="url(#fx)"/><text x="150" y="100" class="d-label">não</text>
+  <path d="M310 100 L356 40" class="d-line" marker-end="url(#fx)"/><path d="M310 107 H356" class="d-line" marker-end="url(#fx)"/><path d="M310 115 L356 178" class="d-line" marker-end="url(#fx)"/>
+  <path d="M500 107 H536" class="d-line" marker-end="url(#fx)"/><path d="M500 175 L536 160" class="d-line" marker-end="url(#fx)"/><path d="M500 190 L536 198" class="d-line" marker-end="url(#fx)"/>
+</svg>
+</Figura>
+
+<Callout tipo="dica" titulo="Testando integrações de verdade">
+No exercício 08.04 os testes sobem um **servidor HTTP de verdade** (o `HttpServer` do próprio JDK) numa porta aleatória, que devolve 200, 404, 500 ou demora 3 s, conforme o teste pede. É o mesmo princípio do WireMock e do MockServer: testar o código real de rede, incluindo timeouts. O `@DynamicPropertySource` injeta a URL desse servidor na configuração.
+</Callout>
+
+## Versionando a sua API (Spring 7)
+
+Quando uma mudança incompatível é inevitável (aula 2), o Spring Framework 7 resolve o roteamento por versão:
+
+```yaml
+spring:
+  mvc:
+    apiversion:
+      use:
+        header: API-Version      # ou query-parameter, path-segment, media-type-parameter
+      default: "1"
+      supported: "1, 2"
+```
+
+```java
+@RestController
+@RequestMapping("/contas")
+class ContaController {
+
+    @GetMapping(path = "/{id}", version = "1")
+    ContaV1 buscarV1(@PathVariable UUID id) { ... }
+
+    @GetMapping(path = "/{id}", version = "2+")      // a partir da 2
+    ContaV2 buscarV2(@PathVariable UUID id) { ... }
+}
+```
+
+Requisições sem versão caem na padrão; versões não suportadas recebem `400`. Do lado do cliente, o `RestClient` tem `apiVersionInserter(...)` para enviar a versão automaticamente. E o Spring pode marcar versões antigas como depreciadas, enviando os headers `Deprecation` e `Sunset`.
+
+| Estratégia | Exemplo | Prós / contras |
+|---|---|---|
+| Caminho | `/v2/contas` | visível, fácil de testar no navegador; "polui" as URIs |
+| Header | `API-Version: 2` | URIs limpas; menos visível, exige documentação |
+| Parâmetro | `?version=2` | simples; mistura versão com filtros |
+| Media type | `Accept: application/json;version=2` | purista; mais difícil para clientes |
+
+## OpenAPI: documentação que não mente
+
+A **OpenAPI Specification** descreve a API num JSON/YAML: endpoints, parâmetros, corpos, respostas e erros. A partir dela, ferramentas geram documentação interativa (Swagger UI), clientes em várias linguagens, *mocks* e testes de contrato.
+
+Com o **springdoc-openapi**, a especificação é gerada **do seu código** — não fica desatualizada como um documento escrito à mão:
+
+```xml
+<dependency>
+  <groupId>org.springdoc</groupId>
+  <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+  <version>3.1.1</version>      <!-- linha 3.x: Spring Boot 4 -->
+</dependency>
+```
+
+Pronto: `/v3/api-docs` devolve a especificação e `/swagger-ui/index.html` mostra a interface interativa. Enriqueça com anotações:
+
+```java
+@Tag(name = "Contas", description = "Abertura, consulta e movimentação de contas")
+@RestController
+class ContaController {
+
+    @Operation(summary = "Abre uma conta", description = "Uma pessoa pode ter no máximo uma conta de cada tipo.")
+    @ApiResponse(responseCode = "409", description = "Já existe conta deste tipo para o CPF")
+    @PostMapping
+    ResponseEntity<ContaResponse> abrir(@Valid @RequestBody NovaContaRequest pedido, UriComponentsBuilder uri) { ... }
+}
+```
+
+As anotações de Bean Validation (`@NotBlank`, `@Size`, `@Positive`) já aparecem na especificação como restrições.
+
+<Callout tipo="dica" titulo="Code-first × contract-first">
+Aqui você escreve o código e gera a especificação (**code-first**). Em empresas com muitos times, é comum o inverso (**contract-first**): o contrato OpenAPI é revisado primeiro e o `openapi-generator` gera interfaces e DTOs. Os dois funcionam; o importante é que o contrato publicado e o código **nunca divirjam**.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você integra com uma API externa instável?" Resposta completa: **timeouts**, distinguir erros permanentes de transitórios, **retry com backoff** só nos transitórios e idempotentes, **circuit breaker**, **cache/fallback** quando o negócio aceitar, e **observabilidade** (métricas de latência e erro por integração). Mencionar que você testa isso com um servidor falso real (WireMock) em vez de só *mocks* mostra experiência.
+</Callout>
+
+<Quiz
+  id="08-integracao"
+  questoes={[
+    {
+      pergunta: 'A API de pagamentos parceira passou a responder em 60 s e sua aplicação parou de responder qualquer rota. Causa mais provável?',
+      opcoes: ['Falta de índice no banco', 'Chamadas sem timeout prenderam todas as threads do servidor', 'Jackson lento', 'Log demais'],
+      correta: 1,
+      explicacao: 'Sem timeout, cada requisição fica presa esperando; quando o pool esgota, nada mais é atendido.',
+    },
+    {
+      pergunta: 'Qual falha NÃO deve ser repetida automaticamente (retry)?',
+      opcoes: ['503 Service Unavailable', 'Timeout de leitura num GET', '404 da moeda desconhecida', 'Conexão recusada momentânea'],
+      correta: 2,
+      explicacao: '404 é um erro do pedido: repetir dá o mesmo resultado.',
+    },
+    {
+      pergunta: 'Qual a principal vantagem de gerar a especificação OpenAPI a partir do código?',
+      opcoes: ['Fica mais bonita', 'Não diverge da implementação', 'Dispensa testes', 'Aumenta a segurança'],
+      correta: 1,
+      explicacao: 'Documentação escrita à mão envelhece; a gerada acompanha cada mudança no código.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **`RestClient`** para chamadas síncronas; **HTTP interfaces** (`@HttpExchange`) para declarar o contrato e deixar o Spring implementar — com `@ImportHttpServices` e `spring.http.serviceclient.*` no Spring 7/Boot 4.
+- Integrações resilientes: **timeouts**, erros permanentes × transitórios, cache e **fallback** sinalizado; retry e circuit breaker no módulo 13.
+- **Versionamento nativo** no Spring 7: `version` nos mapeamentos + estratégia (header, caminho, parâmetro, media type).
+- **OpenAPI** com springdoc: especificação gerada do código em `/v3/api-docs` e Swagger UI.

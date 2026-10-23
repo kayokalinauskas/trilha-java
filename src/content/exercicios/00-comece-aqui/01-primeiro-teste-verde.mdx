@@ -1,0 +1,111 @@
+---
+titulo: Seu primeiro teste verde
+codigo: "00.01"
+resumo: Implemente uma saudação que trata nomes com espaços, maiúsculas e ausência de nome — e aprenda o fluxo vermelho → verde que você vai usar em toda a trilha.
+modulo: 00-comece-aqui
+ordem: 1
+dificuldade: facil
+tempo: 30–45 min
+conceitos: [Maven, JUnit, String, if]
+aulas: [00-comece-aqui/04-git-e-testes]
+java:
+  modulo: m00-comece-aqui
+  teste: SaudacaoTest
+---
+
+## Contexto
+
+O time de produto quer que o app cumprimente cada pessoa pelo nome na tela inicial. Parece trivial — até você ver o que chega do cadastro: nomes com espaços sobrando, tudo em maiúsculas, tudo em minúsculas, e às vezes nada.
+
+Este exercício existe menos pelo problema e mais pelo **fluxo**: ler um teste que falha, entender o que ele espera, escrever o mínimo para passar e rodar de novo. Você vai repetir esse ciclo centenas de vezes daqui para a frente.
+
+## Requisitos
+
+Implemente `Saudacao.para(String nome)` no arquivo `java/m00-comece-aqui/starter/src/main/java/dev/trilhajava/m00/Saudacao.java`.
+
+| Entrada | Saída esperada |
+|---|---|
+| `"Ana"` | `"Olá, Ana!"` |
+| `"   Bruno  "` | `"Olá, Bruno!"` |
+| `"maria clara"` | `"Olá, Maria Clara!"` |
+| `"JOÃO"` | `"Olá, João!"` |
+| `null`, `""`, `"   "` | `"Olá, visitante!"` |
+
+## Regras
+
+- Espaços no começo e no fim do nome são ignorados.
+- Cada parte do nome começa com maiúscula e o resto fica em minúsculas.
+- Ausência de nome (nulo, vazio ou só espaços) resulta em `"Olá, visitante!"`.
+- O método **nunca** lança exceção.
+
+## Como trabalhar
+
+1. Rode os testes **antes** de mudar qualquer coisa. Todos vão falhar com `UnsupportedOperationException` — isso é o esperado.
+2. Faça passar **um teste por vez**, começando pelo mais simples (`cumprimentaPeloNome`).
+3. A cada mudança, rode de novo. Leia a mensagem de falha com atenção: o AssertJ mostra o valor esperado e o recebido.
+
+<Callout tipo="dica" titulo="Lendo uma falha do AssertJ">
+```text
+expected: "Olá, Bruno!"
+ but was: "Olá,    Bruno  !"
+```
+A diferença está nos espaços: falta limpar o nome antes de montar a frase.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] Os 7 testes de `SaudacaoTest` passam.
+- [ ] Você consegue explicar o que `@ParameterizedTest` faz no teste `semNome`.
+- [ ] Nenhum `if` desnecessário (por exemplo, tratar `"Ana"` e `"ana"` em ramos diferentes).
+
+## Desafios opcionais
+
+- Nomes com partículas: `"ana de souza"` → `"Ana de Souza"` (preposições `da`, `de`, `do`, `dos`, `das`, `e` ficam em minúsculas). Escreva o teste antes de implementar.
+- Nomes compostos com hífen: `"jean-luc"` → `"Jean-Luc"`.
+
+<Dicas>
+<Dica nivel={1}>
+Divida o problema em três perguntas: (1) o nome é "vazio"? (2) como limpar os espaços? (3) como capitalizar cada parte? Resolva uma de cada vez, com um teste de cada vez.
+</Dica>
+<Dica nivel={2}>
+A classe `String` tem quase tudo: `isBlank()` responde a pergunta 1 (inclusive para `"\t"`), `strip()` resolve a 2. Para a 3, `split("\\s+")` quebra o nome em partes separadas por um ou mais espaços.
+</Dica>
+<Dica nivel={3}>
+Para capitalizar uma parte: `parte.substring(0, 1).toUpperCase() + parte.substring(1).toLowerCase()`. Junte as partes com um `StringBuilder` (ou `String.join(" ", ...)`). Não esqueça de checar `null` **antes** de chamar qualquer método no nome.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m00-comece-aqui/solucao/src/main/java/dev/trilhajava/m00/Saudacao.java" />
+
+### Por que assim
+
+- **A checagem de `null` vem primeiro.** `nome == null || nome.isBlank()` usa o *curto-circuito* do `||`: se o nome for `null`, a segunda parte nem é avaliada, então não há `NullPointerException`.
+- **`strip()` em vez de `trim()`.** Os dois removem espaços das pontas, mas `strip()` (Java 11+) entende todos os espaços Unicode. Em código novo, prefira `strip()`.
+- **`Locale` explícito.** `toUpperCase()` sem argumento usa o idioma do sistema operacional — em turco, `"i".toUpperCase()` vira `"İ"`. Fixar `pt-BR` torna o resultado igual em qualquer máquina. Esse é um bug real que já derrubou sistemas em produção.
+- **`StringBuilder` para montar texto em laço.** Concatenar `String` com `+` dentro de laço cria um objeto novo a cada volta; o `StringBuilder` reaproveita o mesmo buffer. Você vai ver o porquê na aula de Strings do módulo 01.
+
+### Alternativa com `String.join`
+
+Uma versão igualmente boa, trocando o `StringBuilder` por um array e `String.join`:
+
+```java
+String[] partes = nome.strip().toLowerCase(PT_BR).split("\\s+");
+for (int i = 0; i < partes.length; i++) {
+    partes[i] = partes[i].substring(0, 1).toUpperCase(PT_BR) + partes[i].substring(1);
+}
+return "Olá, " + String.join(" ", partes) + "!";
+```
+
+No módulo 04, com Streams, isso vira uma única expressão.
+
+### Avalie sua solução
+
+- Seu código trata `null` sem exceção?
+- Você chamou `toLowerCase()`/`toUpperCase()` com `Locale`? Se não, é um ponto de melhoria — não um erro grave.
+- Cada método tem uma responsabilidade clara? Extrair um `capitalizar(String)` privado deixa o método principal legível.
+
+</Solucao>

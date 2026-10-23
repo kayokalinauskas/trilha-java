@@ -1,0 +1,1241 @@
+---
+titulo: Agenda Fácil — API de agendamentos para clínicas e consultórios
+resumo: "Uma API REST para clínicas pequenas organizarem a agenda de vários profissionais: horários livres calculados a partir da disponibilidade semanal, agendamento sem conflito mesmo com duas recepcionistas clicando no mesmo segundo, remarcação, faltas, lembretes por e-mail e relatório de ocupação."
+nivel: junior
+ordem: 1
+dominio: Saúde · agendamentos
+horas: 84
+stack: [Java 25, Spring Boot 4, Spring Security 7, Spring Data JPA, PostgreSQL 18, Flyway, JUnit 6, AssertJ, Mockito, Testcontainers 2, Docker Compose, Mailpit, GitHub Actions]
+competencias:
+  - Regra de negócio não trivial (cálculo de horários livres e conflito de agenda) isolada em código puro e coberta por testes de unidade
+  - Concorrência resolvida no lugar certo, com uma exclusion constraint do PostgreSQL e um teste que prova que duas reservas simultâneas não passam
+  - API REST bem desenhada, com paginação, filtros, erros no padrão Problem Details e documentação OpenAPI
+  - Banco versionado com Flyway, constraints que protegem os dados e um relatório escrito em SQL de verdade
+  - Autenticação com JWT e autorização por papel, incluindo a regra de que um profissional só enxerga a própria agenda
+  - Projeto que sobe com um comando (Docker Compose), CI verde no GitHub Actions e README que explica as decisões
+modulos: [02-poo, 03-colecoes-generics-excecoes, 04-java-moderno, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 14-devops]
+marcos:
+  - { id: fundacao, titulo: Fundação do repositório, resumo: "Projeto criado no Spring Initializr, PostgreSQL e Mailpit no Docker Compose, primeira migration, CI verde e README inicial." }
+  - { id: seguranca, titulo: Login, usuários e papéis, resumo: "Login com JWT, cadastro de usuários pelo ADMIN, papéis aplicados em todos os endpoints e erros no formato Problem Details." }
+  - { id: cadastros, titulo: Cadastros da clínica, resumo: "Especialidades, serviços, profissionais e pacientes com validação, paginação, filtros e testes de fatia." }
+  - { id: horarios, titulo: Disponibilidade e horários livres, resumo: "Grade semanal, bloqueios e o motor que calcula os horários livres, testado em código puro." }
+  - { id: agendamento, titulo: Agendamento sem conflito, resumo: "Criação de agendamentos com exclusion constraint no banco e o teste de concorrência com Testcontainers." }
+  - { id: ciclo-de-vida, titulo: Confirmação, remarcação, cancelamento e falta, resumo: "A máquina de estados do agendamento, com antecedências mínimas e histórico de remarcação." }
+  - { id: lembretes-e-relatorios, titulo: Lembretes e relatório de ocupação, resumo: "Job de lembretes de véspera com envio idempotente para o Mailpit e o relatório de ocupação e faltas em SQL." }
+  - { id: entrega, titulo: Observabilidade, deploy e v1.0.0, resumo: "Logs estruturados, health checks, imagem Docker, deploy, README final, vídeo de demonstração e release v1.0.0." }
+---
+
+Todo sistema de agendamento parece simples até a segunda recepcionista chegar. Um CRUD de "consultas" com data e hora qualquer pessoa faz numa tarde; o que separa um projeto de portfólio de um exercício é o que acontece nas bordas: a consulta de 45 minutos que começa às 08:15 e esbarra na de 09:00, o feriado cadastrado depois que a agenda já estava cheia, a paciente que falta pela terceira vez, as duas reservas para o mesmo horário que chegam ao servidor com 3 milissegundos de diferença.
+
+Este projeto é uma especificação completa, no nível de detalhe que um tech lead entregaria a um time. Você vai construir a API do zero, no seu GitHub, marco a marco. No fim, terá um repositório que mostra exatamente o que uma vaga de backend júnior pede: regra de negócio de verdade, testes que a protegem, banco bem modelado, segurança básica correta e um projeto que qualquer pessoa sobe com um comando.
+
+## Visão geral
+
+**O problema.** A Clínica Vida Plena tem oito profissionais (clínica geral, pediatria, nutrição, fisioterapia e psicologia), duas recepcionistas e uma agenda em planilha compartilhada. Toda semana acontece pelo menos um encaixe duplo (duas pacientes no mesmo horário), os feriados são lembrados em cima da hora e ninguém sabe dizer quantas consultas se perdem por falta. A clínica quer uma API que um front-end (web e, depois, um aplicativo) vai consumir.
+
+**O que será construído:**
+
+- Cadastros de especialidades, serviços (duração e preço), profissionais e pacientes.
+- Grade semanal de cada profissional e bloqueios (férias, congressos, feriados).
+- **Horários livres** calculados por profissional e serviço, no fuso `America/Sao_Paulo`.
+- Agendamento **sem conflito**, garantido pelo banco mesmo sob concorrência.
+- Confirmação, remarcação, cancelamento com antecedência mínima, realização e falta.
+- Lembrete de véspera por e-mail (Mailpit), sem envio duplicado, e relatório de ocupação e faltas em SQL.
+- JWT com três papéis, OpenAPI, logs estruturados, Docker Compose, CI e deploy.
+
+**Pitch de uma frase:** "A Agenda Fácil é uma API de agendamentos para clínicas que calcula os horários livres de cada profissional e garante, no próprio banco, que dois pacientes nunca ocupem o mesmo horário, mesmo quando duas recepcionistas reservam ao mesmo tempo."
+
+**Por que chama atenção num portfólio júnior.** A maioria dos portfólios júnior tem CRUDs sem nenhuma regra que possa dar errado. Aqui há um algoritmo pequeno e verificável, um problema clássico de concorrência resolvido como times experientes resolvem (constraint no banco, não `if` no Java) e decisões registradas por escrito. Cada ponto rende cinco minutos de entrevista em que você sabe mais do que se espera de um júnior.
+
+## Contexto de negócio
+
+A **Clínica Vida Plena** é fictícia: uma clínica de bairro em São Paulo, com uma unidade, funcionando de segunda a sábado. As consultas são particulares (não há convênio neste escopo) e o pagamento acontece no balcão, fora do sistema. O preço registrado no agendamento serve para relatórios e para a recepção informar o valor.
+
+| Ator | Papel no sistema | O que faz |
+|---|---|---|
+| Administração | `ADMIN` | Usuários, especialidades, serviços, profissionais, feriados; cancela fora do prazo; relatórios |
+| Recepção | `RECEPCAO` | Pacientes; horários livres; agenda, confirma, remarca, cancela; faltas; bloqueios de profissionais |
+| Profissional de saúde | `PROFISSIONAL` | Vê **só a própria agenda**; registra realização e falta das suas consultas; bloqueios para si |
+| Paciente | (não acessa a API) | Recebe o lembrete por e-mail na véspera. |
+| Job de lembretes | (processo interno) | Todos os dias, entre 18:00 e 21:00, envia os lembretes das consultas do dia seguinte. |
+
+**Glossário**
+
+| Termo | Significado no sistema |
+|---|---|
+| Serviço | O que se agenda ("Consulta de pediatria"): especialidade, duração e preço |
+| Grade semanal | As janelas de atendimento por dia da semana ("terça, 13:00–19:00"), válidas toda semana |
+| Bloqueio | Período sem atendimento dentro da grade, do profissional ou da clínica (feriado) |
+| Passo da grade | Os inícios são oferecidos de 15 em 15 minutos a partir do início da janela |
+| Horário livre (slot) | Início que cabe na janela, não esbarra em consulta ativa nem bloqueio e respeita antecedência e horizonte |
+| Agendamento ativo | Status `AGENDADO` ou `CONFIRMADO`: o único que ocupa a agenda |
+| Falta (no-show) | A paciente não veio a uma consulta não cancelada |
+| Antecedência e horizonte | Agendar: de 2 h antes até 60 dias à frente; cancelar ou remarcar pela recepção: até 12 h antes |
+| Ocupação | Minutos agendados ÷ minutos disponíveis na grade, no período |
+
+## Escopo
+
+**Dentro**
+
+- Uma clínica, uma unidade, um fuso horário configurável (padrão `America/Sao_Paulo`).
+- Os 15 requisitos funcionais abaixo, com a API REST versionada em `/api/v1`.
+- Autenticação própria (login com e-mail e senha, JWT assinado com HS256) e três papéis fixos.
+- E-mail simulado com Mailpit no Docker Compose; nenhum e-mail real é enviado.
+- PostgreSQL 18 com migrations Flyway; testes com Testcontainers.
+- Deploy em um ambiente público (opções gratuitas ou de baixo custo) ou, se não for possível, vídeo de demonstração com o ambiente local.
+
+**Fora** (vira extensão em "Para ir além")
+
+- Front-end (a API é consumida pelo Swagger UI e por um arquivo `.http`).
+- Múltiplas clínicas (multi-tenant), múltiplas unidades, salas e equipamentos.
+- Paciente fazendo login, autoagendamento, link de confirmação no e-mail.
+- Convênios, pagamento, nota fiscal, prontuário eletrônico.
+- Lista de espera, encaixes que furam a grade, consultas recorrentes ("toda terça às 10:00 por 10 semanas").
+- WhatsApp e SMS, notificações em tempo real, refresh token.
+- Várias instâncias rodando o job ao mesmo tempo (coordenação entre instâncias).
+
+## Requisitos funcionais
+
+Convenções para todos os requisitos:
+
+- Datas e horas na API são ISO 8601 **com deslocamento** (`2026-10-05T09:00:00-03:00`); a resposta usa o fuso da clínica; no banco, `timestamptz`. "Agora" vem de um `Clock` injetado.
+- Nos exemplos: fuso `America/Sao_Paulo`, grade de 15 minutos, agora = **sexta, 02/10/2026, 10:00** (salvo indicação), consultas na **segunda, 05/10/2026**.
+- Identificadores são UUID (gerados pela aplicação ou pelo `uuidv7()` do PostgreSQL 18). Os códigos de erro estão na [tabela de erros](#códigos-de-erro).
+
+### RF-01 · Login
+
+- **RN-01** — O login recebe `email` e `senha`, compara o e-mail sem diferenciar caixa e sem espaços nas pontas e confere a senha com BCrypt. Exemplo: `" Recepcao@ClinicaVida.example "` encontra `recepcao@clinicavida.example`.
+- **RN-02** — Sucesso devolve `200` com um JWT HS256 que expira em **60 minutos**, com `sub` (id do usuário), `papel` e, para PROFISSIONAL, `profissionalId`. O segredo (≥ 256 bits) vem de variável de ambiente; ausente ou curto, a aplicação **não sobe**.
+- **RN-03** — E-mail inexistente, senha errada e usuário inativo produzem **a mesma resposta** (`401 CREDENCIAIS_INVALIDAS`, mesma mensagem), para não revelar quais e-mails existem.
+- **RN-04** — Após **5 falhas seguidas**, o usuário fica bloqueado por **15 minutos**; durante o bloqueio, até a senha correta recebe o `401` da RN-03 (o bloqueio só aparece no log). Sucesso zera o contador. Borda: 5ª falha às 10:00; às 10:14:59 a senha correta falha; às 10:15:00 funciona.
+
+**Critérios de aceite**
+
+- Dado um usuário ativo com senha `margarida-azul-2026`, quando faz login com ela, então recebe `200`, `tokenType` = `Bearer`, `expiresIn` = `3600` e um token com o claim `papel` dele.
+- Dado um usuário com 4 falhas, quando erra de novo às 10:00, então recebe `401`; às 10:10, mesmo com a senha certa, recebe `401` com o mesmo corpo.
+- Dado um token expirado há 1 segundo, quando usado em `GET /api/v1/agendamentos`, então a resposta é `401`.
+
+### RF-02 · Usuários e papéis
+
+- **RN-05** — Só ADMIN gerencia usuários. Papéis: `ADMIN`, `RECEPCAO`, `PROFISSIONAL`. Um PROFISSIONAL se vincula a exatamente um profissional, e cada profissional tem no máximo um usuário. Exemplo: PROFISSIONAL sem `profissionalId` → `400 VALIDACAO`; segundo usuário para o mesmo profissional → `409 DUPLICADO`.
+- **RN-06** — Senha com 15 a 64 caracteres (contados em code points), sem exigência de símbolos ou maiúsculas, como pede a NIST SP 800-63B rev. 4 para senha usada como único fator, e com no máximo 72 bytes em UTF-8, o limite do BCrypt (acima disso → `400`). Guardada com BCrypt e nunca exibida em resposta ou log. E-mail único, sem diferenciar caixa.
+- **RN-07** — O primeiro ADMIN nasce na subida, a partir de `AGENDA_ADMIN_EMAIL` e `AGENDA_ADMIN_SENHA`, **só se não houver nenhum ADMIN**. Nada de senha fixa em migration ou README. Sem as variáveis e sem ADMIN, a aplicação sobe e registra um aviso.
+- **RN-08** — Desativar um usuário impede novos logins; tokens já emitidos valem até expirar (limitação documentada). Um ADMIN não desativa a si mesmo (`422 OPERACAO_INVALIDA`).
+
+**Critérios de aceite**
+
+- Dado um token de RECEPCAO, quando chama `POST /api/v1/usuarios`, então recebe `403`.
+- Dado o banco vazio e as variáveis `AGENDA_ADMIN_*` definidas, quando a aplicação sobe duas vezes, então existe exatamente um ADMIN.
+
+### RF-03 · Especialidades e serviços
+
+- **RN-09** — Especialidade tem nome de 3 a 60 caracteres, único sem diferenciar caixa (`Pediatria` e `pediatria` colidem; `Nutrição` e `Nutricao` não, porque acentos não são normalizados).
+- **RN-10** — Serviço tem nome (3 a 80), especialidade, **duração** de 15 a 240 minutos **múltipla de 15** e **preço** `BigDecimal` de `0.00` a `99999.99`. Exemplos: duração 45 → ok; 50 → `400`; preço `180.5` → devolvido como `180.50`; `-1` → `400`. Nunca `double`.
+- **RN-11** — Mudar preço ou duração **não altera** agendamentos feitos: o agendamento guarda `fim` e preço do momento da reserva. Exemplo: agendado a `180.00`, serviço passa a `200.00`, a consulta continua `180.00`.
+- **RN-12** — Serviço não se apaga, desativa-se: some dos horários livres e não pode ser agendado (`422 SERVICO_INATIVO`), mas continua nos agendamentos antigos e nos relatórios.
+
+**Critérios de aceite**
+
+- Dado um serviço de 30 minutos, quando o ADMIN muda a duração para 45, então os agendamentos existentes mantêm o `fim` original e os horários livres passam a usar 45 minutos.
+- Dado `duracaoMinutos` = 20, quando o serviço é criado, então a resposta é `400` com `duracaoMinutos` em `erros`.
+
+### RF-04 · Profissionais
+
+- **RN-13** — Profissional tem nome, e-mail, registro de conselho (`conselho`: `CRM`, `CRP`, `CRN`, `CREFITO`...; `numero` só com dígitos, até 10; `uf` com 2 letras) e **uma ou mais** especialidades. Conselho + número + UF é único: `CRM 123456 SP` duas vezes → `409 DUPLICADO`; `CRM 123456 RJ` é outro profissional.
+- **RN-14** — Um profissional atende um serviço quando tem a especialidade dele. Exemplo: a nutricionista agendada para "Consulta pediátrica" → `422 SERVICO_INCOMPATIVEL`.
+- **RN-15** — Desativar profissional com agendamentos ativos futuros → `409 PROFISSIONAL_COM_AGENDAMENTOS`, com a quantidade no `detail` ("tem 3 agendamentos futuros; cancele ou remarque antes"). Inativo não aparece em horários livres.
+- **RN-16** — Listagem paginada com filtros `especialidadeId`, `ativo` e `nome` (contém, sem diferenciar caixa). Exemplo: `?nome=sou&ativo=true` devolve "Ana Souza" e "Bruno Sousa", mas não "Carla Dias".
+
+**Critérios de aceite**
+
+- Dado um profissional de Nutrição, quando se pedem horários livres dele para um serviço de Pediatria, então a resposta é `422 SERVICO_INCOMPATIVEL`.
+- Dado um profissional com consulta ativa na semana seguinte, quando o ADMIN o desativa, então recebe `409` e ele continua ativo.
+
+### RF-05 · Pacientes
+
+- **RN-17** — Paciente tem nome (3 a 120), CPF, data de nascimento, e-mail (opcional) e telefone (10 ou 11 dígitos). O CPF chega com ou sem pontuação, é gravado com **11 dígitos** e validado pelos dígitos verificadores, percorrendo os caracteres (sem regex). Exemplos: `529.982.247-25` → válido, gravado `52998224725`; `529.982.247-26` → `400`; `111.111.111-11` → `400`; 10 dígitos → `400`.
+- **RN-18** — CPF único: repetido → `409 DUPLICADO`, sem dizer de quem é.
+- **RN-19** — Nascimento entre 1900-01-01 e hoje (recém-nascido nascido hoje é válido).
+- **RN-20** — **Minimização.** Na listagem o CPF vem mascarado (`***.982.247-**`); completo só em `GET /pacientes/{id}`. CPF, e-mail e telefone nunca vão para o log. PROFISSIONAL não acessa pacientes; na própria agenda vê só nome e idade.
+- **RN-21** — `GET /pacientes?q=` busca por nome (contém, mínimo 3 caracteres) ou, se `q` tiver 11 dígitos depois de tirar a pontuação, por CPF exato. `q=52998224725` e `q=529.982.247-25` acham a mesma pessoa; `q=an` → `400`.
+
+**Critérios de aceite**
+
+- Dado o CPF `529.982.247-25` cadastrado, quando a recepção cadastra `52998224725`, então recebe `409 DUPLICADO`.
+- Dado um paciente cadastrado, quando a recepção lista pacientes, então `cpf` vem mascarado; pelo id, vem completo.
+- Dado um cadastro com CPF válido, quando o log da requisição é gravado, então nenhuma linha contém os 11 dígitos.
+
+### RF-06 · Disponibilidade semanal
+
+A grade é substituída por inteiro a cada `PUT`, sem estados intermediários.
+
+- **RN-22** — Cada janela tem `diaDaSemana` (`SEGUNDA` a `DOMINGO`), `inicio` e `fim` locais (`HH:mm`), minutos múltiplos de 15, `inicio` antes de `fim`. `08:00–12:00` ok; `08:10–12:00`, `12:00–12:00` e `22:00–02:00` (vira o dia, fora do escopo) → `400`.
+- **RN-23** — Janelas do mesmo dia não se sobrepõem, mas podem encostar (`08:00–12:00` e `12:00–14:00` ok; `08:00–12:00` e `11:45–13:00` → `400` citando as duas). Máximo de 4 janelas por dia.
+- **RN-24** — Mudar a grade **não cancela** nada: a resposta traz `agendamentosForaDaGrade`, os ativos futuros que deixaram de caber, para a recepção tratar. Exemplo: consulta segunda 17:00–17:30 e nova grade terminando às 17:00 → ela aparece na lista e continua `AGENDADO`.
+
+**Critérios de aceite**
+
+- Dada a grade `SEGUNDA 08:00–12:00`, quando a recepção envia `SEGUNDA 08:00–12:00` e `SEGUNDA 11:00–13:00`, então recebe `400` e a grade anterior continua valendo.
+- Dada uma consulta ativa segunda às 17:00, quando a grade de segunda passa a terminar às 17:00, então a resposta é `200` com a consulta em `agendamentosForaDaGrade`.
+
+### RF-07 · Bloqueios
+
+- **RN-25** — Bloqueio tem `inicio` e `fim` (com deslocamento), `motivo` (3 a 120) e `profissionalId`, **nulo para a clínica inteira** (feriado). Duração de 15 minutos a 90 dias. Bloqueio da clínica: só ADMIN; RECEPCAO cria para qualquer profissional; PROFISSIONAL só para si (senão `403`).
+- **RN-26** — Bloqueio sobre agendamentos ativos → `409 BLOQUEIO_COM_AGENDAMENTOS` com os ids afetados; a recepção remarca ou cancela e tenta de novo. Exemplo: feriado em 12/10 com 2 consultas → `409` com os 2 ids.
+- **RN-27** — Bloqueios podem se sobrepor entre si (férias que incluem um feriado). Excluir bloqueio futuro → `204`; bloqueio já terminado → `422 OPERACAO_INVALIDA` (é histórico do relatório).
+
+**Critérios de aceite**
+
+- Dado um bloqueio da clínica de `2026-10-12T00:00-03:00` a `2026-10-13T00:00-03:00`, quando se pedem horários livres de qualquer profissional em 12/10, então o dia vem vazio.
+- Dado um token de PROFISSIONAL A, quando ele cria bloqueio para o profissional B, então recebe `403`.
+
+### RF-08 · Horários livres
+
+O coração do projeto. O cálculo vive numa classe de **domínio pura** (sem Spring, sem banco), que recebe tudo o que precisa e devolve os inícios.
+
+- **RN-28** — `GET /api/v1/horarios-livres?profissionalId=&servicoId=&de=&ate=` recebe datas locais inclusivas, com até **14 dias** de intervalo (`ate` antes de `de` ou mais de 14 dias → `400`). Sem `de`, hoje; sem `ate`, `de` + 6 dias.
+- **RN-29** — Para cada dia e cada janela da grade daquele dia da semana, os candidatos começam no início da janela e andam de 15 em 15 minutos. O candidato `[inicio, inicio + duração)` é **livre** quando:
+  1. cabe inteiro na janela (o fim pode coincidir com o fim dela);
+  2. não se sobrepõe a agendamento ativo do profissional;
+  3. não se sobrepõe a bloqueio do profissional nem da clínica;
+  4. começa pelo menos **2 horas** depois de agora;
+  5. começa até **60 dias** depois de hoje (dias além do horizonte vêm vazios).
+
+  `[a1, b1)` e `[a2, b2)` se sobrepõem quando `a1` vem antes de `b2` **e** `a2` vem antes de `b1`. Encostar não é sobrepor: uma consulta que termina 09:00 convive com outra que começa 09:00.
+- **RN-30** — Exemplo da figura: grade de segunda `08:00–12:00`, serviço de **45 minutos**, consulta `09:00–09:30` e bloqueio `10:30–11:00`. Livres em 05/10: exatamente **08:00, 08:15, 09:30, 09:45, 11:00 e 11:15**. De 08:30 a 09:15 e de 10:00 a 10:45 esbarram em algo; 11:30 terminaria 12:15.
+- **RN-31** — **Antecedência.** Com agora = segunda 05/10 às **07:50**, o primeiro início permitido é 09:50: no exemplo, sobram **11:00 e 11:15**. Borda: um candidato exatamente em agora + 2 h é livre.
+- **RN-32** — **Fuso.** A grade é hora local, convertida com o `ZoneId` de `agenda.fuso`, nunca com deslocamento fixo: o Brasil está sem horário de verão desde 2019, mas isso já mudou por decreto. Borda testável: com `America/New_York` e grade de domingo `01:00–04:00`, em 08/03/2026 (02:00 pula para 03:00) o motor não oferece início entre 02:00 e 02:59, e uma consulta de 60 minutos às 01:30 termina às 03:30 locais (o relógio avança 2 horas, passa 1 hora real). Documente no README o comportamento escolhido e cubra-o com teste.
+- **RN-33** — A resposta vem agrupada por dia, em ordem, com `inicio` e `fim` de cada horário; dia sem horários aparece com lista vazia, para o calendário não ter buracos.
+- **RN-34** — Profissional ou serviço inativo, ou serviço incompatível → `422` com o código correspondente; inexistente → `404`.
+
+<Figura legenda="Horários livres na segunda, 05/10, para um serviço de 45 minutos: cada candidato anda de 15 em 15 minutos e só é livre se cabe inteiro na janela sem esbarrar na consulta das 09:00 nem no bloqueio das 10:30">
+<svg viewBox="0 0 860 300" width="860" role="img" aria-labelledby="agenda-facil-slots-titulo agenda-facil-slots-desc">
+  <title id="agenda-facil-slots-titulo">Cálculo dos horários livres de uma manhã</title>
+  <desc id="agenda-facil-slots-desc">Linha do tempo de 08:00 a 12:00 com a janela da grade, uma consulta das 09:00 às 09:30 e um bloqueio das 10:30 às 11:00. Dos catorze candidatos de 15 em 15 minutos, são livres 08:00, 08:15, 09:30, 09:45, 11:00 e 11:15.</desc>
+  <text x="20" y="22" class="d-title">Segunda, 05/10 · serviço de 45 min · grade de 15 min</text>
+  <path d="M70 52 L790 52" class="d-line"/>
+  <path d="M70 46 L70 58 M160 46 L160 58 M250 46 L250 58 M340 46 L340 58 M430 46 L430 58 M520 46 L520 58 M610 46 L610 58 M700 46 L700 58 M790 46 L790 58" class="d-line"/>
+  <text x="70" y="42" text-anchor="middle" class="d-mono">08:00</text>
+  <text x="250" y="42" text-anchor="middle" class="d-mono">09:00</text>
+  <text x="430" y="42" text-anchor="middle" class="d-mono">10:00</text>
+  <text x="610" y="42" text-anchor="middle" class="d-mono">11:00</text>
+  <text x="790" y="42" text-anchor="middle" class="d-mono">12:00</text>
+  <rect x="70" y="66" width="720" height="28" rx="6" class="d-info"/>
+  <text x="430" y="85" text-anchor="middle" class="d-text">janela da grade: segunda 08:00–12:00</text>
+  <rect x="250" y="102" width="90" height="28" rx="6" class="d-accent"/>
+  <text x="295" y="121" text-anchor="middle" class="d-label">consulta</text>
+  <rect x="520" y="102" width="90" height="28" rx="6" class="d-violet"/>
+  <text x="565" y="121" text-anchor="middle" class="d-label">bloqueio</text>
+  <text x="20" y="160" class="d-label">inícios</text>
+  <circle cx="70" cy="156" r="9" class="d-ok"/>
+  <circle cx="115" cy="156" r="9" class="d-ok"/>
+  <circle cx="160" cy="156" r="9" class="d-box"/>
+  <circle cx="205" cy="156" r="9" class="d-box"/>
+  <circle cx="250" cy="156" r="9" class="d-box"/>
+  <circle cx="295" cy="156" r="9" class="d-box"/>
+  <circle cx="340" cy="156" r="9" class="d-ok"/>
+  <circle cx="385" cy="156" r="9" class="d-ok"/>
+  <circle cx="430" cy="156" r="9" class="d-box"/>
+  <circle cx="475" cy="156" r="9" class="d-box"/>
+  <circle cx="520" cy="156" r="9" class="d-box"/>
+  <circle cx="565" cy="156" r="9" class="d-box"/>
+  <circle cx="610" cy="156" r="9" class="d-ok"/>
+  <circle cx="655" cy="156" r="9" class="d-ok"/>
+  <text x="70" y="184" text-anchor="middle" class="d-mono">08:00</text>
+  <text x="115" y="202" text-anchor="middle" class="d-mono">08:15</text>
+  <text x="340" y="184" text-anchor="middle" class="d-mono">09:30</text>
+  <text x="385" y="202" text-anchor="middle" class="d-mono">09:45</text>
+  <text x="610" y="184" text-anchor="middle" class="d-mono">11:00</text>
+  <text x="655" y="202" text-anchor="middle" class="d-mono">11:15</text>
+  <rect x="115" y="222" width="135" height="16" rx="4" class="d-ok"/>
+  <text x="258" y="235" class="d-label">08:15 + 45 min = 09:00: encosta na consulta, não sobrepõe → livre</text>
+  <rect x="655" y="250" width="135" height="16" rx="4" class="d-ok"/>
+  <text x="647" y="263" text-anchor="end" class="d-label">11:15 + 45 min = 12:00: termina junto com a janela → livre</text>
+  <text x="20" y="292" class="d-label">verde: livre · cinza: esbarra em consulta ou bloqueio · 11:30 em diante não cabe na janela</text>
+</svg>
+</Figura>
+
+**Critérios de aceite**
+
+- Dado o cenário da RN-30 com agora = sexta 02/10 às 10:00, quando a recepção consulta `de=2026-10-05&ate=2026-10-05`, então recebe exatamente os 6 horários, em ordem.
+- Dado o mesmo cenário com agora = segunda 05/10 às 07:50, então recebe exatamente 11:00 e 11:15.
+- Dado `de=2026-10-05&ate=2026-10-19` (15 dias), então a resposta é `400 VALIDACAO`.
+- Dado o bloqueio da clínica em 12/10, então o dia 12/10 aparece com `horarios: []`.
+
+### RF-09 · Criação de agendamento
+
+- **RN-35** — `POST /api/v1/agendamentos` recebe `profissionalId`, `pacienteId`, `servicoId`, `inicio` e `observacoes` (opcional, até 500). O servidor calcula `fim = inicio + duração`, copia o preço do serviço e grava `AGENDADO`, `criadoPor` e `criadoEm`. Resposta `201` com `Location`.
+- **RN-36** — Validações nesta ordem; a primeira que falha define a resposta: (1) corpo válido → `400`; (2) profissional, paciente e serviço existem → `404`; (3) ativos e compatíveis → `422 PROFISSIONAL_INATIVO`, `SERVICO_INATIVO`, `SERVICO_INCOMPATIVEL`; (4) antecedência de 2 h e horizonte de 60 dias → `422 ANTECEDENCIA_INSUFICIENTE`, `FORA_DO_HORIZONTE`; (5) é um candidato da grade (RN-29, itens 1 e 3) → `422 FORA_DA_DISPONIBILIDADE`; (6) sem conflito com agendamento ativo → `409 CONFLITO_DE_HORARIO`.
+- **RN-37** — **O conflito é garantido pelo banco**, por uma *exclusion constraint* que impede dois agendamentos ativos sobrepostos do mesmo profissional. Uma consulta prévia no Java pode existir para a mensagem, mas a garantia é a constraint. Com `09:00–09:45` marcado: `09:30–10:00` → `409`; `09:45–10:15` → `201`.
+- **RN-38** — Um paciente também não tem dois agendamentos ativos sobrepostos, **nem com profissionais diferentes** (segunda constraint) → `409 PACIENTE_COM_CONFLITO`. Maria com pediatria 09:00–09:30 não marca nutrição às 09:15.
+- **RN-39** — **Concorrência.** Duas requisições simultâneas com horários sobrepostos do mesmo profissional resultam em exatamente um `201` e um `409`; nunca dois `201`, nunca `500`. Um teste automatizado contra PostgreSQL real prova isso.
+- **RN-40** — Horário livre **não é reserva**: se outra pessoa ocupá-lo antes do `POST`, a resposta é `409` com "Esse horário acabou de ser ocupado. Consulte os horários livres novamente." Clique duplo cai no mesmo caso.
+
+**Critérios de aceite**
+
+- Dado o cenário da RN-30, quando a recepção agenda 08:15 (45 min) para Maria, então recebe `201`, `fim` = `09:00`, `preco` do serviço e `AGENDADO`, e 08:15 some dos horários livres.
+- Dada outra requisição para 08:30 do mesmo profissional, então recebe `409 CONFLITO_DE_HORARIO`.
+- Dado `inicio` = `2026-10-05T08:10:00-03:00`, então recebe `422 FORA_DA_DISPONIBILIDADE`.
+- Dadas duas threads liberadas pelo mesmo `CountDownLatch` agendando 09:30 com o mesmo profissional e pacientes diferentes, então uma recebe `201`, a outra `409`, e há um único agendamento ativo nesse horário.
+
+### RF-10 · Consulta da agenda
+
+- **RN-41** — `GET /api/v1/agendamentos` é paginado (`page` a partir de 0, `size` padrão **20**, máximo **100**; `size=500` → `400`) e filtra por `profissionalId`, `pacienteId`, `status` (um ou mais) e período (`de`/`ate` locais inclusivos, até 93 dias). Ordem padrão `inicio,asc`; só `inicio` e `criadoEm` são aceitos para ordenar (outro → `400`).
+- **RN-42** — **Profissional só vê a própria agenda.** Para PROFISSIONAL, o filtro `profissionalId` é forçado pelo token: outro valor → `403`; `GET /agendamentos/{id}` de outro profissional → `404` (não se revela que o id existe).
+- **RN-43** — Sem N+1: uma página de 20 agendamentos com profissional, paciente e serviço usa no máximo 3 consultas SQL, verificável pelo log de SQL no teste.
+
+**Critérios de aceite**
+
+- Dados 57 agendamentos no período, quando a recepção pede `page=2&size=20`, então recebe 17 itens, `totalElements` = 57 e `totalPages` = 3.
+- Dado um token de PROFISSIONAL, quando pede `?profissionalId=` de outro, então recebe `403`.
+
+### RF-11 · Confirmação, realização e falta
+
+- **RN-44** — **Transições permitidas**, e nenhuma outra (→ `422 TRANSICAO_INVALIDA`, com o status atual na mensagem):
+
+  | De | Para | Ação | Quando |
+  |---|---|---|---|
+  | `AGENDADO` | `CONFIRMADO` | confirmar | de 72 h antes até o início |
+  | `AGENDADO`, `CONFIRMADO` | `CANCELADO` | cancelar | RF-12 |
+  | `AGENDADO`, `CONFIRMADO` | `REMARCADO` | remarcar | RF-13 |
+  | `AGENDADO`, `CONFIRMADO` | `REALIZADO` | registrar realização | do início até 7 dias depois do fim |
+  | `AGENDADO`, `CONFIRMADO` | `FALTA` | registrar falta | de 15 min depois do início até 7 dias depois do fim |
+
+  `CANCELADO`, `REMARCADO`, `REALIZADO` e `FALTA` são finais.
+- **RN-45** — Confirmar fora da janela → `422 FORA_DO_PRAZO`. Consulta segunda 09:00: confirmar sexta às 08:59 → `422`; às 09:00 → ok. Confirmar de novo devolve `200` com o mesmo estado (idempotente).
+- **RN-46** — Falta só a partir de 15 minutos do início (a paciente pode estar atrasada) e até 7 dias depois do fim. Consulta 09:00: falta às 09:14 → `422 FORA_DO_PRAZO`; às 09:15 → ok.
+- **RN-47** — RECEPCAO registra falta e realização de qualquer profissional; PROFISSIONAL só das próprias (de outro → `404`, como na RN-42).
+
+**Critérios de aceite**
+
+- Dada uma consulta `AGENDADO` segunda 09:00, quando a recepção registra falta às 09:20, então o status vira `FALTA` e conta na taxa de faltas.
+- Dada uma consulta `REALIZADO`, quando alguém tenta cancelar, então recebe `422 TRANSICAO_INVALIDA`.
+
+### RF-12 · Cancelamento
+
+- **RN-48** — `POST /api/v1/agendamentos/{id}/cancelamento` com `motivo` obrigatório (5 a 200). O status vira `CANCELADO`, com `canceladoEm`, `canceladoPor` e motivo; o horário fica livre na hora (a constraint só considera ativos).
+- **RN-49** — **Antecedência mínima de 12 horas** para RECEPCAO; abaixo disso, só ADMIN, com motivo de pelo menos 20 caracteres. Consulta segunda 09:00: recepção no domingo 20:59 → ok; 21:01 → `422 ANTECEDENCIA_INSUFICIENTE`; ADMIN domingo 23:00 com "Profissional com febre, avisado por telefone" → ok.
+- **RN-50** — Consulta cujo início já passou não se cancela (`422 FORA_DO_PRAZO`): o que houve foi falta ou realização.
+
+**Critérios de aceite**
+
+- Dada a consulta de Maria segunda 09:00, quando a recepção cancela no domingo às 20:00 com motivo, então o status vira `CANCELADO` e 09:00 volta aos horários livres.
+- Dada a mesma consulta, quando a recepção cancela no domingo às 22:00, então recebe `422` e o status continua `AGENDADO`.
+
+### RF-13 · Remarcação
+
+- **RN-51** — `POST /api/v1/agendamentos/{id}/remarcacao` com `novoInicio` e, opcionalmente, `novoProfissionalId` (que atenda o mesmo serviço). Cria um **novo** agendamento `AGENDADO` e marca o original `REMARCADO`, ligados por `remarcadoParaId` e `remarcadoDeId`, **numa única transação**.
+- **RN-52** — O novo horário passa por todas as validações da RN-36. A antecedência é a do cancelamento (12 h para RECEPCAO), medida pelo horário **original**.
+- **RN-53** — O novo horário pode se sobrepor ao **antigo**: 09:00–09:45 remarcado para 09:30–10:15 com o mesmo profissional → `201`. Para isso, o original deixa de ser ativo **antes** do `INSERT` do novo na mesma transação (a constraint é verificada a cada comando). Esse caso tem teste próprio.
+- **RN-54** — O novo agendamento mantém o **preço original**. Remarcar de novo é permitido; a cadeia é navegável pelos dois campos de ligação.
+
+**Critérios de aceite**
+
+- Dada a consulta 09:00–09:45 `CONFIRMADO`, quando a recepção remarca para 09:30 no sábado, então o original fica `REMARCADO`, o novo `AGENDADO` com `remarcadoDeId` apontando o original, e a resposta é `201` com o novo.
+- Dado um novo horário em conflito, então a resposta é `409` e o original continua `CONFIRMADO`.
+
+### RF-14 · Lembretes de véspera
+
+- **RN-55** — Um job roda **às 18:00, 19:00, 20:00 e 21:00** no fuso da clínica e envia lembrete para toda consulta ativa do **dia seguinte** (00:00 a 23:59:59 local) cuja paciente tenha e-mail. Domingo às 18:00 saem os lembretes de segunda, 05/10.
+- **RN-56** — **Idempotência.** No máximo um lembrete de véspera com sucesso por consulta. A tabela `lembrete` tem `UNIQUE (agendamento_id, tipo)`; o job registra `PENDENTE`, envia e marca `ENVIADO` ou `FALHOU` com `tentativas`; os `FALHOU` são tentados de novo até **3 tentativas**. Exemplo: Mailpit fora às 18:00 → `FALHOU` (1); às 19:00 envia → `ENVIADO` (2); às 20:00 e 21:00, nada. Um `PENDENTE` com mais de 10 minutos (a aplicação caiu entre o registro e o envio) é tratado como `FALHOU` na execução seguinte.
+- **RN-57** — Assunto `Lembrete: sua consulta amanhã às 09:00`; corpo com nome da paciente, data e hora locais, profissional, serviço, endereço e telefone para cancelar. **Sem** CPF, preço ou observações.
+- **RN-58** — Falha em um envio não interrompe os outros; cada lembrete é registrado independentemente, e o job loga um resumo (`lembretes: 12 enviados, 1 falhou, 3 sem e-mail`).
+- **RN-59** — Consulta criada depois das 21:00 para o dia seguinte não recebe lembrete; criada às 19:30, recebe no ciclo das 20:00.
+
+**Critérios de aceite**
+
+- Dadas 3 consultas de segunda (duas com e-mail), quando o job roda domingo às 18:00, então o Mailpit recebe 2 e-mails e há 2 linhas `ENVIADO`; às 19:00, nenhum e-mail novo chega.
+- Dado um enviador que falha na primeira chamada, quando o job roda às 18:00 e às 19:00, então o lembrete termina `ENVIADO` com `tentativas` = 2.
+
+### RF-15 · Relatório de ocupação e faltas
+
+- **RN-60** — `GET /api/v1/relatorios/ocupacao?de=&ate=&profissionalId=` (ADMIN; profissional opcional; até **93 dias**) devolve por profissional: minutos disponíveis, minutos agendados, ocupação e contagens de `REALIZADO`, `FALTA`, `CANCELADO` e ativas. O período é `[de 00:00, ate + 1 dia 00:00)` no fuso da clínica.
+- **RN-61** — **Disponíveis** = janelas da grade em cada dia do período menos os trechos bloqueados (bloqueios sobrepostos não descontam duas vezes). **Agendados** = soma de `fim - inicio` dos `AGENDADO`, `CONFIRMADO`, `REALIZADO` e `FALTA` (a falta ocupou a agenda). **Ocupação** = agendados ÷ disponíveis × 100, 1 casa, `HALF_UP`; sem minutos disponíveis, `null`.
+- **RN-62** — **Taxa de faltas** = `FALTA` ÷ (`REALIZADO` + `FALTA`) × 100, 1 casa, `HALF_UP`; cancelamentos e remarcações não entram. 52 realizadas e 6 faltas → `10.3`. Sem consulta finalizada → `null` (zero seria mentira).
+- **RN-63** — Contagens e minutos agendados saem de **uma consulta SQL agregada** (`GROUP BY` e `FILTER`), não de laços em Java. Os minutos disponíveis podem vir do motor da RN-29 (recomendado) ou de SQL; a escolha vai para um ADR.
+
+**Critérios de aceite**
+
+- Dado um profissional com grade de segunda a sexta 08:00–12:00 e o período de 05/10 a 09/10/2026 sem bloqueios, então `minutosDisponiveis` = 1200; com um bloqueio de 08:00–10:00 na quarta, 1080.
+- Dados 52 `REALIZADO`, 6 `FALTA` e 9 `CANCELADO`, então `taxaFaltas` = `10.3` e `canceladas` = 9.
+- Dado um período de 94 dias, então a resposta é `400`.
+
+## Requisitos não funcionais
+
+| RNF | Requisito e meta | Como verificar |
+|---|---|---|
+| RNF-01 | Horários livres de 14 dias com p95 ≤ **200 ms**, 5 000 agendamentos na base, 20 req/s por 1 min | Script k6 (`carga/horarios-livres.js`, via `docker run grafana/k6`), resultado no README |
+| RNF-02 | Demais endpoints com p95 ≤ **300 ms** na máquina local | O mesmo script, com cenários de listagem e criação |
+| RNF-03 | Agenda por profissional e período usa índice (sem `Seq Scan` com 5 000 linhas) | `EXPLAIN ANALYZE` no README ou num ADR |
+| RNF-04 | Token exigido em tudo, exceto login, `/actuator/health/**`, `/v3/api-docs/**` e `/swagger-ui/**`; validade de 60 min; segredo ≥ 256 bits por variável de ambiente | Teste que chama cada endpoint sem token e espera `401`; subir sem segredo falha |
+| RNF-05 | Matriz de papéis respeitada em 100% dos endpoints | Teste parametrizado papel × endpoint × status |
+| RNF-06 | Nenhum segredo no repositório nem no histórico | `.env` ignorado, `.env.example` falso; `gitleaks` no CI (opcional) |
+| RNF-07 | LGPD: CPF, e-mail e telefone fora dos logs; CPF mascarado nas listagens | Teste que captura o log de um cadastro e procura os dígitos |
+| RNF-08 | Logs JSON (ECS) com `requestId` em toda linha; health de liveness e readiness | Log do container; `curl` nos dois endpoints |
+| RNF-09 | Cobertura de linhas ≥ **85%** no domínio e ≥ 70% no projeto; nenhum teste ignorado | JaCoCo como artefato do CI |
+| RNF-10 | CI completo (testes com Testcontainers e imagem) em ≤ **8 min** | Duração do job no GitHub Actions |
+| RNF-11 | `docker compose up` sobe API, PostgreSQL e Mailpit em ≤ **90 s** (imagens baixadas), só com `cp .env.example .env` antes | Seguir o README num clone limpo |
+| RNF-12 | Suíte passa com a JVM em `UTC` e em `America/Sao_Paulo` | Matriz do CI com `-Duser.timezone` |
+| RNF-13 | OpenAPI em `/v3/api-docs`; Swagger UI com Bearer e exemplos nos DTOs principais | Autenticar e agendar pelo `/swagger-ui.html` |
+
+## Modelo de dados
+
+<Figura legenda="Modelo de dados da Agenda Fácil: o agendamento é o centro, e as duas exclusion constraints impedem sobreposição por profissional e por paciente">
+<svg viewBox="0 0 860 600" width="860" role="img" aria-labelledby="agenda-facil-er-titulo agenda-facil-er-desc">
+  <title id="agenda-facil-er-titulo">Diagrama entidade-relacionamento</title>
+  <desc id="agenda-facil-er-desc">Usuário liga-se opcionalmente a um profissional; profissional e especialidade são N:N; especialidade tem serviços; profissional tem disponibilidades e bloqueios. Agendamento liga profissional, paciente e serviço, com duas exclusion constraints, e tem lembretes.</desc>
+  <rect x="10" y="10" width="250" height="160" rx="8" class="d-box"/>
+  <text x="24" y="34" class="d-title">usuario</text>
+  <text x="24" y="58" class="d-mono">id PK</text>
+  <text x="24" y="77" class="d-mono">email UNIQUE (lower)</text>
+  <text x="24" y="96" class="d-mono">senha_hash</text>
+  <text x="24" y="115" class="d-mono">papel</text>
+  <text x="24" y="134" class="d-mono">profissional_id FK UNIQUE</text>
+  <text x="24" y="153" class="d-mono">ativo · falhas · bloq_ate</text>
+  <rect x="305" y="10" width="250" height="134" rx="8" class="d-box"/>
+  <text x="319" y="34" class="d-title">profissional</text>
+  <text x="319" y="58" class="d-mono">id PK</text>
+  <text x="319" y="77" class="d-mono">nome · email</text>
+  <text x="319" y="96" class="d-mono">conselho · numero · uf</text>
+  <text x="319" y="115" class="d-label">UNIQUE (conselho, numero, uf)</text>
+  <text x="319" y="134" class="d-mono">ativo</text>
+  <rect x="600" y="10" width="250" height="106" rx="8" class="d-box"/>
+  <text x="614" y="34" class="d-title">especialidade</text>
+  <text x="614" y="58" class="d-mono">id PK</text>
+  <text x="614" y="77" class="d-mono">nome UNIQUE (lower)</text>
+  <text x="614" y="100" class="d-label">N:N com profissional, via</text>
+  <text x="614" y="112" class="d-label">profissional_especialidade</text>
+  <path d="M260 90 L305 90" class="d-line"/>
+  <text x="282" y="84" text-anchor="middle" class="d-label">0..1</text>
+  <path d="M555 60 L600 60" class="d-line"/>
+  <text x="577" y="54" text-anchor="middle" class="d-label">N:N</text>
+  <rect x="600" y="200" width="250" height="148" rx="8" class="d-box"/>
+  <text x="614" y="224" class="d-title">servico</text>
+  <text x="614" y="248" class="d-mono">id PK</text>
+  <text x="614" y="267" class="d-mono">especialidade_id FK</text>
+  <text x="614" y="286" class="d-mono">nome · ativo</text>
+  <text x="614" y="305" class="d-mono">duracao_min CHECK</text>
+  <text x="614" y="324" class="d-mono">preco NUMERIC(10,2)</text>
+  <path d="M725 116 L725 200" class="d-line"/>
+  <text x="733" y="162" class="d-label">1:N</text>
+  <rect x="10" y="210" width="250" height="116" rx="8" class="d-box"/>
+  <text x="24" y="234" class="d-title">disponibilidade</text>
+  <text x="24" y="258" class="d-mono">id PK</text>
+  <text x="24" y="277" class="d-mono">profissional_id FK</text>
+  <text x="24" y="296" class="d-mono">dia_semana 1..7</text>
+  <text x="24" y="315" class="d-mono">hora_inicio · hora_fim</text>
+  <rect x="10" y="356" width="250" height="116" rx="8" class="d-violet"/>
+  <text x="24" y="380" class="d-title">bloqueio</text>
+  <text x="24" y="404" class="d-mono">id PK</text>
+  <text x="24" y="423" class="d-mono">profissional_id FK (null)</text>
+  <text x="24" y="442" class="d-mono">inicio · fim TIMESTAMPTZ</text>
+  <text x="24" y="461" class="d-mono">motivo</text>
+  <path d="M305 120 L282 120 L282 414 L260 414" class="d-line"/>
+  <path d="M282 268 L260 268" class="d-line"/>
+  <text x="278" y="196" text-anchor="end" class="d-label">1:N</text>
+  <rect x="305" y="190" width="250" height="240" rx="8" class="d-accent"/>
+  <text x="319" y="214" class="d-title">agendamento</text>
+  <text x="319" y="238" class="d-mono">id PK</text>
+  <text x="319" y="257" class="d-mono">profissional_id FK</text>
+  <text x="319" y="276" class="d-mono">paciente_id FK</text>
+  <text x="319" y="295" class="d-mono">servico_id FK</text>
+  <text x="319" y="314" class="d-mono">inicio · fim TIMESTAMPTZ</text>
+  <text x="319" y="333" class="d-mono">status · preco</text>
+  <text x="319" y="352" class="d-mono">remarcado_de_id FK</text>
+  <text x="319" y="371" class="d-mono">criado_por · version</text>
+  <text x="319" y="396" class="d-label">EXCLUDE: profissional + período</text>
+  <text x="319" y="414" class="d-label">EXCLUDE: paciente + período</text>
+  <path d="M430 144 L430 190" class="d-line"/>
+  <text x="438" y="172" class="d-label">1:N</text>
+  <path d="M600 274 L555 274" class="d-line"/>
+  <text x="577" y="268" text-anchor="middle" class="d-label">1:N</text>
+  <rect x="600" y="380" width="250" height="130" rx="8" class="d-box"/>
+  <text x="614" y="404" class="d-title">paciente</text>
+  <text x="614" y="428" class="d-mono">id PK</text>
+  <text x="614" y="447" class="d-mono">nome · data_nascimento</text>
+  <text x="614" y="466" class="d-mono">cpf CHAR(11) UNIQUE</text>
+  <text x="614" y="485" class="d-mono">email · telefone</text>
+  <path d="M600 410 L555 410" class="d-line"/>
+  <text x="577" y="404" text-anchor="middle" class="d-label">1:N</text>
+  <rect x="305" y="476" width="250" height="114" rx="8" class="d-info"/>
+  <text x="319" y="500" class="d-title">lembrete</text>
+  <text x="319" y="524" class="d-mono">id PK</text>
+  <text x="319" y="543" class="d-mono">agendamento_id FK</text>
+  <text x="319" y="562" class="d-mono">tipo · status · tentativas</text>
+  <text x="319" y="580" class="d-label">UNIQUE (agendamento_id, tipo)</text>
+  <path d="M430 430 L430 476" class="d-line"/>
+  <text x="438" y="458" class="d-label">1:N</text>
+</svg>
+</Figura>
+
+### Restrições importantes
+
+O Java valida para dar boas mensagens; o banco, que vê todas as requisições ao mesmo tempo, garante.
+
+| Tabela | Restrição | Por quê |
+|---|---|---|
+| `agendamento` | `EXCLUDE USING gist (profissional_id WITH =, tstzrange(inicio, fim, '[)') WITH &&) WHERE (status IN ('AGENDADO','CONFIRMADO'))` | RN-37 e RN-39: sem sobreposição por profissional, mesmo sob concorrência. Requer a extensão `btree_gist` (para o `=` num índice GiST) |
+| `agendamento` | a mesma, com `paciente_id` | RN-38 |
+| `agendamento` | `CHECK (fim > inicio)`, `CHECK (status IN (...))`, `CHECK (preco >= 0)` | Estados e intervalos impossíveis não entram |
+| `agendamento` | índice `(profissional_id, inicio)` e índice `(paciente_id, inicio)` | Agenda do profissional e histórico do paciente (RNF-03) |
+| `servico` | `CHECK (duracao_min BETWEEN 15 AND 240 AND duracao_min % 15 = 0)` | RN-10 |
+| `disponibilidade` | `CHECK (hora_fim > hora_inicio)`, `CHECK (dia_semana BETWEEN 1 AND 7)` | RN-22 (a não sobreposição entre janelas é validada no Java, porque a grade é trocada inteira numa transação) |
+| `bloqueio` | `CHECK (fim > inicio)`, índice `(profissional_id, inicio)` | RN-25 |
+| `paciente` | `UNIQUE (cpf)`, `CHECK (length(cpf) = 11)` | RN-17 e RN-18 |
+| `usuario` | índice único em `lower(email)`; `UNIQUE (profissional_id)` | RN-05 e RN-06 |
+| `lembrete` | `UNIQUE (agendamento_id, tipo)` | RN-56: idempotência do job |
+
+**Por que `[)` (semiaberto).** Com o intervalo fechado nas duas pontas, a consulta de 08:15–09:00 e a de 09:00–09:30 "se tocariam" às 09:00 e a constraint as recusaria. Com `[)`, o fim não pertence ao intervalo, e consultas encostadas convivem. É a mesma convenção da RN-29, e as duas precisam concordar.
+
+### Migrations
+
+| Versão | O que cria |
+|---|---|
+| `V1__extensoes_e_usuarios.sql` | `CREATE EXTENSION IF NOT EXISTS btree_gist`; tabela `usuario` |
+| `V2__cadastros.sql` | `especialidade`, `profissional`, `profissional_especialidade`, `servico`, `paciente` |
+| `V3__disponibilidade_e_bloqueios.sql` | `disponibilidade`, `bloqueio` e índices |
+| `V4__agendamentos.sql` | `agendamento`, os `CHECK`, as duas exclusion constraints e os índices |
+| `V5__lembretes.sql` | `lembrete` |
+| `V6__...` | O que surgir depois. **Migration aplicada nunca é editada**: mudança vira migration nova |
+
+Dados de demonstração (4 profissionais, 20 pacientes fictícios, uma semana de consultas) ficam fora das migrations de produção: um script ou `ApplicationRunner` só no perfil `demo`.
+
+## Contrato da API
+
+Base: `/api/v1`. JSON em UTF-8, nomes de campo em `camelCase`, datas com deslocamento, dinheiro como número com 2 casas (`180.00`) a partir de `BigDecimal`.
+
+| Método | Caminho | Quem pode | O que faz | Respostas |
+|---|---|---|---|---|
+| POST | `/auth/login` | público | Login (RF-01) | 200, 400, 401 |
+| POST | `/usuarios` | ADMIN | Cria usuário | 201, 400, 409 |
+| GET | `/usuarios` | ADMIN | Lista (paginado) | 200 |
+| PATCH | `/usuarios/{id}` | ADMIN | Altera nome, papel, `ativo` | 200, 404, 422 |
+| GET, POST | `/especialidades` | GET: todos; POST: ADMIN | Lista / cria | 200, 201, 409 |
+| GET, POST | `/servicos` | GET: todos; POST: ADMIN | Lista (filtro `especialidadeId`, `ativo`) / cria | 200, 201, 400 |
+| PUT | `/servicos/{id}` | ADMIN | Altera (inclusive desativa) | 200, 404 |
+| GET, POST | `/profissionais` | GET: ADMIN, RECEPCAO; POST: ADMIN | Lista paginada com filtros / cria | 200, 201, 409 |
+| GET, PUT | `/profissionais/{id}` | GET: todos (PROFISSIONAL só o próprio); PUT: ADMIN | Detalhe / altera | 200, 404, 409 |
+| GET, PUT | `/profissionais/{id}/disponibilidade` | GET: todos; PUT: ADMIN, RECEPCAO | Grade semanal (RF-06) | 200, 400 |
+| GET, POST | `/bloqueios` | todos (regras da RN-25) | Lista por período / cria | 200, 201, 403, 409 |
+| DELETE | `/bloqueios/{id}` | quem pode criar aquele bloqueio | Exclui bloqueio futuro | 204, 404, 422 |
+| GET, POST | `/pacientes` | ADMIN, RECEPCAO | Busca paginada / cria | 200, 201, 400, 409 |
+| GET, PUT | `/pacientes/{id}` | ADMIN, RECEPCAO | Detalhe (CPF completo) / altera | 200, 404, 409 |
+| GET | `/horarios-livres` | todos (PROFISSIONAL só o próprio) | RF-08 | 200, 400, 404, 422 |
+| GET, POST | `/agendamentos` | todos; POST: ADMIN, RECEPCAO | Agenda paginada / agenda (RF-09, RF-10) | 200, 201, 400, 404, 409, 422 |
+| GET | `/agendamentos/{id}` | todos (PROFISSIONAL só os próprios) | Detalhe | 200, 404 |
+| POST | `/agendamentos/{id}/confirmacao` | ADMIN, RECEPCAO | RF-11 | 200, 404, 422 |
+| POST | `/agendamentos/{id}/realizacao` | ADMIN, RECEPCAO, PROFISSIONAL (próprios) | RF-11 | 200, 404, 422 |
+| POST | `/agendamentos/{id}/falta` | ADMIN, RECEPCAO, PROFISSIONAL (próprios) | RF-11 | 200, 404, 422 |
+| POST | `/agendamentos/{id}/cancelamento` | ADMIN, RECEPCAO | RF-12 | 200, 404, 422 |
+| POST | `/agendamentos/{id}/remarcacao` | ADMIN, RECEPCAO | RF-13 | 201, 404, 409, 422 |
+| GET | `/relatorios/ocupacao` | ADMIN | RF-15 | 200, 400 |
+
+As transições são `POST` em sub-recursos com nome de substantivo (`/cancelamento`), e não `PATCH` no `status`: cada uma tem regras, dados próprios (motivo, novo horário) e autorização diferente, e fica explícita no OpenAPI.
+
+### Exemplos
+
+**Login**
+
+```http
+POST /api/v1/auth/login
+Content-Type: application/json
+
+{ "email": "recepcao@clinicavida.example", "senha": "margarida-azul-2026" }
+```
+
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMTkyYTFiYy0uLi4iLCJwYXBlbCI6IlJFQ0VQQ0FPIn0.x7Qm...",
+  "tokenType": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+**Horários livres** (o cenário da RN-30)
+
+```http
+GET /api/v1/horarios-livres?profissionalId=0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01&servicoId=0192a1bc-8e01-7a22-b4c1-77d9e3f10b02&de=2026-10-05&ate=2026-10-06
+Authorization: Bearer eyJ...
+```
+
+```json
+{
+  "profissionalId": "0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01",
+  "servicoId": "0192a1bc-8e01-7a22-b4c1-77d9e3f10b02",
+  "duracaoMinutos": 45,
+  "fuso": "America/Sao_Paulo",
+  "dias": [
+    {
+      "data": "2026-10-05",
+      "horarios": [
+        { "inicio": "2026-10-05T08:00:00-03:00", "fim": "2026-10-05T08:45:00-03:00" },
+        { "inicio": "2026-10-05T08:15:00-03:00", "fim": "2026-10-05T09:00:00-03:00" },
+        { "inicio": "2026-10-05T09:30:00-03:00", "fim": "2026-10-05T10:15:00-03:00" },
+        { "inicio": "2026-10-05T09:45:00-03:00", "fim": "2026-10-05T10:30:00-03:00" },
+        { "inicio": "2026-10-05T11:00:00-03:00", "fim": "2026-10-05T11:45:00-03:00" },
+        { "inicio": "2026-10-05T11:15:00-03:00", "fim": "2026-10-05T12:00:00-03:00" }
+      ]
+    },
+    { "data": "2026-10-06", "horarios": [] }
+  ]
+}
+```
+
+**Criar agendamento**
+
+```http
+POST /api/v1/agendamentos
+Authorization: Bearer eyJ...
+Content-Type: application/json
+
+{
+  "profissionalId": "0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01",
+  "pacienteId": "0192a1bd-1a40-7c55-8e2f-2b6a9d4c3e03",
+  "servicoId": "0192a1bc-8e01-7a22-b4c1-77d9e3f10b02",
+  "inicio": "2026-10-05T08:15:00-03:00",
+  "observacoes": "Primeira consulta; trazer exames recentes."
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /api/v1/agendamentos/0192a1c0-44f1-7b8e-a0d2-9c3b5e7f6a04
+Content-Type: application/json
+```
+
+```json
+{
+  "id": "0192a1c0-44f1-7b8e-a0d2-9c3b5e7f6a04",
+  "status": "AGENDADO",
+  "inicio": "2026-10-05T08:15:00-03:00",
+  "fim": "2026-10-05T09:00:00-03:00",
+  "profissional": { "id": "0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01", "nome": "Dra. Ana Souza" },
+  "paciente": { "id": "0192a1bd-1a40-7c55-8e2f-2b6a9d4c3e03", "nome": "Maria Oliveira", "idade": 34 },
+  "servico": { "id": "0192a1bc-8e01-7a22-b4c1-77d9e3f10b02", "nome": "Consulta de clínica geral" },
+  "preco": 180.00,
+  "observacoes": "Primeira consulta; trazer exames recentes.",
+  "remarcadoDeId": null,
+  "remarcadoParaId": null,
+  "criadoEm": "2026-10-02T10:00:03-03:00"
+}
+```
+
+**Listas paginadas.** Todas as listagens devolvem `content` e `page`. Exemplo: `GET /api/v1/agendamentos?profissionalId=...&de=2026-10-05&ate=2026-10-09&status=AGENDADO&status=CONFIRMADO&page=0&size=20`:
+
+```json
+{
+  "content": [
+    { "id": "0192a1c0-44f1-7b8e-a0d2-9c3b5e7f6a04", "status": "AGENDADO",
+      "inicio": "2026-10-05T08:15:00-03:00", "fim": "2026-10-05T09:00:00-03:00",
+      "profissional": { "id": "0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01", "nome": "Dra. Ana Souza" },
+      "paciente": { "id": "0192a1bd-1a40-7c55-8e2f-2b6a9d4c3e03", "nome": "Maria Oliveira", "idade": 34 },
+      "servico": { "id": "0192a1bc-8e01-7a22-b4c1-77d9e3f10b02", "nome": "Consulta de clínica geral" } }
+  ],
+  "page": { "size": 20, "number": 0, "totalElements": 1, "totalPages": 1 }
+}
+```
+
+É o formato do `PagedModel` do Spring Data (serialização "via DTO"), ou de um record de página seu com os mesmos campos. Não serialize a `PageImpl` direto: ela expõe detalhes internos que mudam entre versões.
+
+**Remarcar e cancelar.** `POST .../{id}/remarcacao` com `{ "novoInicio": "2026-10-05T09:30:00-03:00" }` devolve `201` com o **novo** agendamento (`remarcadoDeId` = id original, `preco` = o original) e `Location` apontando para ele. `POST .../{id}/cancelamento` com `{ "motivo": "Paciente pediu por telefone; vai viajar." }` devolve `200` com o agendamento `CANCELADO`, `canceladoEm` e `motivoCancelamento`.
+
+**Relatório de ocupação**
+
+```http
+GET /api/v1/relatorios/ocupacao?de=2026-10-01&ate=2026-10-31
+```
+
+```json
+{
+  "de": "2026-10-01",
+  "ate": "2026-10-31",
+  "fuso": "America/Sao_Paulo",
+  "profissionais": [
+    {
+      "profissionalId": "0192a1bc-7d2e-7f10-9a33-5c1f0e6b2a01",
+      "nome": "Dra. Ana Souza",
+      "minutosDisponiveis": 4800,
+      "minutosAgendados": 3615,
+      "ocupacao": 75.3,
+      "realizadas": 52,
+      "faltas": 6,
+      "canceladas": 9,
+      "ativas": 14,
+      "taxaFaltas": 10.3
+    }
+  ],
+  "geradoEm": "2026-10-02T10:00:00-03:00"
+}
+```
+
+### Formato de erro
+
+Todos os erros seguem o **Problem Details** (RFC 9457), com `Content-Type: application/problem+json`. Além dos campos padrão, há `codigo` (estável, para o front-end decidir o que fazer) e, em validação, `erros`.
+
+```json
+{
+  "type": "https://agendafacil.example/problemas/conflito-de-horario",
+  "title": "Conflito de horário",
+  "status": 409,
+  "detail": "Esse horário acabou de ser ocupado. Consulte os horários livres novamente.",
+  "instance": "/api/v1/agendamentos",
+  "codigo": "CONFLITO_DE_HORARIO",
+  "requestId": "4f1c2a9e7b3d4e10"
+}
+```
+
+```json
+{
+  "type": "https://agendafacil.example/problemas/validacao",
+  "title": "Requisição inválida",
+  "status": 400,
+  "detail": "Um ou mais campos estão inválidos.",
+  "instance": "/api/v1/servicos",
+  "codigo": "VALIDACAO",
+  "erros": [
+    { "campo": "duracaoMinutos", "mensagem": "deve ser múltiplo de 15, entre 15 e 240" },
+    { "campo": "preco", "mensagem": "deve ser maior ou igual a 0.00" }
+  ]
+}
+```
+
+Um `500` nunca traz stack trace, nome de classe, SQL ou nome de constraint: só `codigo: ERRO_INTERNO` e o `requestId`, que liga a resposta à linha de log.
+
+### Códigos de erro
+
+| Status | `codigo` | Quando |
+|---|---|---|
+| 400 | `REQUISICAO_INVALIDA` | JSON malformado, tipo errado (`size=abc`), data sem deslocamento, ordenação não permitida |
+| 400 | `VALIDACAO` | Bean Validation ou regra de formato (CPF, janelas sobrepostas, período longo demais); traz `erros` |
+| 401 | `NAO_AUTENTICADO` | Sem token, token inválido ou expirado |
+| 401 | `CREDENCIAIS_INVALIDAS` | Login falhou (RN-03, RN-04) |
+| 403 | `ACESSO_NEGADO` | Papel sem permissão, ou PROFISSIONAL pedindo filtro de outro |
+| 404 | `NAO_ENCONTRADO` | Recurso inexistente, ou de outro profissional (RN-42) |
+| 409 | `DUPLICADO` | CPF, e-mail, registro de conselho ou nome já existentes |
+| 409 | `CONFLITO_DE_HORARIO` | Sobreposição com agendamento ativo do profissional |
+| 409 | `PACIENTE_COM_CONFLITO` | Sobreposição com agendamento ativo do paciente |
+| 409 | `BLOQUEIO_COM_AGENDAMENTOS` | Bloqueio sobre consultas ativas (traz `agendamentos`) |
+| 409 | `PROFISSIONAL_COM_AGENDAMENTOS` | Desativar profissional com consultas futuras |
+| 409 | `EDICAO_CONCORRENTE` | Lock otimista (`@Version`) em alterações de cadastro |
+| 422 | `SERVICO_INCOMPATIVEL`, `SERVICO_INATIVO`, `PROFISSIONAL_INATIVO` | RN-12, RN-14, RN-15 |
+| 422 | `FORA_DA_DISPONIBILIDADE` | Fora da grade, desalinhado ou em bloqueio |
+| 422 | `ANTECEDENCIA_INSUFICIENTE`, `FORA_DO_HORIZONTE`, `FORA_DO_PRAZO` | Regras de tempo (RN-29, RN-45, RN-46, RN-49, RN-50) |
+| 422 | `TRANSICAO_INVALIDA` | Transição de status não permitida (RN-44) |
+| 422 | `OPERACAO_INVALIDA` | Outras regras de negócio (RN-08, RN-27) |
+| 500 | `ERRO_INTERNO` | Qualquer erro não previsto |
+
+**400 × 422.** `400` quando a requisição está mal formada ou viola uma regra de formato que não depende do estado do sistema. `422` quando ela é bem formada, mas a regra de negócio a recusa **dado o estado atual** (o serviço está inativo, faltam 10 horas). `409` quando o conflito é com outro dado (o horário já está ocupado).
+
+## Arquitetura
+
+Um monólito Spring Boot, bem organizado, é a arquitetura certa para este problema: um time pequeno, um banco, uma clínica. O que importa é a separação entre a regra de negócio e o framework.
+
+<Figura legenda="Containers e componentes: a API é um único serviço Spring Boot; a regra de horários fica num núcleo de domínio sem Spring, e o banco guarda a última palavra sobre conflitos">
+<svg viewBox="0 0 860 470" width="860" role="img" aria-labelledby="agenda-facil-arq-titulo agenda-facil-arq-desc">
+  <title id="agenda-facil-arq-titulo">Arquitetura da Agenda Fácil</title>
+  <desc id="agenda-facil-arq-desc">Clientes chamam a API Spring Boot com token Bearer. Dentro dela, em camadas: segurança JWT, controllers, serviços transacionais, domínio puro e repositórios, além do job de lembretes e do Actuator. A API usa o PostgreSQL 18 por JDBC e envia e-mails ao Mailpit por SMTP.</desc>
+  <defs><marker id="agenda-facil-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="60" width="170" height="104" rx="10" class="d-box"/>
+  <text x="95" y="86" text-anchor="middle" class="d-title">Clientes</text>
+  <text x="95" y="110" text-anchor="middle" class="d-label">Swagger UI</text>
+  <text x="95" y="128" text-anchor="middle" class="d-label">arquivo .http</text>
+  <text x="95" y="146" text-anchor="middle" class="d-label">front-end (futuro)</text>
+  <path d="M180 100 L236 100" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <text x="208" y="92" text-anchor="middle" class="d-label">Bearer</text>
+  <rect x="220" y="10" width="440" height="420" rx="12" class="d-box"/>
+  <text x="440" y="34" text-anchor="middle" class="d-title">agenda-facil-api · Spring Boot 4 · Java 25</text>
+  <rect x="240" y="50" width="400" height="44" rx="8" class="d-violet"/>
+  <text x="440" y="70" text-anchor="middle" class="d-text">Segurança: Resource Server JWT (HS256)</text>
+  <text x="440" y="86" text-anchor="middle" class="d-label">papéis ADMIN · RECEPCAO · PROFISSIONAL</text>
+  <path d="M440 94 L440 108" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <rect x="240" y="110" width="400" height="44" rx="8" class="d-info"/>
+  <text x="440" y="130" text-anchor="middle" class="d-text">Controllers REST /api/v1</text>
+  <text x="440" y="146" text-anchor="middle" class="d-label">DTOs (records) · Bean Validation · ProblemDetail</text>
+  <path d="M440 154 L440 168" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <rect x="240" y="170" width="400" height="44" rx="8" class="d-accent"/>
+  <text x="440" y="190" text-anchor="middle" class="d-text">Serviços de aplicação (@Transactional)</text>
+  <text x="440" y="206" text-anchor="middle" class="d-label">orquestram: carregam dados, chamam o domínio, salvam</text>
+  <path d="M440 214 L440 228" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <rect x="240" y="230" width="400" height="44" rx="8" class="d-ok"/>
+  <text x="440" y="250" text-anchor="middle" class="d-text">Domínio puro (sem Spring)</text>
+  <text x="440" y="266" text-anchor="middle" class="d-label">MotorDeHorarios · Intervalo · regras de status e prazos</text>
+  <path d="M440 274 L440 288" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <rect x="240" y="290" width="400" height="44" rx="8" class="d-box"/>
+  <text x="440" y="310" text-anchor="middle" class="d-text">Repositórios Spring Data JPA</text>
+  <text x="440" y="326" text-anchor="middle" class="d-label">consultas JPQL · SQL nativo do relatório</text>
+  <rect x="240" y="354" width="190" height="56" rx="8" class="d-violet"/>
+  <text x="335" y="376" text-anchor="middle" class="d-text">Actuator e logs</text>
+  <text x="335" y="394" text-anchor="middle" class="d-label">health · JSON (ECS)</text>
+  <rect x="450" y="354" width="190" height="56" rx="8" class="d-violet"/>
+  <text x="545" y="376" text-anchor="middle" class="d-text">Job de lembretes</text>
+  <text x="545" y="394" text-anchor="middle" class="d-label">@Scheduled 18h–21h</text>
+  <rect x="690" y="260" width="160" height="84" rx="10" class="d-info"/>
+  <text x="770" y="284" text-anchor="middle" class="d-title">PostgreSQL 18</text>
+  <text x="770" y="304" text-anchor="middle" class="d-label">Flyway V1..Vn</text>
+  <text x="770" y="322" text-anchor="middle" class="d-label">EXCLUDE (gist)</text>
+  <path d="M640 312 L688 306" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <text x="664" y="298" text-anchor="middle" class="d-label">JDBC</text>
+  <rect x="690" y="364" width="160" height="66" rx="10" class="d-ok"/>
+  <text x="770" y="388" text-anchor="middle" class="d-title">Mailpit</text>
+  <text x="770" y="408" text-anchor="middle" class="d-label">SMTP 1025 · UI 8025</text>
+  <path d="M640 384 L688 390" class="d-line" marker-end="url(#agenda-facil-seta)"/>
+  <text x="664" y="376" text-anchor="middle" class="d-label">SMTP</text>
+  <text x="440" y="458" text-anchor="middle" class="d-label">docker compose up → api + postgres + mailpit (rede interna do Compose)</text>
+</svg>
+</Figura>
+
+### Organização de pacotes
+
+Organize **por funcionalidade**, não por camada técnica: `agendamento/` com controller, serviço, repositório e DTOs se navega melhor que `controllers/` com 12 classes.
+
+```text
+src/main/java/dev/<seu-usuario>/agendafacil/
+  AgendaFacilApplication.java
+  compartilhado/      Clock, Intervalo, ProblemDetail (@RestControllerAdvice), paginação, requestId
+  seguranca/          SecurityConfig, login, emissão de JWT, bootstrap do ADMIN
+  usuario/
+  cadastro/           especialidade, servico, profissional
+  paciente/           Paciente, Cpf (value object), controller, serviço
+  agenda/             disponibilidade, bloqueio, MotorDeHorarios (domínio puro), horários livres
+  agendamento/        Agendamento, StatusAgendamento, transições, controller, serviço
+  lembrete/           job, EnviadorDeEmail (interface) + implementação SMTP
+  relatorio/          consulta SQL e DTOs
+src/main/resources/
+  db/migration/       V1__...sql, V2__...sql
+  application.yaml
+```
+
+### Decisões para registrar em ADRs
+
+Registre cada decisão em `docs/adr/` (contexto, opções, decisão, consequências). Um ADR com um trade-off bem explicado diz mais sobre você do que mil linhas de código.
+
+**ADR-1 · Como impedir conflito de horário sob concorrência?**
+
+| Opção | Prós | Contras |
+|---|---|---|
+| `SELECT` procura sobreposição; se não houver, `INSERT` | Simples | **Não funciona sob concorrência**: as duas transações leem "livre" e as duas inserem |
+| `UNIQUE (profissional_id, inicio)` | Simples, portável | Só pega inícios iguais: 09:00–09:45 e 09:30–10:00 se sobrepõem com inícios diferentes |
+| `SELECT ... FOR UPDATE` na linha do profissional | Funciona, portável | Serializa as reservas do profissional; todo código precisa lembrar do lock |
+| Isolamento `SERIALIZABLE` | Correto sem mudar o esquema | Retentativa em toda escrita; aborta também casos sem conflito real |
+| **Exclusion constraint** (`EXCLUDE USING gist`, `&&` sobre `tstzrange`) | Garantia declarativa, vale para qualquer escrita, até um `INSERT` manual | Específica do PostgreSQL; requer `btree_gist`; o erro (`SQLSTATE 23P01`) precisa virar `409` |
+
+**Recomendação:** exclusion constraint, com a verificação prévia no Java só para a mensagem de erro. Registre a limitação: o bloqueio (RF-07) é verificado só no Java, então um bloqueio e um agendamento criados no mesmo instante podem passar os dois; numa clínica pequena o risco é aceito.
+
+| ADR | Pergunta | Recomendação de base e trade-off |
+|---|---|---|
+| 2 | Onde calcular os horários livres? | Java puro: testável em milissegundos, com tempo e fuso controlados, alimentado por **três consultas** (grade, agendamentos ativos e bloqueios do período). SQL com `generate_series` tem menos código, mas testes lentos e lógica espalhada |
+| 3 | Como representar tempo? | `Instant` em `timestamptz` para agendamentos e bloqueios; `LocalTime` + dia da semana para a grade ("abre às 08:00", seja qual for o deslocamento); conversão num só lugar, com o `ZoneId`. Descartado: `LocalDateTime` sem fuso, ambíguo quando o deslocamento muda |
+| 4 | Remarcar atualiza o registro ou cria outro? | Criar outro e ligar os dois (RN-51): preserva o histórico e o relatório. Atualizar é mais simples, mas apaga a história |
+| 5 | JWT próprio ou provedor de identidade? | HS256 com o Resource Server: correto e simples para um serviço. Registre quando trocaria por Keycloak ou similar (vários serviços validando tokens, login social, MFA) |
+| 6 | Como o lembrete não duplica? | Registrar `PENDENTE` com `UNIQUE (agendamento_id, tipo)` antes de enviar e marcar `ENVIADO` depois: duas execuções nunca enviam juntas, e o estado mostra o que ficou pela metade. Pior caso aceito: uma queda entre o envio e a marcação `ENVIADO` gera um duplicado, mas nenhum lembrete se perde (RN-56) |
+
+## Plano de execução
+
+O projeto tem **começo, meio e fim**. O começo (marco 1) é a fundação: um repositório que compila, sobe com o banco, roda no CI e explica o que vai ser. O meio (marcos 2 a 7) são **fatias verticais**: cada marco entrega funcionalidades que funcionam de ponta a ponta (migration, entidade, regra, endpoint, teste, documentação) e termina com o CI verde e uma tag. Nada de "fazer todas as entidades primeiro e os endpoints depois". O fim (marco 8) transforma o código em produto: observável, publicado, documentado e demonstrado. Trabalhe com um branch e um pull request por marco, mesmo sozinho: o histórico de PRs é parte do portfólio.
+
+<Marco id="fundacao" numero={1} titulo="Fundação do repositório" horas={8}>
+
+**Objetivo:** ter um repositório público que compila, sobe com PostgreSQL e Mailpit via Docker Compose, aplica a primeira migration e roda no CI a cada push.
+
+**Tarefas**
+
+- Spring Initializr: Maven, Java 25, Spring Boot 4.x, com Spring Web, Validation, Spring Data JPA, PostgreSQL Driver, Flyway Migration, Spring Security, OAuth2 Resource Server, Java Mail Sender, Actuator e Testcontainers.
+- `compose.yaml` com `postgres:18` (volume nomeado, `healthcheck` com `pg_isready`) e `axllent/mailpit` (portas 1025 e 8025); a API entra no Compose no marco 8.
+- `.env.example` com as variáveis (`DB_URL`, `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`, `AGENDA_ADMIN_EMAIL`, `AGENDA_ADMIN_SENHA`, `AGENDA_FUSO`) e valores falsos; `.env` no `.gitignore`.
+- `V1__extensoes_e_usuarios.sql` com `CREATE EXTENSION IF NOT EXISTS btree_gist` e a tabela `usuario`.
+- `Clock` como bean (`Clock.system(ZoneId.of(fuso))`) e `agenda.fuso` num `@ConfigurationProperties` validado.
+- Teste de contexto com PostgreSQL no Testcontainers e `@ServiceConnection`, provando que o Flyway aplica a V1.
+- `.github/workflows/ci.yml` com `actions/setup-java` (Java 25, cache do Maven) e `./mvnw -B verify`; branch `main` protegido exigindo CI verde.
+- README inicial (o que é, status, como rodar) e `docs/adr/0001-registro-de-decisoes.md`.
+
+**Entregáveis:** repositório público, CI verde no primeiro PR, `compose.yaml`, `.env.example`, V1, README inicial, tag `v0.1.0`.
+
+**Definição de pronto**
+
+- Em um clone limpo, `cp .env.example .env && docker compose up -d` sobe PostgreSQL e Mailpit, e `http://localhost:8025` abre a caixa do Mailpit.
+- `./mvnw verify` passa localmente e no GitHub Actions, com o teste de contexto rodando contra o container.
+- `GET /actuator/health` responde `{"status":"UP"}` com a aplicação rodando.
+- O `git log` não contém nenhum `.env` nem senha real.
+
+**Aulas de apoio:** [Git no time](../../../aulas/14-devops/01-git-no-time/) · [Maven e Gradle](../../../aulas/14-devops/02-maven-e-gradle/) · [Docker Compose: aplicação + PostgreSQL](../../../aulas/14-devops/03-docker/#docker-compose-aplicação--postgresql) · [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/) · [Flyway: o schema como código](../../../aulas/09-persistencia/06-locking-e-flyway/#flyway-o-schema-como-código) · [Testcontainers](../../../aulas/10-testes/05-testcontainers/) · [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/)
+
+<Callout tipo="erro" titulo="Armadilhas da fundação">
+
+- **H2 "só para começar".** O H2 não tem `EXCLUDE USING gist` nem `tstzrange`: no marco 5 a peça principal não roda nele. PostgreSQL desde o primeiro teste.
+- **Porta 5432 fixa nos testes.** Passa na sua máquina (o Compose está de pé) e quebra no CI. Quem sabe a porta é o `@ServiceConnection`.
+- **Segredo no `application.yaml`**, mesmo "de desenvolvimento": o repositório é público e o histórico é para sempre.
+
+</Callout>
+
+</Marco>
+
+<Marco id="seguranca" numero={2} titulo="Login, usuários e papéis" horas={10}>
+
+**Objetivo:** fechar a API cedo, para todo endpoint seguinte nascer protegido e com testes de autorização.
+
+**Tarefas**
+
+- `SecurityFilterChain` stateless: CSRF desligado (sem cookie de sessão), `oauth2ResourceServer` com JWT, rotas públicas da RNF-04 e o resto autenticado.
+- `JwtEncoder` e `JwtDecoder` com a chave HS256 de `JWT_SECRET` (subida falha com menos de 32 bytes), algoritmo fixo no decoder, claim `papel` convertido em `ROLE_<papel>`.
+- `POST /auth/login` (RN-01 a RN-04), usuários para ADMIN (RN-05 a RN-08) e bootstrap do ADMIN num `ApplicationRunner`.
+- `@RestControllerAdvice` com `ProblemDetail` e `codigo`, mais `AuthenticationEntryPoint` e `AccessDeniedHandler` para os `401`/`403` saírem no mesmo formato.
+- Filtro de `X-Request-Id` (gera ou aceita, põe no MDC, devolve no cabeçalho).
+- Testes dos critérios de RF-01 e RF-02 e da matriz de autorização de usuários.
+
+**Entregáveis:** login funcionando no Swagger UI (com o botão "Authorize"), `docs/adr/0002-jwt-proprio-hs256.md`, tag `v0.2.0`.
+
+**Definição de pronto**
+
+- `curl` sem token em `/api/v1/usuarios` devolve `401` em `application/problem+json`; com token de RECEPCAO, `403`; com ADMIN, `200`.
+- O teste da RN-04 avança o relógio 15 minutos sem `Thread.sleep`.
+- Subir a aplicação sem `JWT_SECRET` falha com uma mensagem clara no log.
+
+**Aulas de apoio:** [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/) · [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/) · [JWT e Resource Server](../../../aulas/11-seguranca/03-jwt-e-resource-server/) · [Problem Details (RFC 9457)](../../../aulas/08-spring-boot/05-validacao-e-erros/#problem-details-rfc-9457) · [Testes de fatia no Spring](../../../aulas/10-testes/04-testes-de-fatia-no-spring/)
+
+<Callout tipo="erro" titulo="Armadilhas de segurança">
+
+- **Mensagens diferentes para "e-mail não existe" e "senha errada"**: entregam ao atacante os e-mails válidos.
+- **`/error` sem `permitAll()`**: um erro num endpoint público vira `401`. Login com JSON malformado tem de dar `400`.
+- **Dados pessoais no token**: o payload do JWT é só Base64, qualquer um lê.
+
+</Callout>
+
+</Marco>
+
+<Marco id="cadastros" numero={3} titulo="Cadastros da clínica" horas={12}>
+
+**Objetivo:** especialidades, serviços, profissionais e pacientes cadastrados pela API, validados, paginados e com as restrições no banco.
+
+**Tarefas**
+
+- `V2__cadastros.sql` com as tabelas, `CHECK`, `UNIQUE` e índices do Modelo de dados.
+- Entidades, repositórios e o N:N profissional × especialidade (`@ManyToMany` com `Set` ou entidade de ligação; justifique). DTOs `record` com Bean Validation; entidade nunca sai do controller.
+- `Cpf` como value object (record que valida no construtor compacto, com `formatado()` e `mascarado()`) e testes parametrizados da RN-17.
+- Endpoints de RF-03 a RF-05 com paginação, filtros e ordenação permitida; `@Version` com `409 EDICAO_CONCORRENTE`; `UNIQUE` violada (SQLSTATE `23505`) vira `409 DUPLICADO` sem vazar o nome da constraint.
+- Testes: `@WebMvcTest` para validação e erros, `@DataJpaTest` com Testcontainers para constraints, matriz de autorização.
+
+**Entregáveis:** cadastros completos no Swagger UI, arquivo `requisicoes.http` com um exemplo por endpoint, tag `v0.3.0`.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-03 a RF-05 passam em testes automatizados.
+- Uma listagem de 20 profissionais com especialidades executa no máximo 3 consultas SQL (contagem, página, especialidades) (conferido com `spring.jpa.show-sql` ou contagem de statements no teste).
+- `CPF` completo não aparece em nenhuma listagem nem no log.
+
+**Aulas de apoio:** [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/) · [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/) · [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/) · [Relacionamentos](../../../aulas/09-persistencia/02-relacionamentos/) · [Spring Data JPA](../../../aulas/09-persistencia/03-spring-data-jpa/) · [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/) · [DDL e constraints](../../../aulas/07-sql/02-ddl-e-constraints/) · [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/)
+
+<Callout tipo="erro" titulo="Armadilhas dos cadastros">
+
+- **`@ManyToMany` com `List` e `EAGER`**: consultas em cascata e produtos cartesianos. `Set`, `LAZY` e `@EntityGraph` só onde precisa.
+- **`equals`/`hashCode` com todos os campos** (Lombok `@Data`): a entidade muda de "balde" no `Set` quando ganha id.
+- **`JOIN FETCH` de coleção com `Pageable`**: o Hibernate pagina **em memória**. Busque a página de ids e depois as especialidades, ou use `@BatchSize`.
+- **CPF validado só por tamanho**: `111.111.111-11` tem 11 dígitos.
+
+</Callout>
+
+</Marco>
+
+<Marco id="horarios" numero={4} titulo="Disponibilidade e horários livres" horas={14}>
+
+**Objetivo:** a grade semanal, os bloqueios e o cálculo dos horários livres (RF-06 a RF-08), com o motor em Java puro e dezenas de testes rápidos.
+
+**Tarefas**
+
+- `V3__disponibilidade_e_bloqueios.sql`.
+- `PUT /profissionais/{id}/disponibilidade` trocando a grade numa transação (RN-22, RN-23: ordene as janelas do dia e compare cada uma com a seguinte).
+- `/bloqueios` com as regras de papel e exclusão (RN-25, RN-27); a RN-26 fica para o marco 5, quando a tabela de agendamentos existir.
+- `Intervalo` (record de `Instant`s com `sobrepoe` semiaberto) e `MotorDeHorarios`, que recebe grade, ocupações, duração, período, `ZoneId`, agora, antecedência e horizonte e devolve os livres por dia. Sem Spring, sem repositório, sem `Instant.now()`.
+- Serviço com as três consultas do ADR-2 e o endpoint `GET /horarios-livres`; testes de unidade com todos os exemplos das RN-29 a RN-33; ADR-2 e ADR-3.
+
+**Entregáveis:** `GET /horarios-livres` funcionando com a grade de demonstração; motor com cobertura de linhas ≥ 90%; tag `v0.4.0`.
+
+**Definição de pronto**
+
+- O teste com o cenário da RN-30 devolve exatamente 08:00, 08:15, 09:30, 09:45, 11:00 e 11:15.
+- A suíte do motor roda em menos de 1 segundo e passa com a JVM em `UTC` e em `America/Sao_Paulo`.
+- A consulta de 14 dias gera exatamente 3 comandos SQL, qualquer que seja o número de agendamentos.
+
+**Aulas de apoio:** [Intervalos: ordenar e varrer](../../../aulas/05-algoritmos/06-grafos-e-intervalos/#intervalos-ordenar-e-varrer) · [Java moderno na prática](../../../aulas/04-java-moderno/05-java-moderno-na-pratica/) · [Streams](../../../aulas/04-java-moderno/02-streams/) · [JUnit e AssertJ](../../../aulas/10-testes/02-junit-e-assertj/) · [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/)
+
+<Callout tipo="erro" titulo="Armadilhas do cálculo de horários">
+
+- **`ZoneOffset.of("-03:00")` no lugar de `ZoneId`**: funciona até o deslocamento mudar. O deslocamento é consequência da data; o fuso é a regra.
+- **`<=` num lado e `<` no outro**: a convenção semiaberta tem de ser a mesma no Java e na constraint (`'[)'`), senão o motor oferece o que o banco recusa.
+- **Uma consulta por candidato**: 14 dias × 16 candidatos = 224 consultas por tela.
+- **`LocalDateTime.now()` no motor**: o teste de antecedência passa ou falha conforme a hora.
+
+</Callout>
+
+</Marco>
+
+<Marco id="agendamento" numero={5} titulo="Agendamento sem conflito" horas={12}>
+
+**Objetivo:** criar agendamentos (RF-09) e consultar a agenda (RF-10), com o conflito garantido pelo banco e provado por um teste de concorrência.
+
+**Tarefas**
+
+- `V4__agendamentos.sql` com a tabela, os `CHECK`, as duas exclusion constraints e os índices.
+- Entidade `Agendamento` (`Instant`, status enum em texto, preço `BigDecimal`) e o serviço de criação na ordem da RN-36, reusando o motor para validar o candidato.
+- SQLSTATE `23P01` vira `409`, com profissional e paciente distinguidos pelo nome da constraint; `saveAndFlush` para o erro sair dentro do serviço, e não no commit.
+- RN-26 (pendente do marco 4) e `GET /agendamentos` com filtros, RN-42 e RN-43.
+- Teste de concorrência: `@SpringBootTest` com Testcontainers, duas tarefas liberadas pelo mesmo `CountDownLatch`, asserção de um `201`, um `409` e uma linha ativa, com `@RepeatedTest(20)`. ADR-1 com o resultado.
+
+**Entregáveis:** agendamento no Swagger UI, teste de concorrência verde no CI, `docs/adr/0003-conflito-de-horario.md`, tag `v0.5.0`.
+
+**Definição de pronto**
+
+- Os critérios de aceite de RF-09 e RF-10 passam, incluindo o de concorrência, 20 repetições seguidas.
+- Um `INSERT` manual no `psql` que sobrepõe outra consulta ativa falha com `conflicting key value violates exclusion constraint`.
+- Nenhum `500` em nenhum cenário de conflito.
+
+**Aulas de apoio:** [UNIQUE composto resolve concorrência](../../../aulas/07-sql/02-ddl-e-constraints/#unique-composto-resolve-concorrência) · [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/) · [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/) · [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/) · [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/) · [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/) · [BOLA: o bug mais comum de API](../../../aulas/11-seguranca/04-autorizacao-e-bola/#bola-o-bug-mais-comum-de-api)
+
+<Callout tipo="erro" titulo="Armadilhas do agendamento">
+
+- **`@Transactional` no teste de concorrência**: as threads não enxergam a transação do teste e o rollback esconde o resultado. Limpe os dados à mão.
+- **Toda `DataIntegrityViolationException` como `409 DUPLICADO`**: `CHECK` e chave estrangeira também caem nela. Olhe SQLSTATE e constraint.
+- **Constraint sem `WHERE status IN (...)`**: a consulta cancelada bloqueia o horário para sempre.
+
+</Callout>
+
+</Marco>
+
+<Marco id="ciclo-de-vida" numero={6} titulo="Confirmação, remarcação, cancelamento e falta" horas={10}>
+
+**Objetivo:** a máquina de estados completa (RF-11 a RF-13), com prazos, papéis e histórico.
+
+**Tarefas**
+
+- Transições no próprio `StatusAgendamento` e métodos de domínio em `Agendamento` (`confirmar(agora)`, `cancelar(motivo, papel, agora)`...) que lançam exceções de negócio; nada de `setStatus` no serviço.
+- Os cinco endpoints de transição; remarcação numa transação: original `REMARCADO`, `flush`, novo inserido (RN-53).
+- Testes: transições com `@ParameterizedTest` + `@CsvSource`, prazos com `Clock` fixo, integração para as remarcações e a RN-47. ADR-4.
+
+**Entregáveis:** ciclo completo no Swagger UI e no `.http`; diagrama de estados no README (pode ser em Mermaid, que o GitHub renderiza); tag `v0.6.0`.
+
+**Definição de pronto**
+
+- Todos os critérios de aceite de RF-11 a RF-13 passam.
+- A tabela de transições tem um teste para **cada combinação** status × ação (5 ações × 6 status = 30 casos), não só as permitidas.
+- Depois de uma remarcação com conflito, o banco está idêntico ao de antes.
+
+**Aulas de apoio:** [Sealed e pattern matching](../../../aulas/02-poo/06-sealed-e-pattern-matching/) · [Encapsulamento](../../../aulas/02-poo/02-encapsulamento/) · [Exceções](../../../aulas/03-colecoes-generics-excecoes/05-excecoes/) · [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/) · [Testando autorização: a matriz](../../../aulas/11-seguranca/04-autorizacao-e-bola/#testando-autorização-a-matriz)
+
+<Callout tipo="erro" titulo="Armadilhas do ciclo de vida">
+
+- **`@Transactional` em método privado ou chamado na mesma classe**: o proxy não intercepta e um conflito deixa o original `REMARCADO` sem o novo.
+- **Cancelar = apagar a linha**: somem o relatório e o histórico.
+- **Prazo com `LocalDateTime`**: "12 horas antes" é diferença entre instantes (`Duration.between` sobre `Instant`).
+
+</Callout>
+
+</Marco>
+
+<Marco id="lembretes-e-relatorios" numero={7} titulo="Lembretes e relatório de ocupação" horas={10}>
+
+**Objetivo:** o job de lembretes idempotente (RF-14) e o relatório de ocupação e faltas em SQL (RF-15).
+
+**Tarefas**
+
+- `V5__lembretes.sql`; `EnviadorDeEmail` com implementação sobre o `JavaMailSender` (Mailpit em `localhost:1025`) e uma falsa, programável para falhar.
+- Job com `@Scheduled(cron = "0 0 18-21 * * *", zone = "${agenda.fuso}")`; a lógica fica num serviço que recebe "agora", e cada lembrete tem transação própria (RN-58).
+- Relatório em SQL nativo (ponto de partida abaixo), percentuais com `BigDecimal` e `RoundingMode.HALF_UP`.
+- Testes: job com o enviador falso, um teste com Mailpit de verdade (consultando a API HTTP dele) e o relatório com os dados das RN-61 e RN-62. ADR-6.
+
+**Entregáveis:** lembretes chegando no Mailpit durante a demonstração; relatório no Swagger UI; tag `v0.7.0`.
+
+**Definição de pronto**
+
+- Rodar o serviço do job duas vezes seguidas para o mesmo dia envia cada lembrete uma vez só (teste automatizado).
+- Com o Mailpit parado, o job registra `FALHOU` e a aplicação continua respondendo; com o Mailpit de volta, a próxima execução envia.
+- O relatório de um mês com 4 profissionais executa uma consulta SQL para as contagens (conferido no log).
+
+Ponto de partida para a consulta (ajuste ao seu esquema):
+
+```sql
+SELECT p.id,
+       p.nome,
+       count(a.id) FILTER (WHERE a.status = 'REALIZADO')  AS realizadas,
+       count(a.id) FILTER (WHERE a.status = 'FALTA')      AS faltas,
+       count(a.id) FILTER (WHERE a.status = 'CANCELADO')  AS canceladas,
+       count(a.id) FILTER (WHERE a.status IN ('AGENDADO', 'CONFIRMADO')) AS ativas,
+       coalesce(sum(extract(epoch FROM a.fim - a.inicio) / 60)
+                FILTER (WHERE a.status IN ('AGENDADO', 'CONFIRMADO', 'REALIZADO', 'FALTA')), 0)
+                                                        AS minutos_agendados
+FROM profissional p
+LEFT JOIN agendamento a
+       ON a.profissional_id = p.id
+      AND a.inicio >= :inicio
+      AND a.inicio <  :fim
+WHERE (CAST(:profissionalId AS uuid) IS NULL OR p.id = :profissionalId)
+GROUP BY p.id, p.nome
+ORDER BY p.nome;
+```
+
+Repare que o filtro de período está no `ON`, não no `WHERE`: no `WHERE`, profissionais sem consulta no mês sumiriam do relatório.
+
+**Aulas de apoio:** [Consultas e joins](../../../aulas/07-sql/03-consultas-e-joins/) · [Agregações e janelas](../../../aulas/07-sql/04-agregacoes-e-janelas/) · [Mockito](../../../aulas/10-testes/03-mockito/) · [Por que e como testar](../../../aulas/10-testes/01-por-que-e-como-testar/)
+
+<Callout tipo="erro" titulo="Armadilhas dos lembretes e do relatório">
+
+- **Job sem `zone`**: num servidor em UTC, "18:00" vira 15:00 em São Paulo.
+- **Uma transação para o lote**: uma falha desfaz o registro dos e-mails que já saíram, e todos são reenviados.
+- **`BigDecimal.divide` sem `RoundingMode`**: `6 ÷ 58` é dízima e lança `ArithmeticException`.
+
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={8} titulo="Observabilidade, deploy e v1.0.0" horas={8}>
+
+**Objetivo:** transformar o código em um produto que qualquer pessoa sobe, observa, usa e avalia em 5 minutos.
+
+**Tarefas**
+
+- `logging.structured.format.console=ecs` com `requestId` e sem dados pessoais; Actuator só com `health` (liveness e readiness) e `info`.
+- `Dockerfile` multi-stage (JDK 25 no build, JRE 25 e usuário não root no runtime) ou Buildpacks; a API entra no `compose.yaml` esperando o `healthcheck` do banco. Perfil `demo` com dados fictícios.
+- Script k6 da RNF-01; CI com matriz de fuso, JaCoCo como artefato e build da imagem (opcional: publicar no GHCR em tags `v*`).
+- Deploy numa plataforma com imagem Docker e PostgreSQL gerenciado (Render, Railway, Fly.io, Koyeb ou similar; confira os planos gratuitos atuais e se o `btree_gist` está disponível) ou numa VM pequena com o Compose. Em `prod`, o `EnviadorDeEmail` só registra no log.
+- README final, vídeo e release `v1.0.0` com notas.
+
+**Entregáveis:** `docker compose up` sobe tudo; URL pública com Swagger UI (ou justificativa e vídeo); release `v1.0.0`; vídeo de até 3 minutos; post no LinkedIn.
+
+**Definição de pronto**
+
+- Numa máquina limpa, com Docker, `git clone`, `cp .env.example .env` e `docker compose up` deixam a API pronta em até 90 s; o login com o ADMIN do `.env` funciona pelo Swagger UI.
+- `docker compose logs api` mostra linhas JSON com `requestId`.
+- O README tem badge do CI verde, instruções que funcionam copiando e colando, e links para ADRs, diagramas e vídeo.
+- Todos os critérios de aceite deste documento estão cobertos por testes ou pelo roteiro de demonstração.
+
+**Aulas de apoio:** [Logs estruturados](../../../aulas/14-devops/05-observabilidade/#pilar-1-logs-estruturados) · [Actuator, saúde e probes](../../../aulas/14-devops/05-observabilidade/#actuator-saúde-e-probes) · [Docker](../../../aulas/14-devops/03-docker/) · [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/) · [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/) · [OpenAPI com springdoc](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/) · [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/) · [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/)
+
+<Callout tipo="erro" titulo="Armadilhas da entrega">
+
+- **README que só funciona na sua máquina**: teste num clone limpo ou num Codespace.
+- **Deploy com perfil de desenvolvimento**: Swagger aberto vá lá; senha padrão, `show-sql` e stack trace na resposta, não.
+- **Dados reais na demonstração**: nomes e CPFs fictícios, nunca de pessoas reais.
+
+</Callout>
+
+</Marco>
+
+## Estratégia de testes
+
+Base larga no domínio (rápido, sem Spring) e poucos testes caros, mas nos lugares em que só o banco de verdade responde.
+
+| Nível | Ferramentas | O que cobre | Meta |
+|---|---|---|---|
+| Unidade (domínio) | JUnit 6, AssertJ, `@ParameterizedTest`, `Clock` fixo | `MotorDeHorarios`, `Intervalo`, `Cpf`, transições, prazos, percentuais | Suíte em menos de 2 s, cobertura ≥ 85% |
+| Unidade (aplicação) | Mockito | Ordem das validações da RN-36, job com enviador falso | Só onde a orquestração tem regra |
+| Fatia web | `@WebMvcTest` + `spring-security-test` | Validação, Problem Details, códigos HTTP, matriz de autorização | Um teste por código da tabela de erros |
+| Fatia de dados | `@DataJpaTest` + Testcontainers | Constraints, filtros, relatório SQL, ausência de N+1 | Toda constraint tem um teste que a viola |
+| Integração | `@SpringBootTest` + Testcontainers (+ Mailpit) | Ponta a ponta, concorrência, remarcação transacional, e-mail | Poucos e significativos |
+| Carga leve | k6 | RNF-01 e RNF-02 | Resultado no README antes da v1.0.0 |
+
+**Cenários obrigatórios** (além dos critérios de aceite, que já são testes):
+
+1. Motor de horários: o cenário da RN-30; antecedência (RN-31) com o candidato exatamente em agora + 2 h; dia 61 vazio; bloqueio total e parcial; consultas encostadas convivendo no motor **e** no banco; a borda do horário de verão (RN-32).
+2. Concorrência: duas reservas simultâneas, um `201` e um `409`, 20 repetições; paciente com conflito em profissionais diferentes.
+3. Ciclo de vida: as 30 combinações status × ação; remarcação sobre o próprio horário e remarcação com conflito sem efeito colateral; cancelamento com 12 h e 1 min e 11 h e 59 min; falta aos 14 e aos 15 minutos.
+4. Segurança: corpo idêntico para e-mail inexistente e senha errada; bloqueio e fim do bloqueio; matriz endpoint × papel × sem token; PROFISSIONAL abrindo consulta de outro → `404`; subida sem `JWT_SECRET` falha.
+5. Dados: os exemplos de CPF e a máscara; nenhum dado pessoal no log do cadastro de paciente.
+6. Lembretes e relatório: idempotência, falha e nova tentativa, limite de 3 tentativas; exemplos das RN-61 e RN-62, `taxaFaltas` nula e profissional sem consultas presente no resultado.
+
+Dê aos testes nomes que descrevem comportamento (`naoOfereceHorarioQueTerminaDepoisDaJanela`, ou um `@DisplayName`): quem avalia lê a lista de testes como uma segunda especificação.
+
+## Entregáveis do portfólio
+
+**1. README.** É a vitrine. Modelo:
+
+````markdown
+# Agenda Fácil
+API de agendamentos para clínicas: horários livres calculados, agendamento sem conflito
+garantido pelo banco (mesmo sob concorrência), remarcação, faltas, lembretes e relatório.
+
+[![CI](.../actions/workflows/ci.yml/badge.svg)](...)  Java 25 · Spring Boot 4 · PostgreSQL 18
+**Demo:** https://... (Swagger UI) · **Vídeo (3 min):** https://...
+
+## O que tem de interessante
+- Horários livres (grade + bloqueios + antecedência, no fuso da clínica) → motor e testes
+- Conflito impossível: exclusion constraint → docs/adr/0003-conflito-de-horario.md
+- Teste que dispara duas reservas ao mesmo tempo → link
+- Lembretes idempotentes e relatório em SQL
+
+## Rodando em 1 minuto
+cp .env.example .env && docker compose up
+API: http://localhost:8080/swagger-ui.html · e-mails: http://localhost:8025
+
+## Arquitetura e modelo de dados   (diagramas + link para os ADRs)
+## Testes   ./mvnw verify (Docker ligado) · cobertura do domínio · p95 do k6
+## Limitações conhecidas e próximos passos
+````
+
+**2. Diagramas:** ER, arquitetura e estados do agendamento (imagem ou Mermaid no README).
+
+**3. `requisicoes.http`** com o roteiro da demonstração em ordem: login, cadastro, grade, horários livres, agendamento, conflito, remarcação, falta, relatório.
+
+**4. Vídeo de até 3 minutos**, tela e voz:
+
+| Tempo | O que mostrar |
+|---|---|
+| 0:00–0:20 | O problema e o que a API resolve, com o README aberto |
+| 0:20–0:40 | `docker compose up` (acelerado) e o Swagger UI |
+| 0:40–1:30 | Login, horários livres da RN-30, agendar 08:15, ver 08:15 sumir, tentar 08:30 e receber `409` |
+| 1:30–2:00 | O teste de concorrência rodando e a constraint no `V4__agendamentos.sql` |
+| 2:00–2:30 | Remarcação, falta e relatório de ocupação |
+| 2:30–3:00 | O e-mail no Mailpit, o CI verde e os ADRs |
+
+**5. Badges** (CI, licença) e **release `v1.0.0`** com notas: funcionalidades, como rodar, limitações.
+
+**6. Post no LinkedIn**, curto, com o vídeo: o problema (duas recepcionistas, o mesmo segundo), por que um `if` no Java não resolve, a exclusion constraint e o teste com Testcontainers que prova, a stack e o link.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível (júnior) | Acima do nível |
+|---|---|---|---|
+| Horários livres | Consulta por candidato, ou sem testes | Motor puro, exemplos da especificação testados, `Clock` e `ZoneId` injetados | Testes de propriedade (nenhum livre sobrepõe nada) |
+| Conflito sob concorrência | Verificação só no Java | Exclusion constraint, `409`, teste concorrente repetido | Corrida do bloqueio também resolvida |
+| Desenho da API | Verbos no caminho, `200` para tudo, entidades expostas | Recursos coerentes, códigos corretos, DTOs, paginação padrão | `ETag`/`If-Match` nas edições, contrato testado |
+| Erros | Stack trace ou mensagem genérica | Problem Details com `codigo` em todos, inclusive `401`/`403` | Cada código da tabela com teste |
+| Banco | `ddl-auto=update`, sem constraints | Flyway, constraints e índices especificados | `EXPLAIN ANALYZE` documentado por consulta pesada |
+| Segurança | Senha em texto, token eterno, rota aberta | BCrypt, JWT de 60 min, papéis, BOLA tratado, segredo fora do repositório | Rate limit por IP, `gitleaks` no CI |
+| Dados pessoais | CPF em log e listagens | Máscara, nada pessoal em log, teste que prova | Retenção documentada, campos criptografados |
+| Testes | Só caminho feliz, H2 | A pirâmide e os cenários obrigatórios, Testcontainers | Testes de mutação (PIT) no domínio |
+| Tempo e fuso | `LocalDateTime.now()` espalhado | `Clock`, `timestamptz`, suíte em dois fusos | Borda do horário de verão documentada |
+| Código | Regra nos controllers, `setStatus` em todo lugar | Pacotes por funcionalidade, regras no domínio, serviços finos | Módulos verificados (ArchUnit ou Spring Modulith) |
+| Operação | Só roda na IDE | `docker compose up`, logs JSON, health checks, CI verde | Deploy automático por tag, imagem no GHCR |
+| Documentação | "Como rodar" incompleto | README do modelo, ADRs, diagramas, `.http`, vídeo | Changelog e PRs que contam a evolução |
+
+Com "no nível" em pelo menos 10 dos 12 critérios, o projeto está pronto para o currículo.
+
+## Como apresentar na entrevista
+
+**Pitch (60–90 segundos)**
+
+> "Construí a Agenda Fácil, uma API de agendamentos para clínicas, em Java 25, Spring Boot 4 e PostgreSQL. Ela calcula os horários livres de cada profissional a partir da grade semanal, dos bloqueios e das consultas marcadas, no fuso da clínica. A parte de que mais me orgulho é o conflito de horário: no começo eu verificava no Java se o horário estava livre, e escrevi um teste que dispara duas reservas ao mesmo tempo. As duas passavam. A solução foi uma exclusion constraint do PostgreSQL, que impede intervalos sobrepostos do mesmo profissional, com o erro traduzido para 409. Tem também JWT com três papéis, remarcação que preserva o histórico, lembretes por e-mail que não duplicam, relatório em SQL, Flyway, Testcontainers e CI. Sobe com `docker compose up`, e as decisões estão em ADRs."
+
+**Perguntas prováveis e pontos-chave**
+
+1. **"Por que não verificar no Java se o horário está livre?"** Entre o `SELECT` e o `INSERT` outra transação insere; em read committed as duas leem "livre". Só o banco vê as duas. Cite o teste que mostrou isso.
+2. **"Por que não `UNIQUE (profissional_id, inicio)`?"** Durações diferentes: 09:00–09:45 e 09:30–10:00 têm inícios diferentes e se sobrepõem. É preciso comparar intervalos (`&&` com GiST).
+3. **"Como o erro vira 409?"** Causa mais específica da `DataIntegrityViolationException`, SQLSTATE `23P01` e nome da constraint; `saveAndFlush` para o erro sair no serviço. `500` esconderia do cliente que basta consultar de novo.
+4. **"Como calcula os horários livres? Qual a complexidade?"** Três consultas e candidatos de 15 em 15 minutos filtrados por sobreposição: poucas centenas de comparações. Se crescesse, ordenar os ocupados e varrer deixa linear.
+5. **"Como lida com fuso?"** `timestamptz` para instantes, `LocalTime` para a grade, conversão num lugar só com `ZoneId`, `Clock` injetado, suíte em dois fusos, borda do horário de verão testada.
+6. **"Como revoga um token?"** Não revoga: validade de 60 min é a mitigação aceita. Para revogar, lista de bloqueio ou tokens de referência. Nada pessoal no payload.
+7. **"Um profissional vê a agenda do outro?"** Não: filtro forçado pelo token, `404` para ids de outros, matriz de testes. Nomeie: BOLA, o primeiro do OWASP API Top 10.
+8. **"E se a aplicação cair no meio dos lembretes?"** `PENDENTE` antes do envio, `UNIQUE`, retomada na próxima execução: no pior caso um duplicado, nunca um perdido ("pelo menos uma vez").
+9. **"E com duas instâncias?"** As duas rodariam o job; precisaria de lock distribuído (ShedLock) ou `FOR UPDATE SKIP LOCKED`. Fora do escopo, conscientemente.
+10. **"Como você testou? Por que não H2?"** A pirâmide; H2 não tem exclusion constraint. Cite um bug que um teste pegou.
+11. **"Por que remarcar cria outro registro?"** Histórico e relatório honestos, e a sutileza de desativar o original antes de inserir o novo por causa da constraint.
+12. **"O que faria a seguir?"** Autoagendamento com link de confirmação, lista de espera, multi-clínica, refresh token. Mostre que sabe onde o projeto para.
+
+**Trade-offs para mencionar sem esperar a pergunta:** a constraint amarra ao PostgreSQL (portabilidade entre bancos raramente é requisito real); a corrida do bloqueio está documentada; token sem revogação, mitigado pela validade curta; monólito porque há um time, um banco e um domínio.
+
+## Para ir além
+
+- **Paciente no sistema:** papel `PACIENTE`, autoagendamento e link de confirmação no lembrete (token de uso único com validade).
+- **`Idempotency-Key`** no `POST /agendamentos`, para o front-end repetir com segurança depois de um timeout.
+- **Bloqueio sem corrida:** lock no profissional ao criar bloqueio e agendamento, eliminando a limitação do ADR-1.
+- **Lista de espera** que oferece o horário cancelado ao primeiro da fila; **consultas recorrentes** com política para ocorrências em conflito.
+- **Multi-clínica** com `clinica_id` em tudo, isolamento testado e fuso por clínica.
+- **ShedLock** e métricas Micrometer (lembretes, falhas, tempo do cálculo) num Grafana local.
+- **Refresh token** com rotação; **front-end mínimo** com o calendário; **testes de contrato** do OpenAPI no CI.

@@ -1,0 +1,604 @@
+---
+titulo: Dublês de teste com Mockito
+descricao: "Como testar um serviço que fala com cinco dependências sem gateway real, sem banco e sem esperar sete dias: stubs, mocks e fakes na prática, passo a passo, com Mockito 5 e BDDMockito — e como ler as mensagens de erro quando o teste falha."
+modulo: 10-testes
+ordem: 3
+duracao: 100
+objetivos:
+  - Diferenciar dummy, stub, spy, mock e fake e escolher o adequado para cada dependência
+  - Escrever do zero um teste com MockitoExtension, @Mock e given/willReturn, e rodá-lo com o Maven
+  - Verificar interações com then().should(), never(), shouldHaveNoInteractions, ArgumentCaptor e InOrder
+  - Simular falhas com willThrow e controlar o tempo com Clock.fixed
+  - Ler as mensagens de falha do Mockito (Wanted but not invoked, Argument(s) are different, strict stubs) e corrigir a causa
+  - Reconhecer quando NÃO mockar e preferir fakes e objetos reais
+tags: [Mockito, mocks, dublês de teste, BDDMockito, fakes]
+flashcards:
+  - frente: Qual a diferença entre stub e mock?
+    verso: Stub devolve respostas programadas (controla as ENTRADAS do código testado). Mock registra as chamadas para o teste verificar depois (confere as SAÍDAS). No Mockito, o mesmo objeto criado com @Mock pode fazer os dois papéis.
+  - frente: Quando usar um fake em vez de um mock?
+    verso: Quando a dependência é sua e tem comportamento que vale reaproveitar (um repositório em memória, um estoque num Map). Com fake você verifica ESTADO; com mock, INTERAÇÃO.
+  - frente: O que é um ArgumentCaptor e quando ele é necessário?
+    verso: Um capturador do argumento passado a um mock. Serve para inspecionar um objeto que o código testado CRIA e passa adiante (ex. o Reembolso salvo), que o teste não tem como montar antes.
+  - frente: "O que significa UnnecessaryStubbingException?"
+    verso: Com strict stubs (padrão do MockitoExtension), um given/when que o código testado nunca usou quebra o teste. É sinal de teste desatualizado ou de stub copiado sem necessidade. Apague o stub em vez de afrouxar a regra.
+  - frente: "O que significa PotentialStubbingProblem?"
+    verso: O método tem um stub, mas o código chamou com OUTROS argumentos. Quase sempre o stub está com o valor errado (ex. BigDecimal 112.3 em vez de 112.30, que para equals são diferentes).
+  - frente: Por que @InjectMocks não serve para o ServicoDeReembolso?
+    verso: O @InjectMocks só injeta mocks e spies declarados. O Clock não é mock, então o Mockito passa null no construtor, sem avisar, e o teste quebra com NullPointerException. Construa o serviço à mão no @BeforeEach.
+  - frente: Qual o risco de verificar TODAS as interações num teste?
+    verso: O teste fica acoplado à implementação. Qualquer refatoração que mude chamadas internas quebra o teste sem que o comportamento tenha mudado. Verifique só efeitos que importam ao negócio.
+---
+
+Uma cliente comprou dois pacotes de café e um filtro, recebeu em casa e desistiu. O Código de Defesa do Consumidor garante a ela sete dias para se arrepender. O seu time precisa de um `ServicoDeReembolso` que, com um único método, faz tudo isto: busca o pedido no banco, confere o prazo, **estorna o valor no cartão** pelo gateway de pagamento, devolve os produtos ao estoque, registra o reembolso e avisa a cliente.
+
+São cinco dependências, e nenhuma delas é amigável num teste. O gateway de pagamento movimenta dinheiro de verdade. O banco precisa estar de pé e com os dados certos. A notificação manda um e-mail de verdade. E a regra do prazo depende do dia de hoje: para testar "no oitavo dia, recusa", você não vai esperar oito dias. Mesmo assim, é exatamente esse tipo de classe que mais precisa de testes: é onde mora a regra de negócio, e um bug aqui custa dinheiro (estornar duas vezes, estornar o valor errado, avisar o cliente de um reembolso que não foi salvo).
+
+Nesta aula você vai escrever, passo a passo, a suíte de testes desse serviço. Cada dependência será trocada por um **dublê de teste**: um objeto que ocupa o lugar da coisa real e que o teste controla. Você vai usar o **Mockito 5**, a biblioteca de dublês mais usada no Java (já vem no `spring-boot-starter-test` do Spring Boot 4.1), com o estilo **BDDMockito**, que lê como *Given, When, Then*. E vai ver também quando é melhor **não** usar Mockito.
+
+## A intuição: um ensaio de teatro
+
+Pense num ensaio de peça. A atriz principal (a classe que você quer testar) precisa ensaiar a cena do jantar, mas o ator que faz o garçom ainda não chegou, o restaurante do cenário não está montado e a cena seguinte só acontece "uma semana depois". O diretor resolve assim: um assistente lê as falas do garçom na hora certa, uma mesa qualquer faz as vezes do restaurante e alguém avisa "passou uma semana". A atriz ensaia a parte dela de verdade; todo o resto é **dublê**.
+
+Com os dublês, o diretor controla duas coisas:
+
+- **O que chega até a atriz** (as deixas): o assistente fala exatamente o texto combinado. No teste, isso é um **stub**: "quando o serviço perguntar pelo pedido PED-100, responda com este pedido".
+- **O que a atriz faz** (a atuação): o diretor anota se ela entregou o bilhete ao garçom, para quem e em que momento. No teste, isso é um **mock**: "confira se o serviço pediu ao gateway o estorno de R$ 112,30".
+
+E às vezes o cenário improvisado funciona de verdade: a mesa improvisada aguenta os pratos. Isso é um **fake**: uma implementação simples, porém funcional, como um repositório que guarda os dados num `Map` em vez de num banco.
+
+<Figura legenda="O teste controla o que entra na classe (stub), confere o que sai dela (mock) e pode usar implementações simplificadas que funcionam de verdade (fake)">
+<svg viewBox="0 0 420 400" width="420" role="img" aria-labelledby="dubles-titulo dubles-desc">
+  <title id="dubles-titulo">Teste, classe sob teste e três tipos de dublê</title>
+  <desc id="dubles-desc">O teste chama reembolsar no ServicoDeReembolso. Abaixo do serviço há três dublês. O stub, à esquerda, manda dados para o serviço: é a entrada controlada. O mock, no meio, recebe a chamada de estorno do serviço, que fica registrada para o teste verificar: é a saída verificada. O fake, à direita, conversa com o serviço nos dois sentidos, e o teste confere o estado dele no final.</desc>
+  <defs><marker id="mk-dubles" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="110" y="8" width="200" height="50" rx="10" class="d-box"/>
+  <text x="210" y="30" text-anchor="middle" class="d-title">Teste</text>
+  <text x="210" y="49" text-anchor="middle" class="d-label">Given · When · Then</text>
+  <path d="M210 58 L210 104" class="d-line" marker-end="url(#mk-dubles)"/>
+  <text x="218" y="86" class="d-label">reembolsar("PED-100")</text>
+  <rect x="70" y="106" width="280" height="52" rx="10" class="d-accent"/>
+  <text x="210" y="129" text-anchor="middle" class="d-title">ServicoDeReembolso</text>
+  <text x="210" y="148" text-anchor="middle" class="d-label">a classe sob teste (real)</text>
+  <path d="M72 226 L120 160" class="d-line" marker-end="url(#mk-dubles)"/>
+  <path d="M210 158 L210 224" class="d-line" marker-end="url(#mk-dubles)"/>
+  <path d="M300 160 L348 226" class="d-line" marker-start="url(#mk-dubles)" marker-end="url(#mk-dubles)"/>
+  <rect x="8" y="228" width="124" height="86" rx="10" class="d-info"/>
+  <text x="70" y="252" text-anchor="middle" class="d-title">Stub</text>
+  <text x="70" y="274" text-anchor="middle" class="d-label">buscar() devolve</text>
+  <text x="70" y="292" text-anchor="middle" class="d-label">o pedido pronto</text>
+  <rect x="148" y="228" width="124" height="86" rx="10" class="d-violet"/>
+  <text x="210" y="252" text-anchor="middle" class="d-title">Mock</text>
+  <text x="210" y="274" text-anchor="middle" class="d-label">estornar() fica</text>
+  <text x="210" y="292" text-anchor="middle" class="d-label">registrado</text>
+  <rect x="288" y="228" width="124" height="86" rx="10" class="d-ok"/>
+  <text x="350" y="252" text-anchor="middle" class="d-title">Fake</text>
+  <text x="350" y="274" text-anchor="middle" class="d-label">estoque num Map</text>
+  <text x="350" y="292" text-anchor="middle" class="d-label">que funciona</text>
+  <text x="70" y="338" text-anchor="middle" class="d-text">entrada</text>
+  <text x="70" y="356" text-anchor="middle" class="d-text">controlada</text>
+  <text x="210" y="338" text-anchor="middle" class="d-text">saída</text>
+  <text x="210" y="356" text-anchor="middle" class="d-text">verificada</text>
+  <text x="350" y="338" text-anchor="middle" class="d-text">estado</text>
+  <text x="350" y="356" text-anchor="middle" class="d-text">conferido</text>
+  <text x="210" y="390" text-anchor="middle" class="d-label">No Then, o teste confere o retorno, o mock e o fake</text>
+</svg>
+</Figura>
+
+O ponto central da figura: **a classe sob teste é sempre real**. Só as dependências dela são trocadas. Se você se pegar trocando pedaços da própria classe que está testando, algo saiu do lugar (voltamos a isso nas armadilhas).
+
+## Vocabulário: os cinco dublês
+
+Os nomes vêm do livro *xUnit Test Patterns*, de Gerard Meszaros, e são cobrados em entrevistas. No dia a dia muita gente chama tudo de "mock", mas saber a diferença ajuda a decidir **o que verificar**.
+
+| Dublê | O que faz | No serviço de reembolso |
+|---|---|---|
+| **Dummy** | Só preenche um parâmetro; nunca é usado | Um `Notificador` passado num teste em que o fluxo termina antes de notificar |
+| **Stub** | Devolve respostas programadas | "`pedidos.buscar("PED-100")` devolve este pedido" |
+| **Spy** | Envolve um objeto real e registra ou troca partes dele | Raro; quase sempre há opção melhor |
+| **Mock** | Registra as chamadas para o teste verificar | "O gateway recebeu `estornar("AUT-777", 112.30)`?" |
+| **Fake** | Implementação simplificada que funciona | `EstoqueEmMemoria`, com um `Map`; `Clock.fixed(...)` |
+
+Um detalhe que confunde no começo: no Mockito, o objeto criado com `@Mock` é ao mesmo tempo stub e mock. **O papel depende do que o teste faz com ele**: se você programa uma resposta (`given(...)`), ele está atuando como stub; se você confere uma chamada (`then(...).should()`), ele está atuando como mock. Muitas vezes o mesmo objeto faz os dois papéis no mesmo teste.
+
+Antes de escrever cada teste, faça duas perguntas:
+
+1. **Estou verificando estado ou interação?** Estado é "depois da operação, o que mudou?" (o retorno do método, o saldo do estoque, o que ficou salvo). Interação é "a classe chamou tal dependência, com tais argumentos?".
+2. **Essa interação é o comportamento?** Estornar R$ 112,30 no cartão é um efeito que o negócio exige: vale verificar. "O serviço chamou `buscar` antes de calcular o total" é detalhe de implementação: não vale.
+
+A regra prática: **prefira verificar estado e verifique interação quando ela é o próprio efeito esperado** (cobrar, estornar, notificar, publicar um evento). Para o gateway e o notificador, a interação *é* o resultado: não existe outro jeito de observar que o estorno foi pedido.
+
+## O código que vamos testar
+
+Tudo o que aparece nesta aula existe no projeto Maven da trilha, em `java/m10-testes/aulas`, e roda no CI. Primeiro, os tipos de apoio: três `record`s (`Item`, `Pedido` com `total()`, `Reembolso`), cinco interfaces (uma por dependência) e três exceções. O `Pedido` fica assim:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/reembolso/Pedido.java" />
+
+E o gateway, a dependência mais perigosa, é só uma interface:
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/reembolso/GatewayDePagamento.java" />
+
+Agora o serviço inteiro. Leia o Javadoc com atenção: as sete regras dele são exatamente o que a suíte precisa proteger.
+
+<CodigoJava caminho="m10-testes/aulas/src/main/java/dev/trilhajava/m10/aulas/reembolso/ServicoDeReembolso.java" destacar="43-59" />
+
+Três decisões de design tornam essa classe testável, e vale reparar nelas antes de escrever qualquer teste:
+
+- **Todas as dependências chegam pelo construtor** (injeção de dependência, módulo 08). O teste pode entregar o que quiser no lugar de cada uma, sem Spring e sem reflexão.
+- **As dependências são interfaces que o próprio projeto define** (`GatewayDePagamento`, não a biblioteca do fornecedor do cartão). A classe não sabe se do outro lado há uma API HTTP ou um dublê.
+- **O tempo também é uma dependência**: o serviço nunca chama `LocalDate.now()` sem argumento; ele usa `LocalDate.now(clock)` e `Instant.now(clock)`. Em produção, o Spring entrega `Clock.systemDefaultZone()`; no teste, um relógio parado. É assim que se testa "oito dias depois" em um milissegundo.
+
+A ordem das linhas no método também é uma regra: o estorno acontece **antes** de mexer no estoque, e a notificação **depois** de salvar. Se o gateway lançar exceção na linha 49, as linhas seguintes nem executam. Os testes vão garantir que ninguém "otimize" essa ordem sem perceber o que quebra.
+
+## Mão na massa
+
+Os testes ficam em `java/m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/`. Para rodar qualquer um deles, entre na pasta do módulo e use o Maven com `-Dtest`, que filtra pela classe:
+
+```bash
+cd java/m10-testes/aulas
+mvn test -Dtest=ReembolsoPrimeiroTesteTest   # uma classe
+mvn test                                      # o módulo inteiro
+```
+
+### Passo 1: os dados de teste
+
+**O que vamos fazer e por quê.** Todos os testes precisam de um pedido e de um "agora". Em vez de repetir isso em cada classe, criamos uma classe de dados compartilhada. Os valores são escolhidos para que as contas sejam fáceis de conferir de cabeça: 2 × 49,90 + 1 × 12,50 = **112,30**.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/DadosDeTeste.java" />
+
+**O que acabou de acontecer.** `Clock.fixed(AGORA, SAO_PAULO)` cria um relógio que sempre responde o mesmo instante, 10/09/2026 ao meio-dia no horário de Brasília. Repare que ele **não é um mock**: é a implementação real de `java.time.Clock` que o próprio JDK oferece para isso. É um fake pronto, e o melhor tipo de dublê é o que você não precisa escrever. O fuso também importa: `LocalDate.now(clock)` usa a zona do relógio para decidir que dia é hoje, e às 22h de Brasília já é o dia seguinte em UTC.
+
+### Passo 2: o primeiro teste, o caminho feliz
+
+**O que vamos fazer e por quê.** Começamos pelo cenário mais simples: o pedido existe, está no prazo, o gateway aceita o estorno. Vamos conferir apenas o **retorno** do método (verificação de estado), usando stubs para dar ao serviço as respostas de que ele precisa.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoPrimeiroTesteTest.java" destacar="18, 21-25, 32, 39-40" />
+
+Rode:
+
+```bash
+mvn test -Dtest=ReembolsoPrimeiroTesteTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.reembolso.ReembolsoPrimeiroTesteTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.104 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer, linha a linha.**
+
+- `@ExtendWith(MockitoExtension.class)` liga o Mockito ao JUnit 6. Antes de cada teste, a extensão cria os objetos marcados com `@Mock`; depois de cada teste, confere se algum stub ficou sem uso (os *strict stubs*, que aparecem em "Quando o teste falha").
+- `@Mock GatewayDePagamento gateway` cria uma implementação falsa da interface. Um mock recém-criado não faz nada: métodos `void` não fazem nada, e os que devolvem algo devolvem um **valor padrão** (`null` para objetos, `0` para números, `false`, coleção vazia, `Optional.empty()`). É por isso que o mock nunca estorna dinheiro de verdade.
+- No `@BeforeEach`, o serviço é criado **à mão**, passando os cinco mocks e o relógio. Por que não usar `@InjectMocks`, que injetaria os mocks sozinho? Veja o quadro logo abaixo.
+- `given(pedidos.buscar("PED-100")).willReturn(Optional.of(...))` programa um stub: **quando** `buscar` for chamado com `"PED-100"`, devolva este pedido. Os argumentos são comparados com `equals`. Se o serviço chamasse `buscar("PED-200")`, o stub não se aplicaria.
+- `given(gateway.estornar("AUT-777", new BigDecimal("112.30"))).willReturn("EST-1")` faz o mesmo para o gateway. Esse stub já é, de quebra, uma verificação indireta: se o serviço pedisse o estorno de outro valor, o gateway devolveria `"EST-1"`? Não, e o teste perceberia (em "Quando o teste falha" você vê a mensagem exata).
+- O *Then* só usa AssertJ sobre o `Reembolso` devolvido. `isEqualByComparingTo("112.30")` compara `BigDecimal` pelo valor, ignorando a escala (112.3 e 112.30 são iguais para essa asserção, mas diferentes para `equals`). E `realizadoEm` é exatamente `AGORA`: prova de que o serviço usou o relógio injetado, não o relógio do sistema.
+
+<Callout tipo="atencao" titulo="Por que não @InjectMocks aqui">
+O `@InjectMocks` cria a classe sob teste chamando o maior construtor e preenchendo cada parâmetro com um mock ou spy **declarado no teste**. O `Clock` não é um mock, então o Mockito passa `null` no lugar dele, **sem avisar nada**. O erro só aparece quando o serviço usa o relógio. Foi o que aconteceu ao trocar o `@BeforeEach` por `@InjectMocks ServicoDeReembolso servico`:
+
+```text
+[ERROR] ...TemporarioQuebradoTest.injecao -- Time elapsed: 0.994 s <<< ERROR!
+java.lang.NullPointerException: clock
+```
+
+Regra prática: `@InjectMocks` serve quando **todos** os parâmetros do construtor são mocks. Quando algum é um objeto real (um `Clock`, um fake, uma configuração), construa a classe à mão. Isso ainda tem uma vantagem: se alguém acrescentar uma sexta dependência ao construtor, o teste para de compilar, em vez de receber `null` em silêncio.
+</Callout>
+
+<Callout tipo="info" titulo="Onde estão given e then?">
+São métodos estáticos de `org.mockito.BDDMockito`, importados com `import static` no topo do arquivo. O estilo clássico do Mockito faz o mesmo com outros nomes: `when(...).thenReturn(...)` e `verify(...)`. A tabela do passo 3 mostra a equivalência. Escolha um estilo por projeto e mantenha; nesta trilha usamos BDDMockito porque ele segue a estrutura *Given, When, Then* dos testes.
+</Callout>
+
+### Passo 3: verificando interações
+
+**O que vamos fazer e por quê.** O teste do passo 2 prova que o método devolve o reembolso certo, mas não prova que o estoque recebeu os produtos de volta, nem que a cliente foi avisada. `devolver` e `reembolsoConcluido` são `void`: não há retorno para conferir. O efeito deles está **fora** da classe, e a única forma de observá-lo com mocks é perguntar ao mock se ele foi chamado. Aqui a interação **é** o comportamento.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoInteracoesTest.java" semImports destacar="26, 36-38, 48, 59-62" />
+
+```bash
+mvn test -Dtest=ReembolsoInteracoesTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.reembolso.ReembolsoInteracoesTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `then(gateway).should().estornar("AUT-777", new BigDecimal("112.30"))` pergunta ao mock: "você recebeu exatamente uma chamada `estornar` com esses argumentos?". Se não recebeu, o teste falha. `should()` sem argumento significa "exatamente uma vez"; `should(times(2))` e `should(atLeastOnce())` existem para outros casos.
+- Repare que o teste `estornaOTotal` **não** programou um stub para o gateway. O mock devolveu `null` como código de estorno, e tudo bem: esse teste não se importa com o código, só com a chamada. Cada teste programa apenas o que precisa.
+- `then(estoque).shouldHaveNoMoreInteractions()` diz: "além das duas chamadas que acabei de verificar, não houve nenhuma outra". Protege contra devolver um item duas vezes. Use com moderação: ela torna o teste mais rígido (veja as armadilhas).
+- No teste do pedido inexistente, `given(...).willReturn(Optional.empty())` deixa explícito o cenário. O mock já devolveria `Optional.empty()` por padrão, mas o teste fica mais legível dizendo isso com todas as letras.
+- `assertThatThrownBy(() -> servico.reembolsar("PED-999")).isInstanceOf(...)` (AssertJ) executa a lambda e confere que ela lançou a exceção esperada.
+- `should(never()).estornar(any(), any())` e `shouldHaveNoInteractions()` verificam **ausência** de efeitos. `never()` fala de um método específico; `shouldHaveNoInteractions()` diz que o mock inteiro não foi tocado. `any()` é um *argument matcher*: aceita qualquer valor, inclusive `null`.
+
+<Callout tipo="erro" titulo="Matchers: ou todos, ou nenhum">
+Numa mesma chamada, se um argumento usa matcher, **todos** precisam usar. `estornar(any(), new BigDecimal("112.30"))` lança `InvalidUseOfMatchersException`. Escreva `estornar(any(), eq(new BigDecimal("112.30")))`: `eq(...)` transforma um valor comum em matcher.
+</Callout>
+
+As duas APIs lado a lado, para você reconhecer código escrito no estilo clássico:
+
+| BDDMockito (nesta trilha) | Mockito clássico |
+|---|---|
+| `given(m.metodo(x)).willReturn(y)` | `when(m.metodo(x)).thenReturn(y)` |
+| `willThrow(e).given(m).metodo(x)` | `doThrow(e).when(m).metodo(x)` |
+| `then(m).should().metodo(x)` | `verify(m).metodo(x)` |
+| `then(m).should(never()).metodo(x)` | `verify(m, never()).metodo(x)` |
+| `then(m).shouldHaveNoInteractions()` | `verifyNoInteractions(m)` |
+| `then(m).should(ordem).metodo(x)` | `ordem.verify(m).metodo(x)` |
+
+### Passo 4: simulando falhas e controlando o tempo
+
+**O que vamos fazer e por quê.** As regras mais valiosas do serviço são as de falha: gateway fora do ar e pedido fora do prazo. Com dependências reais, provocar essas situações é difícil (derrubar o gateway?) ou lento (esperar dias). Com dublês, é uma linha.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoFalhasTest.java" semImports destacar="23-24, 26-28, 30-32, 39, 41-43" />
+
+```bash
+mvn test -Dtest=ReembolsoFalhasTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.reembolso.ReembolsoFalhasTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `willThrow(new GatewayIndisponivelException(...)).given(gateway).estornar(any(), any())` programa o mock para **lançar** a exceção quando for chamado. A ordem das palavras é invertida em relação ao `given(...).willReturn(...)`, e existe um motivo: essa forma funciona também para métodos `void` (onde `given(estoque.devolver(...))` nem compila, porque não há valor para passar ao `given`). Para métodos com retorno, `given(gateway.estornar(any(), any())).willThrow(...)` também funciona; muita gente prefere usar a forma `willThrow(...).given(...)` sempre, por consistência.
+- `.hasMessageContaining("timeout")` confere que é **aquela** exceção que subiu, e não outra do mesmo tipo lançada por outro motivo.
+- As três linhas `shouldHaveNoInteractions()` são a regra 4 do Javadoc: se o gateway falhou, nada volta ao estoque, nada é salvo, ninguém é avisado. Sem essas linhas, um serviço que devolvesse os produtos ao estoque **antes** de estornar passaria no teste, e a loja ficaria com estoque "fantasma" a cada falha do gateway.
+- No teste de prazo, não há mágica de tempo: o `RELOGIO` marca 10/09/2026 e o pedido foi entregue em 11/08/2026, trinta dias antes. O último dia do prazo seria 18/08, e a mensagem da exceção diz isso, por isso a asserção `hasMessageContaining("2026-08-18")`.
+- Aqui o gateway aparece com `shouldHaveNoInteractions()`, o que é mais forte que `should(never()).estornar(...)`: garante que o serviço nem sequer consultou o gateway.
+
+### Passo 5: capturando argumentos e verificando a ordem
+
+**O que vamos fazer e por quê.** Dois comportamentos ainda estão descobertos. Primeiro: o `Reembolso` que vai para o banco tem os campos certos? Ele é criado **dentro** do serviço, então o teste não tem como montá-lo antes para comparar; precisa "pegá-lo no ar". Segundo: a cliente só é avisada **depois** que o reembolso foi salvo? Se a notificação saísse antes e o `salvar` falhasse, a cliente receberia um e-mail sobre um reembolso que não existe no sistema.
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoCaptorEOrdemTest.java" semImports destacar="12, 19, 29-30, 42-45" />
+
+```bash
+mvn test -Dtest=ReembolsoCaptorEOrdemTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.reembolso.ReembolsoCaptorEOrdemTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `@Captor ArgumentCaptor<Reembolso> reembolsoSalvo` cria um capturador tipado (a extensão cuida disso, como faz com `@Mock`). A alternativa sem anotação é `ArgumentCaptor.forClass(Reembolso.class)`.
+- `then(reembolsos).should().salvar(reembolsoSalvo.capture())` faz duas coisas: verifica que `salvar` foi chamado uma vez e guarda o argumento recebido. `getValue()` devolve esse argumento, e a partir daí são asserções comuns de AssertJ sobre um objeto real.
+- O stub do pedido foi para o `@BeforeEach`, porque os dois testes precisam dele. Isso só é seguro porque **todos** os testes da classe usam esse stub; se um deles não usasse, os strict stubs acusariam (veja "Quando o teste falha").
+- `InOrder ordem = inOrder(gateway, reembolsos, notificador)` cria um verificador de sequência para esses três mocks. Cada `then(x).should(ordem)` precisa encontrar a chamada **depois** da anterior. Chamadas intermediárias (as devoluções ao estoque) não atrapalham: `InOrder` confere a ordem relativa do que você listou, não exige que nada mais aconteça no meio.
+- `reembolsoConcluido(eq("cliente-42"), eq("PED-100"), any())` mistura valores exatos e `any()`, por isso todos os argumentos viraram matchers (lembra do quadro do passo 3?).
+
+<Callout tipo="dica" titulo="Captor ou verificação direta?">
+Se você consegue construir o objeto esperado inteiro, a verificação direta costuma ser mais simples: `then(reembolsos).should().salvar(new Reembolso("PED-100", new BigDecimal("112.30"), "EST-1", AGORA))` funciona, porque `record` tem `equals`. O captor brilha quando um campo é imprevisível (um UUID gerado, por exemplo) ou quando você quer conferir só alguns campos com mensagens de erro mais claras.
+</Callout>
+
+### Passo 6: a mesma coisa com fakes
+
+**O que vamos fazer e por quê.** Até aqui, todas as dependências foram mocks. Funciona, mas repare quantos testes precisaram dizer "o estoque recebeu `devolver` com tais argumentos". Esses testes conhecem o **como**: se amanhã o `Estoque` ganhar um método `devolverTodos(List<Item>)` e o serviço passar a usá-lo, o comportamento continua idêntico, mas os testes quebram. Agora vamos escrever implementações simples, em memória, das dependências que são **nossas**, e verificar o **estado** final.
+
+Os fakes são classes pequenas de teste, que implementam as mesmas interfaces:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/EstoqueEmMemoria.java" semImports />
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/RepositorioDeReembolsosEmMemoria.java" semImports />
+
+O `RepositorioDePedidosEmMemoria` segue o mesmo padrão, com um `Map` de número para pedido. E o teste:
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoComFakesTest.java" semImports destacar="10-12, 14-15, 31-34, 45-47" />
+
+```bash
+mvn test -Dtest=ReembolsoComFakesTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m10.aulas.reembolso.ReembolsoComFakesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- Os fakes são criados como objetos comuns, com `new`, e já com os dados do cenário: o estoque começa com 10 cafés e 5 filtros.
+- O teste não pergunta "você chamou `devolver`?". Pergunta "quantos cafés há no estoque agora?". A resposta é 12: os 10 que havia mais os 2 devolvidos. Se o serviço mudar a forma de devolver, o teste continua valendo, porque o que ele verifica é o que o negócio quer.
+- `containsExactly(new Reembolso(...))` compara o reembolso salvo com um esperado construído inteiro. Não precisou de captor.
+- No cenário de falha, "nada mudou" vira asserções sobre o estado: saldos iguais aos iniciais e lista de reembolsos vazia. Compare com o passo 4, que dizia a mesma coisa com `shouldHaveNoInteractions()`.
+- O gateway e o notificador **continuam mocks**, e de propósito. Eles representam o mundo externo: o efeito deles não é um estado dentro da aplicação, é uma chamada para fora. Um fake de gateway teria que registrar os estornos numa lista, e o teste conferiria essa lista: seria um mock escrito à mão.
+
+Essa divisão é o equilíbrio que você vai encontrar em bases de código maduras: **fakes (ou objetos reais) para o que é seu, mocks para as fronteiras com o mundo externo**. O custo dos fakes é escrevê-los e mantê-los; o ganho é que eles são reaproveitados em dezenas de testes e não quebram a cada refatoração.
+
+### Passo 7: rodando a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoCaptorEOrdemTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoComFakesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoFalhasTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoInteracoesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoPrazoLimiteTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...ReembolsoPrimeiroTesteTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Treze testes, cinco dependências trocadas por dublês, nenhuma rede, nenhum banco, e o módulo inteiro roda em cerca de um segundo depois de compilado. (A classe `ReembolsoPrazoLimiteTest` é a solução do checkpoint mais abaixo; não a abra ainda.)
+
+<Callout tipo="info" titulo="O aviso sobre agentes">
+Nas JVMs recentes, o Mockito se anexa à JVM como um *agente* para conseguir criar dublês de classes finais, e a JVM avisa que um agente foi carregado dinamicamente. O `pom.xml` pai desta trilha configura o Surefire para isso. Em projetos novos, siga a documentação do Mockito para registrá-lo como `-javaagent` na configuração do Surefire.
+</Callout>
+
+## Quando o teste falha: lendo as mensagens do Mockito
+
+As mensagens abaixo são reais: foram geradas quebrando o serviço (ou o teste) de propósito e rodando a suíte. Aprender a lê-las economiza muito tempo, porque o Mockito diz exatamente o que esperava e o que aconteceu.
+
+### Wanted but not invoked
+
+Para gerar esta, a linha que notifica a cliente foi comentada no serviço:
+
+```text
+[ERROR] ReembolsoInteracoesTest.avisaOCliente -- Time elapsed: 0.994 s <<< FAILURE!
+org.mockito.exceptions.verification.WantedButNotInvoked:
+
+Wanted but not invoked:
+notificador.reembolsoConcluido(
+    "cliente-42",
+    "PED-100",
+    112.30
+);
+-> at ...ReembolsoInteracoesTest.avisaOCliente(ReembolsoInteracoesTest.java:65)
+Actually, there were zero interactions with this mock.
+```
+
+**Como ler:** "Wanted" é o que o teste pediu na linha 65; "Actually" é o que o mock viu. *Zero interactions* significa que o serviço nunca falou com o notificador. **Como corrigir:** procure no código de produção o caminho que deveria chegar até a chamada. Pode ser uma linha esquecida, um `return` antecipado ou uma exceção engolida antes da notificação. Se a mensagem disser que houve outras interações, ela lista quais foram, o que ajuda a ver se o método certo foi chamado com outro nome.
+
+### Argument(s) are different!
+
+Aqui o serviço foi alterado para devolver sempre 1 unidade ao estoque, em vez da quantidade comprada:
+
+```text
+[ERROR] ReembolsoInteracoesTest.devolveOsItens -- Time elapsed: 0.011 s <<< FAILURE!
+org.mockito.exceptions.verification.opentest4j.ArgumentsAreDifferent:
+
+Argument(s) are different! Wanted:
+estoque.devolver("CAFE-1KG", 2);
+-> at ...ReembolsoInteracoesTest.devolveOsItens(ReembolsoInteracoesTest.java:53)
+Actual invocations have different arguments at position [1]:
+estoque.devolver("CAFE-1KG", 1);
+-> at ...ServicoDeReembolso.reembolsar(ServicoDeReembolso.java:52)
+estoque.devolver("FILTRO-102", 1);
+-> at ...ServicoDeReembolso.reembolsar(ServicoDeReembolso.java:52)
+```
+
+**Como ler:** o método foi chamado, mas com argumentos diferentes. *Position [1]* aponta o segundo argumento (a contagem começa em zero): a quantidade. A mensagem lista todas as chamadas reais e a linha de produção de onde cada uma saiu (`ServicoDeReembolso.java:52`). Nas IDEs, esse erro abre uma tela de comparação lado a lado. **Como corrigir:** vá à linha indicada e compare com o que a regra pede. Repare que esse bug só foi pego porque o pedido de teste tem um item com quantidade **2**; com quantidade 1 em todos os itens, o mutante passaria. Escolher dados que revelam bugs é metade do trabalho.
+
+### Verification in order failure
+
+Invertendo `salvar` e `reembolsoConcluido` no serviço:
+
+```text
+org.mockito.exceptions.verification.VerificationInOrderFailure:
+
+Verification in order failure
+Wanted but not invoked:
+notificador.reembolsoConcluido(
+    "cliente-42",
+    "PED-100",
+    <any>
+);
+-> at ...ReembolsoCaptorEOrdemTest.ordemDosEfeitos(ReembolsoCaptorEOrdemTest.java:66)
+Wanted anywhere AFTER following interaction:
+reembolsos.salvar(
+    Reembolso[numeroPedido=PED-100, valor=112.30, codigoEstorno=null, realizadoEm=2026-09-10T15:00:00Z]
+);
+```
+
+**Como ler:** a notificação aconteceu, mas não **depois** do `salvar`. Repare em `codigoEstorno=null`: nesse teste o gateway não tinha stub, então devolveu o valor padrão. É um lembrete de como mocks se comportam quando ninguém os programa.
+
+### UnnecessaryStubbingException (strict stubs)
+
+Um teste temporário (já removido do projeto) programou um stub para o gateway num cenário em que o pedido não existe:
+
+```java
+given(pedidos.buscar("PED-999")).willReturn(Optional.empty());
+given(gateway.estornar(any(), any())).willReturn("EST-1");   // nunca será usado
+```
+
+```text
+org.mockito.exceptions.misusing.UnnecessaryStubbingException:
+
+Unnecessary stubbings detected.
+Clean & maintainable test code requires zero unnecessary code.
+Following stubbings are unnecessary (click to navigate to relevant line of code):
+  1. -> at ...TemporarioQuebradoTest$Stubs.desnecessario(TemporarioQuebradoTest.java:36)
+Please remove unnecessary stubbings or use 'lenient' strictness. More info: javadoc for UnnecessaryStubbingException class.
+```
+
+**Como ler:** o `MockitoExtension` trabalha, por padrão, com *strict stubs*: todo `given` precisa ser usado pelo código testado. Um stub sobrando engana quem lê o teste ("o gateway participa desse cenário?") e quase sempre indica um teste copiado e colado ou desatualizado depois de uma mudança no código. **Como corrigir:** apague o stub da linha indicada. A mensagem oferece `lenient()` como saída, mas afrouxar a regra só se justifica em casos raros, como um stub compartilhado no `@BeforeEach` que alguns testes usam e outros não, e mesmo nesse caso costuma ser melhor mover o stub para dentro dos testes que precisam dele.
+
+### PotentialStubbingProblem (strict stubs)
+
+A mais traiçoeira. O stub foi escrito com `new BigDecimal("112.3")`, sem o zero final:
+
+```java
+given(gateway.estornar("AUT-777", new BigDecimal("112.3"))).willReturn("EST-1");
+```
+
+```text
+org.mockito.exceptions.misusing.PotentialStubbingProblem:
+
+Strict stubbing argument mismatch. Please check:
+ - this invocation of 'estornar' method:
+    gateway.estornar("AUT-777", 112.30);
+    -> at ...ServicoDeReembolso.reembolsar(ServicoDeReembolso.java:49)
+ - has following stubbing(s) with different arguments:
+    1. gateway.estornar("AUT-777", 112.3); stubbed with: [Returns: EST-1]
+      -> at ...TemporarioQuebradoTest$Stubs.potencial(TemporarioQuebradoTest.java:47)
+Typically, stubbing argument mismatch indicates user mistake when writing tests.
+Mockito fails early so that you can debug potential problem easily.
+...
+```
+
+**Como ler:** o método tem um stub, mas o código chamou com argumentos diferentes. Sem strict stubs, o mock devolveria `null` em silêncio e o teste falharia mais adiante com uma mensagem confusa (ou, pior, passaria). Aqui a diferença é sutil: para `BigDecimal.equals`, `112.3` e `112.30` são **diferentes**, porque a escala faz parte da comparação. **Como corrigir:** acerte o valor do stub (`new BigDecimal("112.30")`). Se o que importa é o valor numérico e não a escala, use um matcher: `argThat(v -> v.compareTo(new BigDecimal("112.3")) == 0)`.
+
+## Armadilhas e quando NÃO mockar
+
+Mockito é uma ferramenta poderosa, e por isso é fácil exagerar. Os problemas abaixo aparecem em code review toda semana.
+
+<Comparar antes="Mock de tudo, verificando cada passo" depois="Objetos reais e fakes; verifique só os efeitos">
+```java
+@Mock Pedido pedido;                       // mock de um record
+@Mock RepositorioDePedidos pedidos;
+@Mock Estoque estoque;
+// ...
+given(pedido.total()).willReturn(new BigDecimal("112.30"));
+given(pedido.itens()).willReturn(List.of());
+given(pedidos.buscar("PED-100")).willReturn(Optional.of(pedido));
+
+servico.reembolsar("PED-100");
+
+then(pedidos).should().buscar("PED-100");  // detalhe interno
+then(pedido).should().total();             // detalhe interno
+then(gateway).should().estornar(any(), any());
+```
+
+```java
+// Pedido de verdade, repositório e estoque em memória
+var pedidos = new RepositorioDePedidosEmMemoria()
+        .com(pedidoDentroDoPrazo());
+var estoque = new EstoqueEmMemoria()
+        .comSaldo("CAFE-1KG", 10);
+// ...
+servico.reembolsar("PED-100");
+
+// Só o que o negócio exige
+then(gateway).should()
+        .estornar("AUT-777", new BigDecimal("112.30"));
+assertThat(estoque.saldo("CAFE-1KG")).isEqualTo(12);
+```
+</Comparar>
+
+O teste da esquerda tem três problemas. **Mocka um tipo de valor**: `Pedido` é um `record` com uma regra (`total()`); mockado, a regra real nunca roda, e um bug no cálculo do total passaria despercebido. **Verifica detalhes internos**: "chamou `buscar`" e "chamou `total()`" não são efeitos; se amanhã o serviço calcular o total de outro jeito, o teste quebra sem que nada tenha mudado para a cliente. **Programa respostas inconsistentes**: um pedido com total 112,30 e nenhum item não existe no mundo real, e o teste está exercitando uma situação impossível.
+
+As regras de bolso:
+
+- **Não mocke tipos de valor.** `String`, `BigDecimal`, `LocalDate`, `List`, `record`s do domínio: crie os objetos reais. Eles são baratos, determinísticos e contêm regras que você quer exercitar.
+- **Não mocke o que você não controla sem um adaptador.** Mockar `RestClient`, `JdbcTemplate` ou o SDK do fornecedor do cartão testa o que você **acha** que a biblioteca faz. Esconda a biblioteca atrás de uma interface sua (como `GatewayDePagamento`), mocke essa interface nos testes do serviço e teste o adaptador contra a coisa real ou um servidor falso (Testcontainers e afins, aula 5).
+- **Não mocke a classe sob teste.** Um `@Spy` parcial para trocar um método da própria classe quase sempre indica uma classe fazendo coisas demais. Extraia a parte difícil para uma dependência.
+- **Verifique efeitos, não passos.** Estornar, salvar, notificar, devolver ao estoque: sim. Consultar, calcular, converter: não. Use `shouldHaveNoMoreInteractions()` só onde uma chamada extra seria um bug de verdade (como devolver um item duas vezes).
+- **Muitos mocks são um sinal de design.** Se o teste precisa de oito mocks e vinte stubs, o problema provavelmente não é o teste: a classe acumula responsabilidades demais.
+- **Tempo, aleatoriedade e identificadores são dependências.** `Clock`, um gerador de números, um gerador de UUID: injete-os. `Clock.fixed(...)` resolve o tempo sem Mockito nenhum.
+
+<Callout tipo="erro" titulo="Teste que passa sem testar">
+Um teste em que tudo é mock e as asserções só conferem que os mocks devolveram o que foram programados para devolver não testa nada. Se `given(x.a()).willReturn(5)` seguido de `assertThat(x.a()).isEqualTo(5)` aparecer num code review, é isso que está acontecendo. Pergunte sempre: **se eu introduzir um bug na classe sob teste, este teste quebra?** O exercício a seguir é exatamente esse jogo.
+</Callout>
+
+## Checkpoint: a borda do prazo
+
+Agora é a sua vez. O teste de prazo do passo 4 usou uma entrega de trinta dias atrás: longe demais da borda para pegar um erro de "mais ou menos um". Imagine que alguém troque `hoje.isAfter(ultimoDia)` por `!hoje.isBefore(ultimoDia)`: o sétimo dia deixaria de ser aceito, a cliente perderia um direito garantido por lei, e nenhum teste atual perceberia.
+
+**O desafio:** crie a classe `MeuTesteDePrazoTest` no mesmo pacote de testes, com dois testes:
+
+1. Pedido entregue em 01/09/2026; no dia **08/09** (sétimo dia depois da entrega), o reembolso é feito e o gateway recebe o estorno de 112,30.
+2. No dia **09/09** (oitavo dia), o serviço lança `ForaDoPrazoException` e o gateway **não** é chamado.
+
+Para dar mais valor à borda, faça o relógio marcar o **último minuto** de cada dia no horário de Brasília. Rode com `mvn test -Dtest=MeuTesteDePrazoTest` e depois, para ter certeza de que os testes pegam o bug, troque temporariamente a condição no serviço e veja o primeiro teste falhar (desfaça a troca em seguida).
+
+<Dicas>
+<Dica nivel={1}>
+O `RELOGIO` de `DadosDeTeste` é fixo em 10/09. Você precisa de um relógio diferente em cada teste, então o serviço também precisa ser criado dentro de cada teste (ou por um método auxiliar que recebe o dia), e não no `@BeforeEach`.
+</Dica>
+<Dica nivel={2}>
+`DadosDeTeste.pedidoEntregueEm(LocalDate.of(2026, 9, 1))` monta o pedido com a data de entrega que você quiser. Para o relógio: `LocalDate` → `atTime(23, 59)` → `atZone(SAO_PAULO)` → `toInstant()`, e então `Clock.fixed(instante, SAO_PAULO)`.
+</Dica>
+<Dica nivel={3}>
+Um método auxiliar deixa os testes curtos:
+
+```java
+ServicoDeReembolso servicoNoDia(LocalDate dia) {
+    Clock relogio = Clock.fixed(dia.atTime(23, 59).atZone(SAO_PAULO).toInstant(), SAO_PAULO);
+    return new ServicoDeReembolso(pedidos, gateway, estoque, reembolsos, notificador, relogio);
+}
+```
+
+No primeiro teste, verifique com `then(gateway).should().estornar(...)`; no segundo, `assertThatThrownBy(...)` e `should(never())`.
+</Dica>
+</Dicas>
+
+<Solucao titulo="Solução do checkpoint">
+
+<CodigoJava caminho="m10-testes/aulas/src/test/java/dev/trilhajava/m10/aulas/reembolso/ReembolsoPrazoLimiteTest.java" semImports />
+
+**Por que assim.** Os dois testes ficam um de cada lado da borda: o último dia aceito e o primeiro recusado. Esse par é o que pega erros de `<` trocado por `<=` (em inglês, *off-by-one*). O horário 23h59 acrescenta outra proteção: se alguém trocar `LocalDate.now(clock)` por um cálculo em UTC, às 23h59 de Brasília já são 2h59 do dia seguinte em UTC, e o teste do sétimo dia falha.
+
+**Por que não há stub para o gateway no primeiro teste.** O teste verifica a chamada (`should().estornar`), não usa o código devolvido. O mock devolve `null`, o serviço salva um reembolso com código `null`, e isso não importa para esta regra. Um stub aqui seria desnecessário, e os strict stubs reclamariam se ele não fosse usado.
+
+**Alternativa.** Um `@ParameterizedTest` com `@CsvSource({"7, true", "8, false"})` cobriria os dois casos num único método. Com apenas dois casos e asserções diferentes em cada um, dois testes separados costumam ler melhor.
+
+</Solucao>
+
+<Callout tipo="entrevista">
+"Qual a diferença entre mock e stub?", "quando você **não** usaria um mock?" e "como você testa código que depende da data atual?" aparecem em quase toda entrevista para vaga de backend Java. Uma resposta com substância: stub controla as entradas da classe, mock verifica as saídas; eu verifico interações só quando elas são o comportamento (estorno, notificação), e verifico estado sempre que posso. Não mocko tipos de valor nem bibliotecas de terceiros: escondo a biblioteca atrás de uma interface minha e testo o adaptador com integração real. Para tempo, injeto um `java.time.Clock` e uso `Clock.fixed` no teste. E se um teste precisa de muitos mocks, trato isso como um sinal de design, não como um problema do teste. Bônus: citar os strict stubs do Mockito e o motivo de não desligá-los mostra experiência prática.
+</Callout>
+
+<Quiz
+  id="10-mockito"
+  questoes={[
+    {
+      pergunta: 'O serviço de reembolso deve avisar a cliente só DEPOIS de salvar o reembolso. Como verificar isso?',
+      opcoes: ['Com then(notificador).should() apenas', 'Com InOrder: then(reembolsos).should(ordem).salvar(...) e depois then(notificador).should(ordem)...', 'Com um ArgumentCaptor no notificador', 'Não é possível testar ordem de chamadas'],
+      correta: 1,
+      explicacao: '`InOrder` confere a sequência relativa das chamadas entre os mocks listados. Um `should()` comum só diz que a chamada aconteceu, não quando.',
+    },
+    {
+      pergunta: 'Um teste falha com PotentialStubbingProblem apontando `gateway.estornar("AUT-777", 112.30)` chamado e `gateway.estornar("AUT-777", 112.3)` programado. Qual a causa mais provável?',
+      opcoes: ['Um bug no serviço, que calculou o total errado', 'O stub usa um BigDecimal com escala diferente; para equals, 112.3 e 112.30 são valores diferentes', 'O Mockito não suporta BigDecimal', 'O stub deveria estar no @BeforeEach'],
+      correta: 1,
+      explicacao: '`BigDecimal.equals` compara valor e escala. O total real é 112.30. Corrija o stub ou use um matcher com `compareTo`.',
+    },
+    {
+      pergunta: 'Por que o teste do serviço de reembolso cria o serviço à mão no @BeforeEach em vez de usar @InjectMocks?',
+      opcoes: ['@InjectMocks não funciona com o JUnit 6', 'O construtor recebe um Clock, que não é mock; o @InjectMocks passaria null sem avisar', 'Porque o serviço tem mais de três dependências', 'Por desempenho'],
+      correta: 1,
+      explicacao: 'O `@InjectMocks` só preenche parâmetros com mocks e spies declarados. Os demais recebem `null`, e o erro só aparece depois, como `NullPointerException: clock`.',
+    },
+    {
+      pergunta: 'Qual destas dependências faz mais sentido substituir por um fake em vez de um mock?',
+      opcoes: ['O gateway de pagamento de um fornecedor externo', 'O repositório de reembolsos da própria aplicação, usado em dezenas de testes', 'O serviço de e-mail', 'O record Pedido'],
+      correta: 1,
+      explicacao: 'Fakes compensam para dependências suas, com estado, reaproveitadas em muitos testes. Fronteiras externas ficam bem como mocks, e um `record` não se substitui: usa-se o objeto real.',
+    },
+    {
+      pergunta: 'Um teste passa a falhar com UnnecessaryStubbingException depois de uma refatoração. O que fazer?',
+      opcoes: ['Anotar a classe com lenient strictness para o erro sumir', 'Remover o stub que o código não usa mais e conferir se o teste ainda cobre o que deveria', 'Trocar @Mock por @Spy', 'Desligar o MockitoExtension'],
+      correta: 1,
+      explicacao: 'O stub sobrando indica que o teste está desatualizado. Apagá-lo deixa o teste honesto; afrouxar a regra só esconde o problema.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Dublês de teste substituem as **dependências** da classe sob teste; a classe em si é sempre real.
+- **Stub** controla as entradas (`given(...).willReturn(...)`); **mock** confere as saídas (`then(...).should()`); **fake** é uma implementação simples que funciona (repositório em memória, `Clock.fixed`). No Mockito, o mesmo `@Mock` pode ser stub e mock.
+- Antes de cada teste, pergunte: **estado ou interação?** Prefira estado; verifique interação quando ela é o efeito (estornar, notificar).
+- Caixa de ferramentas: `MockitoExtension`, `@Mock`, `@Captor`, `given/willReturn`, `willThrow(...).given(...)`, `then(...).should()`, `should(never())`, `shouldHaveNoInteractions()`, `ArgumentCaptor`, `InOrder`. Matchers: ou todos os argumentos, ou nenhum.
+- `@InjectMocks` só quando todos os parâmetros do construtor são mocks; com `Clock` ou fakes, construa à mão.
+- **Strict stubs** são aliados: `UnnecessaryStubbingException` aponta stub sobrando, `PotentialStubbingProblem` aponta argumento diferente do programado.
+- Não mocke tipos de valor, bibliotecas de terceiros (use adaptadores) nem a classe sob teste. Muitos mocks são sinal de design.
+
+## Próximo passo
+
+No [exercício 10.02, Caça-mutantes com Mockito](../../../exercicios/10-testes/02-caca-mutantes-checkout/), você escreve a suíte de um checkout com quatro dependências e um `Clock`. Onze versões com bugs escondidos ("mutantes") vão tentar passar pela sua suíte: estoque liberado só para o último item, notificação antes de salvar, cobrança sem multiplicar pela quantidade. Tudo o que você praticou aqui, de `ArgumentCaptor` a `InOrder` e dados que revelam bugs, será necessário para pegar todos eles.

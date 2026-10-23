@@ -1,0 +1,195 @@
+---
+titulo: "Caça-mutantes: a suíte de testes da calculadora de frete"
+codigo: "10.01"
+resumo: O código está pronto e correto; quem escreve os testes é você. Sua suíte precisa passar na calculadora de frete e ser capaz de pegar 14 defeitos sutis, escondidos em bordas, arredondamentos e regras combinadas.
+modulo: 10-testes
+ordem: 1
+dificuldade: medio
+tempo: 2–3h
+conceitos: [JUnit, AssertJ, testes parametrizados, casos de borda, BigDecimal, testes de mutação]
+aulas: [10-testes/01-por-que-e-como-testar, 10-testes/02-junit-e-assertj]
+java:
+  modulo: m10-testes
+  arquivos: [src/test/java/dev/trilhajava/m10/frete/CalculadoraDeFreteTest.java]
+---
+
+## Contexto
+
+Uma transportadora vai reescrever o motor de frete em outra linguagem. Antes, ela quer uma **suíte de testes que sirva de especificação**: se a versão nova passar nos testes, ela cobra igual à antiga. O problema é que a suíte atual tem 97% de cobertura de linhas e, mesmo assim, **deixou passar** três bugs que chegaram à produção no ano passado: um frete grátis que só valia acima de R$ 500 (e não a partir de), um peso fracionado arredondado para baixo e uma conta que truncava os centavos.
+
+Cobertura alta com bugs passando é o sintoma clássico de testes que **executam** o código sem **verificar** o que importa. Você vai escrever a suíte nova, e o critério de qualidade é o mesmo das ferramentas de teste de mutação: para cada defeito plausível que alguém possa introduzir na calculadora, pelo menos um teste seu precisa ficar vermelho.
+
+## O que você vai praticar
+
+- **O que é um bom teste.** Um comportamento por teste, nome que descreve a regra, dados mínimos e explícitos, e **valores esperados calculados fora do código**: se você copiar o resultado da calculadora para o teste, ele passa a proteger o bug. Veja [Por que testar, e o que é um bom teste](../../../aulas/10-testes/01-por-que-e-como-testar/).
+- **Cobertura não é qualidade; testes de mutação medem o que importa.** Um *mutante* é uma cópia do código com um defeito pequeno (`>=` vira `>`, um arredondamento muda). Se nenhum teste falha, o mutante "sobreviveu": existe uma regra que ninguém protege. A lista de defeitos deste exercício é essa ideia, feita à mão. Veja a mesma [aula 10.01](../../../aulas/10-testes/01-por-que-e-como-testar/).
+- **Testes parametrizados.** `@ParameterizedTest` com `@CsvSource` transforma uma tabela de entradas e saídas em vários testes, um por linha, e converte texto em `BigDecimal` e em enum sozinho. Uma tabela comentada, com casos no meio **e nas bordas**, é a forma mais eficiente de proteger uma regra de cálculo. Veja [JUnit 6 e AssertJ a fundo](../../../aulas/10-testes/02-junit-e-assertj/).
+- **AssertJ, com `BigDecimal` e exceções.** `isEqualByComparingTo("14.16")` compara o **valor** (`14.16` e `14.160` são iguais); `isEqualTo` compara também a **escala**. Para exceções, `assertThatIllegalArgumentException().isThrownBy(() -> ...)`. Veja a [aula de JUnit e AssertJ](../../../aulas/10-testes/02-junit-e-assertj/).
+- **Organização da suíte.** `@DisplayName` em português descrevendo a regra, `@Nested` para agrupar cenários (por exemplo, "entradas inválidas"). O relatório dos testes vira uma especificação legível.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m10.frete` (em `src/main/java`, pronto e correto; não precisa mudar):
+
+- `CalculadoraDeFrete` — a classe que você vai testar. Um único método público: `BigDecimal calcular(Envio envio)`. O construtor não recebe nada: `new CalculadoraDeFrete()`.
+- `Envio` — record com `ufOrigem`, `ufDestino` (siglas como `"SP"`), `pesoKg` e `valorDeclarado` (`BigDecimal`) e `modalidade`.
+- `Modalidade` — `ECONOMICA` e `EXPRESSA`.
+- `Regiao` — as cinco regiões e as UFs de cada uma (`Regiao.de("SP")` devolve `SUDESTE`; UF inexistente lança `IllegalArgumentException`).
+- (`CalculoDeFrete` e `Fretes` também estão lá, mas você não precisa deles.)
+
+### O que você implementa
+
+A classe de teste `CalculadoraDeFreteTest`, em `src/test/java/dev/trilhajava/m10/frete/` (a classe já existe, vazia). A suíte é sua: quantos testes, como organizá-los e quais casos usar. Ela precisa **passar** na calculadora como está e **falhar** em cada um dos defeitos listados em **Regras**.
+
+As regras da calculadora (também estão no Javadoc dela):
+
+| # | Regra | Detalhe |
+|---|---|---|
+| R1 | Validação | peso em (0, 30] kg; valor declarado ≥ 0; UFs de origem e destino válidas; modalidade informada. Senão, `IllegalArgumentException` |
+| R2 | Frete grátis | modalidade `ECONOMICA` **e** valor declarado ≥ R$ 500,00 **e** origem e destino na **mesma região** → R$ 0,00, sem imposto |
+| R3 | Base | R$ 12,00 na mesma UF; R$ 18,00 em UFs diferentes da mesma região; R$ 25,00 entre regiões |
+| R4 | Peso | o 1º kg está incluído; cada kg adicional custa R$ 2,50, e a fração conta como kg inteiro (1,2 kg → 1 kg adicional) |
+| R5 | EXPRESSA | +60% sobre (base + peso) |
+| R6 | Seguro | 1% do valor declarado que **passar** de R$ 100,00 (somado depois da modalidade) |
+| R7 | ICMS | sobre tudo: 18% na mesma UF, 12% entre UFs diferentes |
+| R8 | Arredondamento | resultado com 2 casas, `HALF_UP` (inclusive o frete grátis: `0.00`) |
+
+A conta, na ordem: `((base + peso) × modalidade + seguro) × (1 + ICMS)`, arredondado. Três exemplos, para você conferir que entendeu:
+
+| Envio | Conta | Resultado |
+|---|---|---|
+| SP → SP, 1 kg, R$ 0, ECONOMICA | 12,00 × 1,18 | `14.16` |
+| SP → RJ, 3 kg, R$ 0, EXPRESSA | (18,00 + 2 × 2,50) × 1,6 × 1,12 = 41,216 | `41.22` |
+| SP → BA, 1 kg, R$ 250, ECONOMICA | (25,00 + 1% de 150) × 1,12 | `29.68` |
+
+## Regras
+
+**Os defeitos que a sua suíte precisa pegar.** Cada item descreve uma versão errada da calculadora. Para cada um, se alguém introduzir aquele defeito (e só ele), **pelo menos um** teste seu deve falhar. Todos são defeitos que já aconteceram em código de verdade.
+
+| # | Defeito | Regra que ele quebra |
+|---|---|---|
+| D1 | dá frete grátis só **acima** de R$ 500, e não a partir de R$ 500 | R2 |
+| D2 | dá frete grátis também na **EXPRESSA** | R2 |
+| D3 | dá frete grátis também **entre regiões diferentes** | R2 |
+| D4 | cobra a base de regiões diferentes (R$ 25) para UFs diferentes da **mesma região** | R3 |
+| D5 | arredonda a fração de kg para **baixo** (1,2 kg não cobra kg adicional) | R4 |
+| D6 | cobra também o **primeiro** kg | R4 |
+| D7 | aplica os 60% da EXPRESSA **só sobre a base**, esquecendo o peso | R5 |
+| D8 | cobra seguro sobre o valor **inteiro**, esquecendo a franquia de R$ 100 | R6 |
+| D9 | **troca** as alíquotas de ICMS (12% na mesma UF, 18% entre UFs) | R7 |
+| D10 | **trunca** os centavos em vez de arredondar `HALF_UP` | R8 |
+| D11 | devolve o frete grátis como `0`, sem as 2 casas decimais | R8 |
+| D12 | aceita peso **zero** | R1 |
+| D13 | aceita peso **acima de 30 kg** | R1 |
+| D14 | aceita valor declarado **negativo** | R1 |
+
+**Exigências sobre a suíte**
+
+1. **Valores esperados calculados à mão** (ou numa planilha), nunca copiados da saída da calculadora. Exemplo: para SP → RJ, 1 kg, R$ 146, a conta é (18,00 + 0,46) × 1,12 = 20,6752, e o esperado é `20.68`.
+2. **Bordas dos dois lados.** Onde há um limite, teste o valor exato do limite e o primeiro valor que passa dele: 30 kg é aceito e 30,01 kg não; R$ 500 exatos dão frete grátis. É nas bordas que `>=` e `>` se diferenciam.
+3. **Casos que isolam regras.** Cada caso deve fazer diferença para a regra que ele protege. Uma EXPRESSA de 1 kg não distingue "60% sobre base + peso" de "60% só sobre a base" (o peso é zero); uma EXPRESSA de 3 kg distingue.
+4. **Parametrizados para as tabelas de casos.** Use `@ParameterizedTest` com `@CsvSource` (ou `@ValueSource`, `@MethodSource`) para os cálculos e para as entradas inválidas, em vez de copiar o mesmo teste dez vezes.
+5. **`BigDecimal` comparado do jeito certo.** Para o valor, `isEqualByComparingTo`. Se quiser verificar a escala (defeito D11), faça isso explicitamente, com `isEqualTo(new BigDecimal("0.00"))` ou conferindo `scale()`, num teste que diga por quê.
+6. **Nomes descritivos.** `@DisplayName` (e o `name` do parametrizado) diz a regra, não o método: "frete grátis: ECONOMICA, R$ 500 exatos, mesma região", e não "teste3".
+7. **Testes independentes e rápidos.** Crie a calculadora com `new CalculadoraDeFrete()`; nada de estado compartilhado entre testes. A suíte inteira roda em menos de um segundo.
+
+## Passo a passo sugerido
+
+1. **Rode a suíte vazia.** Abra o starter no IntelliJ e rode `CalculadoraDeFreteTest` (▶ ao lado da classe) ou `mvn test "-Dtest=CalculadoraDeFreteTest*"` (veja **Experimente**). Nenhum teste roda ainda, e está tudo verde: é o ponto de partida.
+2. **Primeiro teste, à mão.** Escreva um `@Test` para SP → SP, 1 kg, R$ 0, ECONOMICA, esperando `14.16`. Veja-o passar. Depois, mude o esperado para `14.17` e veja a mensagem do AssertJ quando falha.
+3. **Vire tabela.** Troque o teste por um `@ParameterizedTest` com `@CsvSource` e acrescente a base das outras duas situações (R3) e o ICMS (R7). Calcule cada esperado no papel antes de rodar.
+4. **Peso e modalidade (R4 e R5).** Acrescente linhas para 1,2 kg, 2 kg, 30 kg, e uma EXPRESSA com peso adicional. Confira D5, D6 e D7 na tabela de defeitos: cada um tem uma linha que o pega?
+5. **Seguro e arredondamento (R6 e R8).** Um valor declarado acima de R$ 100 e um caso cujo resultado tenha a terceira casa decimal ≥ 5.
+6. **Frete grátis (R2).** A borda exata e as duas condições que o impedem (modalidade e região). E o `0.00` (D11).
+7. **Entradas inválidas (R1).** Um `@Nested` com os pesos inválidos parametrizados e os demais casos.
+8. **Cace os defeitos.** Para cada linha da tabela de defeitos, sabote a calculadora (veja **Experimente**), rode a suíte e desfaça. Se ficar tudo verde, falta um caso: escreva-o e repita.
+
+## Experimente
+
+**Rodando a sua suíte.** No IntelliJ, com o starter aberto pelo `pom.xml`, clique no ▶ ao lado de `class CalculadoraDeFreteTest`. Pelo terminal:
+
+```bash
+cd java/m10-testes/starter
+mvn test "-Dtest=CalculadoraDeFreteTest*"
+```
+
+O `*` inclui as classes `@Nested`. Sem o `-Dtest`, o Maven roda também os testes dos outros exercícios do módulo (e o da fila de tarefas precisa do Docker).
+
+**Sabotando de propósito.** É assim que você confere, sozinho, se a suíte pega um defeito. Abra `CalculadoraDeFrete` (em `src/main/java`), onde cada regra está num método privado com o nome dela, e introduza **um** defeito por vez. Por exemplo, o D1, em `freteGratis`:
+
+```java
+&& envio.valorDeclarado().compareTo(VALOR_FRETE_GRATIS) >= 0   // correto
+&& envio.valorDeclarado().compareTo(VALOR_FRETE_GRATIS) > 0    // defeito D1
+```
+
+Rode a suíte: ao menos um teste precisa ficar vermelho, de preferência um cujo nome aponte a regra quebrada. Depois, **desfaça** a alteração (Ctrl+Z, ou `git checkout -- src/main` se o starter estiver num repositório git) e rode de novo, para ter certeza de que voltou ao verde.
+
+| Cenário | Resultado esperado |
+|---|---|
+| a suíte na calculadora como veio | todos os testes passam |
+| cada defeito D1 a D14, introduzido sozinho | pelo menos um teste falha |
+| o defeito desfeito | todos os testes voltam a passar |
+
+Alguns defeitos mudam uma linha fora do método da regra (o D7, por exemplo, se faz no `calcular`, aplicando a modalidade só à `base` e somando o peso depois): o que importa é que o comportamento fique como a tabela descreve.
+
+## Critérios de aceite
+
+- [ ] A suíte passa na `CalculadoraDeFrete` como ela veio.
+- [ ] Cada um dos 14 defeitos da tabela, introduzido sozinho, faz pelo menos um teste falhar (você conferiu sabotando o código).
+- [ ] Cada valor esperado tem uma conta que você sabe refazer no papel.
+- [ ] Lendo só os nomes dos testes no relatório, dá para reconstruir as regras R1 a R8.
+- [ ] Você sabe explicar por que uma suíte com 100% de cobertura de linhas pode deixar o D1 passar.
+
+## Desafios opcionais
+
+- **Rode o PIT de verdade.** Acrescente o plugin `org.pitest:pitest-maven` (com o `pitest-junit5-plugin`) ao `pom.xml` do starter e rode `mvn test-compile org.pitest:pitest-maven:mutationCoverage -DtargetClasses=dev.trilhajava.m10.frete.*`. Abra o relatório em `target/pit-reports` e compare os mutantes que ele gera com os 14 daqui: quantos sobrevivem à sua suíte? Algum sobrevivente é um mutante **equivalente** (muda o código sem mudar o comportamento)?
+- Mova a tabela do `@CsvSource` para um arquivo lido com `@CsvFileSource`, que o time de negócio consiga editar numa planilha.
+- Remova da sua tabela uma linha de cada vez: quais podem sair sem que nenhum defeito passe? Casos redundantes custam pouco; os que isolam uma regra valem ouro.
+
+<Dicas>
+<Dica nivel={1}>
+Para cada regra, pergunte "qual é a **borda**?": exatamente R$ 500 (não R$ 600), exatamente 1 kg e 1,2 kg, exatamente 30 kg e 30,01 kg. E para cada defeito da tabela, pergunte "qual envio daria um resultado **diferente** com esse defeito?". Se nenhum caso seu muda de valor, o defeito passa.
+</Dica>
+<Dica nivel={2}>
+Pense em **combinações** que isolam cada regra:
+- uma EXPRESSA **com** peso adicional (sem peso, o D7 dá o mesmo número);
+- UFs diferentes da **mesma região**, como SP → RJ (senão, o D4 não aparece);
+- R$ 500 numa EXPRESSA e R$ 500 entre regiões (D2 e D3);
+- um valor declarado acima de R$ 100 que gere seguro (D8): R$ 250 dá R$ 1,50 de seguro, e o D8 cobraria R$ 2,50.
+</Dica>
+<Dica nivel={3}>
+Para pegar o arredondamento (D10), você precisa de um total com a **terceira casa decimal ≥ 5**: SP → RJ, 1 kg, R$ 146 dá (18 + 0,46) × 1,12 = 20,6752, que vira `20.68` com `HALF_UP` e `20.67` truncando. Para o D11, `isEqualByComparingTo("0.00")` **não** serve (`0` e `0.00` têm o mesmo valor): compare com `isEqualTo(new BigDecimal("0.00"))`. Para as validações, um `@ParameterizedTest` com `@ValueSource(strings = {"0", "-1", "30.01", "31"})` e `assertThatIllegalArgumentException()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A suíte de referência
+
+<CodigoJava caminho="m10-testes/solucao/src/test/java/dev/trilhajava/m10/frete/CalculadoraDeFreteTest.java" />
+
+Ela foi conferida contra os 14 defeitos: cada um, introduzido sozinho, faz ao menos um teste falhar.
+
+### Por que assim
+
+- **Uma tabela, uma regra por linha, com o nome da regra na primeira coluna.** O relatório mostra "EXPRESSA: +60% sobre base + peso: R$ 41.22", e quem lê a suíte entende as regras sem abrir a calculadora. Ao olhar a tabela, fica evidente qual borda falta.
+- **Casos que isolam regras.** "SP → SP, 1 kg" só distingue base e ICMS; "SP → RJ, 3 kg, EXPRESSA" distingue base de mesma região, peso **e** a aplicação dos 60%. A última linha junta tudo (peso fracionado, seguro, EXPRESSA) para pegar interações entre regras.
+- **Valores calculados à parte.** Se o esperado fosse copiado da implementação, a suíte congelaria os bugs em vez de detectá-los.
+- **`isEqualByComparingTo` para o valor e um teste separado para a escala.** O contrato "sempre 2 casas" é real (um `0` num JSON onde se espera `0.00` quebra um cliente), mas misturá-lo em todas as linhas tornaria cada falha ambígua.
+- **Validações com os dois lados da borda.** 30 kg está na tabela dos cálculos (passa); 30,01 e 31 estão nas inválidas. Um defeito que aceite 31 kg só aparece se alguém testar 31.
+
+### Alternativas
+
+- **Um `@Test` por caso**, com nomes como `freteGratisComExatamente500NaMesmaRegiao()`. Fica mais verboso, mas cada teste pode ter asserções diferentes e um comentário com a conta. Bom quando os casos não cabem numa tabela uniforme.
+- **`@Nested` por regra** (Base, Peso, Expressa, Seguro, Frete grátis), cada um com a sua tabela. O relatório fica mais hierárquico; o preço é repetir a montagem do `Envio` em vários lugares.
+- **`@MethodSource`** com objetos `Envio` montados em Java, em vez de texto no CSV: mais tipado, menos legível para quem não programa.
+
+### Avalie sua solução
+
+- Algum dos seus testes quebraria se a regra de frete grátis mudasse de R$ 500 para R$ 400? E **deveria** quebrar?
+- Quais linhas da sua tabela poderiam sair sem deixar nenhum defeito passar? Alguma delas vale a pena manter mesmo assim, como documentação?
+- Se você trocar todos os `isEqualByComparingTo` por `isEqualTo`, o que acontece? E o contrário, no teste do D11?
+
+</Solucao>

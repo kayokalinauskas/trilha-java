@@ -1,0 +1,173 @@
+---
+titulo: Coleções modernas e utilitários
+descricao: Sequenced Collections (Java 21), LinkedHashMap como cache, PriorityQueue, a classe Collections, e como escolher estruturas em problemas reais — com o cache LRU como estudo de caso.
+modulo: 03-colecoes-generics-excecoes
+ordem: 6
+duracao: 45
+objetivos:
+  - Usar a API de Sequenced Collections para acessar primeiro e último elemento
+  - Aplicar PriorityQueue e TreeMap em problemas de ordem
+  - Conhecer os utilitários de Collections e quando usá-los
+  - Projetar uma estrutura combinando HashMap e lista encadeada
+tags: [SequencedCollection, PriorityQueue, Collections, LRU]
+flashcards:
+  - frente: O que as Sequenced Collections (Java 21) adicionaram?
+    verso: Uma interface comum para coleções com ordem definida, com getFirst, getLast, addFirst, addLast, removeFirst, removeLast e reversed.
+  - frente: Como obter o último elemento de uma List no Java 21+?
+    verso: lista.getLast() — antes era lista.get(lista.size() - 1).
+  - frente: Para que serve uma PriorityQueue?
+    verso: Fila em que poll() sempre devolve o menor elemento (ou o de maior prioridade, segundo um Comparator), com inserção e remoção em O(log n).
+  - frente: Como um cache LRU atinge O(1) em todas as operações?
+    verso: HashMap para achar o nó em O(1) e lista duplamente encadeada para mover para a frente e remover do fim em O(1).
+  - frente: Qual atalho da JDK implementa um cache LRU?
+    verso: LinkedHashMap com accessOrder = true e removeEldestEntry sobrescrito para remover quando passar da capacidade.
+---
+
+Esta aula fecha o módulo com recursos que você vai usar no dia a dia e com um estudo de caso que aparece em entrevistas de empresas de todos os tamanhos: o **cache LRU**.
+
+## Sequenced Collections (Java 21)
+
+Até o Java 20, pegar o último elemento dependia da coleção: `list.get(list.size() - 1)`, `deque.getLast()`, `sortedSet.last()`, e para `LinkedHashSet`… não havia jeito direto. O Java 21 unificou isso com a interface **`SequencedCollection`**:
+
+```java
+List<String> etapas = new ArrayList<>(List.of("pedido", "pagamento", "envio"));
+
+etapas.getFirst();        // "pedido"
+etapas.getLast();         // "envio"
+etapas.addFirst("carrinho");
+etapas.removeLast();
+etapas.reversed();        // visão invertida: ["pagamento", "pedido", "carrinho"]
+```
+
+- `List`, `Deque`, `LinkedHashSet` e `SortedSet` implementam `SequencedCollection`.
+- `LinkedHashMap` e `SortedMap` implementam **`SequencedMap`**: `firstEntry()`, `lastEntry()`, `pollFirstEntry()`, `putFirst()`…
+- `reversed()` devolve uma **visão**, sem copiar os dados.
+
+<Callout tipo="novidade">
+Se você vê `lista.get(lista.size() - 1)` em um código novo, é um sinal de que dá para modernizar com `getLast()`.
+</Callout>
+
+## `PriorityQueue`: sempre o próximo mais importante
+
+```java
+record Tarefa(String nome, int prioridade) { }
+
+PriorityQueue<Tarefa> fila = new PriorityQueue<>(
+        Comparator.comparingInt(Tarefa::prioridade).reversed());
+
+fila.offer(new Tarefa("enviar e-mail", 1));
+fila.offer(new Tarefa("estornar pagamento", 10));
+fila.offer(new Tarefa("gerar relatório", 5));
+
+fila.poll();   // estornar pagamento (10)
+fila.poll();   // gerar relatório (5)
+```
+
+Inserir e remover custam **O(log n)**; espiar o topo (`peek`) é O(1). Usos típicos: agendadores, "os K maiores de um fluxo enorme" (mantenha uma fila de tamanho K) e o algoritmo de Dijkstra.
+
+<Callout tipo="atencao">
+Iterar uma `PriorityQueue` com for-each **não** devolve os elementos em ordem: só `poll()` garante a ordem.
+</Callout>
+
+## `TreeMap` para perguntas de intervalo
+
+```java
+TreeMap<LocalTime, String> agenda = new TreeMap<>();
+agenda.put(LocalTime.of(9, 0), "Daily");
+agenda.put(LocalTime.of(14, 0), "Revisão de código");
+agenda.put(LocalTime.of(16, 30), "1:1");
+
+agenda.ceilingKey(LocalTime.of(13, 0));    // 14:00 — próximo compromisso a partir das 13h
+agenda.floorEntry(LocalTime.of(15, 0));    // 14:00=Revisão — o último antes das 15h
+agenda.headMap(LocalTime.of(12, 0));       // tudo antes do meio-dia
+```
+
+"Qual a faixa de frete para este CEP?", "qual a alíquota para este salário?", "qual o próximo horário livre?" — perguntas de intervalo são resolvidas em O(log n) com `floorEntry`/`ceilingEntry`.
+
+## A classe `Collections`
+
+| Método | Uso |
+|---|---|
+| `Collections.sort(lista)` | Ordena (hoje, prefira `lista.sort(comparator)`) |
+| `Collections.shuffle(lista)` | Embaralha (sorteios, testes) |
+| `Collections.frequency(col, x)` | Conta ocorrências |
+| `Collections.max(col)` / `min` | Maior / menor pela ordem natural ou por um `Comparator` |
+| `Collections.unmodifiableList(l)` | Visão somente leitura (atenção: não é cópia!) |
+| `Collections.emptyList()` | Lista vazia imutável (hoje, `List.of()`) |
+| `Collections.nCopies(n, x)` | Lista imutável com n cópias de x |
+
+## Estudo de caso: cache LRU
+
+Um **cache LRU** (*Least Recently Used*) guarda no máximo N itens e, quando enche, descarta o que foi **usado há mais tempo**. Está em todo lugar: cache de páginas do sistema operacional, cache de sessões e cache de consultas caras. E é uma das perguntas de entrevista mais clássicas do mundo.
+
+O requisito que torna o problema interessante: **`obter` e `colocar` em O(1)**.
+
+- Um `HashMap` dá acesso O(1) pela chave, mas não sabe **quem foi usado há mais tempo**.
+- Uma lista sabe a ordem de uso, mas mover um item para a frente é O(n) se for preciso procurá-lo.
+
+A solução é **combinar os dois**: o `HashMap` aponta direto para os **nós** de uma lista duplamente encadeada.
+
+<Figura legenda="HashMap (acesso O(1) ao nó) + lista duplamente encadeada (reordenar em O(1))">
+<svg viewBox="0 0 680 220" width="680" role="img" aria-label="Um HashMap com chaves A, B e C apontando para nós de uma lista duplamente encadeada entre sentinelas cabeça e cauda; o mais recente fica perto da cabeça">
+  <defs><marker id="s11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <text x="80" y="22" text-anchor="middle" class="d-title">HashMap</text>
+  <rect x="20" y="35" width="120" height="36" rx="8" class="d-info"/><text x="80" y="58" text-anchor="middle" class="d-mono">"C" ●</text>
+  <rect x="20" y="80" width="120" height="36" rx="8" class="d-info"/><text x="80" y="103" text-anchor="middle" class="d-mono">"A" ●</text>
+  <rect x="20" y="125" width="120" height="36" rx="8" class="d-info"/><text x="80" y="148" text-anchor="middle" class="d-mono">"B" ●</text>
+  <rect x="200" y="165" width="80" height="40" rx="8" class="d-box"/><text x="240" y="190" text-anchor="middle" class="d-label">cabeça</text>
+  <rect x="300" y="165" width="80" height="40" rx="8" class="d-accent"/><text x="340" y="190" text-anchor="middle" class="d-mono">C</text>
+  <rect x="400" y="165" width="80" height="40" rx="8" class="d-accent"/><text x="440" y="190" text-anchor="middle" class="d-mono">A</text>
+  <rect x="500" y="165" width="80" height="40" rx="8" class="d-accent"/><text x="540" y="190" text-anchor="middle" class="d-mono">B</text>
+  <rect x="600" y="165" width="70" height="40" rx="8" class="d-box"/><text x="635" y="190" text-anchor="middle" class="d-label">cauda</text>
+  <path d="M280 180 H296" class="d-line" marker-end="url(#s11)"/>
+  <path d="M380 180 H396" class="d-line" marker-end="url(#s11)"/>
+  <path d="M480 180 H496" class="d-line" marker-end="url(#s11)"/>
+  <path d="M580 180 H596" class="d-line" marker-end="url(#s11)"/>
+  <path d="M130 53 C220 53, 330 90, 338 161" class="d-line" stroke-dasharray="4 4" marker-end="url(#s11)"/>
+  <path d="M130 98 C240 98, 430 110, 438 161" class="d-line" stroke-dasharray="4 4" marker-end="url(#s11)"/>
+  <path d="M130 143 C250 143, 530 130, 538 161" class="d-line" stroke-dasharray="4 4" marker-end="url(#s11)"/>
+  <text x="340" y="150" text-anchor="middle" class="d-label">mais recente</text>
+  <text x="540" y="150" text-anchor="end" class="d-label">menos recente →</text>
+</svg>
+</Figura>
+
+- **`obter(k)`**: o mapa acha o nó (O(1)); o nó é desligado e religado logo após a cabeça (O(1)).
+- **`colocar(k, v)`** com o cache cheio: o nó antes da cauda é o menos recente; remova-o da lista e do mapa (O(1)).
+- **Nós sentinela** (cabeça e cauda vazias) eliminam os casos especiais de "lista vazia" e "primeiro/último elemento".
+
+Você vai implementar essa estrutura no exercício 03.05 — é o exercício mais difícil do módulo, e o que mais se parece com uma pergunta real de entrevista.
+
+<Callout tipo="info" titulo="O atalho da JDK">
+Na vida real, um `LinkedHashMap` com `accessOrder = true` e `removeEldestEntry` sobrescrito já é um LRU. Em produção, você provavelmente usaria o **Caffeine**, a biblioteca de cache mais usada no ecossistema Java (e padrão no Spring Cache). Mas implementar do zero é o que ensina **por que** essas estruturas funcionam — e é o que a entrevista pede.
+</Callout>
+
+<Quiz
+  id="03-colecoes-modernas"
+  questoes={[
+    {
+      pergunta: 'Qual a forma moderna (Java 21+) de pegar o último elemento de um LinkedHashSet?',
+      opcoes: ['Iterar até o fim', '`set.getLast()`', '`set.get(set.size() - 1)`', 'Não é possível'],
+      correta: 1,
+      explicacao: 'LinkedHashSet implementa SequencedCollection desde o Java 21.',
+    },
+    {
+      pergunta: 'Você precisa manter os 100 maiores valores de um fluxo com bilhões de números. Qual estrutura?',
+      opcoes: ['ArrayList ordenada a cada inserção', 'PriorityQueue de tamanho 100 (min-heap)', 'HashSet', 'LinkedList'],
+      correta: 1,
+      explicacao: 'Um min-heap de tamanho K mantém os K maiores: se o novo valor é maior que o topo, troca. Custo O(n log K).',
+    },
+    {
+      pergunta: 'Em um cache LRU, por que usar lista DUPLAMENTE encadeada?',
+      opcoes: ['Para ocupar menos memória', 'Para remover um nó do meio em O(1), sem precisar achar o anterior', 'Porque o HashMap exige', 'Para ordenar as chaves'],
+      correta: 1,
+      explicacao: 'Com o ponteiro para o anterior, desligar um nó é só religar os vizinhos.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Sequenced Collections**: `getFirst`, `getLast`, `addFirst`, `reversed` em `List`, `Deque`, `LinkedHashSet`, `LinkedHashMap`…
+- `PriorityQueue` para "sempre o próximo mais importante"; `TreeMap` para perguntas de intervalo.
+- `Collections` tem utilitários prontos — mas prefira `List.of`/`List.copyOf` para imutáveis.
+- **Cache LRU** = `HashMap` + lista duplamente encadeada, tudo em O(1).

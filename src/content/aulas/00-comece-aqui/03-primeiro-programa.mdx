@@ -1,0 +1,185 @@
+---
+titulo: Seu primeiro programa (do jeito moderno e do jeito clássico)
+descricao: Rode Java em segundos com arquivos-fonte compactos do Java 25, entenda cada palavra do main clássico e experimente no JShell.
+modulo: 00-comece-aqui
+ordem: 3
+duracao: 35
+objetivos:
+  - Executar um programa Java com um único comando, sem compilar manualmente
+  - Entender cada palavra de `public static void main(String[] args)`
+  - Usar o JShell para testar trechos de código rapidamente
+tags: [main, JShell, Java 25]
+flashcards:
+  - frente: O que são "compact source files" (Java 25)?
+    verso: Arquivos .java sem declaração de classe, com um `void main()` de instância. Ideais para scripts e aprendizado; o compilador cria a classe implicitamente.
+  - frente: O que `java Ola.java` faz?
+    verso: Compila em memória e executa o arquivo em um único passo (source-file launcher). Não gera .class em disco.
+  - frente: Por que o main clássico é `static`?
+    verso: Porque a JVM precisa chamá-lo sem criar um objeto da classe antes.
+  - frente: Para que serve o JShell?
+    verso: É o REPL do Java — executa expressões e trechos isolados na hora, ótimo para experimentar APIs.
+---
+
+Chegou a hora de rodar código. Nesta aula você vai conhecer **duas formas** de escrever o ponto de entrada de um programa Java: a forma moderna, introduzida oficialmente no Java 25 e pensada para aprender e escrever scripts, e a forma clássica, que você vai ver em todo projeto profissional.
+
+## O jeito moderno: arquivos-fonte compactos
+
+Crie uma pasta qualquer e, dentro dela, um arquivo `Ola.java`:
+
+```java title="Ola.java"
+void main() {
+    IO.println("Olá, backend!");
+}
+```
+
+No terminal, dentro da pasta:
+
+```bash
+java Ola.java
+```
+
+```text
+Olá, backend!
+```
+
+Só isso. Três coisas aconteceram aqui:
+
+1. **Não há declaração de classe.** No Java 25, um arquivo pode conter métodos e campos soltos; o compilador cria uma classe implícita em volta deles (JEP 512).
+2. **`main` não precisa ser `public static` nem receber `String[] args`.** Um `void main()` simples basta.
+3. **`IO.println`** é uma classe utilitária nova do pacote `java.lang` para entrada e saída no console, pensada justamente para esse estilo.
+
+E o comando `java Ola.java` **compila em memória e executa** em um único passo. Não aparece nenhum `.class` na pasta.
+
+<Callout tipo="novidade" titulo="Java 25 — JEP 512">
+Os arquivos-fonte compactos e o `main` de instância ficaram em *preview* entre o Java 21 e o 24 e se tornaram oficiais no **Java 25**. No Java 21 eles só funcionam com `--enable-preview`. Em projetos Spring e em entrevistas você ainda vai usar a forma clássica — mas para experimentar ideias, o formato compacto é imbatível.
+</Callout>
+
+### Lendo dados do usuário
+
+```java title="Idade.java"
+void main() {
+    String nome = IO.readln("Qual seu nome? ");
+    int anoNascimento = Integer.parseInt(IO.readln("Ano de nascimento? "));
+    int idade = 2026 - anoNascimento;
+    IO.println(nome + ", você faz " + idade + " anos em 2026.");
+}
+```
+
+Repare no `Integer.parseInt`: tudo o que vem do teclado é texto (`String`). Para fazer contas, você **converte** para número. Se a pessoa digitar `abc`, o programa quebra com `NumberFormatException` — e tratar esse tipo de erro é assunto do módulo 03.
+
+## O jeito clássico
+
+Este é o formato que você vai encontrar em 99% dos projetos existentes:
+
+```java title="Ola.java"
+public class Ola {
+
+    public static void main(String[] args) {
+        System.out.println("Olá, backend!");
+    }
+}
+```
+
+Vale entender cada palavra, porque isso cai em entrevista:
+
+| Trecho | Significado |
+|---|---|
+| `public class Ola` | Declara uma classe pública chamada `Ola`. O arquivo **precisa** se chamar `Ola.java`. |
+| `public` (no método) | A JVM, que está "fora" da classe, precisa conseguir chamar o método. |
+| `static` | O método pertence à classe, não a um objeto: a JVM o chama sem precisar fazer `new Ola()` antes. |
+| `void` | O método não devolve nenhum valor. |
+| `main` | O nome que a JVM procura como ponto de entrada. |
+| `String[] args` | Os argumentos passados na linha de comando (`java Ola.java a b` → `args = ["a", "b"]`). |
+| `System.out.println` | Escreve uma linha na saída padrão. `System.out` é um objeto `PrintStream`. |
+
+### Compilando em dois passos
+
+O jeito "manual", que o Maven e a IDE fazem por você:
+
+```bash
+javac Ola.java     # gera Ola.class
+java Ola           # executa a classe (sem .java!)
+```
+
+Fazer isso uma vez ajuda a entender o que acontece quando você clica no ▶ do IntelliJ.
+
+## JShell: seu laboratório
+
+O **JShell** é um REPL (*Read-Eval-Print Loop*): você digita uma expressão e vê o resultado na hora, sem criar arquivo nem classe. É perfeito para tirar dúvidas do tipo "o que esse método devolve?".
+
+```text
+$ jshell
+jshell> 7 / 2
+$1 ==> 3
+
+jshell> 7 / 2.0
+$2 ==> 3.5
+
+jshell> "backend".toUpperCase()
+$3 ==> "BACKEND"
+
+jshell> "a,b,,c".split(",").length
+$4 ==> 4
+
+jshell> /exit
+```
+
+Repare no primeiro resultado: `7 / 2` dá `3`, não `3.5`. Divisão entre inteiros descarta a parte decimal. Esse é um dos erros mais comuns de quem está começando — e você vai entender o porquê na aula de tipos do módulo 01.
+
+<Callout tipo="dica">
+Sempre que uma aula mostrar um trecho curto e você ficar em dúvida, abra o JShell e teste. Experimentar é mais rápido e fixa mais do que reler.
+</Callout>
+
+## Erros do compilador são seus amigos
+
+Tente compilar isto:
+
+```java title="Erro.java"
+void main() {
+    int total = "10";
+    IO.println(total)
+}
+```
+
+```text
+Erro.java:2: error: incompatible types: String cannot be converted to int
+    int total = "10";
+                ^
+Erro.java:3: error: ';' expected
+    IO.println(total)
+                     ^
+2 errors
+```
+
+Leia a mensagem com calma. Ela diz **o arquivo, a linha, o problema e aponta a coluna** com `^`. Java é uma linguagem de **tipagem estática**: o compilador pega uma categoria inteira de erros antes de o programa rodar. No backend, isso é uma enorme vantagem — um erro pego na compilação nunca chega à produção.
+
+<Quiz
+  id="00-primeiro-programa"
+  questoes={[
+    {
+      pergunta: 'No main clássico, por que o método precisa ser `static`?',
+      opcoes: ['Para rodar mais rápido', 'Porque a JVM o chama sem criar um objeto da classe', 'Porque métodos estáticos não podem ter erros', 'É só uma convenção de estilo'],
+      correta: 1,
+      explicacao: 'Métodos `static` pertencem à classe. A JVM chama `Ola.main(args)` diretamente, sem instanciar `Ola`.',
+    },
+    {
+      pergunta: 'Qual o resultado de `7 / 2` em Java?',
+      opcoes: ['3.5', '3', '4', 'Erro de compilação'],
+      correta: 1,
+      explicacao: 'Os dois operandos são `int`, então a divisão é inteira e a parte decimal é descartada. Use `7 / 2.0` para obter 3.5.',
+    },
+    {
+      pergunta: 'O que o comando `java Ola.java` faz?',
+      opcoes: ['Apenas compila e gera `Ola.class`', 'Compila em memória e executa em um passo', 'Abre o arquivo no editor', 'Executa só se `Ola.class` já existir'],
+      correta: 1,
+      explicacao: 'É o *source-file launcher*: compila em memória e executa, sem deixar `.class` em disco.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Java 25: `void main() { IO.println("..."); }` em um arquivo e `java Arquivo.java` para rodar.
+- Forma clássica: `public class X { public static void main(String[] args) { ... } }` — `static` porque a JVM chama sem instanciar.
+- O JShell é seu laboratório para experimentos rápidos.
+- Mensagens do compilador dizem arquivo, linha e coluna. Leia-as com calma.

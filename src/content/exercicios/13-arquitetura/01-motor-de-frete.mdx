@@ -1,0 +1,294 @@
+---
+titulo: "Refatorando o frete: Strategy e aberto/fechado, com golden master"
+codigo: "13.01"
+resumo: Substitua uma calculadora de frete legada de 60 linhas de ifs por modalidades e promoções plugáveis (Strategy + injeção de listas do Spring) — com a garantia de que 2.000 pedidos aleatórios dão exatamente o mesmo resultado que o código antigo, e de que uma modalidade nova é só uma classe nova.
+modulo: 13-arquitetura
+ordem: 1
+dificuldade: medio
+tempo: 2–3h
+conceitos: [SOLID, aberto/fechado, Strategy, refatoração, golden master, injeção de dependência, ArchUnit, BigDecimal]
+aulas: [13-arquitetura/01-solid-sem-dogma, 13-arquitetura/02-padroes-de-projeto]
+java:
+  modulo: m13-arquitetura
+  arquivos:
+    - src/main/java/dev/trilhajava/m13/frete/MotorDeFrete.java
+---
+
+## Contexto
+
+A `CalculadoraDeFreteLegada` está em produção há quatro anos. Funciona, mas cada transportadora nova é mais um `if`, cada campanha de marketing é mais uma exceção no meio, e ninguém tem coragem de mexer. O time comercial já avisou: no próximo trimestre entram entrega por drone e uma parceria com uma transportadora regional.
+
+Sua missão é **refatorar**: mudar a estrutura sem mudar nenhum resultado. Ao final, uma modalidade nova de frete precisa ser uma classe nova, e não mais uma edição num método de 60 linhas.
+
+## O que você vai praticar
+
+- **Aberto/fechado na prática.** Um código aberto para extensão e fechado para modificação aceita comportamento novo sem que alguém edite o que já funciona. Aqui, isso quer dizer: o motor de frete não muda quando uma modalidade entra. Veja [SOLID sem dogma](../../../aulas/13-arquitetura/01-solid-sem-dogma/).
+- **Strategy com injeção de listas.** Cada modalidade é uma *estratégia*: uma implementação de `ModalidadeDeFrete`. O Spring injeta **todas** as implementações numa `List<ModalidadeDeFrete>`, e o motor percorre a lista sem saber quem está nela. Veja [Padrões de projeto](../../../aulas/13-arquitetura/02-padroes-de-projeto/).
+- **Ordem explícita com `@Order`.** As promoções dependem da ordem (o seguro entra antes do frete grátis). Com `@Order(1)` e `@Order(2)` nas classes, o Spring monta a `List<RegraDePromocao>` nessa ordem.
+- **Golden master.** Quando não existe especificação confiável além do próprio código, o código antigo vira a referência: você gera milhares de entradas e compara a saída do código novo com a do antigo, uma a uma. Qualquer diferença é um erro da refatoração.
+- **Dinheiro com `BigDecimal`.** Valores monetários nunca em `double`; o arredondamento é explícito (`Cotacao` normaliza para 2 casas, `HALF_EVEN`).
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m13.frete` (não precisa mudar):
+
+- `Pedido(String cep, BigDecimal valorDosItens, int pesoEmGramas, boolean temItemFragil)` — o CEP tem 8 dígitos, sem hífen. `pedido.regiao()` devolve a `Regiao` pelo primeiro dígito do CEP: `0` a `3` → `SUDESTE`, `4` a `6` → `NORTE_NORDESTE`, `7` → `CENTRO_OESTE`, `8` e `9` → `SUL`.
+- `Cotacao(String modalidade, BigDecimal valor, int prazoEmDiasUteis)` — normaliza o valor para 2 casas (`HALF_EVEN`) e recusa valor ou prazo negativos. `cotacao.comValor(novoValor)` devolve uma cópia com outro valor. É um `record`: duas cotações são iguais quando os três campos são iguais.
+- `ModalidadeDeFrete` — `Optional<Cotacao> cotar(Pedido pedido)`. Vazio quer dizer "esta modalidade não atende o pedido".
+- `RegraDePromocao` — `Cotacao aplicar(Pedido pedido, Cotacao cotacao)`. Devolve a mesma cotação quando a regra não se aplica.
+- `legado.CalculadoraDeFreteLegada` — `List<Cotacao> cotar(Pedido)`, **a referência de comportamento**. Não a altere; o código novo não pode usá-la (só o programa do **Experimente**, que fica em `src/test/java`).
+- `FreteApplication` — a aplicação Spring Boot do exercício.
+
+### O que você implementa
+
+`MotorDeFrete`, já criado e vazio, e as classes das modalidades e das promoções, que são suas: os nomes e os pacotes (dentro de `dev.trilhajava.m13.frete`) ficam a seu critério. Uma sugestão é `frete.modalidades` e `frete.promocoes`.
+
+```java
+// MotorDeFrete (@Service) — assinaturas fixas
+public MotorDeFrete(List<ModalidadeDeFrete> modalidades, List<RegraDePromocao> promocoes)
+public List<Cotacao> cotar(Pedido pedido)                       // regras 1 a 9
+
+// Uma classe por modalidade (@Component), cada uma implementando ModalidadeDeFrete:
+//   PAC, SEDEX, TRANSPORTADORA e RETIRADA                     // regras 1 a 4
+// Uma classe por promoção (@Component + @Order), cada uma implementando RegraDePromocao:
+//   seguro para frágeis e frete grátis no Sudeste             // regras 5 a 7
+```
+
+Um resumo de entradas e saídas (o resultado completo de `motor.cotar(pedido)`, já ordenado):
+
+| Pedido | Cotações |
+|---|---|
+| Campinas (`13015000`), R$ 50,00, 1 kg | PAC 18,90 (5 dias), SEDEX 34,02 (3) |
+| o mesmo, com item frágil | PAC 26,90 (5), SEDEX 42,02 (3) |
+| Curitiba (`80010000`), R$ 50,00, 3,2 kg | PAC 30,40 (6), SEDEX 54,72 (3) |
+| Campinas, R$ 50,00, 12,5 kg, frágil | PAC 56,90 (5), TRANSPORTADORA 69,69 (7), SEDEX 96,02 (3) |
+| São Paulo (`01310100`), R$ 300,00, 6 kg | RETIRADA 0,00 (1), PAC 0,00 (5), TRANSPORTADORA 52,20 (7), SEDEX 56,52 (3) |
+| Recife (`50010000`), R$ 50,00, 31 kg | TRANSPORTADORA 82,20 (7) |
+
+## Regras
+
+As regras foram extraídas do legado. Em caso de dúvida, o legado decide: é ele que está em produção.
+
+**Modalidades**
+
+1. **PAC atende até 30 kg** (`pesoEmGramas <= 30000`). Valor = base da região + R$ 2,50 por quilo **ou fração** acima do primeiro. Base: Sudeste R$ 18,90, Sul R$ 22,90, Centro-Oeste R$ 26,90, Norte/Nordeste R$ 32,90. Prazo: Sudeste 5, Sul 6, Centro-Oeste 8, Norte/Nordeste 10. Exemplos: 1.000 g em Campinas → 0 quilo excedente → R$ 18,90; 1.001 g em Curitiba → 1 fração → R$ 25,40; 3.200 g em Curitiba → 2.200 g acima do primeiro quilo = 3 frações → R$ 30,40.
+2. **SEDEX atende até 30 kg.** Valor = o PAC **sem seguro e sem promoção** × 1,8. Prazo = metade do prazo do PAC, arredondada para cima. Exemplos: Campinas, 1 kg → 18,90 × 1,8 = R$ 34,02 em 3 dias; Recife, 1 kg → 32,90 × 1,8 = R$ 59,22 em 5 dias.
+3. **TRANSPORTADORA atende só acima de 5 kg** (`pesoEmGramas > 5000`). Valor = R$ 45,00 + R$ 1,20 por quilo **ou fração do peso total**; com item frágil, o valor inteiro × 1,15 (o seguro dela é percentual). Prazo 7. Exemplos: 5.000 g → não atende; 12.500 g → 13 quilos → R$ 60,60; o mesmo, frágil → R$ 69,69.
+4. **RETIRADA na loja só na capital paulista**: CEP de `01000000` a `05999999` (os dois primeiros dígitos entre `01` e `05`). Grátis, prazo 1. Exemplos: `05999999` atende; `06000000` e `00999999` não.
+
+**Promoções** (nesta ordem)
+
+5. **Seguro para frágeis.** Com item frágil, + R$ 8,00 no PAC e no SEDEX (a transportadora já cobrou o dela na regra 3). Exemplo: Campinas, 1 kg, frágil → PAC R$ 26,90 e SEDEX R$ 42,02 (34,02 + 8,00, e **não** 26,90 × 1,8).
+6. **PAC grátis no Sudeste** para pedidos a partir de R$ 299,00 em itens, inclusive o seguro, que também é zerado. Só o PAC. Exemplos: Campinas, R$ 299,00, frágil → PAC R$ 0,00; R$ 298,99 → PAC R$ 18,90; Curitiba, R$ 500,00 → PAC R$ 22,90 (Sul não ganha); o SEDEX de Campinas com R$ 299,00 continua R$ 34,02.
+7. **A ordem é explícita.** O seguro vem antes do frete grátis; se a ordem se inverter, um pedido frágil de R$ 299,00 no Sudeste pagaria R$ 8,00 de PAC.
+
+**Resultado e arquitetura**
+
+8. **Ordenação:** por valor, depois por prazo, depois pelo nome da modalidade. Exemplo: São Paulo, R$ 300,00, 6 kg → RETIRADA (0,00; 1 dia), PAC (0,00; 5 dias), TRANSPORTADORA (52,20), SEDEX (56,52).
+9. **Igual ao legado, sempre.** Para qualquer pedido válido, `motor.cotar(p)` é igual (`equals`) a `legado.cotar(p)`: mesmas cotações, mesmos valores com 2 casas, mesma ordem.
+10. **O motor não conhece ninguém pelo nome.** `MotorDeFrete` não depende de nenhuma classe que implemente `ModalidadeDeFrete` ou `RegraDePromocao`, e nenhuma classe fora de `legado` usa o legado. Cada modalidade e cada promoção é uma classe separada (pelo menos 4 e 2).
+11. **Aberto para extensão.** Uma modalidade nova, declarada como bean, aparece no resultado sem nenhuma mudança no motor. Exemplo: um bean "DRONE" que cota R$ 9,99 em 0 dias para pedidos de até 2 kg aparece em primeiro lugar para Campinas, 1,5 kg.
+
+## Passo a passo sugerido
+
+1. **Monte a rede de proteção primeiro.** Escreva no `MotorDeFrete` o construtor e um `cotar` que devolve `List.of()`, só para compilar. Copie o programa do **Experimente** para `src/test/java` e rode-o: as linhas saem vazias e o golden master acusa `2000 de 2000 pedidos divergem`. A partir daqui, rode-o depois de cada passo.
+2. **O motor (regras 8 e 9).** Guarde as duas listas (`List.copyOf`). Em `cotar`: para cada modalidade, `cotar(pedido)`; em cada cotação, aplique as promoções em sequência; ordene com um `Comparator`. Ainda sem nenhuma modalidade, o Spring injeta uma lista vazia, e nada muda na saída.
+3. **PAC (regra 1).** Extraia só o PAC, rode o programa: as linhas do PAC passam a aparecer, e o golden master ainda diverge nos outros.
+4. **SEDEX (regra 2).** Repare que o SEDEX depende do PAC **antes** do seguro. Pense em composição: o `Sedex` pode receber o `Pac` no construtor.
+5. **TRANSPORTADORA e RETIRADA (regras 3 e 4).**
+6. **As promoções (regras 5 a 7).** Uma classe para cada, com `@Order`.
+7. **Golden master e arquitetura (regras 9 e 10).** O programa precisa terminar com `0 de 2000 pedidos divergem` e `arquitetura: ok`.
+8. **Extensão (regra 11).** Crie uma classe `Drone` temporária com `@Component`, rode e veja o DRONE na primeira linha de Campinas, 1,5 kg; depois apague.
+
+## Experimente
+
+Este programa cota alguns pedidos, roda o **golden master** (2.000 pedidos aleatórios, sempre os mesmos, por causa da semente fixa) e confere as regras de arquitetura com ArchUnit. Salve-o em `src/test/java/dev/trilhajava/m13/frete/ExperimenteFrete.java` (o ArchUnit só está disponível nos testes) e rode pelo ▶ do IntelliJ ao lado do `main`, ou no terminal, na pasta do starter:
+
+```bash
+mvn -q test-compile exec:java "-Dexec.mainClass=dev.trilhajava.m13.frete.ExperimenteFrete" "-Dexec.classpathScope=test"
+```
+
+```java
+package dev.trilhajava.m13.frete;
+
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
+import dev.trilhajava.m13.frete.legado.CalculadoraDeFreteLegada;
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Random;
+import org.springframework.boot.Banner;
+import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+
+public class ExperimenteFrete {
+
+    public static void main(String[] args) {
+        try (var contexto = new SpringApplicationBuilder(FreteApplication.class)
+                .web(WebApplicationType.NONE).bannerMode(Banner.Mode.OFF).logStartupInfo(false).run(args)) {
+            MotorDeFrete motor = contexto.getBean(MotorDeFrete.class);
+
+            imprimir(motor, "Campinas, 1 kg", pedido("13015000", "50.00", 1_000, false));
+            imprimir(motor, "Campinas, 1 kg, frágil", pedido("13015000", "50.00", 1_000, true));
+            imprimir(motor, "Curitiba, 3,2 kg", pedido("80010000", "50.00", 3_200, false));
+            imprimir(motor, "Campinas, 12,5 kg, frágil", pedido("13015000", "50.00", 12_500, true));
+            imprimir(motor, "SP capital, 6 kg, R$ 300", pedido("01310100", "300.00", 6_000, false));
+            imprimir(motor, "Recife, 31 kg", pedido("50010000", "50.00", 31_000, false));
+
+            // O golden master: 2.000 pedidos aleatórios (sempre os mesmos, pela semente) contra o legado.
+            var legado = new CalculadoraDeFreteLegada();
+            var aleatorio = new Random(2026);
+            int divergencias = 0;
+            for (int i = 0; i < 2_000; i++) {
+                String cep = String.format("%08d", aleatorio.nextInt(100_000_000));
+                String valor = BigDecimal.valueOf(aleatorio.nextInt(60_000), 2).toPlainString();
+                Pedido p = pedido(cep, valor, 1 + aleatorio.nextInt(40_000), aleatorio.nextBoolean());
+                List<Cotacao> esperado = legado.cotar(p);
+                List<Cotacao> obtido = motor.cotar(p);
+                if (!obtido.equals(esperado) && divergencias++ == 0) {
+                    System.out.printf("primeira divergência: %s%n  legado: %s%n  motor:  %s%n", p, esperado, obtido);
+                }
+            }
+            System.out.printf("golden master: %d de 2000 pedidos divergem%n", divergencias);
+        }
+
+        // A arquitetura: o motor não conhece nenhuma modalidade nem promoção, e ninguém usa o legado.
+        JavaClasses classes = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("dev.trilhajava.m13.frete");
+        noClasses().that().haveSimpleName("MotorDeFrete")
+                .should().dependOnClassesThat().implement(ModalidadeDeFrete.class)
+                .orShould().dependOnClassesThat().implement(RegraDePromocao.class)
+                .check(classes);
+        noClasses().that().resideOutsideOfPackage("..legado..")
+                .should().dependOnClassesThat().resideInAPackage("..legado..")
+                .check(classes);
+        System.out.println("arquitetura: ok");
+    }
+
+    static Pedido pedido(String cep, String valor, int gramas, boolean fragil) {
+        return new Pedido(cep, new BigDecimal(valor), gramas, fragil);
+    }
+
+    static void imprimir(MotorDeFrete motor, String titulo, Pedido pedido) {
+        StringBuilder linha = new StringBuilder(String.format("%-27s", titulo));
+        for (Cotacao c : motor.cotar(pedido)) {
+            linha.append(String.format(" %s %s (%dd)", c.modalidade(), c.valor(), c.prazoEmDiasUteis()));
+        }
+        System.out.println(linha);
+    }
+}
+```
+
+Com a refatoração completa, a saída (depois das linhas de log da subida) é:
+
+```text
+Campinas, 1 kg              PAC 18.90 (5d) SEDEX 34.02 (3d)
+Campinas, 1 kg, frágil      PAC 26.90 (5d) SEDEX 42.02 (3d)
+Curitiba, 3,2 kg            PAC 30.40 (6d) SEDEX 54.72 (3d)
+Campinas, 12,5 kg, frágil   PAC 56.90 (5d) TRANSPORTADORA 69.69 (7d) SEDEX 96.02 (3d)
+SP capital, 6 kg, R$ 300    RETIRADA 0.00 (1d) PAC 0.00 (5d) TRANSPORTADORA 52.20 (7d) SEDEX 56.52 (3d)
+Recife, 31 kg               TRANSPORTADORA 82.20 (7d)
+golden master: 0 de 2000 pedidos divergem
+arquitetura: ok
+```
+
+Quando algo diverge, o programa mostra o **primeiro** pedido que divergiu, com a lista do legado e a sua. É a informação de que você precisa: refaça a conta daquele pedido à mão, seguindo as regras. Se o motor depender de uma modalidade concreta, o ArchUnit lança um `AssertionError` que começa com `Architecture Violation [Priority: MEDIUM]`, cita a regra violada e lista cada dependência proibida, com a classe e a linha do código.
+
+Para a regra 11, crie temporariamente uma modalidade a mais e acrescente `imprimir(motor, "Campinas, 1,5 kg", pedido("13015000", "50.00", 1_500, false));` ao programa:
+
+```java
+@Component
+class Drone implements ModalidadeDeFrete {
+    @Override
+    public Optional<Cotacao> cotar(Pedido pedido) {
+        return pedido.pesoEmGramas() <= 2_000
+                ? Optional.of(new Cotacao("DRONE", new BigDecimal("9.99"), 0))
+                : Optional.empty();
+    }
+}
+```
+
+A linha nova começa com `DRONE 9.99 (0d)`, sem nenhuma mudança no motor. (O golden master passa a divergir, claro: o legado não conhece drones. Apague a classe depois.)
+
+## Critérios de aceite
+
+- [ ] O programa do **Experimente** imprime exatamente as linhas acima, incluindo `0 de 2000 pedidos divergem` e `arquitetura: ok`.
+- [ ] Cada modalidade e cada promoção é uma classe (um bean) separada: pelo menos 4 e 2.
+- [ ] `MotorDeFrete` só conhece as duas interfaces, `Pedido` e `Cotacao`.
+- [ ] A modalidade DRONE temporária aparece no resultado sem mudança no motor.
+- [ ] Nenhum `double` no cálculo de valores.
+
+## Desafios opcionais
+
+- Leve a tabela de preços para `application.yml` com um `@ConfigurationProperties`: mudar o preço base vira configuração.
+- Um item frágil de R$ 5.000 paga o mesmo seguro que um de R$ 20. Implemente a regra nova (seguro de 1% do valor dos itens, mínimo R$ 8,00) como uma promoção separada, e decida o que fazer com o golden master, que agora vai divergir de propósito.
+- Troque `@Order` por uma prioridade declarada na própria interface `RegraDePromocao` e compare.
+- Escreva a sua própria suíte com `@SpringBootTest`: um teste por linha da tabela de exemplos, o golden master como teste e uma classe `@Nested` com uma `@TestConfiguration` que pluga o DRONE.
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo golden master: com ele rodando, qualquer passo que quebre um pedido aparece na hora, com o pedido que quebrou. Extraia **uma** modalidade por vez: PAC primeiro, rode o programa, depois as outras.
+</Dica>
+<Dica nivel={2}>
+- Cada modalidade é um `@Component` que implementa `ModalidadeDeFrete`. O Spring injeta **todas** na `List<ModalidadeDeFrete>` do motor.
+- As promoções precisam de ordem: `@Order(1)` e `@Order(2)`. O Spring monta a lista nessa ordem.
+- O motor: para cada modalidade, `cotar` → aplicar as promoções em sequência → ordenar com `Comparator.comparing(Cotacao::valor).thenComparingInt(Cotacao::prazoEmDiasUteis).thenComparing(Cotacao::modalidade)`.
+</Dica>
+<Dica nivel={3}>
+- O SEDEX é o PAC **antes** do seguro × 1,8. Em vez de copiar a tabela de preços, o `Sedex` pode receber o `Pac` no construtor e usar a cotação dele (composição). Como as promoções só são aplicadas pelo motor, a cotação que o `Pac` devolve ainda não tem seguro.
+- "Por kg ou fração acima do 1º": `(Math.max(0, gramas - 1000) + 999) / 1000`.
+- Frete grátis e seguro são promoções sobre uma cotação existente: `cotacao.comValor(...)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="MotorDeFrete">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/MotorDeFrete.java" />
+</Tab>
+<Tab rotulo="Modalidades">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/modalidades/Pac.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/modalidades/TabelaPorRegiao.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/modalidades/Sedex.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/modalidades/Transportadora.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/modalidades/RetiradaNaLoja.java" />
+</Tab>
+<Tab rotulo="Promoções">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/promocoes/SeguroParaFrageis.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/promocoes/FreteGratisSudeste.java" />
+</Tab>
+<Tab rotulo="O legado">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/frete/legado/CalculadoraDeFreteLegada.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Uma classe por motivo de mudar.** A tabela do PAC muda quando os Correios reajustam; o frete grátis, quando o marketing muda a campanha; a transportadora, quando o contrato é renegociado. Cada mudança toca um arquivo.
+- **Composição no SEDEX.** O SEDEX depende do preço do PAC. Receber o `Pac` e transformar a cotação dele deixa a relação explícita, sem duplicar a tabela.
+- **Dados em vez de ternários.** `TabelaPorRegiao` é um `switch` sobre o `enum`: o compilador avisa se uma região nova ficar sem preço.
+- **Promoções como decorators de cotação.** Cada regra recebe uma cotação e devolve outra. A ordem (seguro antes do frete grátis) é explícita no `@Order`, e não escondida no meio de um método.
+
+### O erro que o golden master pega
+
+O erro mais comum nesta refatoração é calcular o SEDEX sobre o PAC **com** seguro: num pedido frágil de 1 kg no Sudeste, o SEDEX sai R$ 48,42 em vez de R$ 42,02 (o seguro também é multiplicado por 1,8). O legado aplica o seguro **depois** do fator. Um teste escrito à mão só pega isso se alguém lembrar do caso; o golden master pega na primeira execução, mostrando o pedido exato que divergiu.
+
+### Os testes da solução
+
+A solução de referência tem uma suíte com 12 testes (`MotorDeFreteTest`, em `java/m13-arquitetura/solucao/src/test/java`): um por regra, o golden master e o DRONE plugado por uma `@TestConfiguration`. Compare com a sua, se você fez o desafio da suíte.
+
+### Avalie sua solução
+
+- Se o marketing pedir "frete grátis em TODAS as modalidades para clientes VIP", o que muda? E onde entra a informação "cliente VIP"?
+- O golden master deve ficar no projeto para sempre? O que acontece com ele quando uma regra mudar de propósito?
+
+</Solucao>

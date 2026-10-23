@@ -1,0 +1,121 @@
+---
+titulo: Hash consistente com nós virtuais
+codigo: "15.03"
+resumo: Implemente o anel de hash consistente que distribui chaves entre nós de cache — um TreeMap com ceilingEntry, nós virtuais para equilibrar a carga — e prove com números que adicionar um nó move cerca de 1/6 das chaves, enquanto o hash % n moveria mais de 80%.
+modulo: 15-system-design
+ordem: 3
+dificuldade: medio
+tempo: 1h30
+conceitos: [hash consistente, nós virtuais, particionamento, TreeMap, NavigableMap, ceilingEntry, MD5, rebalanceamento]
+aulas: [15-system-design/05-escala-e-consistencia]
+java:
+  modulo: m15-system-design
+  teste: AnelDeHashTest
+---
+
+## Contexto
+
+Uma aplicação distribui as sessões dos clientes entre 5 servidores de cache com a regra mais simples possível: `servidor = hash(chave) % 5`. Funciona bem até a Black Friday, quando o time adiciona um sexto servidor. Com `% 6`, a maioria das chaves passa a apontar para **outro** servidor, onde ela não está. O cache, na prática, esvazia de uma vez: todas as leituras dão *miss*, o banco recebe de uma vez a carga que o cache segurava, e cai. Tirar um servidor para manutenção causa o mesmo efeito.
+
+O **hash consistente** resolve: nós e chaves ficam no mesmo anel de valores, e cada chave pertence ao primeiro nó no sentido horário. Um nó novo assume só um trecho do anel; o resto das chaves não se move.
+
+Este exercício é Java puro: sem Spring, sem Docker.
+
+## O que já existe
+
+Em `dev.trilhajava.m15.hash`, a classe `AnelDeHash` (esboço), com:
+
+- o construtor `AnelDeHash(int virtuaisPorNo)` e os métodos `adicionar(no)`, `remover(no)`, `noPara(chave)` e `nos()`, todos com `TODO`;
+- `static long hash(String valor)`, **pronta**: os 8 primeiros bytes do MD5 do texto, como `long`. Use-a para posicionar tanto os nós quanto as chaves.
+
+## Os requisitos
+
+**1. O anel.** Cada nó físico ocupa `virtuaisPorNo` pontos no anel (os **nós virtuais**). O dono de uma chave é o nó do **primeiro ponto** com posição maior ou igual a `hash(chave)`; se não houver nenhum, **dá a volta**: o dono é o nó do menor ponto do anel.
+
+**2. Nós virtuais determinísticos.** A posição de cada ponto depende só do nome do nó e do número do ponto (por exemplo, `hash("n1#0")`, `hash("n1#1")`...). Dois anéis com os mesmos nós, adicionados em qualquer ordem, dão o mesmo dono para cada chave. Sem `Random`, sem depender da ordem de inserção.
+
+**3. As operações.**
+
+| Operação | Comportamento |
+|---|---|
+| `new AnelDeHash(0)` (ou negativo) | `IllegalArgumentException`: cada nó precisa de pelo menos um ponto |
+| `noPara(chave)` com o anel vazio | `IllegalStateException` |
+| `adicionar(no)` de um nó que já existe | nada muda |
+| `remover(no)` de um nó que não existe | nada muda |
+| `nos()` | os nós físicos (não os pontos), numa cópia que não altera o anel |
+
+**4. As garantias que os testes medem**, com 100 mil chaves `cliente:0` a `cliente:99999`:
+
+- com 200 nós virtuais e 5 nós, **cada** nó recebe entre 80% e 120% da média (20 mil chaves);
+- ao adicionar um 6º nó, entre **10% e 22%** das chaves mudam de dono, e **todas** as que mudaram vão para o nó novo;
+- ao remover um nó, só as chaves **dele** mudam de dono.
+
+O teste também calcula, para comparar, quantas chaves mudariam com `hash % 5` contra `hash % 6`: mais de 70%.
+
+## Critérios de aceite
+
+- [ ] `AnelDeHashTest` passa (8 testes).
+- [ ] `noPara` custa O(log n) no número de pontos do anel, e não uma varredura da lista inteira.
+- [ ] Nenhum ponto de um nó é removido por engano quando outro nó sai.
+
+## Desafios opcionais
+
+- Rode a distribuição com 1, 10, 50 e 200 nós virtuais e imprima o desvio entre o nó mais carregado e o menos carregado. Onde a curva fica "boa o suficiente"? Quanto de memória custam 200 pontos por nó com 100 nós?
+- Dê **pesos** aos nós: um servidor com o dobro de memória recebe o dobro de pontos. Mude a API para `adicionar(no, peso)` e verifique a proporção.
+- Implemente a **replicação**: `nosPara(chave, 3)` devolve os 3 primeiros nós **físicos distintos** no sentido horário. É o que o Cassandra e o Dynamo fazem para decidir onde guardar as réplicas.
+- Troque o MD5 pelo MurmurHash3 (do Guava ou de uma implementação sua). A distribuição muda? E o tempo de `noPara`?
+
+<Dicas>
+<Dica nivel={1}>
+O anel é um mapa ordenado de "posição → nó". A pergunta "qual o primeiro ponto a partir desta posição?" é exatamente o que um mapa ordenado sabe responder rápido. Guarde também um conjunto com os nós físicos: é ele que torna `adicionar` e `remover` idempotentes e que responde `nos()`.
+</Dica>
+<Dica nivel={2}>
+- `NavigableMap<Long, String> anel = new TreeMap<>()`: as chaves ficam ordenadas, e as buscas custam O(log n).
+- `anel.ceilingEntry(h)` devolve a entrada com a menor chave maior ou igual a `h`, ou `null`. No `null`, dê a volta com `anel.firstEntry()`.
+- O `hash` devolve `long` com sinal, de `Long.MIN_VALUE` a `Long.MAX_VALUE`. Não precisa converter nada: o `TreeMap` ordena os `long` e o anel é esse intervalo inteiro.
+</Dica>
+<Dica nivel={3}>
+- `adicionar`: `if (!nos.add(no)) return;` e, para `i` de 0 a `virtuaisPorNo - 1`, `anel.put(hash(no + "#" + i), no)`.
+- `remover`: `if (!nos.remove(no)) return;` e o mesmo laço com `anel.remove(hash(no + "#" + i), no)`. O `remove` de **dois argumentos** só apaga se o ponto ainda for daquele nó: se dois nós colidirem na mesma posição (raro com 64 bits, mas possível), você não arranca o ponto do outro.
+- `nos()`: `Set.copyOf(nos)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/hash/AnelDeHash.java" />
+
+### Passo a passo
+
+1. **Um `TreeMap` é o anel.** As posições (`long`) ficam ordenadas. `ceilingEntry(hash(chave))` encontra o primeiro ponto no sentido horário em O(log n); o `firstEntry()` fecha o círculo quando a chave cai depois do último ponto.
+2. **Nós virtuais equilibram a carga.** Com um ponto por nó, 5 pontos dividem o anel em 5 trechos de tamanhos aleatórios, e um nó pode ficar com o triplo da carga de outro. Com 200 pontos por nó, cada nó tem 200 trechos pequenos espalhados, e a soma deles se aproxima de 1/5 do anel (é a lei dos grandes números). Além disso, quando um nó sai, as chaves dele se espalham entre **todos** os outros, e não caem num único vizinho.
+3. **Nomes determinísticos.** `hash("n1#0")` é igual em qualquer JVM e em qualquer ordem de inserção. Isso é o que permite a várias instâncias da aplicação, cada uma com o seu anel, concordarem sobre o dono de cada chave sem conversar entre si.
+4. **Por que MD5, e não `String.hashCode()`.** O MD5 aqui não tem nada a ver com segurança: ele espalha bem valores parecidos. O `hashCode` de `"n1#0"` e `"n1#1"` difere pouco, e os pontos de um mesmo nó ficariam amontoados num canto do anel.
+5. **Idempotência.** O `Set` de nós físicos responde "já existe?" antes de mexer no anel. Adicionar duas vezes não duplica pontos; remover um nó desconhecido não apaga nada.
+
+### Os números
+
+Por que o `% n` move tanto? Uma chave só fica no mesmo nó se `h % 5 == h % 6`. Isso acontece quando `h % 30` está entre 0 e 4: **5 em cada 30** casos, 1/6. As outras **83%** mudam de nó. No anel, o nó novo assume cerca de 1/6 do espaço (o seu "quinhão" entre 6 nós), e **só** essas chaves se movem: cerca de 17%, todas para ele.
+
+| Mudança | `hash % n` | Anel com nós virtuais |
+|---|---|---|
+| 5 → 6 nós | ~83% das chaves mudam | ~17% (1/6), todas para o nó novo |
+| 5 → 4 nós | ~80% mudam | ~20%: só as do nó que saiu |
+
+### Alternativas e trade-offs
+
+- **Rendezvous hashing** (*highest random weight*): para cada chave, calcule `hash(chave + no)` para todos os nós e escolha o maior. Não precisa de nós virtuais nem de estrutura, e move o mínimo possível; custa O(n) por chave. Ótimo com poucos nós.
+- **Jump consistent hash** (Google, 2014): O(1) de memória, distribuição perfeita e rápida, mas os nós são numerados de 0 a n-1 e só dá para adicionar ou remover **o último**. Serve para shards numerados, não para servidores que entram e saem em qualquer ordem.
+- **Slots fixos**, como os 16384 *hash slots* do Redis Cluster (aula 2): a chave vai para `CRC16(chave) % 16384`, e uma tabela diz qual nó tem cada slot. Mover dados é mover slots, de forma explícita e controlada. Troca a elegância do anel por um mapa que precisa ser distribuído e mantido.
+- **Thread-safety.** Esta classe não é thread-safe. Num sistema real, a topologia muda raramente: monte um anel novo e troque a referência inteira (um `AtomicReference<AnelDeHash>` ou um campo `volatile`), em vez de sincronizar cada `noPara`.
+
+### Avalie sua solução
+
+- Seu `noPara` percorre o mapa com um laço? Se sim, com 5 nós e 200 pontos são 1.000 comparações por chamada. Quanto custa com o `ceilingEntry`?
+- Você usou `anel.remove(posicao)` ou `anel.remove(posicao, no)`? Escreva um teste que force uma colisão (sobrescrevendo o `hash` numa subclasse de teste, por exemplo) e veja a diferença.
+- Um único cliente gera 30% do tráfego (uma *hot key*). O hash consistente ajuda? O que ajudaria? (Aula 5: cache local, subchaves.)
+- Ao adicionar o 6º nó num cache real, 17% das chaves dão *miss* de uma vez. Como você suavizaria isso (aquecer o nó novo, adicionar pontos aos poucos)?
+
+</Solucao>

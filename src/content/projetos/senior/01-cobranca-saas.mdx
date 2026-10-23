@@ -1,0 +1,1316 @@
+---
+titulo: "Cobra+ — plataforma SaaS multi-tenant de cobrança recorrente"
+resumo: Uma plataforma de billing em que empresas (tenants) cobram as assinaturas dos próprios clientes — planos fixos, por assento e por uso medido, faturamento idempotente em escala, adquirente simulada com falhas reais, ledger de partidas dobradas, webhooks assinados e isolamento de tenant provado por teste.
+nivel: senior
+ordem: 1
+dominio: Fintech · billing de assinaturas
+horas: 200
+stack: [Java 25, Spring Boot 4, Spring Security 7, Spring Modulith 2, Hibernate 7, Flyway, PostgreSQL 18, Kafka 4 (KRaft), Redis, Resilience4j, Micrometer + OpenTelemetry, Grafana · Prometheus · Tempo · Loki, Keycloak, k6, JUnit 6, Testcontainers 2, Docker Compose, GitHub Actions]
+competencias:
+  - Correção financeira demonstrada, não prometida — ledger de partidas dobradas imutável, invariantes verificadas por job e por testes de propriedade, zero cobrança duplicada mesmo com timeout da adquirente
+  - Faturamento em lote idempotente e escalável (SKIP LOCKED, restrições únicas, reprocessamento seguro) medido com milhares de tenants
+  - Isolamento multi-tenant com Row-Level Security do PostgreSQL, com ADR comparando alternativas e teste que prova que um tenant não lê dado de outro
+  - API pública de nível de produto — versionada, com chaves por escopo, rate limiting por plano, Idempotency-Key e Problem Details — e webhooks assinados no padrão Standard Webhooks com DLQ e reenvio
+  - Arquitetura defendida por escrito — monólito modular com fronteiras verificadas e um serviço de ingestão separado, cada escolha em ADR com trade-offs
+  - Operação de verdade — SLOs com error budget, alertas por taxa de consumo, dashboards, runbook, migração sem downtime demonstrada sob carga e postmortem de um incidente provocado
+  - Conformidade tratada como requisito — LGPD (exportação, anonimização, retenção), auditoria encadeada por hash e nenhum dado de cartão armazenado
+modulos: [06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 12-mensageria, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - { id: fundacao, titulo: "Fundação, ADRs e esteira de qualidade", resumo: "Repositório multi-módulo, ADRs iniciais, Docker Compose com toda a infraestrutura, CI com qualidade e fronteiras de módulo verificadas." }
+  - { id: tenancy, titulo: "Tenants, chaves de API e isolamento", resumo: "Cadastro de tenants, chaves de API com escopos, Row-Level Security e o teste que prova o isolamento." }
+  - { id: catalogo-assinaturas, titulo: "Catálogo e ciclo de vida das assinaturas", resumo: "Produtos, preços, cupons, clientes e a máquina de estados da assinatura, com alteração de plano e pró-rata." }
+  - { id: faturamento-ledger, titulo: "Faturamento idempotente e ledger", resumo: "Fechamento de ciclo em lote sem faturar duas vezes, faturas com desconto e imposto, e ledger de partidas dobradas com invariantes." }
+  - { id: pagamentos-dunning, titulo: "Cobrança na adquirente e régua de dunning", resumo: "Adquirente simulada, estado desconhecido e reconciliação, circuit breaker, régua com backoff, notas de crédito e reembolsos." }
+  - { id: uso-medido, titulo: "Ingestão de uso em alto volume", resumo: "Serviço cobra-ingest, Kafka, deduplicação, agregação por período e cobrança por uso, medidos com k6." }
+  - { id: webhooks, titulo: "Eventos e webhooks assinados", resumo: "Outbox para Kafka, webhooks com HMAC e timestamp, rotação de segredo, retentativa exponencial, DLQ e reenvio pelo console." }
+  - { id: operacao-conformidade, titulo: "Conformidade, auditoria e migração sem downtime", resumo: "LGPD, auditoria encadeada, feature flags e uma migração expand/contract demonstrada sob carga." }
+  - { id: entrega, titulo: "Produção reproduzível, caos e v1.0.0", resumo: "SLOs medidos e alertas, experimento de caos com postmortem, runbook, README final, demonstração e release." }
+---
+
+## Visão geral
+
+Cobrar uma assinatura parece trivial até você fazer isso para milhares de empresas ao mesmo tempo. O cliente muda de plano no dia 16 e espera pagar só a diferença. O cartão é recusado e a empresa quer tentar de novo sem irritar ninguém. A adquirente demora 30 segundos para responder e você não sabe se cobrou ou não. O fechamento do mês cai no dia 1º para 60% das assinaturas e o job não pode, em hipótese nenhuma, gerar a mesma fatura duas vezes. E o financeiro de cada empresa quer um extrato que feche até o centavo.
+
+O **Cobra+** é uma plataforma SaaS de cobrança recorrente (*billing*). Empresas clientes — os **tenants** — integram o sistema delas à API do Cobra+ para cobrar os **clientes finais** delas. Você vai construir o backend inteiro, do primeiro commit à release `v1.0.0`:
+
+- **Catálogo e assinaturas**: produtos e preços fixos, por assento e por uso medido, mensais ou anuais; assinaturas com ciclo de vida (trial, ativa, inadimplente, pausada, cancelada), upgrade e downgrade com pró-rata e cupons.
+- **Faturamento em lote**: fechamento de ciclo idempotente e paralelizável, com imposto simplificado, numeração sem lacunas e janela de rascunho para uso tardio.
+- **Cobrança e dunning**: integração com uma adquirente **simulada** que falha de forma realista (recusas, lentidão, timeout com cobrança efetivada), reconciliação do estado desconhecido, circuit breaker e régua de retentativas.
+- **Ledger contábil de partidas dobradas**: imutável, com saldos derivados e invariantes verificadas continuamente; notas de crédito e reembolsos passam por ele.
+- **Uso medido em alto volume**: um serviço de ingestão separado recebe eventos de uso, publica no Kafka e o núcleo deduplica e agrega por período.
+- **API pública e webhooks**: versionada, com chaves de API por escopo, rate limiting por plano do tenant, `Idempotency-Key`, Problem Details e webhooks assinados (HMAC com timestamp, rotação de segredo, DLQ e reenvio).
+- **Multi-tenancy com RLS**: isolamento no banco com Row-Level Security, provado por teste.
+- **Operação e conformidade**: SLOs com error budget, dashboards e alertas, auditoria encadeada por hash, LGPD, feature flags, migração sem downtime, runbook e um postmortem de incidente provocado.
+
+**Pitch de uma frase:** "Construí uma plataforma de billing multi-tenant que fatura milhares de assinaturas por lote sem nunca cobrar duas vezes, com ledger de partidas dobradas que fecha no centavo, isolamento de tenant no banco e SLOs medidos sob falha da adquirente."
+
+**Por que isso chama atenção num portfólio Sênior.** Um projeto Sênior não é avaliado pela quantidade de endpoints, e sim pelo **julgamento**: que problemas você enxergou antes de acontecerem, que trade-offs escolheu e por quê, como provou que o dinheiro está certo e como o sistema se comporta quando algo quebra. Billing concentra tudo isso num domínio que qualquer gestor entende ("não pode cobrar duas vezes"). Um revisor que abre o repositório encontra ADRs, invariantes com testes, um relatório de carga, um postmortem e um runbook: evidências de que você opera o que constrói e sabe explicar para o negócio.
+
+## Contexto de negócio
+
+A **Cobra+ Tecnologia** (fictícia) é uma startup de infraestrutura financeira que vende billing como serviço para empresas SaaS e de assinatura: um software de gestão para academias, um app de idiomas, uma API de geolocalização que cobra por chamada. Essas empresas não querem construir cobrança recorrente: querem chamar uma API, receber webhooks e ver um extrato que o contador aceite.
+
+A Cobra+ cobra dos tenants um plano da plataforma (Starter, Growth ou Enterprise), que define limites de uso da API. O dinheiro dos clientes finais passa por uma **adquirente** parceira (simulada neste projeto); a Cobra+ não guarda dados de cartão, só *tokens*.
+
+| Ator | O que faz no sistema |
+|---|---|
+| **Operador da plataforma** (Cobra+) | Cria e suspende tenants, define o plano da plataforma, consulta relatórios de invariantes e a saúde do sistema. |
+| **Administrador do tenant** | Gerencia chaves de API, endpoints de webhook, usuários do console e configurações (fuso, alíquota, régua). |
+| **Financeiro do tenant** | Consulta faturas, emite notas de crédito e reembolsos, exporta o extrato do ledger, reenvia webhooks. |
+| **Sistema do tenant** (integração) | Chama a API pública com uma chave: cria clientes, assinaturas, envia eventos de uso, recebe webhooks. |
+| **Cliente final** | A pessoa ou empresa que paga a assinatura. Não acessa o Cobra+ diretamente; recebe e-mails da régua e pode exercer direitos da LGPD pelo tenant. |
+| **Adquirente** (simulada) | Processa as cobranças em cartão tokenizado; aprova, recusa, demora ou fica fora do ar. |
+| **Agendadores internos** | Fecham ciclos, finalizam rascunhos, executam a régua, entregam webhooks, verificam invariantes e aplicam a retenção. |
+
+**Glossário**
+
+| Termo | Significado |
+|---|---|
+| **Tenant** | Empresa cliente da Cobra+. Todo dado de negócio pertence a exatamente um tenant. |
+| **Produto / preço** | O que se vende (ex.: "Plano Pro") e quanto custa e como se cobra (R$ 299,00 por mês, R$ 49,00 por assento, R$ 0,002 por chamada). Um produto tem vários preços. |
+| **Assinatura** | O vínculo recorrente entre um cliente final e um ou mais preços (os **itens** da assinatura). |
+| **Âncora de cobrança** | O dia do mês (ou do ano) em que o ciclo vira; definido na criação da assinatura. |
+| **Pró-rata** | Cobrança ou crédito proporcional ao tempo restante do ciclo numa alteração de plano. |
+| **Fatura** | O documento de cobrança de um período, com linhas, desconto, imposto e total. Passa por `RASCUNHO` antes de ser finalizada. |
+| **Nota de crédito** | Documento que reduz o valor devido ou pago de uma fatura finalizada (a fatura em si nunca é editada). |
+| **Dunning (régua de cobrança)** | O processo de retentar cobranças recusadas e avisar o cliente até receber ou desistir. |
+| **Recusa soft / hard** | Recusa que pode passar numa nova tentativa (saldo insuficiente) ou que não vai passar (cartão roubado). |
+| **Ledger** | O livro contábil: transações com lançamentos a débito e a crédito em contas, sempre balanceados. |
+
+## Escopo
+
+**Dentro**
+
+- API pública `/v1` (chaves de API) e API do console `/console/v1` (usuários autenticados por JWT emitido por um Keycloak local) e `/plataforma/v1` (operadores).
+- Catálogo, clientes finais, meios de pagamento tokenizados, cupons, assinaturas e todo o ciclo de vida, pró-rata, faturamento, cobrança, dunning, notas de crédito, reembolsos, ledger, uso medido, webhooks, auditoria, LGPD, feature flags.
+- Moeda **BRL** apenas, mas com a moeda modelada em todo valor (a segunda moeda é extensão).
+- Imposto **simplificado**: uma alíquota única por tenant sobre a base da fatura.
+- A adquirente simulada (`adquirente-fake`), que você também escreve, e um servidor SMTP de teste (Mailpit) para os e-mails da régua.
+- Observabilidade completa no Docker Compose, testes de carga com k6, experimento de caos.
+
+**Fora** (vão para "Para ir além")
+
+- Interface gráfica do console (a API do console é o produto; um front mínimo é opcional).
+- Emissão de nota fiscal real, cálculo tributário real (ISS por município, retenções), boleto e Pix.
+- Múltiplas moedas e câmbio; reconhecimento de receita ao longo do tempo (receita diferida).
+- Modo de teste separado do modo de produção por tenant (como `livemode` em gateways comerciais).
+- Tokenização real de cartão: a adquirente fake emite tokens fixos de teste.
+- Multi-região e alta disponibilidade real do banco; deploy em nuvem é opcional.
+
+## Requisitos funcionais
+
+Convenções usadas em todas as regras: horários em ISO 8601; valores em centavos (`29900` = R$ 299,00); arredondamento **HALF_EVEN** (o "arredondamento bancário": 0,5 vai para o par mais próximo) sempre que um cálculo produzir fração de centavo; o fuso padrão de um tenant é `America/Sao_Paulo`.
+
+### RF-01 · Tenants e planos da plataforma
+
+O operador cria tenants; cada tenant tem um plano da plataforma que define limites.
+
+- **RN-01 — Plano define limites.** Starter: 20 req/s na API (rajada de 40), 500 eventos de uso por segundo, 3 endpoints de webhook. Growth: 100 req/s (rajada 200), 2.000 eventos/s, 10 endpoints. Enterprise: 400 req/s (rajada 800), 10.000 eventos/s, 25 endpoints. Trocar o plano vale em até 60 s sem reiniciar nada.
+- **RN-02 — Configurações do tenant.** `fuso` (identificador IANA válido; `"Brasil/SP"` → `422`), `aliquota_imposto_bp` em pontos-base de 0 a 3000 (500 = 5%; `3001` → `422`), `janela_rascunho_min` de 0 a 4320 (padrão 60), `acao_final_dunning` (`cancelar` ou `manter_inadimplente`, padrão `cancelar`).
+- **RN-03 — Tenant suspenso.** Com status `SUSPENSO`, toda chamada da API pública recebe `403` com `type` `tenant-suspenso`; os agendadores **não** fecham ciclos nem cobram assinaturas dele; webhooks pendentes continuam sendo entregues. Reativar retoma de onde parou (ciclos vencidos durante a suspensão são fechados na ordem, sem pular período).
+
+**Critérios de aceite**
+
+- Dado um tenant Starter, quando ele dispara 60 requisições ao mesmo tempo com o balde cheio, então a rajada de 40 passa e cerca de 20 recebem `429` com o header `Retry-After`.
+- Dado um tenant suspenso com 3 assinaturas vencidas, quando ele é reativado, então as 3 faturas são geradas no próximo ciclo do agendador, uma por período vencido.
+
+### RF-02 · Chaves de API e escopos
+
+- **RN-04 — Formato e armazenamento.** A chave tem o formato `ck_<id de 8 caracteres>_<segredo de 43 caracteres base64url>` (32 bytes aleatórios de um `SecureRandom`). O Cobra+ guarda o id (visível no console, por exemplo `ck_7Fh2Kq9x`) e o **HMAC-SHA256 do segredo com um *pepper*** do servidor; o segredo completo é mostrado **uma única vez**, na criação. Segredo de alta entropia não precisa de BCrypt (não há dicionário a atacar), e o HMAC permite validar em microssegundos a cada requisição — registre isso no ADR de autenticação.
+- **RN-05 — Escopos.** `catalogo:escrita`, `clientes:escrita`, `assinaturas:leitura`, `assinaturas:escrita`, `faturas:leitura`, `faturas:escrita`, `uso:leitura`, `uso:escrita`, `webhooks:gestao`. Escrita não implica leitura, exceto do recurso criado na própria resposta. Chave sem o escopo → `403` `escopo-insuficiente`, com o escopo exigido no campo `escopo_necessario`.
+- **RN-06 — Revogação.** Revogar é imediato no core e vale em até **60 s** no `cobra-ingest` (que usa cache). Uma chave revogada nunca volta a valer; o tenant pode ter até 10 chaves ativas.
+- **RN-07 — Resposta uniforme.** Chave malformada, inexistente, revogada ou de tenant inexistente produz a **mesma** resposta `401` `nao-autenticado`, sem indicar o motivo (o motivo vai para o log e para a auditoria).
+
+**Critérios de aceite**
+
+- Dada uma chave recém-criada, quando o banco é inspecionado, então não existe nenhuma coluna com o segredo em claro.
+- Dada uma chave só com `faturas:leitura`, quando ela chama `POST /v1/assinaturas`, então recebe `403` com `escopo_necessario: "assinaturas:escrita"`.
+
+### RF-03 · Isolamento entre tenants
+
+- **RN-08 — Todo dado de negócio tem dono.** Toda tabela de negócio tem `tenant_id NOT NULL` e uma política de RLS; a aplicação conecta ao banco com um papel que **não** é dono das tabelas e não tem `BYPASSRLS`, e as tabelas usam `FORCE ROW LEVEL SECURITY`.
+- **RN-09 — O tenant vem da credencial, nunca da requisição.** O tenant é derivado da chave de API ou do claim `tenant_id` do JWT. Um `tenant_id` no corpo ou na query é ignorado (e registrado como tentativa suspeita se divergir).
+- **RN-10 — Recurso de outro tenant não existe.** `GET /v1/faturas/{id}` com o id de uma fatura de outro tenant → `404` `recurso-nao-encontrado`, idêntico ao de um id que não existe (nunca `403`, que confirmaria a existência).
+- **RN-11 — Sem contexto, sem dados.** Uma consulta executada sem o tenant definido na transação devolve **zero linhas** (e uma escrita falha), em vez de devolver dados de todos.
+- **RN-12 — Processos entre tenants.** Os agendadores que varrem vários tenants usam uma tabela de trabalho sem dados sensíveis para descobrir *o que* processar e então processam cada item **dentro do contexto do tenant dono**. Nenhum caminho de código de negócio usa um papel com `BYPASSRLS`.
+
+**Critérios de aceite**
+
+- Dados os tenants A e B com dados em todas as tabelas, quando o teste de isolamento executa cada endpoint de leitura de A com ids de B, então todas as respostas são `404` e nenhum corpo contém um id de B.
+- Dado um teste que abre uma transação sem definir o tenant, quando ele faz `SELECT count(*) FROM faturas`, então o resultado é 0 mesmo com faturas no banco.
+
+### RF-04 · Clientes finais e meios de pagamento
+
+- **RN-13 — Referência externa única.** O cliente tem `ref_externa` (o id dele no sistema do tenant, 1–64 caracteres), única por tenant: `POST /v1/clientes` com uma `ref_externa` já usada → `409` `cliente-duplicado`, com o id existente no corpo.
+- **RN-14 — Dados pessoais mínimos.** Nome (1–120), e-mail (normalizado em minúsculas), documento opcional (CPF ou CNPJ, validado pelos dígitos verificadores; `"111.111.111-11"` é inválido) e endereço opcional.
+- **RN-15 — Meio de pagamento é um token.** `POST /v1/clientes/{id}/meios-pagamento` recebe só o `token` emitido pela adquirente; o Cobra+ consulta a adquirente e guarda `bandeira`, `ultimos4`, `validade_mes`, `validade_ano`. Qualquer campo com aparência de número de cartão (13 a 19 dígitos que passam no algoritmo de Luhn) em **qualquer** corpo de requisição → `422` `dado-de-cartao-proibido`, sem logar o valor.
+- **RN-16 — Meio padrão.** Um cliente tem no máximo um meio padrão; adicionar um novo com `padrao: true` substitui o anterior. Trocar o meio padrão de um cliente `INADIMPLENTE` dispara uma tentativa imediata das faturas abertas (RN-47).
+
+**Critérios de aceite**
+
+- Dado um corpo com `"observacao": "4111 1111 1111 1111"`, quando qualquer endpoint o recebe, então a resposta é `422` e o valor não aparece em log, trace ou auditoria.
+
+### RF-05 · Catálogo: produtos, preços e cupons
+
+- **RN-17 — Modelos de preço.** `fixo` (valor por ciclo), `por_assento` (valor × quantidade, quantidade de 1 a 10.000) e `por_uso` (métrica, franquia inclusa e preço unitário). Intervalo `mes` ou `ano`. Um preço é **imutável** depois de criado: mudar o valor é criar outro preço e arquivar o antigo; assinaturas existentes continuam no preço delas.
+- **RN-18 — Preço por uso com fração de centavo.** O preço unitário é um decimal em centavos com até 6 casas (`0.2` = R$ 0,002). O valor da linha é `round_half_even((quantidade − franquia) × preco_unitario)`, nunca negativo. Exemplo: 25.300 chamadas, franquia de 10.000, preço 0,2 centavo → 15.300 × 0,2 = **3.060 centavos** (R$ 30,60). Com 9.000 chamadas, a linha vale 0 e aparece na fatura com quantidade 9.000.
+- **RN-19 — Cupons.** Código de 3 a 32 caracteres `A–Z`, `0–9` e `-`, único por tenant, sem diferenciar maiúsculas (`black-friday` = `BLACK-FRIDAY`). Tipo `percentual` (1 a 100) ou `valor_fixo` (em centavos, na moeda do cupom). Duração `uma_vez`, `repetir` (1 a 36 ciclos) ou `sempre`. Opcionais: `max_resgates` e `valido_ate` (vale para **aplicar** o cupom; um cupom `repetir` já aplicado continua valendo depois de `valido_ate`).
+- **RN-20 — Uma assinatura, um cupom.** Aplicar um segundo cupom substitui o primeiro a partir do próximo ciclo. Cupom esgotado, expirado ou de moeda diferente → `422` `cupom-invalido`, com `motivo` (`esgotado`, `expirado`, `moeda-incompativel`, `inexistente`).
+- **RN-21 — Resgate sem corrida.** Dois pedidos simultâneos pelo último resgate de um cupom com `max_resgates: 100` resultam em exatamente um sucesso e um `422` `cupom-invalido` (`esgotado`). Resolva com uma atualização condicional (`UPDATE ... SET resgates = resgates + 1 WHERE resgates < max_resgates`) ou lock; o teste dispara as duas requisições em paralelo.
+
+**Critérios de aceite**
+
+- Dado um cupom com 1 resgate restante, quando 20 threads o aplicam ao mesmo tempo, então exatamente 1 aplicação tem sucesso e `resgates` termina igual a `max_resgates`.
+
+### RF-06 · Assinaturas e ciclo de vida
+
+<Figura legenda="Máquina de estados da assinatura. Qualquer transição fora destas setas é recusada com 409 transicao-invalida">
+<svg viewBox="0 0 860 370" width="860" role="img" aria-labelledby="cobra-estados-titulo cobra-estados-desc">
+  <title id="cobra-estados-titulo">Estados de uma assinatura no Cobra+</title>
+  <desc id="cobra-estados-desc">Uma assinatura nasce em TRIAL, quando criada com período de teste, ou em ATIVA, quando criada sem teste. TRIAL vai para ATIVA quando o teste termina com meio de pagamento, ou para CANCELADA quando termina sem meio de pagamento ou é cancelada. ATIVA vai para INADIMPLENTE quando um pagamento falha, e volta para ATIVA quando um pagamento é aprovado. ATIVA vai para PAUSADA ao pausar e volta ao retomar ou após no máximo 90 dias. INADIMPLENTE vai para CANCELADA quando a régua se esgota. ATIVA e PAUSADA podem ser canceladas. CANCELADA é terminal.</desc>
+  <defs><marker id="cobra-mk-estados" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <circle cx="95" cy="20" r="8" class="d-accent"/>
+  <path d="M95 28 L95 68" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="103" y="52" class="d-label">criar com trial</text>
+  <path d="M103 20 L405 20 L405 68" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="250" y="14" text-anchor="middle" class="d-label">criar sem trial (1ª fatura na hora)</text>
+  <rect x="20" y="70" width="150" height="48" rx="10" class="d-box"/>
+  <text x="95" y="99" text-anchor="middle" class="d-title">TRIAL</text>
+  <rect x="330" y="70" width="150" height="48" rx="10" class="d-ok"/>
+  <text x="405" y="99" text-anchor="middle" class="d-title">ATIVA</text>
+  <rect x="660" y="70" width="150" height="48" rx="10" class="d-info"/>
+  <text x="735" y="99" text-anchor="middle" class="d-title">PAUSADA</text>
+  <rect x="330" y="240" width="150" height="48" rx="10" class="d-accent"/>
+  <text x="405" y="269" text-anchor="middle" class="d-title">INADIMPLENTE</text>
+  <rect x="660" y="240" width="150" height="48" rx="10" class="d-violet"/>
+  <text x="735" y="262" text-anchor="middle" class="d-title">CANCELADA</text>
+  <text x="735" y="280" text-anchor="middle" class="d-label">terminal</text>
+  <path d="M170 94 L328 94" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="250" y="86" text-anchor="middle" class="d-label">fim do trial</text>
+  <text x="250" y="112" text-anchor="middle" class="d-label">com meio de pagamento</text>
+  <path d="M380 118 L380 238" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="372" y="184" text-anchor="end" class="d-label">pagamento falhou</text>
+  <path d="M430 238 L430 120" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="438" y="184" class="d-label">pagamento aprovado</text>
+  <path d="M480 86 L658 86" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="570" y="80" text-anchor="middle" class="d-label">pausar</text>
+  <path d="M658 104 L482 104" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="570" y="122" text-anchor="middle" class="d-label">retomar (máx. 90 dias)</text>
+  <path d="M470 118 L668 238" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="600" y="160" class="d-label">cancelar</text>
+  <path d="M735 118 L735 238" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="743" y="184" class="d-label">cancelar</text>
+  <path d="M480 264 L658 264" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="570" y="256" text-anchor="middle" class="d-label">régua esgotada</text>
+  <path d="M95 118 L95 340 L735 340 L735 290" class="d-line" marker-end="url(#cobra-mk-estados)"/>
+  <text x="415" y="332" text-anchor="middle" class="d-label">trial terminou sem meio de pagamento, ou cancelado no trial</text>
+</svg>
+</Figura>
+
+- **RN-22 — Criação.** Uma assinatura tem de 1 a 20 itens, todos na **mesma moeda e no mesmo intervalo** (`mes` com `ano` → `422` `intervalos-incompativeis`). Com `dias_trial` de 1 a 90, nasce `TRIAL` e o primeiro período começa no fim do trial; sem trial, nasce `ATIVA`, o período começa agora e a primeira fatura é gerada e finalizada **imediatamente** (sem janela de rascunho).
+- **RN-23 — Âncora e fim de mês.** A âncora é o dia da criação (ou do fim do trial), no fuso do tenant. Se o mês não tem esse dia, o ciclo vira no último dia do mês, e a âncora **não se perde**: âncora 31 → 31/01, 28/02 (29/02 em ano bissexto), 31/03, 30/04, 31/05. Anual criada em 29/02/2028 → vira em 28/02/2029 e 29/02/2032.
+- **RN-24 — Cobrança antecipada e uso postecipado.** Itens `fixo` e `por_assento` são cobrados **no início** do período a que se referem; itens `por_uso` são cobrados **no fim**, pelo que foi medido. A fatura de fechamento de 01/11 contém o fixo de novembro e o uso de outubro.
+- **RN-25 — Transições.** Só as da figura. `POST /v1/assinaturas/{id}/pausa` numa assinatura `INADIMPLENTE` → `409` `transicao-invalida`, com `estado_atual` e `transicoes_permitidas` no corpo.
+- **RN-26 — Pausa.** Durante a pausa nenhum ciclo é fechado e nada é cobrado. A pausa dura até a retomada ou até `retomar_em` (máximo 90 dias; o padrão é 90). Ao retomar, o novo período começa no instante da retomada e a âncora passa a ser esse dia; não há cobrança retroativa.
+- **RN-27 — Cancelamento.** `modo: "imediato"` encerra agora e **não** gera crédito automático (o tenant decide se emite nota de crédito, RF-11); `modo: "fim_do_periodo"` marca `cancelar_no_fim_do_periodo = true` e a assinatura fica `ATIVA` até o fim do período, quando vira `CANCELADA` sem nova fatura, exceto o uso medido do último período, que é faturado. Desfazer um cancelamento agendado é permitido até o fim do período.
+- **RN-28 — Concorrência.** A assinatura tem `versao` (lock otimista). Duas alterações simultâneas: uma vence, a outra recebe `409` `conflito-de-versao`. O fechamento de ciclo e uma alteração de plano no mesmo instante nunca produzem uma fatura com o plano "misturado" (o teste força a corrida).
+
+**Critérios de aceite**
+
+- Dada uma assinatura mensal criada em 31/01/2027 às 10:00 (São Paulo), quando o relógio avança, então os fechamentos acontecem em 28/02, 31/03 e 30/04, às 10:00.
+- Dada uma assinatura `TRIAL` de 14 dias sem meio de pagamento, quando o trial termina, então ela vira `CANCELADA`, nenhuma fatura é gerada e o evento `assinatura.cancelada` sai com `motivo: "trial_sem_meio_de_pagamento"`.
+
+### RF-07 · Alteração de plano com pró-rata
+
+- **RN-29 — Upgrade é imediato; downgrade, no fim do período.** É *upgrade* quando o valor mensal equivalente do novo conjunto de itens é maior (anual ÷ 12, com o arredondamento só para comparação). Upgrade vale agora e gera uma **fatura de pró-rata** imediata; downgrade (incluindo reduzir assentos) é agendado para o fim do período, sem crédito. Mudança de `mes` para `ano` é upgrade e reinicia o ciclo agora; de `ano` para `mes` é agendada.
+- **RN-30 — Cálculo do pró-rata.** Com `f = segundos_restantes / segundos_do_periodo`: crédito do item antigo = `round_half_even(valor_antigo × f)`; cobrança do novo = `round_half_even(valor_novo × f)`; a fatura de pró-rata traz as duas linhas (o crédito como linha negativa) e o total é a diferença. Exemplo: período de 01/10 a 01/11 (31 dias), upgrade do Básico (R$ 99,00) para o Pro (R$ 299,00) em 17/10 à 00:00, com 15 dias restantes: `f = 15/31`; crédito = 9900 × 15/31 = 4790,32 → **4790**; cobrança = 29900 × 15/31 = 14467,74 → **14468**; total da fatura de pró-rata = **9678** (R$ 96,78), mais o imposto sobre essa base.
+- **RN-31 — Prévia sem efeito.** `POST /v1/assinaturas/{id}/alteracoes/previa` devolve exatamente as linhas e o total que a alteração geraria **naquele instante**, sem gravar nada. Uma alteração enviada com `previa_calculada_em` mais de 5 minutos antes é recalculada; o total pode mudar e a resposta traz o valor efetivamente cobrado.
+- **RN-32 — Assentos.** Aumentar de 5 para 8 assentos a R$ 49,00 no mesmo exemplo cobra `round_half_even(3 × 4900 × 15/31)` = 7112,90 → **7113**. Reduzir de 8 para 5 só vale no próximo período.
+- **RN-33 — Cupom no pró-rata.** Um cupom `percentual` ativo também se aplica às linhas de pró-rata; um cupom `valor_fixo` **não** (ele vale uma vez por ciclo, na fatura de fechamento).
+
+**Critérios de aceite**
+
+- Dado o exemplo da RN-30, quando a prévia e a alteração são executadas no mesmo instante, então as duas trazem as linhas `-4790` e `14468` e o total antes do imposto `9678`.
+- Dado um downgrade agendado, quando o período fecha, então a fatura de fechamento já usa o preço menor e não há linha de crédito.
+
+### RF-08 · Fechamento de ciclo e faturas
+
+<Figura legenda="Fluxo crítico: do fechamento do ciclo à cobrança, incluindo o timeout em que a adquirente cobrou mas o Cobra+ não recebeu a resposta">
+<svg viewBox="0 0 880 560" width="880" role="img" aria-labelledby="cobra-seq-titulo cobra-seq-desc">
+  <title id="cobra-seq-titulo">Sequência do faturamento e da cobrança com estado desconhecido</title>
+  <desc id="cobra-seq-desc">O agendador reivindica um lote de assinaturas vencidas com SKIP LOCKED. O módulo de faturamento cria a fatura em rascunho, protegida por uma restrição única de assinatura e período, e depois a finaliza gravando os lançamentos do ledger e o evento na outbox na mesma transação. O módulo de pagamentos cria a tentativa 1 com a chave de idempotência pgto-F1-1 e chama a adquirente. A chamada expira em 5 segundos; a tentativa fica DESCONHECIDA. Depois de 60 segundos, a reconciliação consulta a adquirente pela referência, descobre que a cobrança foi aprovada, grava o pagamento, os lançamentos e o evento pagamento.aprovado. O relay publica o evento no Kafka e os webhooks são entregues.</desc>
+  <defs><marker id="cobra-mk-seq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="10" width="140" height="44" rx="8" class="d-box"/>
+  <text x="90" y="37" text-anchor="middle" class="d-title">Agendador</text>
+  <rect x="200" y="10" width="140" height="44" rx="8" class="d-accent"/>
+  <text x="270" y="37" text-anchor="middle" class="d-title">Faturamento</text>
+  <rect x="380" y="10" width="140" height="44" rx="8" class="d-accent"/>
+  <text x="450" y="37" text-anchor="middle" class="d-title">Pagamentos</text>
+  <rect x="560" y="10" width="140" height="44" rx="8" class="d-violet"/>
+  <text x="630" y="37" text-anchor="middle" class="d-title">adquirente-fake</text>
+  <rect x="730" y="10" width="140" height="44" rx="8" class="d-info"/>
+  <text x="800" y="37" text-anchor="middle" class="d-title">Outbox → Kafka</text>
+  <path d="M90 54 L90 540" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M270 54 L270 540" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M450 54 L450 540" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M630 54 L630 540" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M800 54 L800 540" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M90 90 L268 90" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="96" y="82" class="d-label">lote de 100 (SKIP LOCKED)</text>
+  <path d="M270 112 L300 112 L300 132 L274 132" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="306" y="126" class="d-label">RASCUNHO · UNIQUE(assinatura, período)</text>
+  <path d="M270 178 L798 178" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="280" y="170" class="d-label">finaliza: número, ledger e fatura.finalizada na MESMA transação</text>
+  <path d="M270 222 L448 222" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="276" y="214" class="d-label">cobrar F1 · tentativa 1</text>
+  <path d="M450 264 L628 264" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="456" y="256" class="d-mono">POST · pgto-F1-1</text>
+  <path d="M628 306 L452 306" class="d-line" stroke-dasharray="6 4" marker-end="url(#cobra-mk-seq)"/>
+  <text x="540" y="298" text-anchor="middle" class="d-label">sem resposta em 5 s (mas aprovou)</text>
+  <path d="M450 330 L480 330 L480 350 L454 350" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="486" y="344" class="d-label">tentativa = DESCONHECIDA</text>
+  <path d="M450 398 L628 398" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="456" y="390" class="d-mono">GET ?referencia=F1</text>
+  <path d="M628 436 L452 436" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="540" y="428" text-anchor="middle" class="d-label">200 · APROVADA</text>
+  <path d="M450 478 L798 478" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="456" y="470" class="d-label">pagamento + ledger + pagamento.aprovado</text>
+  <path d="M800 510 L840 510 L840 530 L804 530" class="d-line" marker-end="url(#cobra-mk-seq)"/>
+  <text x="700" y="552" text-anchor="middle" class="d-label">relay publica; webhooks fatura.paga</text>
+  <text x="90" y="372" text-anchor="middle" class="d-label">+60 s</text>
+</svg>
+</Figura>
+
+- **RN-34 — O que é "vencido".** Uma assinatura `ATIVA` ou `INADIMPLENTE` com `periodo_fim ≤ agora` precisa de fechamento. O fechamento avança o período (`[fim_antigo, próximo_fim)`) e gera **uma** fatura de fechamento com: itens fixos e por assento do novo período, uso do período que terminou, cupom e imposto.
+- **RN-35 — Nunca duas faturas para o mesmo período.** `faturas` tem `UNIQUE (tenant_id, assinatura_id, tipo, periodo_inicio)`. O avanço do período e a criação da fatura acontecem na **mesma transação**. Se dois workers ou duas execuções do job pegarem a mesma assinatura, um deles falha na restrição (ou nem a enxerga, por causa do `SKIP LOCKED`) e segue para a próxima, sem erro para o operador. Matar o processo no meio do lote e rodar de novo produz exatamente as faturas que faltavam.
+- **RN-36 — Escala.** O agendador roda a cada 60 s, reivindica lotes de 100 assinaturas com `SELECT ... FOR UPDATE SKIP LOCKED` e processa cada assinatura em transação própria (uma falha não derruba o lote). A meta: **300.000 faturas** geradas em até **2 horas** com 2 instâncias do core, e o dobro de instâncias reduz o tempo de forma aproximadamente proporcional até o banco virar gargalo — meça e registre onde ele vira.
+- **RN-37 — Janela de rascunho.** A fatura de fechamento nasce `RASCUNHO` e é finalizada `janela_rascunho_min` depois (padrão 60 min), para acomodar eventos de uso atrasados. Durante o rascunho, o tenant pode adicionar linhas avulsas (`POST /v1/faturas/{id}/linhas`); depois, não.
+- **RN-38 — Finalização.** Ao finalizar: recalcula o uso, atribui o **número** sequencial por tenant sem lacunas (`2026-000123`, com um contador por tenant e ano travado na transação), grava os lançamentos do ledger (RF-12) e o evento `fatura.finalizada` na outbox — **tudo na mesma transação**. Uma fatura finalizada nunca mais muda de valor; correções só por nota de crédito.
+- **RN-39 — Ordem do cálculo.** `subtotal = Σ linhas`; `desconto = cupom sobre o subtotal`, limitado ao subtotal (um `valor_fixo` de R$ 50 numa fatura de R$ 30 desconta R$ 30 e o resto se perde); `base = subtotal − desconto`; `imposto = round_half_even(base × aliquota_bp / 10000)`; `total = base + imposto`. Exemplo: subtotal 29900, cupom de 10% → desconto 2990, base 26910, alíquota 500 → 26910 × 0,05 = 1345,5 → **1346** (HALF_EVEN leva ao par), total **28256**.
+- **RN-40 — Fatura zerada.** Uma fatura finalizada com `total = 0` (cupom de 100%, uso abaixo da franquia) vai direto para `PAGA`, sem chamar a adquirente, e gera os lançamentos de desconto normalmente.
+- **RN-41 — Estados da fatura.** `RASCUNHO → ABERTA → PAGA`, `ABERTA → INCOBRAVEL` (régua esgotada) e `RASCUNHO → ANULADA` (assinatura cancelada durante o rascunho). `PAGA` e `INCOBRAVEL` são finais para o pagamento; notas de crédito se aplicam a `ABERTA` e `PAGA`.
+- **RN-42 — Tempo simulável.** Todo o domínio lê a hora de um `Clock` injetado. Um endpoint de plataforma, **só no perfil `demo`**, avança o relógio (`POST /plataforma/v1/relogio/avancar` com `{"dias": 31}`) para demonstrar ciclos inteiros em minutos.
+
+**Critérios de aceite**
+
+- Dadas 10.000 assinaturas vencidas e 4 workers concorrentes, quando o job termina, então existem exatamente 10.000 faturas de fechamento e a consulta `SELECT assinatura_id, periodo_inicio, count(*) ... HAVING count(*) > 1` não devolve linhas.
+- Dado um job interrompido (kill -9) no meio do lote, quando ele é reiniciado, então a contagem final é a mesma do cenário sem interrupção e os números das faturas não têm lacunas.
+- Dada a fatura da RN-39, quando ela é finalizada, então `total_centavos = 28256` e a soma dos débitos da transação do ledger é igual à dos créditos.
+
+### RF-09 · Cobrança na adquirente
+
+A adquirente é o `adquirente-fake`, um serviço HTTP que você escreve (um Spring Boot mínimo basta) e sobe no Compose. Contrato:
+
+| Endpoint | Comportamento |
+|---|---|
+| `POST /v1/cobrancas` (header `Idempotency-Key` obrigatório) | Corpo com `token`, `valor_centavos`, `moeda`, `referencia`. `201` com `id`, `status` (`APROVADA` ou `RECUSADA`), `codigo_recusa`, `referencia`. Mesma chave e mesmo corpo devolvem a **mesma** resposta, sem nova cobrança; corpo diferente, `422`. |
+| `GET /v1/cobrancas?referencia=...` | Lista as cobranças com essa referência (para reconciliar um timeout). |
+| `POST /v1/cobrancas/{id}/estornos` (com `Idempotency-Key`) | Estorno total ou parcial; `201` `CONCLUIDO`, ou `422` se exceder o valor cobrado. |
+| `GET /v1/tokens/{token}` e `DELETE /v1/tokens/{token}` | Bandeira, últimos 4 e validade; apagar o token (usado na anonimização). |
+| `POST /admin/caos` | Corpo `{"taxa_5xx": 0.3, "latencia_extra_ms": 2000, "fora_do_ar": false}`: muda o comportamento global em tempo real. |
+
+Tokens de teste com comportamento fixo: `tok_aprovado`; `tok_saldo_insuficiente` e `tok_limite_excedido` (recusa **soft**); `tok_roubado`, `tok_expirado` e `tok_conta_encerrada` (recusa **hard**); `tok_recusa_2x` (recusa soft nas 2 primeiras cobranças da referência, aprova a partir da terceira); `tok_lento_3s` (aprova depois de 3 s); `tok_aprova_sem_responder` (**aprova na hora, mas segura a resposta por 30 s** — o caso que separa um sistema correto de um que cobra duas vezes).
+
+- **RN-43 — Uma chave por tentativa.** Cada tentativa de cobrança de uma fatura tem número `n` e chave `pgto-<fatura_id>-<n>`. Retentativas **HTTP** de uma mesma tentativa (erro de rede, 5xx) reusam a chave; só uma nova tentativa da **régua** (RF-10), depois de uma recusa definitiva, usa `n + 1`.
+- **RN-44 — Timeout é estado desconhecido, não falha.** Com timeout de conexão de 1 s e de resposta de 5 s, uma chamada sem resposta deixa a tentativa `DESCONHECIDA`. A reconciliação consulta `GET /v1/cobrancas?referencia=<fatura_id>` 1, 5 e 15 minutos depois: achando `APROVADA`, registra o pagamento; achando `RECUSADA` ou nada, conclui a tentativa. Depois da terceira consulta sem conclusão, a tentativa vai para `EM_ANALISE`, dispara um alerta e **nenhuma nova tentativa é criada para essa fatura** até um operador resolver.
+- **RN-45 — Indisponibilidade não é recusa.** `5xx`, conexão recusada ou circuit breaker aberto deixam a tentativa `PENDENTE_REPROCESSAMENTO`: ela **não** conta como tentativa da régua, **não** muda a assinatura para `INADIMPLENTE` e **não** envia e-mail. O reprocessamento começa quando o circuito fecha, com no máximo 20 chamadas simultâneas (bulkhead), em ordem de vencimento.
+- **RN-46 — Zero cobrança duplicada.** No máximo um pagamento `APROVADO` por fatura (índice único parcial). Se a reconciliação encontrar uma **segunda** cobrança aprovada na adquirente para a mesma fatura (o que o desenho deve tornar impossível), o sistema estorna a excedente, registra `cobranca_duplicada_detectada` e isso conta como violação do SLO de corretude.
+
+**Critérios de aceite**
+
+- Dada uma fatura de cliente com `tok_aprova_sem_responder`, quando a cobrança é executada, então a tentativa fica `DESCONHECIDA`, a reconciliação a conclui como `APROVADA` e a adquirente registra **exatamente uma** cobrança para a referência.
+- Dada a adquirente com `fora_do_ar: true` por 10 minutos durante um fechamento de 1.000 faturas, quando ela volta, então todas as faturas são cobradas uma única vez, nenhuma assinatura virou `INADIMPLENTE` por causa da queda e nenhum e-mail de recusa saiu.
+
+### RF-10 · Régua de cobrança (dunning)
+
+- **RN-47 — Agenda.** A tentativa 1 acontece até 5 minutos depois da finalização. Recusa **soft** agenda as próximas para D+1, D+3, D+5 e D+7 contados da finalização (5 tentativas no total), às 10:00 no fuso do tenant, com *jitter* aleatório de até 30 minutos. Trocar o meio de pagamento padrão antecipa a próxima tentativa para agora (e ela consome uma tentativa).
+- **RN-48 — Recusa hard.** Interrompe as tentativas automáticas até um novo meio de pagamento ser cadastrado; o prazo continua correndo e, se nada mudar até D+7, aplica-se a ação final.
+- **RN-49 — Efeitos.** A primeira recusa muda a assinatura para `INADIMPLENTE` e envia o e-mail "Não conseguimos processar seu pagamento" (Mailpit); no máximo **um** e-mail de recusa por dia. Aprovação volta a assinatura para `ATIVA` e envia "Pagamento confirmado".
+- **RN-50 — Ação final.** Depois da última tentativa recusada, a fatura vira `INCOBRAVEL` e, conforme `acao_final_dunning`, a assinatura vira `CANCELADA` (`motivo: "inadimplencia"`) ou permanece `INADIMPLENTE`. Os ciclos de uma assinatura inadimplente **continuam** fechando, e cada nova fatura entra na régua.
+- **RN-51 — Pagamento manual.** `POST /console/v1/faturas/{id}/pagamento-externo` marca uma fatura `ABERTA` como paga fora do Cobra+, com justificativa obrigatória; lança contra `recebimentos_externos` e vai para a auditoria.
+
+**Critérios de aceite**
+
+- Dado um cliente com `tok_recusa_2x`, quando a régua corre (relógio avançado), então há 3 tentativas (D+0, D+1, D+3), a terceira aprova, a assinatura termina `ATIVA` e o cliente recebeu 2 e-mails de recusa e 1 de confirmação.
+- Dado um cliente com `tok_roubado`, quando a tentativa 1 é recusada, então nenhuma tentativa automática acontece nos 7 dias seguintes e, no D+7, a fatura é `INCOBRAVEL`.
+
+### RF-11 · Notas de crédito e reembolsos
+
+- **RN-52 — Nota de crédito.** Vale para fatura `ABERTA` ou `PAGA`, de 1 centavo até o **saldo creditável** (total − notas anteriores). O imposto é revertido proporcionalmente: `imposto_nc = round_half_even(valor × imposto_fatura / total_fatura)`; o restante reverte receita. Fatura de 28256 com 1346 de imposto e nota de 10000: `10000 × 1346 / 28256` = 476,36 → **476** de imposto e **9524** de receita.
+- **RN-53 — Destino do crédito.** Em fatura `ABERTA`, a nota reduz o valor devido (se zerar, a fatura vira `PAGA`). Em fatura `PAGA`, o tenant escolhe `destino`: `saldo` (saldo credor do cliente, consumido nas próximas faturas antes de cobrar o cartão) ou `reembolso` (estorno na adquirente).
+- **RN-54 — Reembolso.** Até 180 dias depois do pagamento; a soma dos reembolsos nunca passa do valor pago (duas requisições simultâneas de R$ 200 numa fatura paga de R$ 300 → uma aceita, outra `422` `valor-excede-saldo-creditavel`). Status `PENDENTE → CONCLUIDO | FALHOU`, com a mesma disciplina de idempotência e estado desconhecido da RN-44.
+
+**Critério de aceite:** dada a nota do exemplo com `destino: "saldo"`, quando a próxima fatura do cliente, de 28256, é finalizada, então o valor cobrado no cartão é 18256 e o saldo credor termina em 0.
+
+### RF-12 · Ledger de partidas dobradas
+
+Cada fato financeiro gera uma **transação** com dois ou mais **lançamentos**, cada um um débito (D) ou crédito (C) de valor positivo numa **conta**:
+
+| Conta | Natureza | Quando movimenta |
+|---|---|---|
+| `contas_a_receber:<cliente>` | devedora (ativo) | D na finalização; C no pagamento e na nota de crédito de fatura aberta |
+| `recebiveis_adquirente` | devedora (ativo) | D no pagamento aprovado; C no reembolso |
+| `recebimentos_externos` | devedora (ativo) | D no pagamento manual |
+| `receita_assinaturas` / `receita_uso` | credora (receita) | C na finalização |
+| `descontos_concedidos` / `devolucoes` | devedora (redutora de receita) | D na finalização com cupom / na nota de crédito |
+| `impostos_a_recolher` | credora (passivo) | C na finalização; D na nota de crédito |
+| `saldo_credor:<cliente>` | credora (passivo) | C na nota com destino `saldo`; D quando o saldo é usado ou reembolsado |
+
+A fatura da RN-39, finalizada e paga:
+
+```text
+T1 fatura_finalizada F-2026-000123
+  D contas_a_receber:cli_42     28256
+  D descontos_concedidos         2990
+  C receita_assinaturas                 29900
+  C impostos_a_recolher                  1346
+                                31246   31246   ← balanceada
+
+T2 pagamento_aprovado P-9f1c
+  D recebiveis_adquirente       28256
+  C contas_a_receber:cli_42             28256
+```
+
+- **RN-55 — Balanceamento no banco.** Em toda transação, `Σ débitos = Σ créditos`, verificado **pelo banco** no commit (gatilho de restrição `DEFERRABLE INITIALLY DEFERRED`), não só pela aplicação. Transação com um único lançamento, ou desbalanceada em 1 centavo, falha no commit.
+- **RN-56 — Imutabilidade.** `UPDATE` e `DELETE` em `transacoes_ledger` e `lancamentos` falham (gatilho e `REVOKE` para o papel da aplicação). Erro se corrige com uma transação de **estorno** que referencia a original e inverte os lados.
+- **RN-57 — Uma transação por fato.** `UNIQUE (tenant_id, tipo, origem_id)`: finalizar a mesma fatura duas vezes, ou processar duas vezes o mesmo pagamento, não gera segunda transação.
+- **RN-58 — Saldos derivados.** Saldo = `Σ D − Σ C` (natureza devedora) ou `Σ C − Σ D` (credora). Uma tabela de saldos, se existir, é cache reconstruível que o job de invariantes confere.
+- **RN-59 — Invariantes verificadas.** Um job a cada 15 minutos (e `GET /plataforma/v1/invariantes`) verifica por tenant: (a) toda transação balanceada; (b) saldo de `contas_a_receber:<cliente>` = soma do valor em aberto das faturas `ABERTA` do cliente; (c) toda fatura `PAGA` com total positivo tem exatamente um pagamento aprovado ou externo, ou foi quitada por notas de crédito ou saldo; (d) `total = subtotal − desconto + imposto` em toda fatura; (e) reembolsos de cada fatura não passam do valor pago. Violação incrementa `cobra_invariante_violada_total{invariante}` e **pagina**.
+- **RN-60 — Extrato.** `GET /console/v1/ledger/extrato?conta=...&de=...&ate=...` devolve lançamentos com saldo acumulado (cursor) e exporta CSV com `;` e valores em reais com vírgula — o formato que o contador abre no Excel.
+
+**Critérios de aceite**
+
+- Dado qualquer cenário de ponta a ponta, quando o job de invariantes roda ao fim, então as cinco invariantes passam para todos os tenants.
+- Dado `UPDATE lancamentos SET valor_centavos = 1` com o papel da aplicação, então o banco recusa.
+
+### RF-13 · Medição de uso
+
+- **RN-61 — Ingestão.** `POST /v1/uso/eventos` (serviço `cobra-ingest`) recebe de 1 a 500 eventos e até 512 KB. Cada evento: `id_evento` (1–64 caracteres, do tenant), `cliente_ref`, `metrica` (1–64 caracteres em `[a-z0-9_.]`), `quantidade` (inteiro de 1 a 1.000.000.000) e `ocorrido_em`. Lote maior → `413` `lote-muito-grande`.
+- **RN-62 — Validação síncrona só de formato.** O ingest valida formato e janela (`ocorrido_em` entre agora − 72 h e agora + 5 min) e responde `202` com o status de cada evento, **só depois** de o Kafka confirmar a escrita (`acks=all`, produtor idempotente). A validação semântica (cliente existe? tem essa métrica?) é assíncrona, no core: inválidos vão para `uso_rejeitados` e para `GET /v1/uso/rejeitados`.
+- **RN-63 — Deduplicação.** O mesmo `id_evento` do mesmo tenant conta **uma vez**, mesmo reenviado em outro lote, horas depois, ou reentregue pelo Kafka. A garantia está no banco, na mesma transação que soma ao agregado (`INSERT ... ON CONFLICT DO NOTHING` nos ids vistos, e só soma o que foi inserido). Janela de 40 dias; mesmo id com quantidade diferente é ignorado e contado em `cobra_uso_conflito_total`.
+- **RN-64 — Atribuição ao período.** O evento soma no período que contém `ocorrido_em`. Se esse período já tem fatura **finalizada**, soma no período atual e aparece na próxima fatura como linha "Uso tardio de `<período>`".
+- **RN-65 — Consulta.** `GET /v1/uso/resumo?assinatura_id=...` devolve, por métrica, a quantidade do período atual, a franquia e o valor estimado, com atraso p99 de até 60 s.
+
+**Critérios de aceite**
+
+- Dado um lote de 500 eventos enviado 3 vezes seguidas e mais uma 2 horas depois, quando o agregado é consultado, então a quantidade é exatamente a de um envio.
+- Dado o consumidor do core parado por 10 minutos durante ingestão contínua, quando ele volta, então o lag zera em até 5 minutos e nenhum evento foi perdido nem contado duas vezes.
+
+### RF-14 · Webhooks de saída
+
+- **RN-66 — Endpoints e SSRF.** O tenant registra endpoints (limite pelo plano) com `url` e a lista de `eventos` (ou `["*"]`). A URL precisa ser `https` (no perfil `dev`, `http://localhost` e nomes do Compose são aceitos); o host é resolvido **na hora da entrega** e IPs privados, de loopback, link-local e de metadados de nuvem (`169.254.169.254`) são bloqueados.
+- **RN-67 — Assinatura (Standard Webhooks).** Headers `webhook-id` (o mesmo em todas as tentativas), `webhook-timestamp` (segundos Unix) e `webhook-signature` no formato `v1,<base64 do HMAC-SHA256 de "<id>.<timestamp>.<corpo>">`, com segredo `whsec_` + 32 bytes em base64. O guia de integração orienta o receptor a recusar timestamps com mais de 5 minutos de diferença e a comparar assinaturas em tempo constante.
+- **RN-68 — Rotação de segredo.** `POST /v1/webhooks/endpoints/{id}/rotacao-segredo` devolve o novo segredo; por **24 horas** as entregas levam as duas assinaturas separadas por espaço, depois só a nova. Rotacionar de novo dentro das 24 h descarta a mais antiga.
+- **RN-69 — Entrega at-least-once.** Timeout de 10 s; sucesso é `2xx`; redirecionamento conta como falha. Tentativas: imediata, 5 s, 5 min, 30 min, 2 h, 5 h, 10 h e 10 h (8, cerca de 27 h). Esgotadas, a entrega vai para `FALHOU` (a DLQ). `410 Gone` desativa o endpoint na hora; um endpoint sem **nenhum** sucesso por 5 dias é desativado e o administrador recebe e-mail.
+- **RN-70 — Ordem e duplicidade.** Sem garantia de ordem nem de entrega única; o payload traz `ocorrido_em` e a `versao` do recurso, e o guia explica como deduplicar por `webhook-id` e descartar versões antigas.
+- **RN-71 — Reenvio.** `POST /console/v1/webhooks/entregas/{id}/reenvio` (mesmo `webhook-id`, novo timestamp e nova assinatura) e `.../reenvio-em-lote` por endpoint, status e período, até 10.000 entregas, no máximo 50 por segundo por endpoint. Exige `ADMIN_TENANT` ou `FINANCEIRO` e fica na auditoria.
+
+**Critérios de aceite**
+
+- Dado um receptor que responde `500` nas 3 primeiras tentativas, quando o relógio avança, então a 4ª (30 min) tem sucesso e as 4 tiveram o mesmo `webhook-id`.
+- Dado um endpoint cuja URL resolve para `10.0.0.5`, quando uma entrega é tentada, então ela falha sem abrir conexão, com motivo `destino-bloqueado` no console.
+- Dada uma rotação, quando um receptor que só conhece o segredo antigo valida uma entrega nas 24 h seguintes, então passa; depois das 24 h, falha.
+
+### RF-15 · API pública: idempotência, limites e versões
+
+- **RN-72 — Idempotency-Key.** Obrigatória em todo `POST` da API pública que cria recurso ou movimenta dinheiro (ausente → `400` `idempotency-key-obrigatoria`), 1 a 255 caracteres, guardada por **24 h** por tenant com o SHA-256 do corpo e a resposta. Mesma chave e corpo → **mesma resposta**, com `Idempotency-Replayed: true`; corpo diferente → `422` `idempotency-key-reutilizada`; primeira ainda executando → `409` `requisicao-em-andamento`. Respostas `5xx` **não** são guardadas.
+- **RN-73 — Rate limiting.** Token bucket por tenant no Redis (operação atômica: script Lua ou a integração do Bucket4j com Redis), com os limites da RN-01. Respostas com `X-RateLimit-Limit` e `X-RateLimit-Remaining`; o `429` traz `Retry-After`. Se o Redis cair, a API **continua** atendendo com limite local por instância (degradação em ADR) e `cobra_ratelimit_degradado` vai a 1.
+- **RN-74 — Versões.** Versão no caminho (`/v1`). Mudanças compatíveis (campo novo, endpoint novo, valor novo em enum documentado como extensível) não mudam a versão; outra mudança exige `/v2`, e a `/v1` passa a responder `Deprecation` e `Sunset` (no mínimo 6 meses à frente). Clientes devem ignorar campos desconhecidos — está no guia.
+- **RN-75 — Paginação por cursor.** `?limite=25&cursor=...` (1 a 100), ordem `(criado_em, id)`, resposta com `tem_mais` e `proximo_cursor`. Sem offset.
+- **RN-76 — Correlação.** Toda resposta traz `X-Request-Id`, que aparece nos logs, no trace e na auditoria.
+
+**Critérios de aceite**
+
+- Dadas duas `POST /v1/assinaturas` idênticas com a mesma `Idempotency-Key` em paralelo, então uma é `201` e a outra `409` `requisicao-em-andamento` ou `201` com `Idempotency-Replayed: true`, e existe **uma** assinatura.
+- Dado o Redis parado, quando o k6 roda o cenário de leitura, então a taxa de `5xx` é 0.
+
+### RF-16 · Auditoria
+
+- **RN-77 — O que se audita.** Toda escrita das três APIs, leitura de dados pessoais pelo console, reenvios, exportações e anonimizações: `ator_tipo` (`chave_api`, `usuario`, `sistema`), `ator_id`, `acao`, `recurso`, `recurso_id`, `request_id`, IP, `ocorrido_em` e as mudanças, com campos pessoais mascarados (`a***@email.com`).
+- **RN-78 — Encadeamento.** Cada registro guarda `hash = SHA-256(hash_anterior || conteúdo canônico)`, uma cadeia por tenant. `GET /console/v1/auditoria/verificacao` recalcula e aponta o primeiro registro adulterado. Append-only, como na RN-56.
+- **RN-79 — Consulta e retenção.** Filtros por período, ator, recurso e ação, paginados por cursor; retenção de 5 anos.
+
+**Critério de aceite:** dado um registro alterado diretamente no banco por um superusuário, quando a verificação roda, então responde `integra: false` com o id do registro.
+
+### RF-17 · LGPD: exportação, anonimização e retenção
+
+- **RN-80 — Exportação.** `POST /console/v1/clientes/{id}/exportacoes` gera, assincronamente (meta de 10 minutos; o prazo legal da declaração completa é de até 15 dias), um JSON com cadastro, meios de pagamento (bandeira e últimos 4), assinaturas, faturas, pagamentos, uso agregado e e-mails enviados. Download autenticado, expira em 24 h.
+- **RN-81 — Anonimização.** Exige que o cliente não tenha assinatura em `TRIAL`, `ATIVA`, `PAUSADA` ou `INADIMPLENTE` (senão `409` `cliente-com-assinatura-ativa`). Irreversível: nome vira `"Cliente anonimizado"`, e-mail vira `anon-<hash>@anonimizado.invalid`, documento, endereço e metadados são apagados, tokens são apagados na adquirente e payloads de webhook guardados com dados do cliente são expurgados. O ledger não muda: ele **nunca** guarda dado pessoal, só ids.
+- **RN-82 — Retenção com base legal.** Faturas guardam um *snapshot* de nome e documento do pagador por obrigação legal e fiscal (5 anos; LGPD art. 16, I), que a anonimização preserva e um job de retenção expurga ao fim do prazo.
+
+| Dado | Retenção | Depois |
+|---|---|---|
+| Ids de eventos de uso (deduplicação) | 40 dias | partição removida |
+| Agregados de uso, faturas, ledger | 5 anos | snapshot pessoal expurgado; valores mantidos |
+| Payload de entregas de webhook | 30 dias | payload apagado; metadados mantidos |
+| Chaves de idempotência | 24 horas | apagadas |
+| Logs de aplicação | 30 dias | descartados pelo Loki |
+| Auditoria | 5 anos | arquivamento fora do banco (extensão) |
+
+**Critério de aceite:** dado um cliente anonimizado, quando se procura o e-mail original em todas as tabelas, nos logs do teste e nos payloads guardados, então ele só aparece no snapshot fiscal das faturas.
+
+### RF-18 · Feature flags
+
+- **RN-83 — Flags com dono e validade.** Tabela `flags` com `chave`, `descricao`, `dono`, `expira_em` e valor por tenant (com padrão global), avaliação com cache de 30 s. Um teste do build falha se o código usar flag vencida: flag é dívida com prazo.
+- **RN-84 — Flags do projeto.** No mínimo `leitura.endereco-estruturado` (a migração do marco 8), `dunning.jitter` e `pro-rata.por-segundo` (desligada, o pró-rata usa dias inteiros; no exemplo da RN-30 os dois modos dão o mesmo resultado, porque a alteração ocorre à 00:00 — o teste confere).
+
+## Requisitos não funcionais
+
+| RNF | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Disponibilidade da API de cobrança (`/v1`, exceto `/v1/uso`) | **SLO 99,9%** de requisições sem `5xx` em janela móvel de 28 dias (error budget de cerca de 40 min) | Recording rules no Prometheus; painel de SLO; relatório do marco 9 |
+| RNF-02 | Latência da API | p99 ≤ 500 ms e p95 ≤ 200 ms no servidor, a 150 req/s mistas (70% leitura) | k6 com *thresholds*; histograma do Micrometer |
+| RNF-03 | Ingestão de uso | 5.000 eventos/s por 10 min (lotes de 25), p99 do `POST` ≤ 150 ms, lag de agregação p99 ≤ 60 s | k6 + lag do consumidor; se o hardware não chegar, registre o máximo medido e o gargalo |
+| RNF-04 | Corretude financeira | **0** cobranças duplicadas; **0** violações de invariante; 100% das transações balanceadas | Job de invariantes (RN-59) depois de todos os testes de carga e de caos |
+| RNF-05 | Faturamento em lote | 99,9% das faturas de um fechamento finalizadas até 2 h depois do horário | `cobra_faturamento_atraso_segundos`; teste de volume com 300.000 assinaturas (ou o máximo da sua máquina, extrapolado pelo throughput medido) |
+| RNF-06 | Webhooks | 99% entregues em até 60 s a endpoints saudáveis | Atraso entre `ocorrido_em` e o `2xx` |
+| RNF-07 | Isolamento | 0 vazamentos entre tenants em todos os endpoints de leitura | Teste de isolamento (RF-03) no CI |
+| RNF-08 | Segurança | 0 vulnerabilidades altas ou críticas conhecidas; nenhum segredo no repositório; nenhum PAN em lugar nenhum | Scanner de dependências (OWASP Dependency-Check ou Trivy) e de segredos (Gitleaks) no CI; teste da RN-15 |
+| RNF-09 | Observabilidade | 100% das requisições com `X-Request-Id` e `traceId` nos logs; traces cobrindo HTTP, JDBC, Kafka e adquirente; dashboards RED por endpoint | Grafana; a demonstração mostra um trace de ponta a ponta |
+| RNF-10 | Qualidade | Build verde com testes de unidade, fatia e integração; cobertura de linhas ≥ 80% em `faturamento`, `ledger` e `pagamentos` (medida, não perseguida); fronteiras de módulo verificadas | GitHub Actions; JaCoCo; teste do Spring Modulith |
+| RNF-11 | Operação | Ambiente completo sobe com um comando em até 3 min numa máquina de 16 GB; runbook cobre todos os alertas; RTO de 15 min e RPO de 5 min documentados para o banco | `make up` cronometrado; exercício de restauração no marco 9 |
+| RNF-12 | Migrações | Toda migração compatível com a versão anterior rodando; 0 `5xx` durante o deploy de uma migração sob carga | Demonstração do marco 8 com k6 |
+| RNF-13 | Recursos | Core com heap ≤ 1 GB e ingest ≤ 512 MB nos testes de carga, sem `OutOfMemoryError` | Métricas da JVM |
+
+## Modelo de dados
+
+<Figura legenda="Modelo de dados do núcleo de billing. Todas as tabelas de negócio têm tenant_id com Row-Level Security; as linhas indicam a cardinalidade dos relacionamentos">
+<svg viewBox="0 0 900 540" width="900" role="img" aria-labelledby="cobra-er-titulo cobra-er-desc">
+  <title id="cobra-er-titulo">Diagrama entidade-relacionamento do Cobra+</title>
+  <desc id="cobra-er-desc">Primeira linha: tenants tem muitos clientes; clientes tem muitas assinaturas; assinaturas tem muitos itens. Segunda linha: chaves_api pertencem a tenants; faturas pertencem a assinaturas; preços são referenciados pelos itens; uso_agregado pertence aos itens. Terceira linha: contas_ledger e transacoes_ledger têm muitos lançamentos; pagamentos pertencem a faturas; transações do ledger têm como origem faturas e pagamentos, por referência lógica.</desc>
+  <rect x="10" y="10" width="190" height="130" rx="8" class="d-box"/>
+  <text x="105" y="32" text-anchor="middle" class="d-title">tenants</text>
+  <text x="20" y="56" class="d-label">id uuid PK</text>
+  <text x="20" y="74" class="d-label">nome, plano, status</text>
+  <text x="20" y="92" class="d-label">fuso, aliquota_imposto_bp</text>
+  <text x="20" y="110" class="d-label">janela_rascunho_min</text>
+  <text x="20" y="128" class="d-label">acao_final_dunning</text>
+  <rect x="240" y="10" width="190" height="130" rx="8" class="d-box"/>
+  <text x="335" y="32" text-anchor="middle" class="d-title">clientes</text>
+  <text x="250" y="56" class="d-label">id PK, tenant_id</text>
+  <text x="250" y="74" class="d-label">ref_externa UNIQUE/tenant</text>
+  <text x="250" y="92" class="d-label">nome, email, documento</text>
+  <text x="250" y="110" class="d-label">endereço (estruturado)</text>
+  <text x="250" y="128" class="d-label">anonimizado_em</text>
+  <rect x="470" y="10" width="190" height="130" rx="8" class="d-accent"/>
+  <text x="565" y="32" text-anchor="middle" class="d-title">assinaturas</text>
+  <text x="480" y="56" class="d-label">id PK, cliente_id FK</text>
+  <text x="480" y="74" class="d-label">status, ancora_dia</text>
+  <text x="480" y="92" class="d-label">periodo_inicio, periodo_fim</text>
+  <text x="480" y="110" class="d-label">cupom_id, cancelar_no_fim</text>
+  <text x="480" y="128" class="d-label">versao (lock otimista)</text>
+  <rect x="700" y="10" width="190" height="130" rx="8" class="d-box"/>
+  <text x="795" y="32" text-anchor="middle" class="d-title">itens_assinatura</text>
+  <text x="710" y="56" class="d-label">id PK, assinatura_id FK</text>
+  <text x="710" y="74" class="d-label">preco_id FK</text>
+  <text x="710" y="92" class="d-label">quantidade 1..10000</text>
+  <text x="710" y="110" class="d-label">vigente_de, vigente_ate</text>
+  <text x="710" y="128" class="d-label">agendado (downgrade)</text>
+  <rect x="10" y="190" width="190" height="130" rx="8" class="d-box"/>
+  <text x="105" y="212" text-anchor="middle" class="d-title">chaves_api</text>
+  <text x="20" y="236" class="d-label">id PK (ck_7Fh2Kq9x)</text>
+  <text x="20" y="254" class="d-label">tenant_id FK</text>
+  <text x="20" y="272" class="d-label">hmac_segredo</text>
+  <text x="20" y="290" class="d-label">escopos text[]</text>
+  <text x="20" y="308" class="d-label">revogada_em</text>
+  <rect x="240" y="190" width="190" height="130" rx="8" class="d-accent"/>
+  <text x="335" y="212" text-anchor="middle" class="d-title">faturas</text>
+  <text x="250" y="236" class="d-label">id PK, assinatura_id FK</text>
+  <text x="250" y="254" class="d-label">tipo, periodo_inicio</text>
+  <text x="250" y="272" class="d-label">UNIQUE(assin., tipo, período)</text>
+  <text x="250" y="290" class="d-label">numero, status, moeda</text>
+  <text x="250" y="308" textLength="174" lengthAdjust="spacingAndGlyphs" class="d-label">subtotal, desconto, imposto, total</text>
+  <rect x="470" y="190" width="190" height="130" rx="8" class="d-box"/>
+  <text x="565" y="212" text-anchor="middle" class="d-title">precos</text>
+  <text x="480" y="236" class="d-label">id PK, produto_id FK</text>
+  <text x="480" y="254" class="d-label">modelo: fixo, assento, uso</text>
+  <text x="480" y="272" class="d-label">intervalo: mes, ano</text>
+  <text x="480" y="290" class="d-label">valor_centavos, moeda</text>
+  <text x="480" y="308" class="d-label">metrica, franquia, unitario</text>
+  <rect x="700" y="190" width="190" height="130" rx="8" class="d-info"/>
+  <text x="795" y="212" text-anchor="middle" class="d-title">uso_agregado</text>
+  <text x="710" y="236" class="d-label">PK(item, período, métrica)</text>
+  <text x="710" y="254" class="d-label">item_assinatura_id FK</text>
+  <text x="710" y="272" class="d-label">periodo_inicio</text>
+  <text x="710" y="290" class="d-label">quantidade bigint</text>
+  <text x="710" y="308" class="d-label">(+ uso_ids_vistos, 40 dias)</text>
+  <rect x="10" y="370" width="190" height="130" rx="8" class="d-ok"/>
+  <text x="105" y="392" text-anchor="middle" class="d-title">contas_ledger</text>
+  <text x="20" y="416" class="d-label">id PK, tenant_id</text>
+  <text x="20" y="434" class="d-label">codigo (receita_uso...)</text>
+  <text x="20" y="452" class="d-label">natureza: D ou C</text>
+  <text x="20" y="470" class="d-label">cliente_id (opcional)</text>
+  <text x="20" y="488" class="d-label">moeda</text>
+  <rect x="240" y="370" width="190" height="130" rx="8" class="d-ok"/>
+  <text x="335" y="392" text-anchor="middle" class="d-title">lancamentos</text>
+  <text x="250" y="416" class="d-label">id PK</text>
+  <text x="250" y="434" class="d-label">transacao_id FK</text>
+  <text x="250" y="452" class="d-label">conta_id FK</text>
+  <text x="250" y="470" class="d-label">lado: D ou C</text>
+  <text x="250" y="488" class="d-label">valor_centavos positivo</text>
+  <rect x="470" y="370" width="190" height="130" rx="8" class="d-ok"/>
+  <text x="565" y="392" text-anchor="middle" class="d-title">transacoes_ledger</text>
+  <text x="480" y="416" class="d-label">id PK, tenant_id</text>
+  <text x="480" y="434" class="d-label">tipo, origem_id</text>
+  <text x="480" y="452" class="d-label">UNIQUE(tenant, tipo, origem)</text>
+  <text x="480" y="470" class="d-label">estorna_transacao_id</text>
+  <text x="480" y="488" class="d-label">ocorrido_em (imutável)</text>
+  <rect x="700" y="370" width="190" height="130" rx="8" class="d-violet"/>
+  <text x="795" y="392" text-anchor="middle" class="d-title">pagamentos</text>
+  <text x="710" y="416" class="d-label">id PK, fatura_id FK</text>
+  <text x="710" y="434" class="d-label">tentativa n, status</text>
+  <text x="710" y="452" class="d-label">chave_idempotencia UNIQUE</text>
+  <text x="710" y="470" class="d-label">id_adquirente, codigo_recusa</text>
+  <text x="710" y="488" class="d-label">1 APROVADO por fatura</text>
+  <path d="M200 60 L240 60" class="d-line"/>
+  <text x="220" y="52" text-anchor="middle" class="d-label">1:N</text>
+  <path d="M430 60 L470 60" class="d-line"/>
+  <text x="450" y="52" text-anchor="middle" class="d-label">1:N</text>
+  <path d="M660 60 L700 60" class="d-line"/>
+  <text x="680" y="52" text-anchor="middle" class="d-label">1:N</text>
+  <path d="M105 140 L105 190" class="d-line"/>
+  <text x="112" y="170" class="d-label">1:N</text>
+  <path d="M490 140 L410 190" class="d-line"/>
+  <text x="458" y="172" class="d-label">1:N</text>
+  <path d="M720 140 L640 190" class="d-line"/>
+  <text x="688" y="172" class="d-label">N:1</text>
+  <path d="M845 140 L845 190" class="d-line"/>
+  <text x="852" y="170" class="d-label">1:N</text>
+  <path d="M200 435 L240 435" class="d-line"/>
+  <text x="220" y="427" text-anchor="middle" class="d-label">1:N</text>
+  <path d="M470 435 L430 435" class="d-line"/>
+  <text x="450" y="427" text-anchor="middle" class="d-label">1:N</text>
+  <path d="M430 300 L700 380" class="d-line"/>
+  <text x="600" y="342" class="d-label">1:N</text>
+  <path d="M700 470 L660 470" class="d-line" stroke-dasharray="4 4"/>
+  <text x="680" y="462" text-anchor="middle" class="d-label">origem</text>
+  <path d="M380 320 L500 370" class="d-line" stroke-dasharray="4 4"/>
+  <text x="400" y="352" class="d-label">origem</text>
+  <text x="450" y="528" text-anchor="middle" class="d-label">Tracejado: referência lógica (tipo + origem_id). Fora do desenho: produtos, cupons, linhas_fatura, notas_credito, webhooks, auditoria, flags.</text>
+</svg>
+</Figura>
+
+**Restrições e índices que carregam regra de negócio** (cada um citado no teste que o exercita):
+
+- `faturas UNIQUE (tenant_id, assinatura_id, tipo, periodo_inicio)` — RN-35; `faturas UNIQUE (tenant_id, numero)` — RN-38.
+- `pagamentos`: índice único parcial `(fatura_id) WHERE status = 'APROVADO'` — RN-46; `UNIQUE (tenant_id, chave_idempotencia)` — RN-43.
+- `transacoes_ledger UNIQUE (tenant_id, tipo, origem_id)` — RN-57; gatilho de restrição adiado de balanceamento — RN-55; gatilhos de imutabilidade — RN-56; `lancamentos CHECK (valor_centavos > 0)`.
+- `uso_ids_vistos` com chave `(tenant_id, id_evento)`, **particionada por mês** de recebimento e expurgada por `DROP` de partição (RN-63, RN-82). Numa tabela particionada, a chave primária precisa incluir a coluna de partição: resolva a janela de 40 dias consultando as duas partições mais recentes, ou particione por hash de `tenant_id` e expurgue em lotes. É uma decisão de ADR.
+- `idempotencia PRIMARY KEY (tenant_id, chave)` com `expira_em` indexado; `cupons UNIQUE (tenant_id, lower(codigo))`.
+- `assinaturas`: índice parcial em `periodo_fim` para status `ATIVA` e `INADIMPLENTE` (é o que o agendador lê).
+- Todas as tabelas de negócio: `tenant_id NOT NULL`, índices começando por `tenant_id` e política `USING (tenant_id = current_setting('app.tenant_id', true)::uuid)` com a mesma expressão em `WITH CHECK`.
+- Ids em **UUIDv7** (ordenáveis no tempo, amigáveis ao índice), gerados pela aplicação ou pela função `uuidv7()` do PostgreSQL 18.
+
+**Migrations previstas** (Flyway, uma por fatia vertical, nunca editadas depois de aplicadas):
+
+| Versão | O que cria |
+|---|---|
+| `V1__tenancy.sql` | papéis (`cobra_app` sem `BYPASSRLS`; `cobra_migracao`, dono), `tenants`, `chaves_api`, `idempotencia`, `auditoria` |
+| `V2__catalogo_clientes.sql` | `produtos`, `precos`, `cupons`, `clientes`, `meios_pagamento` + políticas RLS |
+| `V3__assinaturas.sql` | `assinaturas`, `itens_assinatura`, `trabalho_fechamento` |
+| `V4__ledger.sql` | `contas_ledger`, `transacoes_ledger`, `lancamentos`, gatilhos, `REVOKE` |
+| `V5__faturas.sql` | `faturas`, `linhas_fatura`, `contadores_fatura`, `notas_credito` |
+| `V6__pagamentos.sql` | `pagamentos`, `reembolsos`, `agenda_dunning` |
+| `V7__uso.sql` | `uso_ids_vistos` (particionada), `uso_agregado`, `uso_rejeitados` |
+| `V8__eventos_webhooks.sql` | registro de publicações (se não usar o do Spring Modulith), `webhook_endpoints`, `webhook_entregas` |
+| `V9__flags_lgpd.sql` | `flags`, `exportacoes` |
+| `V10`–`V13` | a migração expand/contract do endereço (marco 8), um passo por release |
+
+## Contrato da API
+
+Base: `/v1` (chave de API em `Authorization: Bearer ck_...`), `/console/v1` e `/plataforma/v1` (JWT do Keycloak, com os papéis `ADMIN_TENANT`, `FINANCEIRO` e `OPERADOR`). JSON em `snake_case`, datas ISO 8601 com fuso, dinheiro em campos `*_centavos` (inteiros) com `moeda` no objeto. OpenAPI gerado e versionado no repositório.
+
+| Método | Caminho | Quem | O que faz | Respostas |
+|---|---|---|---|---|
+| `POST` | `/v1/clientes` | `clientes:escrita` | Cria cliente final | `201`, `409`, `422` |
+| `POST` | `/v1/clientes/{id}/meios-pagamento` | `clientes:escrita` | Associa token da adquirente | `201`, `404`, `422` |
+| `POST` | `/v1/produtos`, `/v1/precos`, `/v1/cupons` | `catalogo:escrita` | Catálogo | `201`, `422` |
+| `POST` | `/v1/assinaturas` | `assinaturas:escrita` | Cria assinatura | `201`, `404`, `409`, `422` |
+| `GET` | `/v1/assinaturas/{id}` | `assinaturas:leitura` | Consulta | `200`, `404` |
+| `POST` | `/v1/assinaturas/{id}/alteracoes/previa` | `assinaturas:escrita` | Prévia de pró-rata, sem efeito | `200`, `409` |
+| `POST` | `/v1/assinaturas/{id}/alteracoes` | `assinaturas:escrita` | Upgrade, downgrade, assentos | `200`, `409`, `422` |
+| `POST` | `/v1/assinaturas/{id}/pausa`, `/retomada`, `/cancelamento` | `assinaturas:escrita` | Transições | `200`, `409` |
+| `GET` | `/v1/faturas`, `/v1/faturas/{id}` | `faturas:leitura` | Lista (cursor) e detalhe | `200`, `404` |
+| `POST` | `/v1/faturas/{id}/linhas` | `faturas:escrita` | Linha avulsa (só `RASCUNHO`) | `201`, `409` |
+| `POST` | `/v1/faturas/{id}/notas-credito` | `faturas:escrita` | Nota de crédito / reembolso | `201`, `409`, `422` |
+| `POST` | `/v1/uso/eventos` | `uso:escrita` | Lote de eventos (cobra-ingest) | `202`, `413`, `422`, `429` |
+| `GET` | `/v1/uso/resumo`, `/v1/uso/rejeitados` | `uso:leitura` | Consulta de uso | `200` |
+| `POST` | `/v1/webhooks/endpoints[/{id}/rotacao-segredo]` | `webhooks:gestao` | Registra endpoint / rotaciona segredo | `201`, `200`, `422` |
+| `POST`/`DELETE` | `/console/v1/chaves-api[/{id}]` | `ADMIN_TENANT` | Cria / revoga chave | `201`, `204` |
+| `GET`/`POST` | `/console/v1/webhooks/entregas[...]` | `ADMIN_TENANT`, `FINANCEIRO` | DLQ e reenvio | `200`, `202` |
+| `GET` | `/console/v1/ledger/extrato` | `FINANCEIRO` | Extrato (JSON ou CSV) | `200` |
+| `POST` | `/console/v1/faturas/{id}/pagamento-externo` | `FINANCEIRO` | Baixa manual | `200`, `409` |
+| `POST` | `/console/v1/clientes/{id}/exportacoes`, `/anonimizacao` | `ADMIN_TENANT` | LGPD | `202`, `409` |
+| `GET` | `/console/v1/auditoria[/verificacao]` | `ADMIN_TENANT` | Auditoria | `200` |
+| `POST`/`GET` | `/plataforma/v1/tenants`, `/plataforma/v1/invariantes` | `OPERADOR` | Tenants e invariantes | `201`, `200` |
+
+**Criar assinatura**
+
+```http
+POST /v1/assinaturas
+Authorization: Bearer ck_7Fh2Kq9x_...
+Idempotency-Key: 3f0c2b7e-assin-cli42-pro
+Content-Type: application/json
+
+{
+  "cliente_id": "01928f3a-7c1e-7b52-9a40-5d2b1c9e0a11",
+  "itens": [
+    { "preco_id": "01928f3a-80aa-7d10-8c11-0a9d4f2e3b77", "quantidade": 1 },
+    { "preco_id": "01928f3a-80ab-7a21-9e05-7b3c2d1a0f88", "quantidade": 5 },
+    { "preco_id": "01928f3a-80ac-7f3e-a1d2-3c4b5a6d7e99" }
+  ],
+  "dias_trial": 0,
+  "cupom": "BOASVINDAS10",
+  "metadados": { "plano_interno": "pro-2026" }
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /v1/assinaturas/01928f3b-0d44-7c9a-b1e2-6f7a8b9c0d12
+X-Request-Id: 6b1e0c7a-2f4d-4a8e-9c3b-1d2e3f4a5b6c
+
+{
+  "id": "01928f3b-0d44-7c9a-b1e2-6f7a8b9c0d12",
+  "cliente_id": "01928f3a-7c1e-7b52-9a40-5d2b1c9e0a11",
+  "status": "ATIVA",
+  "moeda": "BRL",
+  "intervalo": "mes",
+  "ancora_dia": 17,
+  "periodo_atual": { "inicio": "2026-10-17T10:00:00-03:00", "fim": "2026-11-17T10:00:00-03:00" },
+  "itens": [
+    { "id": "01928f3b-0d45-7001-8a00-000000000001", "modelo": "fixo", "valor_centavos": 29900, "quantidade": 1 },
+    { "id": "01928f3b-0d45-7001-8a00-000000000002", "modelo": "por_assento", "valor_centavos": 4900, "quantidade": 5 },
+    { "id": "01928f3b-0d45-7001-8a00-000000000003", "modelo": "por_uso", "metrica": "chamadas_api", "franquia": 10000, "preco_unitario_centavos": "0.2" }
+  ],
+  "cupom": { "codigo": "BOASVINDAS10", "tipo": "percentual", "percentual": 10, "duracao": "repetir", "ciclos_restantes": 3 },
+  "cancelar_no_fim_do_periodo": false,
+  "fatura_inicial_id": "01928f3b-0d50-7e11-b000-00000000f001",
+  "versao": 1,
+  "criada_em": "2026-10-17T10:00:00-03:00"
+}
+```
+
+O preço unitário de uso vai como **string decimal** (`"0.2"`): número com casas decimais em JSON vira `double` em algum cliente, e dinheiro não passa por `double`.
+
+**Consultar fatura** (`GET /v1/faturas/{id}`, `200`)
+
+```json
+{
+  "id": "01928f3b-0d50-7e11-b000-00000000f001",
+  "numero": "2026-000123",
+  "assinatura_id": "01928f3b-0d44-7c9a-b1e2-6f7a8b9c0d12",
+  "tipo": "fechamento",
+  "status": "PAGA",
+  "moeda": "BRL",
+  "periodo": { "inicio": "2026-10-17T10:00:00-03:00", "fim": "2026-11-17T10:00:00-03:00" },
+  "linhas": [
+    { "descricao": "Plano Pro (17/10 a 17/11)", "quantidade": 1, "valor_unitario_centavos": "29900", "valor_centavos": 29900 },
+    { "descricao": "Assentos (17/10 a 17/11)", "quantidade": 5, "valor_unitario_centavos": "4900", "valor_centavos": 24500 }
+  ],
+  "subtotal_centavos": 54400,
+  "desconto_centavos": 5440,
+  "aliquota_imposto_bp": 500,
+  "imposto_centavos": 2448,
+  "total_centavos": 51408,
+  "valor_em_aberto_centavos": 0,
+  "pagamentos": [
+    { "id": "01928f3b-1a00-7c00-9000-00000000a001", "tentativa": 1, "status": "APROVADO", "bandeira": "visa", "ultimos4": "4242", "processado_em": "2026-10-17T10:00:03-03:00" }
+  ],
+  "notas_credito": [],
+  "finalizada_em": "2026-10-17T10:00:01-03:00",
+  "versao": 3
+}
+```
+
+**Enviar eventos de uso**
+
+```http
+POST /v1/uso/eventos
+Authorization: Bearer ck_7Fh2Kq9x_...
+Content-Type: application/json
+
+{
+  "eventos": [
+    { "id_evento": "req-2026-10-20-000001", "cliente_ref": "academia-centro", "metrica": "chamadas_api", "quantidade": 120, "ocorrido_em": "2026-10-20T13:03:11Z" },
+    { "id_evento": "req-2026-10-20-000002", "cliente_ref": "academia-centro", "metrica": "chamadas_api", "quantidade": 80, "ocorrido_em": "2026-10-16T09:00:00Z" }
+  ]
+}
+```
+
+```http
+HTTP/1.1 202 Accepted
+
+{
+  "aceitos": 1,
+  "rejeitados": 1,
+  "resultados": [
+    { "id_evento": "req-2026-10-20-000001", "status": "aceito" },
+    { "id_evento": "req-2026-10-20-000002", "status": "rejeitado", "motivo": "fora-da-janela" }
+  ]
+}
+```
+
+Aqui não se exige `Idempotency-Key`: a idempotência é por `id_evento` (RN-63), e reenviar o lote inteiro depois de um erro é o comportamento esperado do cliente.
+
+**Webhook entregue ao tenant**
+
+```http
+POST /webhooks/cobra HTTP/1.1
+Host: api.academia-exemplo.test
+Content-Type: application/json
+webhook-id: msg_01928f3b2c8e7a10b1c2d3e4f5a6b7c8
+webhook-timestamp: 1792242003
+webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=
+
+{
+  "id": "msg_01928f3b2c8e7a10b1c2d3e4f5a6b7c8",
+  "tipo": "fatura.paga",
+  "versao_schema": 1,
+  "ocorrido_em": "2026-10-17T13:00:03Z",
+  "dados": {
+    "fatura": { "id": "01928f3b-0d50-7e11-b000-00000000f001", "numero": "2026-000123", "status": "PAGA", "total_centavos": 51408, "moeda": "BRL", "versao": 3 },
+    "assinatura_id": "01928f3b-0d44-7c9a-b1e2-6f7a8b9c0d12",
+    "cliente_id": "01928f3a-7c1e-7b52-9a40-5d2b1c9e0a11"
+  }
+}
+```
+
+(A assinatura do exemplo é ilustrativa; o seu teste calcula a real.)
+
+**Formato de erro (Problem Details, RFC 9457)**
+
+```json
+{
+  "type": "https://cobra.example/erros/transicao-invalida",
+  "title": "Transição de estado inválida",
+  "status": 409,
+  "detail": "A assinatura está INADIMPLENTE e não pode ser pausada.",
+  "instance": "/v1/assinaturas/01928f3b-0d44-7c9a-b1e2-6f7a8b9c0d12/pausa",
+  "request_id": "6b1e0c7a-2f4d-4a8e-9c3b-1d2e3f4a5b6c",
+  "estado_atual": "INADIMPLENTE",
+  "transicoes_permitidas": ["cancelamento"]
+}
+```
+
+| `type` (sufixo) | Status | Quando |
+|---|---|---|
+| `requisicao-invalida` | 400 | JSON malformado, tipo errado |
+| `idempotency-key-obrigatoria` | 400 | `POST` sem `Idempotency-Key` (RN-72) |
+| `nao-autenticado` | 401 | Chave ou token ausente, inválido ou revogado (RN-07) |
+| `escopo-insuficiente` / `tenant-suspenso` | 403 | RN-05 (traz `escopo_necessario`) / RN-03 |
+| `recurso-nao-encontrado` | 404 | Não existe **ou** é de outro tenant (RN-10) |
+| `cliente-duplicado` | 409 | RN-13 |
+| `transicao-invalida` | 409 | RN-25 |
+| `conflito-de-versao` | 409 | Lock otimista (RN-28) |
+| `requisicao-em-andamento` | 409 | Mesma `Idempotency-Key` em execução (RN-72) |
+| `cliente-com-assinatura-ativa` | 409 | RN-81 |
+| `lote-muito-grande` | 413 | RN-61 |
+| `validacao` | 422 | Regras de campo; traz a lista `erros` com `campo` e `mensagem` |
+| `idempotency-key-reutilizada` | 422 | Mesma chave, corpo diferente |
+| `cupom-invalido` | 422 | RN-20; traz `motivo` |
+| `intervalos-incompativeis` | 422 | RN-22 |
+| `dado-de-cartao-proibido` | 422 | RN-15 |
+| `valor-excede-saldo-creditavel` | 422 | RN-52, RN-54 |
+| `limite-excedido` | 429 | RN-73; com `Retry-After` |
+| `erro-interno` | 500 | Inesperado; nunca expõe stack trace, traz `request_id` |
+
+### Catálogo de eventos (Kafka)
+
+Os eventos de domínio saem do core pelo **registro de publicações** (outbox) na mesma transação da mudança de estado e são externalizados para o Kafka. Envelope: `id` (UUIDv7, usado para deduplicar), `tipo`, `versao_schema`, `tenant_id`, `ocorrido_em`, `dados`. Evolução: na mesma versão, só campos opcionais novos; mudança incompatível publica a versão nova em paralelo durante a transição.
+
+| Evento | Produtor | Consumidores | Tópico · chave | `dados` | Garantia |
+|---|---|---|---|---|---|
+| `uso.evento_recebido` v1 | cobra-ingest | core (uso) | `cobra.uso.eventos.v1` · `tenant_id:cliente_ref` | `id_evento`, `cliente_ref`, `metrica`, `quantidade`, `ocorrido_em`, `recebido_em` | at-least-once; dedup por `(tenant, id_evento)` |
+| `assinatura.criada` / `assinatura.status_alterado` / `assinatura.cancelada` v1 | core (assinaturas) | webhooks, e-mails | `cobra.assinaturas.v1` · `tenant_id:assinatura_id` | snapshot; `de`, `para`, `motivo`, `versao` | at-least-once, ordem por assinatura |
+| `fatura.finalizada` v1 | core (faturamento) | pagamentos, webhooks | `cobra.faturas.v1` · `tenant_id:fatura_id` | fatura completa | at-least-once, ordem por fatura |
+| `fatura.paga` / `fatura.incobravel` v1 | core (pagamentos) | webhooks, e-mails | idem | `fatura_id`, `numero`, `total_centavos`, `moeda`, `versao` | idem |
+| `pagamento.aprovado` / `pagamento.recusado` v1 | core (pagamentos) | dunning, webhooks | `cobra.pagamentos.v1` · `tenant_id:fatura_id` | `pagamento_id`, `tentativa`, `codigo_recusa`, `tipo_recusa` | idem |
+| `nota_credito.emitida` / `reembolso.concluido` v1 | core | webhooks | `cobra.faturas.v1` / `cobra.pagamentos.v1` | ids, `valor_centavos`, `destino` | idem |
+| `cliente.anonimizado` v1 | core (privacidade) | módulos que guardam cópias, webhooks | `cobra.clientes.v1` · `tenant_id:cliente_id` | só `cliente_id` | idem |
+
+### Catálogo de webhooks de saída
+
+| Tipo | Quando | `dados` | Versão |
+|---|---|---|---|
+| `assinatura.criada`, `assinatura.atualizada`, `assinatura.cancelada` | Criação, mudança de item ou status, cancelamento efetivo | `assinatura` (snapshot com `versao`) | 1 |
+| `assinatura.trial_terminando` | 3 dias antes do fim do trial | `assinatura_id`, `trial_fim` | 1 |
+| `fatura.finalizada`, `fatura.paga`, `fatura.incobravel` | Mudança de status | `fatura` (resumo com `versao`) | 1 |
+| `pagamento.recusado` | Cada recusa | `fatura_id`, `tentativa`, `tipo_recusa`, `proxima_tentativa_em` | 1 |
+| `nota_credito.emitida`, `reembolso.concluido` | Emissão / conclusão | ids e valores | 1 |
+| `uso.rejeitado` | Evento recusado na validação assíncrona | `id_evento`, `motivo` | 1 |
+
+Todos: at-least-once, sem ordem garantida, assinados no padrão Standard Webhooks, com as retentativas da RN-69 e DLQ consultável e reenviável pelo console.
+
+## Arquitetura
+
+<Figura legenda="Containers do Cobra+ no Docker Compose: um monólito modular, um serviço de ingestão separado e as dependências, todas locais">
+<svg viewBox="0 0 880 500" width="880" role="img" aria-labelledby="cobra-arq-titulo cobra-arq-desc">
+  <title id="cobra-arq-titulo">Arquitetura de containers do Cobra+</title>
+  <desc id="cobra-arq-desc">No topo, três atores externos: o sistema do tenant, que chama a API pública com chave de API; o console do tenant, autenticado com JWT do Keycloak; e o endpoint de webhook do tenant. No meio, o serviço cobra-ingest, que recebe eventos de uso e os publica no Kafka; o cobra-core, um monólito modular com dez módulos; a adquirente-fake e o Mailpit. Embaixo, Kafka, PostgreSQL com RLS, Redis para rate limit e cache, e a pilha de observabilidade com OpenTelemetry Collector e Grafana.</desc>
+  <defs><marker id="cobra-mk-arq" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="10" width="250" height="56" rx="10" class="d-box"/>
+  <text x="145" y="34" text-anchor="middle" class="d-title">Sistema do tenant</text>
+  <text x="145" y="54" text-anchor="middle" class="d-label">API /v1 · chave de API</text>
+  <rect x="315" y="10" width="250" height="56" rx="10" class="d-box"/>
+  <text x="440" y="34" text-anchor="middle" class="d-title">Console do tenant</text>
+  <text x="440" y="54" text-anchor="middle" class="d-label">/console/v1 · JWT (Keycloak)</text>
+  <rect x="610" y="10" width="250" height="56" rx="10" class="d-box"/>
+  <text x="735" y="34" text-anchor="middle" class="d-title">Endpoint de webhook</text>
+  <text x="735" y="54" text-anchor="middle" class="d-label">servidor do tenant</text>
+  <rect x="20" y="130" width="220" height="120" rx="10" class="d-info"/>
+  <text x="130" y="156" text-anchor="middle" class="d-title">cobra-ingest</text>
+  <text x="130" y="180" text-anchor="middle" class="d-label">POST /v1/uso/eventos</text>
+  <text x="130" y="200" text-anchor="middle" class="d-label">valida chave, formato, limite</text>
+  <text x="130" y="220" text-anchor="middle" class="d-label">202 só após ack do Kafka</text>
+  <text x="130" y="240" text-anchor="middle" class="d-label">sem estado · escala sozinho</text>
+  <rect x="280" y="130" width="360" height="200" rx="10" class="d-accent"/>
+  <text x="460" y="154" text-anchor="middle" class="d-title">cobra-core (monólito modular)</text>
+  <rect x="295" y="166" width="160" height="26" rx="6" class="d-box"/>
+  <text x="375" y="184" text-anchor="middle" class="d-mono">tenancy</text>
+  <rect x="465" y="166" width="160" height="26" rx="6" class="d-box"/>
+  <text x="545" y="184" text-anchor="middle" class="d-mono">catalogo</text>
+  <rect x="295" y="198" width="160" height="26" rx="6" class="d-box"/>
+  <text x="375" y="216" text-anchor="middle" class="d-mono">assinaturas</text>
+  <rect x="465" y="198" width="160" height="26" rx="6" class="d-box"/>
+  <text x="545" y="216" text-anchor="middle" class="d-mono">faturamento</text>
+  <rect x="295" y="230" width="160" height="26" rx="6" class="d-box"/>
+  <text x="375" y="248" text-anchor="middle" class="d-mono">pagamentos</text>
+  <rect x="465" y="230" width="160" height="26" rx="6" class="d-box"/>
+  <text x="545" y="248" text-anchor="middle" class="d-mono">ledger</text>
+  <rect x="295" y="262" width="160" height="26" rx="6" class="d-box"/>
+  <text x="375" y="280" text-anchor="middle" class="d-mono">uso</text>
+  <rect x="465" y="262" width="160" height="26" rx="6" class="d-box"/>
+  <text x="545" y="280" text-anchor="middle" class="d-mono">webhooks</text>
+  <rect x="295" y="294" width="160" height="26" rx="6" class="d-box"/>
+  <text x="375" y="312" text-anchor="middle" class="d-mono">auditoria</text>
+  <rect x="465" y="294" width="160" height="26" rx="6" class="d-box"/>
+  <text x="545" y="312" text-anchor="middle" class="d-mono">privacidade</text>
+  <rect x="680" y="130" width="180" height="80" rx="10" class="d-violet"/>
+  <text x="770" y="160" text-anchor="middle" class="d-title">adquirente-fake</text>
+  <text x="770" y="182" text-anchor="middle" class="d-label">cobranças, tokens, caos</text>
+  <rect x="680" y="240" width="180" height="60" rx="10" class="d-box"/>
+  <text x="770" y="266" text-anchor="middle" class="d-title">Mailpit</text>
+  <text x="770" y="286" text-anchor="middle" class="d-label">e-mails da régua</text>
+  <rect x="20" y="390" width="200" height="60" rx="10" class="d-box"/>
+  <text x="120" y="416" text-anchor="middle" class="d-title">Kafka 4 (KRaft)</text>
+  <text x="120" y="436" text-anchor="middle" class="d-label">uso, eventos de domínio</text>
+  <rect x="250" y="390" width="200" height="60" rx="10" class="d-box"/>
+  <text x="350" y="416" text-anchor="middle" class="d-title">PostgreSQL 18</text>
+  <text x="350" y="436" text-anchor="middle" class="d-label">RLS · ledger · outbox</text>
+  <rect x="480" y="390" width="160" height="60" rx="10" class="d-box"/>
+  <text x="560" y="416" text-anchor="middle" class="d-title">Redis</text>
+  <text x="560" y="436" text-anchor="middle" class="d-label">rate limit · cache</text>
+  <rect x="670" y="390" width="190" height="60" rx="10" class="d-ok"/>
+  <text x="765" y="416" text-anchor="middle" class="d-title">Observabilidade</text>
+  <text x="765" y="436" text-anchor="middle" class="d-label">OTel Collector → Grafana</text>
+  <path d="M110 66 L110 128" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M220 66 L330 128" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M440 66 L440 128" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M600 128 L700 68" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <text x="660" y="112" class="d-label">webhooks assinados</text>
+  <path d="M640 170 L678 170" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M640 270 L678 270" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M110 250 L110 388" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <text x="118" y="320" class="d-mono">cobra.uso.eventos.v1</text>
+  <path d="M190 388 L300 334" class="d-line" marker-start="url(#cobra-mk-arq)" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M380 332 L360 388" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M540 332 L560 388" class="d-line" marker-end="url(#cobra-mk-arq)"/>
+  <path d="M640 320 L740 388" class="d-line" stroke-dasharray="4 4" marker-end="url(#cobra-mk-arq)"/>
+  <text x="440" y="482" text-anchor="middle" class="d-label">Setas cheias: chamadas síncronas ou escrita; Kafka liga ingest e core de forma assíncrona; tracejado: telemetria OTLP de todos os serviços</text>
+</svg>
+</Figura>
+
+**Organização do repositório** (um repositório, build multi-módulo Maven ou Gradle):
+
+```text
+cobra-plus/
+  cobra-core/        → Spring Boot; pacotes = módulos do Spring Modulith
+    src/main/java/.../tenancy | catalogo | assinaturas | faturamento | pagamentos
+                     | ledger | uso | webhooks | auditoria | privacidade | compartilhado
+  cobra-ingest/      → Spring Boot mínimo, sem acesso ao banco do core
+  adquirente-fake/   → Spring Boot mínimo com o contrato da RF-09
+  infra/             → compose.yaml, configs do Grafana/Prometheus/Tempo/Loki/OTel, realm do Keycloak
+  carga/             → scripts k6
+  docs/adr/          → ADRs numerados;  docs/runbook.md;  docs/postmortens/;  docs/slo.md
+```
+
+Cada módulo expõe só uma API pública (interfaces e eventos no pacote raiz) e esconde o resto em `internal`. O teste `ApplicationModules.of(...).verify()` roda no CI: um módulo que acessa `internal` de outro quebra o build. Módulos conversam por chamada à API pública (síncrona, na mesma transação, quando a consistência precisa ser imediata — finalizar fatura e lançar no ledger) ou por evento (assíncrona — pagamento aprovado → webhooks).
+
+### Decisões para registrar em ADRs
+
+Cada ADR tem contexto, opções, decisão, consequências e "o que nos faria mudar de ideia". As recomendações abaixo são uma base; você pode decidir diferente se defender.
+
+**ADR-001 — Monólito modular + serviço de ingestão separado.** Opções: (a) monólito único; (b) microsserviços por domínio (assinaturas, faturamento, pagamentos, ledger); (c) monólito modular com a ingestão separada. *Recomendação: (c).* Faturamento, pagamentos e ledger precisam de transações ACID entre si ("fatura finalizada e lançamento no ledger, ou nenhum dos dois"); separá-los traria sagas e consistência eventual onde o domínio pede atomicidade, mais custo operacional sem time que justifique. A ingestão, ao contrário, tem perfil oposto: volume 100 vezes maior, sem estado, tolerante a atraso, e uma rajada de eventos não pode derrubar o p99 da API de cobrança (RNF-01). Separá-la isola falha e escala, e o Kafka absorve picos. O ADR diz o que faria extrair outro módulo (ex.: webhooks com volume ou time próprio).
+
+**ADR-002 — Isolamento de tenant.**
+
+| Opção | Isolamento | Custo operacional | Escala de tenants | Consultas entre tenants |
+|---|---|---|---|---|
+| Coluna `tenant_id` + RLS | Lógico, garantido pelo banco se o papel não tiver `BYPASSRLS` | Baixo: um schema, uma migração | Milhares sem esforço | Fáceis para jobs (com cuidado) |
+| Schema por tenant | Melhor (`search_path`) | Migração × N schemas; catálogo do Postgres cresce | Centenas a poucos milhares | Difíceis |
+| Banco por tenant | Máximo; backup e restauração por tenant | Alto: pools e migrações × N | Dezenas a centenas | Muito difíceis |
+
+*Recomendação: coluna + RLS*, porque o produto mira milhares de tenants pequenos e médios. O ponto delicado é o pool de conexões: o tenant é definido com `set_config('app.tenant_id', ?, true)` (o `true` restringe à **transação**), no início de cada transação, por um componente único — nunca `SET` de sessão, que vazaria para a próxima requisição que pegar a mesma conexão. Registre também a rota de evolução: um tenant Enterprise que exija banco dedicado é atendido com roteamento de datasource, sem mudar o modelo.
+
+**ADR-003 — Dinheiro.** `long` em centavos + `moeda` (ISO 4217) num `record Dinheiro`; `BigDecimal` com `RoundingMode.HALF_EVEN` só nos cálculos intermediários (pró-rata, preço unitário fracionário); `double` proibido (regra do ArchUnit ou revisão). Arredondamento por linha, não no total, e documentado (RN-30, RN-39).
+
+**ADR-004 — Ledger.** Opções: coluna `saldo` atualizada; tabela de lançamentos com saldos derivados; banco especializado. *Recomendação:* lançamentos imutáveis com balanceamento verificado pelo banco; saldo materializado só como cache conferido. A consequência a registrar: consultas de saldo custam mais, e você mede quanto.
+
+**ADR-005 — Agendamento do faturamento.** Opções: `@Scheduled` + ShedLock (um nó por vez); Quartz em cluster; fila no próprio Postgres com `FOR UPDATE SKIP LOCKED`; disparar via Kafka. *Recomendação:* fila no Postgres com `SKIP LOCKED`: paralelismo real entre instâncias, sem infraestrutura nova, e a idempotência vem da restrição única, não do agendador.
+
+**ADR-006 — Publicação de eventos.** Registro de publicações do Spring Modulith com externalização para o Kafka, ou outbox própria com relay. Qualquer uma, desde que o evento seja gravado na mesma transação da mudança e haja republicação de incompletos. Escreva o que acontece se o Kafka ficar 1 hora fora.
+
+**ADR-007 — Entrega de webhooks.** Fila no Postgres (`webhook_entregas` com `proxima_tentativa_em`, `SKIP LOCKED`) ou tópicos de retry no Kafka. *Recomendação:* Postgres, porque o painel de reenvio, a consulta por status e o atraso de horas são naturais numa tabela; Kafka com retry por atraso longo é desconfortável.
+
+**ADR-008 — Rate limiting e degradação.** Redis compartilhado (correto entre instâncias) com *fallback* local por instância quando o Redis falha (*fail-open* controlado) versus *fail-closed*. Justifique: para uma API de cobrança, recusar todo mundo porque o limitador caiu custa mais do que deixar passar alguns acima do limite por minutos.
+
+**ADR-009 — Deduplicação de uso.** Banco (correta, mais cara) versus Redis `SET NX` com TTL (rápida, pode perder estado) versus transações do Kafka (exactly-once só dentro do Kafka). *Recomendação:* banco como fonte da verdade, com filtro opcional no Redis para economizar escrita, e o ADR explica por que "exactly-once do Kafka" não resolve um efeito gravado no Postgres.
+
+**ADR-010 — Versionamento e evolução da API.** Caminho (`/v1`) versus header (o Spring Framework 7 suporta os dois). *Recomendação:* caminho, pela clareza para integradores e para cache e logs; regras de compatibilidade da RN-74.
+
+## Plano de execução
+
+O plano tem **começo** (marco 1: decisões, esqueleto e esteira antes de qualquer regra de negócio), **meio** (marcos 2 a 7: fatias verticais, cada uma de ponta a ponta — migration, domínio, API, eventos, testes, métricas e README atualizado — terminando com algo demonstrável) e **fim** (marcos 8 e 9: conformidade, operação, prova sob falha e entrega). Trabalhe em branches curtas com PR para você mesmo, descrição citando RF/RN, e uma tag por marco (`m1`, `m2`...). A soma é de cerca de 200 horas: em ritmo de 10 h por semana, cinco meses.
+
+<Marco id="fundacao" numero={1} titulo="Fundação, ADRs e esteira de qualidade" horas={18}>
+
+**Objetivo:** ter o esqueleto que todo o resto vai usar, com as decisões mais caras de mudar já registradas.
+
+**Tarefas**
+
+- Criar o repositório com os três aplicativos (`cobra-core`, `cobra-ingest`, `adquirente-fake`) num build multi-módulo; Java 25, Spring Boot 4.
+- Escrever os ADRs 001, 002 e 003 antes do primeiro código de domínio.
+- `infra/compose.yaml` com PostgreSQL 18, Kafka 4 em modo KRaft, Redis, Keycloak (realm importado de arquivo, com usuários de exemplo dos três papéis), Mailpit, OpenTelemetry Collector, Prometheus, Grafana, Tempo e Loki — tudo com healthcheck; um `Makefile` (ou script) com `up`, `down`, `test`, `carga`.
+- Flyway com `V1__tenancy.sql` criando os papéis `cobra_migracao` (dono, usado só pelo Flyway) e `cobra_app` (usado pela aplicação, sem `BYPASSRLS`).
+- GitHub Actions: build, testes (com Testcontainers), JaCoCo, scanner de dependências e de segredos, build das imagens; proteção da branch principal.
+- Teste do Spring Modulith verificando as fronteiras (com os pacotes ainda quase vazios).
+- Logs em JSON com `request_id` e `traceId`; endpoint de health; `README.md` inicial com o problema, a arquitetura-alvo e "como rodar".
+
+**Entregáveis:** repositório público, ADRs 001–003, Compose, CI verde, README inicial, tag `m1`.
+
+**Definição de pronto:** `make up` sobe tudo em até 3 minutos numa máquina limpa; o Grafana abre com o datasource do Prometheus funcionando; um PR com uma classe acessando `internal` de outro módulo deixa o CI vermelho.
+
+**Aulas de apoio:** [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/), [Docker](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/#flyway-o-schema-como-código), [Git no time](../../../aulas/14-devops/01-git-no-time/), [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), [Domain-Driven Design](../../../aulas/13-arquitetura/07-domain-driven-design/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Rodar a aplicação com o mesmo usuário dono das tabelas: o dono ignora o RLS (a menos que a tabela use `FORCE ROW LEVEL SECURITY`) e o isolamento parece funcionar só porque ninguém testou. E deixar os ADRs "para o fim": escritos depois, viram justificativa, não decisão.
+</Callout>
+
+</Marco>
+
+<Marco id="tenancy" numero={2} titulo="Tenants, chaves de API e isolamento" horas={22}>
+
+**Objetivo:** nenhum dado de negócio existe fora de um tenant, e isso é provado por teste.
+
+**Tarefas**
+
+- RF-01 e RF-02: criação de tenants pela plataforma, chaves de API com HMAC e escopos, autenticação por filtro no Spring Security 7, console com JWT do Keycloak (resource server) e o claim `tenant_id`.
+- Componente único que, no início de cada transação, executa `set_config('app.tenant_id', ..., true)`; políticas RLS com `FORCE ROW LEVEL SECURITY` em todas as tabelas.
+- Idempotency-Key (RN-72) como um componente transversal, já usado pelos `POST` deste marco.
+- Rate limiting por plano no Redis (RN-73), com o fallback local.
+- Problem Details padronizado e `X-Request-Id`.
+- **Teste de isolamento** (RF-03): sobe dois tenants com dados, percorre os endpoints de leitura de A com ids de B e confere `404`; inclui o teste "sem contexto, zero linhas". Ele é escrito de forma que cada endpoint novo dos próximos marcos entre na lista (por exemplo, varrendo os mapeamentos do Spring MVC e falhando se um `GET` com `{id}` não estiver coberto).
+- ADR-008.
+
+**Entregáveis:** API de tenants e chaves, matriz de autorização (papel × endpoint) no README, teste de isolamento no CI.
+
+**Definição de pronto:** o teste de isolamento passa; uma chave revogada recebe `401` em até 60 s em todas as instâncias; 60 requisições simultâneas num tenant Starter produzem cerca de 20 respostas `429`.
+
+**Aulas de apoio:** [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/), [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/), [BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/#bola-o-bug-mais-comum-de-api), [Rate limiting](../../../aulas/11-seguranca/06-defesas-da-api/#limite-de-requisições-rate-limiting), [Redis](../../../aulas/15-system-design/02-redis/), [OAuth 2 e OpenID Connect](../../../aulas/11-seguranca/07-oauth2-e-openid-connect/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+`SET app.tenant_id` sem o escopo de transação: com pool de conexões, a próxima requisição herda o tenant anterior. Código assíncrono (`@Async`, virtual threads, consumidores Kafka) roda fora da transação da requisição e precisa definir o tenant explicitamente. E `403` para recurso de outro tenant confirma que ele existe.
+</Callout>
+
+</Marco>
+
+<Marco id="catalogo-assinaturas" numero={3} titulo="Catálogo e ciclo de vida das assinaturas" horas={24}>
+
+**Objetivo:** criar e mudar assinaturas com todas as regras de data e de pró-rata corretas.
+
+**Tarefas**
+
+- RF-04 e RF-05: clientes, meios de pagamento por token (com o bloqueio de PAN da RN-15), produtos, preços imutáveis, cupons com resgate concorrente seguro (RN-21).
+- RF-06: máquina de estados como tipo selado ou enum com tabela de transições; `Clock` injetado em todo o domínio; âncora e fim de mês (RN-23); lock otimista (RN-28).
+- RF-07: prévia e alteração com pró-rata; o cálculo num serviço de domínio puro, sem Spring, coberto por testes com os exemplos da especificação e por testes de propriedade (ex.: "para qualquer `f`, crédito ≤ valor antigo"; "alterar e desfazer no mesmo instante dá total zero").
+- Eventos `assinatura.*` publicados (a externalização vem no marco 7).
+
+**Entregáveis:** endpoints de catálogo e assinaturas, arquivo `.http` com o fluxo completo, tabela de transições no README.
+
+**Definição de pronto:** os testes das RN-22 a RN-33 passam, incluindo âncora 31 em fevereiro de ano bissexto e o exemplo numérico da RN-30; 20 threads disputando o último resgate de um cupom produzem exatamente um sucesso.
+
+**Aulas de apoio:** [Sealed e pattern matching](../../../aulas/02-poo/06-sealed-e-pattern-matching/), [Records e imutabilidade](../../../aulas/02-poo/05-records-e-imutabilidade/), [Lock otimista](../../../aulas/09-persistencia/06-locking-e-flyway/#lock-otimista-com-version), [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/), [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Somar "1 mês" à data de fim do período anterior: 31/01 + 1 mês = 28/02, e 28/02 + 1 mês = 28/03 — a âncora se perdeu. Calcule cada fim a partir da âncora e do número do ciclo. E calcular datas em UTC: "dia 1º às 00:00" em São Paulo é dia 1º às 03:00 UTC.
+</Callout>
+
+</Marco>
+
+<Marco id="faturamento-ledger" numero={4} titulo="Faturamento idempotente e ledger" horas={30}>
+
+**Objetivo:** fechar ciclos em lote sem nunca faturar duas vezes, com cada centavo lançado no ledger.
+
+**Tarefas**
+
+- ADRs 004 e 005.
+- RF-12: contas, transações, lançamentos; gatilho adiado de balanceamento; gatilhos de imutabilidade e `REVOKE`; estorno.
+- RF-08: tabela de trabalho, agendador com `SKIP LOCKED` em lotes de 100, uma transação por assinatura, rascunho e finalização, numeração sem lacunas, cupom e imposto na ordem da RN-39, fatura zerada.
+- Job de invariantes (RN-59) com métricas e o endpoint de plataforma.
+- Teste de volume: gerar 300.000 assinaturas (script SQL ou endpoint de *seed* do perfil `demo`), avançar o relógio e medir o tempo de fechamento com 1, 2 e 4 instâncias; registrar resultado e gargalo em `docs/desempenho.md`.
+
+**Entregáveis:** faturamento e ledger, extrato CSV, relatório de volume.
+
+**Definição de pronto:** o teste com 4 workers concorrentes e 10.000 assinaturas gera exatamente 10.000 faturas; o teste com `kill -9` no meio do lote converge para o mesmo resultado; o exemplo da RN-39 gera total 28256 e os lançamentos do exemplo do RF-12; um `UPDATE` em `lancamentos` com o papel da aplicação falha.
+
+**Aulas de apoio:** [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/), [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/), [Agregações e janelas](../../../aulas/07-sql/04-agregacoes-e-janelas/), [N+1 e desempenho](../../../aulas/09-persistencia/04-n-mais-1-e-desempenho/), [Executors](../../../aulas/06-concorrencia/03-executors/), [Testcontainers](../../../aulas/10-testes/05-testcontainers/), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Tratar idempotência só no agendador ("o lock garante que roda uma vez"): locks expiram, processos pausam em GC e voltam. A garantia final é a restrição única. E carregar 300.000 entidades JPA num único contexto de persistência: processe em lotes, com transação por item e consultas de projeção.
+</Callout>
+
+</Marco>
+
+<Marco id="pagamentos-dunning" numero={5} titulo="Cobrança na adquirente e régua de dunning" horas={26}>
+
+**Objetivo:** cobrar com segurança diante de uma adquirente que recusa, demora, some e às vezes cobra sem responder.
+
+**Tarefas**
+
+- `adquirente-fake` completo (RF-09), com os tokens de teste e o endpoint de caos.
+- Cliente HTTP com `RestClient` (ou HTTP interface), timeouts de 1 s e 5 s, Resilience4j com circuit breaker e bulkhead; chave de idempotência por tentativa (RN-43).
+- Estado `DESCONHECIDA` e reconciliação (RN-44); `PENDENTE_REPROCESSAMENTO` (RN-45); índice único de pagamento aprovado (RN-46).
+- Régua (RF-10) com agenda persistida, jitter, e-mails pelo Mailpit; notas de crédito e reembolsos (RF-11) passando pelo ledger.
+- Painel no Grafana: taxa de aprovação, recusas por código, estado do circuit breaker, tentativas desconhecidas.
+
+**Entregáveis:** cobrança, régua, notas de crédito, reembolsos e o painel de pagamentos.
+
+**Definição de pronto:** os critérios de aceite do RF-09 ao RF-11 passam em testes de integração (Testcontainers + adquirente-fake em container); com `tok_aprova_sem_responder`, a adquirente registra exatamente uma cobrança; com a adquirente fora do ar durante um fechamento, nenhuma assinatura vira `INADIMPLENTE`.
+
+**Aulas de apoio:** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/#camada-3-circuit-breaker), [RestClient e integrações](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/), [Backoff com jitter](../../../aulas/12-mensageria/06-retry-e-dlq/#backoff-exponencial-com-jitter), [Caso PIX](../../../aulas/15-system-design/06-caso-pix/), [Mockito](../../../aulas/10-testes/03-mockito/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Chamar a adquirente **dentro** da transação do banco: a conexão fica presa por até 5 s e, se o commit falhar depois da aprovação, você cobrou sem registrar. Grave a tentativa, faça o commit, chame a adquirente e registre o resultado em outra transação. E gerar uma chave de idempotência nova a cada retry HTTP: é exatamente assim que nasce a cobrança duplicada.
+</Callout>
+
+</Marco>
+
+<Marco id="uso-medido" numero={6} titulo="Ingestão de uso em alto volume" horas={24}>
+
+**Objetivo:** aceitar milhares de eventos por segundo sem perder nem contar duas vezes, e faturá-los.
+
+**Tarefas**
+
+- `cobra-ingest`: autenticação por chave com cache de 60 s, limites por plano em eventos por segundo, validação de formato e janela, produtor idempotente com `acks=all`, resposta por evento.
+- Consumidor no core em lote: deduplicação e agregação na mesma transação (RN-63), validação semântica e `uso_rejeitados`, atribuição ao período e uso tardio (RN-64); ADR-009.
+- Partições de `uso_ids_vistos` e o job de retenção.
+- Linhas de uso na fatura (RN-18, RN-24) e `GET /v1/uso/resumo`.
+- Script k6 (`carga/uso.js`) com o cenário da RNF-03 e reenvio proposital de 10% dos lotes.
+
+**Entregáveis:** serviço de ingestão, consumidor, relatório de carga com throughput, p99 e lag.
+
+**Definição de pronto:** depois do k6, a soma dos agregados é igual à soma dos eventos **únicos** enviados; parar o consumidor por 10 minutos e religar não perde nem duplica; o relatório mostra o throughput sustentado e onde está o gargalo.
+
+**Aulas de apoio:** [Kafka](../../../aulas/12-mensageria/03-kafka/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/#deduplicação-na-mesma-transação), [Escala e consistência](../../../aulas/15-system-design/05-escala-e-consistencia/), [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/), [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/), [Kafka em produção](../../../aulas/12-mensageria/08-kafka-em-producao/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Responder `202` antes do ack do Kafka (o evento some se o processo cair). Usar a chave `tenant_id` sozinha no tópico: um tenant grande vira partição quente; `tenant_id:cliente_ref` espalha a carga e mantém a ordem por cliente. E confiar no `enable.idempotence` do produtor como deduplicação de ponta a ponta: ele só evita duplicata causada pelo retry do próprio produtor.
+</Callout>
+
+</Marco>
+
+<Marco id="webhooks" numero={7} titulo="Eventos e webhooks assinados" horas={20}>
+
+**Objetivo:** todo fato relevante sai do sistema de forma confiável, assinada e reprocessável.
+
+**Tarefas**
+
+- Externalização dos eventos de domínio para o Kafka pela outbox (ADR-006); catálogo de eventos versionado em `docs/eventos.md`.
+- RF-14 completo: endpoints, proteção contra SSRF, assinatura Standard Webhooks, rotação com assinatura dupla, agenda de tentativas, DLQ, desativação automática, reenvio individual e em lote (ADR-007).
+- Um **receptor de exemplo** (container simples) que valida a assinatura e a janela de 5 minutos, usado na demonstração e nos testes.
+- Guia de integração em `docs/integracao.md`: autenticação, idempotência, paginação, verificação de webhook com exemplo de código, deduplicação por `webhook-id`.
+
+**Entregáveis:** webhooks de ponta a ponta, receptor de exemplo, guia de integração.
+
+**Definição de pronto:** os critérios do RF-14 passam; derrubar o Kafka por 5 minutos não perde evento (a outbox republica); o receptor de exemplo rejeita uma entrega com timestamp de 6 minutos atrás.
+
+**Aulas de apoio:** [Transactional outbox](../../../aulas/12-mensageria/04-transactional-outbox/), [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/), [Registro de publicações](../../../aulas/13-arquitetura/04-monolito-modular/#o-registro-de-publicações-eventos-que-não-se-perdem), [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/), [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/), [Evolução de esquemas de eventos](../../../aulas/12-mensageria/07-evolucao-de-esquemas-de-eventos/), [Testes de contrato](../../../aulas/10-testes/07-testes-de-contrato/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Assinar o JSON depois de reserializá-lo: a ordem dos campos ou os espaços mudam e a assinatura não confere. Assine os **bytes exatos** enviados. E resolver o DNS só no cadastro do endpoint: o atacante troca o registro depois (DNS rebinding) e o seu servidor passa a chamar a rede interna.
+</Callout>
+
+</Marco>
+
+<Marco id="operacao-conformidade" numero={8} titulo="Conformidade, auditoria e migração sem downtime" horas={20}>
+
+**Objetivo:** o sistema atende à LGPD, deixa rastro verificável e evolui o schema sem parar.
+
+**Tarefas**
+
+- RF-16: auditoria encadeada e verificação.
+- RF-17: exportação assíncrona, anonimização, retenção com base legal.
+- RF-18: flags com dono e validade e o teste que barra flag vencida.
+- **Migração expand/contract demonstrada:** trocar `clientes.endereco` (texto livre) por colunas estruturadas (`logradouro`, `numero`, `cidade`, `uf`, `cep`). Passos, cada um numa release: (1) *expand* — colunas novas anuláveis; (2) escrita dupla na aplicação; (3) *backfill* em lotes de 1.000 com pausa, idempotente e retomável; (4) leitura das colunas novas atrás da flag `leitura.endereco-estruturado`; (5) restrição `CHECK ... NOT VALID` seguida de `VALIDATE CONSTRAINT`; (6) *contract* — parar de escrever e remover a coluna antiga numa release posterior. Índices novos com `CREATE INDEX CONCURRENTLY` numa migration que não roda em transação (configuração por script do Flyway).
+- Rodar a sequência com **duas réplicas** do core atrás de um balanceador (nginx no Compose), reiniciando uma de cada vez, com o k6 gerando carga.
+
+**Entregáveis:** endpoints de LGPD e auditoria, `docs/migracao-endereco.md` com os passos, os tempos e o gráfico de erros do k6.
+
+**Definição de pronto:** o critério da RN-81 passa (o e-mail anonimizado não é encontrado); a verificação de auditoria acusa uma adulteração feita à mão; a migração completa termina com 0 respostas `5xx` no k6.
+
+**Aulas de apoio:** [Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/#flyway-o-schema-como-código), [DDL e constraints](../../../aulas/07-sql/02-ddl-e-constraints/), [Segredos fora do código](../../../aulas/11-seguranca/06-defesas-da-api/#segredos-fora-do-código), [Hexagonal](../../../aulas/13-arquitetura/03-hexagonal/), [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+`ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ...` com expressão volátil, ou um `ADD CONSTRAINT` validado de uma vez numa tabela grande: ambos seguram lock e travam a API. E remover a coluna antiga na mesma release que para de usá-la: durante o deploy, as instâncias antigas ainda leem dela.
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Produção reproduzível, caos e v1.0.0" horas={16}>
+
+**Objetivo:** provar, com números, que o sistema cumpre os SLOs e se comporta bem sob falha — e entregar.
+
+**Tarefas**
+
+- `docs/slo.md`: SLIs exatos (consultas PromQL), metas, janela de 28 dias, error budget e política ("budget esgotado congela funcionalidade e prioriza confiabilidade").
+- Recording rules e alertas por **taxa de consumo do budget** em duas janelas (rápida para paginar, lenta para ticket); alertas de invariante violada, tentativa `EM_ANALISE`, lag de uso, DLQ crescendo, atraso de faturamento. Dashboards: visão de SLO, RED por endpoint, faturamento, pagamentos, uso, webhooks.
+- `docs/runbook.md`: para cada alerta, o que significa, como confirmar, como mitigar, quando escalar.
+- **Experimento de caos:** durante um fechamento de 5.000 faturas com k6 na API, pôr a adquirente `fora_do_ar` por 20 minutos e depois com 2 s de latência extra. Registrar o comportamento esperado antes e o observado depois.
+- `docs/postmortens/2026-xx-adquirente-fora.md` no formato sem culpa: resumo, impacto (com números), linha do tempo, detecção, causa, o que funcionou, o que não funcionou, ações com dono e prazo.
+- Backup e restauração do Postgres testados (RNF-11); imagens versionadas; deploy opcional num Kubernetes local (kind ou k3d) com probes de liveness e readiness.
+- README final, vídeo de demonstração, release `v1.0.0` com changelog.
+
+**Entregáveis:** SLOs, alertas, dashboards exportados como JSON, runbook, postmortem, relatório de carga final, release.
+
+**Definição de pronto:** o relatório final mostra disponibilidade, p95 e p99 medidos contra as metas; o job de invariantes passou depois do caos; um clone limpo do repositório sobe com `make up` e roda a demonstração seguindo só o README.
+
+**Aulas de apoio:** [Observabilidade](../../../aulas/14-devops/05-observabilidade/#sli-slo-red-e-alertas), [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/), [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/), [Processo seletivo](../../../aulas/17-carreira/03-processo-seletivo/), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/).
+
+<Callout tipo="erro" titulo="Armadilhas do marco">
+Alertar por causa ("CPU a 80%") em vez de sintoma (budget queimando): gera ruído e não pega o que importa. E escrever o postmortem sem ter rodado o experimento de verdade: o valor está justamente no que deu diferente do esperado.
+</Callout>
+
+</Marco>
+
+## Estratégia de testes
+
+| Nível | O que cobre | Ferramentas |
+|---|---|---|
+| Unidade | Pró-rata, datas e âncora, cálculo de fatura, máquina de estados, assinatura de webhook, régua (agenda) — domínio puro com `Clock` fixo | JUnit 6, AssertJ |
+| Propriedade | Invariantes com entradas aleatórias: crédito de pró-rata nunca maior que o valor; total de fatura nunca negativo; toda transação gerada é balanceada; soma de notas nunca passa do total | jqwik (confira a compatibilidade com a sua versão da JUnit Platform) ou geração aleatória com semente fixa num teste comum |
+| Fatia | Controllers (Problem Details, validação, escopos), repositórios com consultas não triviais | `@WebMvcTest`, `@DataJpaTest` com Testcontainers |
+| Módulo | Cada módulo isolado, com eventos publicados verificados | Testes de módulo do Spring Modulith |
+| Integração | Fluxos com Postgres, Kafka, Redis e adquirente-fake reais | Testcontainers 2 |
+| Contrato | OpenAPI gerado comparado ao versionado (mudança incompatível quebra o build); schemas dos eventos | Diff de OpenAPI no CI |
+| Carga e caos | RNF-02, RNF-03, RNF-05, marco 9 | k6, endpoint de caos, Toxiproxy (opcional) |
+
+**Cenários obrigatórios:** todos os critérios de aceite desta especificação viram testes nomeados com a regra que cobrem (`RN-35 fechamento concorrente não duplica fatura`). Os que mais pesam numa revisão: isolamento em todos os `GET` (RF-03); fechamento com 4 workers e com `kill -9` no meio (RN-35, RN-38); os exemplos numéricos das RN-18, 30, 32, 39 e 52, valor por valor; âncora 31 e 29/02 ao longo de 14 meses (RN-23); `tok_aprova_sem_responder` com exatamente uma cobrança (RN-44, RN-46); adquirente fora do ar sem inadimplência (RN-45); lote de uso reenviado e consumidor religado (RN-63); Idempotency-Key em replay, corpo diferente e concorrência (RN-72); disputas de cupom e de reembolso (RN-21, RN-54); `UPDATE` no ledger e na auditoria recusado pelo banco (RN-55, RN-56); anonimização (RN-81); e o job de invariantes verde ao fim da suíte e depois de cada teste de carga.
+
+## Entregáveis do portfólio
+
+**Modelo de README**
+
+```markdown
+# Cobra+ — billing multi-tenant
+
+Plataforma de cobrança recorrente para empresas SaaS: assinaturas fixas, por assento e por uso,
+faturamento em lote idempotente, ledger de partidas dobradas e webhooks assinados.
+
+[CI] [cobertura] [release v1.0.0]   ▶ Demonstração em vídeo (3 min)
+
+## O que este projeto prova
+- 0 cobranças duplicadas, inclusive com timeout da adquirente (link para o teste)
+- 300.000 faturas em X min com 4 instâncias (link para docs/desempenho.md)
+- Isolamento de tenant com RLS, provado por teste (link)
+- SLO 99,9% medido sob falha da adquirente (link para o postmortem)
+
+## Arquitetura          → diagrama + link para docs/adr/
+## Como rodar           → make up; usuários de exemplo; make demo
+## Fluxo de demonstração → passo a passo com os .http
+## Decisões e trade-offs → 1 linha por ADR
+## Operação             → SLOs, dashboards, runbook, postmortem
+## O que eu faria a seguir
+```
+
+**Também no repositório:** diagramas (os três desta especificação, refeitos por você), coleção `.http` cobrindo o fluxo completo, `docs/integracao.md`, dashboards em JSON, relatórios de carga, runbook, postmortem, changelog.
+
+**Roteiro do vídeo (até 3 minutos):** (0:00) o problema em uma frase; (0:15) criar tenant, chave e assinatura com cupom pelo `.http`; (0:40) upgrade com prévia de pró-rata; (1:00) avançar o relógio 31 dias e mostrar o fechamento, o ledger e o webhook chegando ao receptor; (1:30) ligar o caos na adquirente e mostrar o painel: circuito aberto, API verde, nenhuma inadimplência; (2:10) desligar o caos e ver o backlog drenar sem duplicar; (2:30) relatório de invariantes verde e o trace de uma cobrança no Tempo; (2:50) link para ADRs e postmortem.
+
+**Post para o LinkedIn:** três parágrafos curtos — o problema ("cobrar duas vezes é o pior bug de um billing"), duas decisões com trade-off (RLS em vez de schema por tenant; timeout tratado como estado desconhecido) e um número medido. Link para o repositório e o vídeo.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível (Sênior) | Acima do nível |
+|---|---|---|---|
+| Correção financeira | Valores em `double` ou arredondamento ad hoc | Centavos + HALF_EVEN documentado; exemplos da especificação testados | Testes de propriedade e invariantes rodando continuamente em carga |
+| Idempotência | Só no caminho feliz | Restrições únicas, Idempotency-Key, chave por tentativa e estado desconhecido testados | Testes de falha injetada (kill, timeout) em todos os pontos de escrita externa |
+| Ledger | Saldo em coluna atualizada | Partidas dobradas imutáveis com balanceamento no banco | Reconciliação com a adquirente e extrato aceito por alguém de finanças |
+| Isolamento | Filtro por `tenant_id` só no código | RLS com papel sem bypass e teste que cobre todos os endpoints | Teste que falha se um endpoint novo não estiver coberto; ameaças documentadas |
+| Arquitetura | Pacotes por camada, sem fronteiras | Módulos verificados no CI e ADRs com opções e consequências | ADRs revisitados com dados medidos (ex.: onde o banco virou gargalo) |
+| Mensageria | Publicação fora da transação | Outbox, consumidores idempotentes, DLQ | Evolução de schema de evento demonstrada |
+| API pública | CRUD sem padrão de erro | Versão, escopos, rate limit, Problem Details, cursor, OpenAPI | Diff de contrato no CI e guia de integração com exemplos |
+| Webhooks | POST sem assinatura nem retry | Standard Webhooks, retentativas, DLQ, reenvio, SSRF | Receptor de exemplo e rotação sem downtime demonstrados |
+| Desempenho | Sem medição | k6 com metas e relatório | Gargalo identificado, corrigido e medido de novo |
+| Operação | Logs soltos | SLOs, alertas por burn rate, dashboards, runbook | Postmortem de caos com ações executadas |
+| Conformidade | Dados pessoais espalhados | LGPD, auditoria encadeada, retenção com base legal | Threat model escrito e revisado |
+| Comunicação | README "como rodar" | README que prova resultados com links | Vídeo e post que um gestor não técnico entende |
+
+## Como apresentar na entrevista
+
+**Pitch (60–90 s):** "Construí o Cobra+, uma plataforma de billing multi-tenant: empresas usam a API para cobrar assinaturas fixas, por assento e por uso dos clientes delas. O que tem de difícil é dinheiro e escala ao mesmo tempo. Três decisões resumem o projeto. Primeiro, correção: todo valor é inteiro em centavos, todo fato vai para um ledger de partidas dobradas imutável, e um job verifica invariantes o tempo todo; o faturamento em lote usa restrições únicas, então rodar duas vezes não fatura duas vezes. Segundo, falha: tratei timeout da adquirente como estado desconhecido, com reconciliação, e não como recusa — testei com uma adquirente simulada que aprova e não responde, e não houve cobrança duplicada. Terceiro, operação: SLO de 99,9% com alertas por consumo de error budget; derrubei a adquirente por 20 minutos durante um fechamento, a API ficou verde e o backlog drenou sozinho; escrevi o postmortem. A arquitetura é um monólito modular com a ingestão de uso separada, e os ADRs explicam por quê."
+
+**Perguntas prováveis**
+
+1. **"Como você garante que não cobra duas vezes?"** — Três camadas: uma fatura por período (restrição única); uma chave de idempotência por tentativa, reusada nos retries HTTP; timeout como `DESCONHECIDA` com reconciliação antes de qualquer nova tentativa; e o índice único de pagamento aprovado mais o job de invariantes como rede de segurança.
+2. **"Por que RLS e não schema por tenant?"** — Escala de tenants, custo de migração, jobs entre tenants; o risco do pool de conexões e como `set_config(..., true)` resolve; rota para tenant dedicado.
+3. **"Por que não microsserviços?"** — Atomicidade entre fatura e ledger; custo operacional; a ingestão foi separada por perfil de carga e isolamento de falha, com critério explícito para a próxima extração.
+4. **"Desenhe o fechamento do dia 1º para 500 mil assinaturas."** — Fila no banco com `SKIP LOCKED`, lote de 100, transação por item, escala horizontal, números medidos, gargalo encontrado, e o que faria acima disso (particionar a tabela de trabalho, espalhar âncoras).
+5. **"O que é exactly-once aqui?"** — Não existe de ponta a ponta; é at-least-once com efeitos idempotentes. Explicar a deduplicação do uso no banco e por que transações do Kafka não cobrem o Postgres.
+6. **"Como versiona a API e os eventos sem quebrar clientes?"** — Regras de compatibilidade, `Deprecation`/`Sunset`, diff de OpenAPI no CI, versão de schema no envelope e publicação paralela.
+7. **"Como você mediu o SLO e o que aconteceu no caos?"** — SLI exato, janela, burn rate em duas janelas, o que o painel mostrou, o que deu diferente do esperado e as ações do postmortem.
+8. **"Como faria uma migração numa tabela de 100 milhões de linhas sem parar?"** — Expand/contract, backfill em lotes retomável, `NOT VALID` + `VALIDATE`, índices `CONCURRENTLY`, flag para a leitura, remoção em release posterior.
+9. **"Como trata LGPD num sistema financeiro que precisa guardar tudo?"** — Ledger sem dado pessoal; snapshot fiscal com base legal e prazo; anonimização com pré-condições; exportação; retenção por partição.
+10. **"Se você tivesse um time de 4 pessoas, como dividiria o trabalho?"** — Pelos módulos e fronteiras já verificadas: uma pessoa em catálogo/assinaturas, uma em faturamento/ledger, uma em pagamentos/dunning, uma em plataforma (ingestão, webhooks, observabilidade); contratos (eventos e APIs internas) definidos primeiro; você revisando as decisões de dinheiro e os ADRs.
+11. **"O que você priorizou e o que deixou de fora, e por quê?"** — Corretude e operação antes de amplitude: ledger e idempotência antes de múltiplas moedas, sem UI; o "Fora" do escopo como decisão consciente; o que entraria em seguida com base em risco e valor.
+12. **"Conte um problema que você encontrou e como resolveu."** — Use um real do projeto (ex.: o `SET` de sessão vazando tenant no pool, a chave de idempotência regenerada no retry, o gargalo do contador de numeração), com sintoma, diagnóstico, correção e o teste que impede a volta.
+
+**Trade-offs para mencionar sem esperar a pergunta:** numeração sem lacunas serializa a finalização por tenant (custo aceito, medido); *fail-open* do rate limit quando o Redis cai; validação semântica do uso assíncrona (o tenant descobre o erro depois, via webhook); webhooks sem ordem garantida, compensados por `versao` no payload.
+
+## Para ir além
+
+- Receita diferida: reconhecer um plano anual mês a mês no ledger.
+- Múltiplas moedas, com a moeda já presente em todo valor.
+- Modo de teste separado do modo de produção por tenant.
+- Interface do console (o painel de reenvio de webhooks e o extrato são bons começos).
+- Boleto e Pix como meios de pagamento assíncronos (conciliação por arquivo ou por webhook da instituição).
+- Tarifa da adquirente (MDR) lançada no ledger e conciliação com o extrato de liquidação.
+- Particionar `faturas` e `lancamentos` por tempo; réplica de leitura para extratos.
+- Extrair `webhooks` como serviço e medir o antes e o depois.
+- Kubernetes com HPA para o `cobra-ingest` escalando pelo lag do consumidor.
+
+## O que estudar além da trilha
+
+A trilha vai do básico ao Pleno, e as aulas avançadas (módulos 10 a 13) já trazem a visão sênior de decisões e trade-offs. Os tópicos abaixo vão além delas. Estes tópicos aparecem no projeto e são cobrados de quem se candidata a Sênior; cada um vem com o suficiente para começar.
+
+**Multi-tenancy e Row-Level Security.** RLS faz o banco aplicar um filtro obrigatório em toda consulta de uma tabela, a partir de políticas (`CREATE POLICY`). Os detalhes que mordem: donos de tabela e papéis com `BYPASSRLS` ignoram as políticas, `FORCE ROW LEVEL SECURITY` muda isso para o dono, e variáveis de sessão com pool de conexões. Referências: [PostgreSQL — Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html), [CREATE POLICY](https://www.postgresql.org/docs/current/sql-createpolicy.html); o whitepaper *SaaS Tenant Isolation Strategies* da AWS, para o panorama dos modelos.
+
+**Contabilidade de partidas dobradas para engenheiros.** Todo movimento sai de uma conta e entra em outra; débitos e créditos sempre somam igual; ativos e despesas têm natureza devedora, passivos e receitas, credora. Saber isso permite conversar com o financeiro e desenhar ledgers que fecham. Referências: Martin Fowler, *Analysis Patterns* (capítulos de contabilidade); a série *Accounting for Developers*, da Modern Treasury; para receita de assinaturas, a norma IFRS 15 (CPC 47 no Brasil).
+
+**SLI, SLO e error budget.** SLI é a medida (proporção de requisições boas), SLO é a meta numa janela, e o error budget é o quanto se pode falhar — o que transforma confiabilidade em decisão de produto. Alertar por taxa de consumo do budget, em duas janelas, reduz ruído e pega incidentes reais. Referências: [Site Reliability Engineering](https://sre.google/sre-book/table-of-contents/) e [The Site Reliability Workbook](https://sre.google/workbook/table-of-contents/), em especial o capítulo [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/).
+
+**Idempotência e "exactly-once" na prática.** Em sistemas distribuídos, entrega exatamente uma vez não existe; o que existe é entrega pelo menos uma vez com efeitos idempotentes (chaves, restrições únicas, deduplicação na mesma transação). Referências: Martin Kleppmann, *Designing Data-Intensive Applications*; o rascunho do IETF *The Idempotency-Key HTTP Header Field*; a seção de semântica de entrega da [documentação do Apache Kafka](https://kafka.apache.org/documentation/).
+
+**Migrações sem downtime.** A ideia central é a mudança paralela: expandir, migrar, contrair, cada passo compatível com a versão anterior do código. No PostgreSQL, saiba quais operações de `ALTER TABLE` seguram lock forte e como evitar. Referências: [Parallel Change](https://martinfowler.com/bliki/ParallelChange.html), de Martin Fowler; *Refactoring Databases*, de Scott Ambler e Pramod Sadalage; [PostgreSQL — ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html).
+
+**Design de APIs públicas e webhooks.** API pública é contrato de longo prazo: compatibilidade, versões, depreciação, paginação, erros, limites. Webhooks precisam de assinatura, proteção contra replay e retentativas previsíveis. Referências: [Standard Webhooks](https://www.standardwebhooks.com/) (especificação e bibliotecas em [github.com/standard-webhooks](https://github.com/standard-webhooks/standard-webhooks)); [RFC 9457 — Problem Details](https://www.rfc-editor.org/rfc/rfc9457); [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html).
+
+**Threat modeling (STRIDE).** Antes de proteger, enumere as ameaças por categoria — falsificação de identidade, adulteração, repúdio, vazamento de informação, negação de serviço, elevação de privilégio — para cada fluxo de dados. Faça um para o Cobra+ (chaves de API, webhooks, isolamento, console). Ponto de partida na trilha: [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/). Referências: [OWASP Threat Modeling Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html); Adam Shostack, *Threat Modeling: Designing for Security*.
+
+**PCI DSS em alto nível.** O padrão de segurança para quem armazena, processa ou transmite dados de cartão. A forma mais barata de cumprir é não tocar no número do cartão (PAN): tokenização pela adquirente reduz drasticamente o escopo — por isso o Cobra+ recusa qualquer coisa que pareça um PAN. Referência: o padrão PCI DSS v4.0.1 no site do [PCI Security Standards Council](https://www.pcisecuritystandards.org/).
+
+**Gestão de segredos.** Pepper das chaves de API, segredos de webhook, credenciais do banco: onde ficam, quem lê, como rotacionar sem downtime, como auditar o acesso. Referências: [OWASP Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html); a documentação do HashiCorp Vault ou do OpenBao.
+
+**Engenharia do caos e postmortem sem culpa.** Injetar falhas de propósito, com hipótese escrita antes, e analisar incidentes focando no sistema e não em culpados. Referências: o capítulo *Postmortem Culture* do livro [Site Reliability Engineering](https://sre.google/sre-book/table-of-contents/); *Chaos Engineering*, de Casey Rosenthal e Nora Jones.
+
+**LGPD aplicada.** Bases legais, direitos do titular, prazos e a convivência com obrigações fiscais de retenção. Referências: a [Lei nº 13.709/2018](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm) (arts. 7º, 16 e 18 em especial) e os guias orientativos da ANPD.

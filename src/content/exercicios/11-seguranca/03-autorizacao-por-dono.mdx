@@ -1,0 +1,299 @@
+---
+titulo: "Autorização por dono: a API de RH"
+codigo: "11.03"
+resumo: Implemente a autorização no nível do objeto de uma API de RH — quem vê quem, quem vê salários, quem altera salários — com 404 para o que não pode ser visto e 403 para o que não pode ser feito, e confira a matriz completa de papéis × recursos × operações contra a API rodando.
+modulo: 11-seguranca
+ordem: 3
+dificuldade: medio
+tempo: 2h
+conceitos: [BOLA, IDOR, autorização por objeto, 404 × 403, exposição de campos, segregação de funções]
+aulas: [11-seguranca/04-autorizacao-e-bola, 11-seguranca/02-spring-security-7, 11-seguranca/05-owasp-top-10]
+java:
+  modulo: m11-seguranca
+  arquivos: [src/main/java/dev/trilhajava/m11/rh/ServicoDeFuncionarios.java]
+---
+
+## Contexto
+
+Uma empresa de 400 pessoas contratou um teste de invasão (*pentest*) na sua API de RH. O relatório chegou com um achado crítico: qualquer funcionário logado que trocasse o número em `GET /funcionarios/3` via os dados e o salário de qualquer colega. Bastou um script contando de 1 a 400 para baixar a folha de pagamento inteira.
+
+A autenticação estava certa: HTTP Basic, senhas com BCrypt, nenhuma rota aberta. O que não existia era a **autorização no nível do objeto**: a API conferia *quem* fazia o pedido, mas nunca perguntava se aquela pessoa podia ver *aquele* funcionário. É o BOLA (*Broken Object Level Authorization*), o primeiro item do OWASP API Security Top 10, também chamado de IDOR.
+
+Você vai escrever o `ServicoDeFuncionarios`, que decide, para cada pedido, o que o solicitante pode ver, com ou sem salário, e o que pode alterar.
+
+## O que você vai praticar
+
+- **Autorização por objeto (BOLA/IDOR).** Uma regra de papel ("só GESTOR acessa esta rota") não basta quando a resposta depende de **qual** registro foi pedido. A verificação precisa olhar o solicitante **e** o objeto, e ela mora no serviço, onde os dois estão disponíveis. Veja [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/).
+- **404 ou 403.** Para o que a pessoa não pode nem saber que existe, a resposta é a mesma de um id inexistente (404); para o que ela pode ver mas não pode fazer, 403. A **ordem** das verificações decide qual das duas sai. Mesma aula.
+- **A identidade vem do `Authentication`.** O Spring Security entrega ao controller um `Authentication` com o nome do usuário (`getName()`) e as autoridades (`ROLE_RH`, `ROLE_GESTOR`...). Nenhum parâmetro que o cliente escolhe diz quem ele é. Veja [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/).
+- **Exposição de campos.** Mesmo quem pode ver um registro nem sempre pode ver todos os campos dele. Decidir o que sai na resposta também é autorização (o "BOPLA" do OWASP API Top 10, *Broken Object Property Level Authorization*). Veja [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/).
+- **Segregação de funções.** Quem tem o poder de alterar salários não pode alterar o próprio. É um controle exigido em auditorias, e fácil de esquecer na primeira versão.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m11.rh` (não precisa mudar):
+
+- `RhApplication` — a aplicação Spring Boot, com `rh.properties` (que liga `spring.mvc.problemdetails.enabled`).
+- `SegurancaDoRh` — HTTP Basic, sem sessão, CSRF desligado, todas as rotas exigem login. **Não há** regra de papel por rota: a autorização é toda sua.
+- `UsuariosDoRh` — os logins. A senha de cada um é `senha-de-` + o usuário (a da rita é `senha-de-rita`).
+- `Funcionario` — `record Funcionario(long id, String usuario, String nome, String departamento, Long gestorId, BigDecimal salario)`, com `comSalario(BigDecimal novo)`, que devolve uma cópia com o salário trocado. `usuario` é o mesmo nome de `Authentication.getName()`; `gestorId` é o id do gestor direto, ou `null`.
+- `RepositorioDeFuncionarios` (`@Repository`, em memória) com `Optional<Funcionario> porId(long id)`, `Optional<Funcionario> porUsuario(String usuario)`, `List<Funcionario> todos()` (em ordem de id) e `Funcionario salvar(Funcionario f)`. Já vem com seis funcionários:
+
+| id | Usuário | Papel | Nome | Departamento | Gestor | Salário |
+|---|---|---|---|---|---|---|
+| 1 | `rita` | RH | Rita Andrade | Pessoas | — | 9800.00 |
+| 2 | `gustavo` | GESTOR | Gustavo Lima | Engenharia | — | 15000.00 |
+| 3 | `fernanda` | FUNCIONARIO | Fernanda Souza | Engenharia | 2 | 11000.00 |
+| 4 | `felipe` | FUNCIONARIO | Felipe Costa | Engenharia | 2 | 8500.00 |
+| 5 | `gabriela` | GESTOR | Gabriela Rocha | Vendas | — | 14000.00 |
+| 6 | `fabio` | FUNCIONARIO | Fábio Nunes | Vendas | 5 | 7000.00 |
+
+- `FuncionarioResposta` — o que a API devolve: `record FuncionarioResposta(long id, String nome, String departamento, Long gestorId, BigDecimal salario)`, com duas fábricas, `comSalario(Funcionario)` e `semSalario(Funcionario)`. Um campo `null` **some** do JSON (`@JsonInclude(NON_NULL)`): sem salário, a resposta não tem nem a chave `salario`.
+- `FuncionarioController` — as três rotas, que só repassam ao serviço o id, o corpo e o `Authentication`:
+  - `GET /funcionarios` → `servico.listar(quem)`;
+  - `GET /funcionarios/{id}` → `servico.buscar(id, quem)`;
+  - `PUT /funcionarios/{id}/salario` com `{"salario": 7350.00}` → `servico.alterarSalario(id, salario, quem)`. O corpo é validado antes: salário ausente, zero, negativo ou acima de `1000000.00` → `400`, sem chegar ao serviço.
+
+  Ele também converte as duas exceções do pacote em Problem Details: `FuncionarioNaoEncontradoException(long id)` → **404**, `type` `https://api.rh.dev/problemas/nao-encontrado`, sempre com o mesmo `detail` (`"Funcionário não encontrado"`); `OperacaoNaoPermitidaException(String mensagem)` → **403**, `type` `https://api.rh.dev/problemas/operacao-nao-permitida`, com a sua mensagem no `detail`.
+
+### O que você implementa
+
+Em `ServicoDeFuncionarios` (`@Service`). Como o controller já chama os três métodos, eles existem no código inicial com um retorno provisório (`List.of()` e `null`): com ele, a listagem sai vazia e a busca sai com corpo vazio. Substitua-os.
+
+```java
+public ServicoDeFuncionarios(RepositorioDeFuncionarios repositorio)
+
+public List<FuncionarioResposta> listar(Authentication quem)                                  // regras 1 a 4
+public FuncionarioResposta buscar(long id, Authentication quem)                               // regras 1 a 5
+public FuncionarioResposta alterarSalario(long id, BigDecimal novoSalario, Authentication quem) // regras 1, 5 a 8
+```
+
+- `quem` é o usuário autenticado: `quem.getName()` dá o login (`"felipe"`) e `quem.getAuthorities()` dá as autoridades (`ROLE_FUNCIONARIO`).
+- "Não pode ver" e "não existe" se expressam lançando `FuncionarioNaoEncontradoException(id)`; "pode ver, mas não pode fazer", lançando `OperacaoNaoPermitidaException` (mensagem livre). O controller cuida do HTTP.
+
+| Pedido | Resposta |
+|---|---|
+| rita: `GET /funcionarios` | `200`, os ids 1 a 6, todos com salário |
+| gustavo: `GET /funcionarios` | `200`, ids 2 (com salário), 3 e 4 (sem salário) |
+| felipe: `GET /funcionarios/4` | `200`, `{"id":4,"nome":"Felipe Costa","departamento":"Engenharia","gestorId":2,"salario":8500.00}` |
+| felipe: `GET /funcionarios/3` | `404` `nao-encontrado` |
+| gustavo: `GET /funcionarios/3` | `200`, sem a chave `salario` |
+| rita: `PUT /funcionarios/6/salario` `{"salario": 7350.00}` | `200`, com `"salario":7350.00` |
+| rita: `PUT /funcionarios/1/salario` | `403` `operacao-nao-permitida` |
+| felipe: `PUT /funcionarios/3/salario` | `404` `nao-encontrado` |
+
+## Regras
+
+1. **A identidade vem só do `Authentication`.** Quem pede é o funcionário cujo `usuario` é `quem.getName()`; o papel vem das autoridades (`ROLE_RH`, `ROLE_GESTOR`, `ROLE_FUNCIONARIO`). Exemplo: com o login `felipe`, "eu" é o funcionário 4, com papel FUNCIONARIO. Nenhum parâmetro, header ou campo do corpo muda isso. Um login sem funcionário correspondente é erro de configuração do sistema (um `IllegalStateException`, que vira `500`), não um `404`.
+2. **Quem vê quem.**
+
+   | Papel | Vê |
+   |---|---|
+   | RH | todos |
+   | GESTOR | a si mesmo e os **subordinados diretos** (quem tem `gestorId` igual ao seu id) |
+   | FUNCIONARIO | só a si mesmo |
+
+   Exemplos: gustavo vê 2, 3 e 4; gabriela vê 5 e 6, mas **não** 3 e 4 (são de outro gestor); fernanda vê só o 3, nem o próprio gestor; rita vê os seis.
+3. **Quem vê o salário: o RH e o próprio funcionário.** O gestor vê a equipe **sem** salário (a resposta não tem a chave `salario`). Exemplos: gustavo em `GET /funcionarios/3` → `{"id":3,"nome":"Fernanda Souza","departamento":"Engenharia","gestorId":2}`; gustavo em `GET /funcionarios/2` → com `"salario":15000.00`; rita em qualquer um → com salário.
+4. **A listagem mostra só o que se pode ver, em ordem de id, cada um com ou sem salário pelas regras 2 e 3.** Exemplos: gustavo → `[{"id":2,…,"salario":15000.00},{"id":3,…,"gestorId":2},{"id":4,…,"gestorId":2}]`; gabriela → ids 5 e 6; fernanda → só o 3, com `"salario":11000.00`.
+5. **Não pode ver = não existe: `404`, com o mesmo corpo.** Um id que a pessoa não pode ver e um id inexistente produzem o mesmo `404`, com o mesmo `type` e o mesmo `detail`. Exemplos: felipe em `GET /funcionarios/3` e em `GET /funcionarios/999` → `404` `nao-encontrado`, `"detail":"Funcionário não encontrado"` (só o `instance`, que repete o caminho pedido, difere). Um `403` aqui confirmaria ao atacante que o funcionário 3 existe.
+6. **Só o RH altera salários: os outros recebem `403`.** Vale para quem **pode ver** o alvo. Exemplos: gustavo em `PUT /funcionarios/3/salario` → `403` (ele vê a fernanda, mas não altera); felipe em `PUT /funcionarios/4/salario` (o próprio) → `403`.
+7. **Ninguém altera o próprio salário, nem o RH (segregação de funções): `403`.** Exemplo: rita em `PUT /funcionarios/1/salario` com `{"salario": 50000.00}` → `403`, e o salário dela continua `9800.00`.
+8. **Primeiro "pode ver?", depois "pode alterar?".** Na alteração, quem não pode ver o alvo recebe `404` antes de qualquer outra verificação; só depois vêm as regras 6 e 7. Exemplos: felipe em `PUT /funcionarios/3/salario` → `404` (e não `403`); gustavo em `PUT /funcionarios/6/salario` → `404` (fábio não é da equipe dele); rita em `PUT /funcionarios/999/salario` → `404`. Quando tudo passa, o novo salário é gravado e devolvido com salário: rita em `PUT /funcionarios/6/salario` `{"salario": 7350.00}` → `200` `{"id":6,"nome":"Fábio Nunes","departamento":"Vendas","gestorId":5,"salario":7350.00}`, e um `GET /funcionarios/6` do fábio passa a mostrar `7350.00`.
+
+## Passo a passo sugerido
+
+Suba a aplicação depois de cada passo e experimente (veja **Experimente**).
+
+1. **Suba o código inicial e monte o seu jeito de experimentar.** Com o retorno provisório, `GET /funcionarios` devolve `[]` para todo mundo. Prepare o `curl` ou o programa do **Experimente**.
+2. **"Eu" e o meu papel (regra 1).** Escreva dois métodos privados: um que acha o `Funcionario` de `quem.getName()` no repositório, e um `temPapel(quem, "RH")` que procura `ROLE_RH` nas autoridades.
+3. **`podeVer` (regra 2).** Um método privado `podeVer(quem, eu, alvo)` com as três condições. Use-o na listagem (regra 4), ainda devolvendo todos com salário. Confira a lista de cada um dos seis usuários.
+4. **O salário (regra 3).** Um método que escolhe entre `FuncionarioResposta.comSalario` e `semSalario`. A listagem do gustavo passa a esconder o salário da fernanda e do felipe.
+5. **A busca (regra 5).** Busque pelo id e, se não existir **ou** não puder ser visto, lance `FuncionarioNaoEncontradoException(id)`. Compare os corpos do felipe pedindo o 3 e o 999.
+6. **A alteração (regras 6 a 8).** Reaproveite a busca "visível" do passo 5 e só depois confira o papel e se o alvo é o próprio solicitante. Grave com `repositorio.salvar(alvo.comSalario(novo))`.
+7. **A matriz.** Rode o programa do **Experimente** e confira a matriz inteira, célula por célula.
+
+## Experimente
+
+Suba a API (porta 8080) pelo ▶ ao lado do `main` de `RhApplication` no IntelliJ, ou na pasta do starter:
+
+```bash
+mvn spring-boot:run "-Dspring-boot.run.main-class=dev.trilhajava.m11.rh.RhApplication"
+```
+
+Com HTTP Basic, o `curl` resolve tudo com `-u usuario:senha` (no PowerShell, use `curl.exe`):
+
+```bash
+curl -i -u felipe:senha-de-felipe localhost:8080/funcionarios/4
+curl -i -u felipe:senha-de-felipe localhost:8080/funcionarios/3
+curl -i -u gustavo:senha-de-gustavo localhost:8080/funcionarios
+curl -i -u rita:senha-de-rita -X PUT localhost:8080/funcionarios/6/salario \
+     -H "Content-Type: application/json" -d '{"salario": 7350.00}'
+```
+
+Autorização se confere em **matriz**: cada solicitante contra cada recurso. Este programa, num arquivo seu no pacote `dev.trilhajava.m11.rh`, monta a matriz do `GET /funcionarios/{id}` para os seis usuários e depois testa as alterações. Rode-o com a API no ar (e reinicie a API antes de rodá-lo de novo, porque ele altera o salário do fábio):
+
+```java
+package dev.trilhajava.m11.rh;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
+
+/** Monta a matriz "quem pede × qual id" contra a API rodando em localhost:8080. */
+public class ExperimenteRh {
+
+    static final HttpClient HTTP = HttpClient.newHttpClient();
+    static final List<String> USUARIOS = List.of("rita", "gustavo", "fernanda", "felipe", "gabriela", "fabio");
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("GET /funcionarios/{id}   (200 = vê com salário, 200* = vê sem salário)");
+        System.out.println("           1     2     3     4     5     6   999");
+        for (String usuario : USUARIOS) {
+            var linha = new StringBuilder(String.format("%-9s", usuario));
+            for (int id : new int[] {1, 2, 3, 4, 5, 6, 999}) {
+                HttpResponse<String> r = chamar("GET", "/funcionarios/" + id, usuario, null);
+                String marca = r.statusCode() == 200 && !r.body().contains("salario") ? "*" : " ";
+                linha.append(String.format("%5d%s", r.statusCode(), marca));
+            }
+            System.out.println(linha);
+        }
+
+        System.out.println();
+        mostrar("listagem (gustavo)", chamar("GET", "/funcionarios", "gustavo", null));
+        mostrar("felipe pede o 3", chamar("GET", "/funcionarios/3", "felipe", null));
+        mostrar("felipe pede o 999", chamar("GET", "/funcionarios/999", "felipe", null));
+        mostrar("rita muda o 6", chamar("PUT", "/funcionarios/6/salario", "rita", "{\"salario\": 7350.00}"));
+        mostrar("rita muda o próprio", chamar("PUT", "/funcionarios/1/salario", "rita", "{\"salario\": 50000.00}"));
+        mostrar("gustavo muda o 3", chamar("PUT", "/funcionarios/3/salario", "gustavo", "{\"salario\": 20000.00}"));
+        mostrar("felipe muda o próprio", chamar("PUT", "/funcionarios/4/salario", "felipe", "{\"salario\": 20000.00}"));
+        mostrar("felipe muda o 3", chamar("PUT", "/funcionarios/3/salario", "felipe", "{\"salario\": 1.00}"));
+        mostrar("rita, salário zero", chamar("PUT", "/funcionarios/6/salario", "rita", "{\"salario\": 0}"));
+        mostrar("sem login", chamar("GET", "/funcionarios", null, null));
+    }
+
+    static HttpResponse<String> chamar(String metodo, String rota, String usuario, String corpo) throws Exception {
+        var requisicao = HttpRequest.newBuilder(URI.create("http://localhost:8080" + rota))
+                .method(metodo, corpo == null ? HttpRequest.BodyPublishers.noBody()
+                        : HttpRequest.BodyPublishers.ofString(corpo));
+        if (corpo != null) {
+            requisicao.header("Content-Type", "application/json");
+        }
+        if (usuario != null) {
+            String credenciais = usuario + ":senha-de-" + usuario;
+            requisicao.header("Authorization", "Basic "
+                    + Base64.getEncoder().encodeToString(credenciais.getBytes(StandardCharsets.UTF_8)));
+        }
+        return HTTP.send(requisicao.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    static void mostrar(String cenario, HttpResponse<String> resposta) {
+        System.out.printf("%-22s %d %s%n", cenario, resposta.statusCode(), resposta.body());
+    }
+}
+```
+
+Saída com a solução de referência:
+
+```text
+GET /funcionarios/{id}   (200 = vê com salário, 200* = vê sem salário)
+           1     2     3     4     5     6   999
+rita       200   200   200   200   200   200   404
+gustavo    404   200   200*  200*  404   404   404
+fernanda   404   404   200   404   404   404   404
+felipe     404   404   404   200   404   404   404
+gabriela   404   404   404   404   200   200*  404
+fabio      404   404   404   404   404   200   404
+
+listagem (gustavo)     200 [{"id":2,"nome":"Gustavo Lima","departamento":"Engenharia","salario":15000.00},{"id":3,"nome":"Fernanda Souza","departamento":"Engenharia","gestorId":2},{"id":4,"nome":"Felipe Costa","departamento":"Engenharia","gestorId":2}]
+felipe pede o 3        404 {"detail":"Funcionário não encontrado","instance":"/funcionarios/3","status":404,"title":"Not Found","type":"https://api.rh.dev/problemas/nao-encontrado"}
+felipe pede o 999      404 {"detail":"Funcionário não encontrado","instance":"/funcionarios/999","status":404,"title":"Not Found","type":"https://api.rh.dev/problemas/nao-encontrado"}
+rita muda o 6          200 {"id":6,"nome":"Fábio Nunes","departamento":"Vendas","gestorId":5,"salario":7350.00}
+rita muda o próprio    403 {"detail":"Ninguém altera o próprio salário (segregação de funções)","instance":"/funcionarios/1/salario","status":403,"title":"Forbidden","type":"https://api.rh.dev/problemas/operacao-nao-permitida"}
+gustavo muda o 3       403 {"detail":"Só o RH altera salários","instance":"/funcionarios/3/salario","status":403,"title":"Forbidden","type":"https://api.rh.dev/problemas/operacao-nao-permitida"}
+felipe muda o próprio  403 {"detail":"Só o RH altera salários","instance":"/funcionarios/4/salario","status":403,"title":"Forbidden","type":"https://api.rh.dev/problemas/operacao-nao-permitida"}
+felipe muda o 3        404 {"detail":"Funcionário não encontrado","instance":"/funcionarios/3/salario","status":404,"title":"Not Found","type":"https://api.rh.dev/problemas/nao-encontrado"}
+rita, salário zero     400 {"detail":"Invalid request content.","instance":"/funcionarios/6/salario","status":400,"title":"Bad Request"}
+sem login              401
+```
+
+Os resultados esperados, por regra:
+
+| Cenário | Resultado |
+|---|---|
+| a matriz acima | exatamente as mesmas células, inclusive os `*` |
+| listagem da rita / gustavo / gabriela / fernanda | ids 1–6 com salário / 2 (com), 3 e 4 (sem) / 5 (com) e 6 (sem) / só o 3, com salário |
+| felipe pedindo o 3 e o 999 | `404` com o mesmo `type` e o mesmo `detail` |
+| rita altera o salário do 6 para `7350.00` | `200`, e o `GET` do fábio passa a mostrar `7350.00` |
+| rita altera o próprio salário | `403`, e o salário dela continua `9800.00` |
+| gustavo altera o 3; felipe altera o próprio | `403` |
+| felipe altera o 3; gustavo altera o 6; rita altera o 999 | `404` |
+| salário `0`, `-10.00` ou `1000000.01` | `400` (do controller, antes do serviço) |
+| sem login, ou com senha errada | `401` com `WWW-Authenticate: Basic` |
+
+O que pode variar: as mensagens das suas `OperacaoNaoPermitidaException` (o `detail` dos `403`) e a ordem das chaves nos corpos de erro. Um terminal do Windows que não esteja em UTF-8 pode trocar os acentos da saída.
+
+## Critérios de aceite
+
+- [ ] A matriz e todos os cenários da tabela acima dão o resultado indicado.
+- [ ] Nenhuma resposta permite distinguir "o funcionário não existe" de "você não pode vê-lo".
+- [ ] Nenhuma informação de quem pede vem de algo que o cliente escolhe (parâmetro, header, corpo): só do `Authentication`.
+- [ ] Você explica, com as suas palavras, por que a regra "felipe altera o 3" responde `404` e não `403`.
+
+## Desafios opcionais
+
+- Mude a regra do gestor para "subordinados diretos **e indiretos**" (a árvore inteira abaixo dele) e acrescente um diretor acima do gustavo e da gabriela. Que estrutura de dados você usaria em memória? E que consulta SQL num banco? (Pesquise `WITH RECURSIVE`.)
+- Registre em log toda tentativa negada (`404` por falta de permissão e `403`), com usuário, alvo e operação, mas **sem** o salário pedido. Como você distingue, no log, o `404` de "não existe" do `404` de "não pode ver", se a resposta é a mesma?
+- Escreva a sua própria suíte com `@SpringBootTest`, `@AutoConfigureMockMvc` e `MockMvcTester`, cobrindo a matriz inteira com um teste parametrizado (`@ParameterizedTest` com `@CsvSource` de usuário, id e status esperado).
+- Reescreva a regra de alteração com `@PreAuthorize("hasRole('RH')")` (e `@EnableMethodSecurity`) e veja o que acontece com a regra 8.
+
+<Dicas>
+<Dica nivel={1}>
+Descubra quem está pedindo com `repositorio.porUsuario(quem.getName())`, e o papel olhando as autoridades de `quem` (`ROLE_RH`, `ROLE_GESTOR`). A partir daí, toda a autorização cabe em duas perguntas, cada uma num método privado pequeno: "pode ver?" (`podeVer(quem, eu, alvo)`) e "vê o salário?". Listagem, busca e alteração usam as mesmas duas funções, para que nenhuma rota tenha uma cópia da regra.
+</Dica>
+<Dica nivel={2}>
+- Papel: `quem.getAuthorities().stream().map(GrantedAuthority::getAuthority).anyMatch("ROLE_RH"::equals)`.
+- Listagem: `repositorio.todos().stream().filter(alvo -> podeVer(...)).map(alvo -> resposta(...)).toList()`.
+- Busca: `repositorio.porId(id).filter(alvo -> podeVer(...)).orElseThrow(() -> new FuncionarioNaoEncontradoException(id))`. O `filter` junta "não existe" e "não pode ver" num único caminho, e é por isso que os dois `404` saem iguais.
+- Compare ids com `==` (`long`), mas cuidado com `gestorId`, que é `Long` e pode ser `null`: `Long.valueOf(eu.id()).equals(alvo.gestorId())` funciona; `eu.id() == alvo.gestorId()` lança `NullPointerException` para quem não tem gestor.
+</Dica>
+<Dica nivel={3}>
+Na alteração, a ordem é tudo: (1) busque o alvo **visível**, reaproveitando o método da busca, que já lança o `404`; (2) não é RH? `OperacaoNaoPermitidaException`; (3) o alvo é ele mesmo (`alvo.id() == eu.id()`)? `OperacaoNaoPermitidaException`; (4) `repositorio.salvar(alvo.comSalario(novoSalario))` e devolva `FuncionarioResposta.comSalario(...)` do que foi salvo.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m11-seguranca/solucao/src/main/java/dev/trilhajava/m11/rh/ServicoDeFuncionarios.java" />
+
+### Por que assim
+
+- **Um único `podeVer`.** Listagem, busca e alteração usam a mesma regra. Se cada rota tivesse a sua cópia, a primeira mudança de regra deixaria uma delas para trás, e é exatamente assim que o BOLA volta depois de corrigido.
+- **`filter` antes do `orElseThrow`.** "Não existe" e "existe, mas não é seu" passam pelo mesmo caminho e viram a mesma exceção, com a mesma mensagem. Não há um `if` separado que alguém possa, um dia, trocar por um `403`.
+- **Ver antes de alterar.** A ordem das verificações é parte da segurança: um `403` para um id que o usuário não pode ver confirmaria que aquele funcionário existe, e um script percorrendo os ids mapearia a empresa inteira.
+- **O salário é decidido na resposta.** `FuncionarioResposta` tem duas fábricas, e o serviço escolhe uma para cada alvo. Não existe um "DTO completo" que alguém devolva por engano, nem uma entidade serializada direto para o JSON.
+- **Segregação de funções.** Ninguém aprova o próprio aumento, nem o RH. Regras assim aparecem em auditorias (SOX, controles internos de empresas de capital aberto) e quase sempre ficam de fora da primeira versão.
+- **Login sem funcionário é `500`.** Se um usuário autenticado não tem cadastro, o sistema está mal configurado. Tratar isso como `404` esconderia o problema de quem precisa corrigi-lo.
+
+### Alternativas e trade-offs
+
+- **`@PreAuthorize("hasRole('RH')")` em `alterarSalario`.** Parece mais simples, mas roda **antes** do método: um funcionário comum receberia `403` para qualquer id, inclusive os que não pode ver, e a regra 8 deixaria de valer. Anotações de papel servem para regras que não dependem do objeto; quando o objeto importa, a regra vai para o código (ou para um `@PostAuthorize` e um `PermissionEvaluator`, que deixam a regra mais longe de quem lê o serviço).
+- **Filtrar no banco.** Com 50 mil funcionários, `todos().stream().filter(...)` carrega a empresa inteira para mostrar três registros. Num banco, a mesma regra vira a cláusula `WHERE` da consulta (`WHERE id = :eu OR gestor_id = :eu`, ou nenhuma restrição para o RH), e a busca por id vira `WHERE id = :id AND (...)`. A regra continua num lugar só, mas agora dentro do repositório.
+- **Uma biblioteca de políticas** (Spring Authorization com `AuthorizationManager` próprio, OPA, Cedar). Faz sentido quando as regras mudam com frequência ou são compartilhadas por vários serviços; para três regras estáveis, o código simples ganha em clareza.
+- **Ids imprevisíveis (UUID) em vez de 1, 2, 3.** Dificultam a enumeração, mas não são autorização: um id vazado num log ou num link continua dando acesso se a verificação não existir.
+
+### Avalie sua solução
+
+- Quantas vezes, numa única listagem, a sua solução busca "eu" no repositório? E com um banco, quantas consultas a listagem faria?
+- O que muda se um gestor puder ter um gestor (hierarquia de vários níveis)? A sua função `podeVer` continua pequena?
+- Onde, na sua solução, alguém poderia adicionar uma rota nova e esquecer a autorização? Como um teste de matriz (ou uma regra de arquitetura) pegaria isso?
+
+</Solucao>

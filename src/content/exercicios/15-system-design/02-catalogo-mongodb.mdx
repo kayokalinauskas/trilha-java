@@ -1,0 +1,174 @@
+---
+titulo: Um catálogo de produtos no MongoDB
+codigo: "15.02"
+resumo: Modele um catálogo com atributos que variam por categoria no MongoDB 8 — índices único e composto que existam de verdade no banco, preço como Decimal128, faixa de preço fechada e paginada (e a armadilha do Between exclusivo), busca por atributo protegida contra injeção de operador, reserva de estoque atômica, avaliações embutidas com limite e um resumo por categoria calculado no servidor.
+modulo: 15-system-design
+ordem: 2
+dificuldade: medio
+tempo: 2h30–3h
+conceitos: [MongoDB, Spring Data MongoDB, modelo de documento, índices, índice composto, Decimal128, métodos derivados, Range, MongoTemplate, update atômico, "$inc", "$push com $slice", aggregation pipeline, Testcontainers]
+aulas: [15-system-design/03-mongodb]
+java:
+  modulo: m15-system-design
+  teste: CatalogoMongoTest
+---
+
+## Contexto
+
+Um marketplace vende de camisetas a notebooks. No PostgreSQL, o catálogo virou uma tabela `produto` com 60 colunas, a maioria vazia (`voltagem` numa camiseta, `tamanho` num notebook), e uma tabela `produto_atributo` que ninguém consegue consultar sem cinco `JOIN`s. A cada categoria nova, uma migração. O time decidiu levar **o catálogo** (e só ele: pedidos e pagamentos continuam no relacional) para o MongoDB.
+
+A migração já começou, e três problemas apareceram na homologação:
+
+- dois produtos foram cadastrados com o mesmo `sku`, embora a classe tivesse `@Indexed(unique = true)`;
+- a busca "livros de R$ 9,90 a R$ 100,00" trouxe um livro de R$ 100,01 e deixou de fora um de R$ 10,00 (o preço estava gravado como texto, e `"10.00"` vem antes de `"9.90"` na ordem alfabética);
+- na promoção, o mesmo último item foi vendido para três clientes.
+
+Sua missão é terminar o catálogo sem esses problemas.
+
+<Callout tipo="atencao" titulo="Precisa de Docker">
+Os testes sobem um MongoDB de verdade (`mongo:8`) com Testcontainers. Deixe o Docker rodando antes de executar. Sem Docker, os testes são **pulados** (aparecem como *skipped*), e não aprovados.
+</Callout>
+
+## O que já existe
+
+Em `dev.trilhajava.m15.documentos` (a `DocumentosApplication`):
+
+- `Produto`, um record mapeado na coleção `produtos`: `id`, `sku`, `nome`, `categoria`, `preco` (`BigDecimal`), `estoque`, `atributos` (`Map<String, String>`), `avaliacoes` (as mais recentes, embutidas), `totalAvaliacoes` e `somaDasNotas` (contadores pré-calculados), mais `Produto.novo(...)` e `notaMedia()`;
+- `Avaliacao(autor, nota, comentario)`, com nota de 1 a 5. Pronta;
+- `RepositorioDeProdutos`, um `MongoRepository` com `findBySku`;
+- `ServicoDeCatalogo` (esboço), com `MongoTemplate` e o repositório injetados, a constante `AVALIACOES_EMBUTIDAS = 10` e o record `ResumoDaCategoria(categoria, produtos, precoMedio)`;
+- `src/main/resources/application.properties`, com dois `TODO`.
+
+Você mexe no `Produto` (só anotações), no `RepositorioDeProdutos`, no `ServicoDeCatalogo` e no `application.properties`.
+
+## Os requisitos
+
+**1. Atributos flexíveis.** Documentos da mesma coleção têm atributos diferentes: uma camiseta com `cor` e `tamanho`, um notebook com `memoria` e `tela`. Nenhum esquema a declarar: o `Map` já resolve. No banco, fica assim:
+
+```json
+{
+  "_id": ObjectId("..."),
+  "sku": "NOT-1",
+  "nome": "Produto NOT-1",
+  "categoria": "informatica",
+  "preco": NumberDecimal("4999.00"),
+  "estoque": 2,
+  "atributos": { "memoria": "16GB", "tela": "14" },
+  "avaliacoes": [],
+  "totalAvaliacoes": 0,
+  "somaDasNotas": 0
+}
+```
+
+**2. Índices que existem de verdade.** Declare no `Produto`:
+
+| Índice | Campos | Para quê |
+|---|---|---|
+| único | `sku` | recusar sku repetido (`DuplicateKeyException`) |
+| composto | `categoria`, `preco` | a busca por categoria e faixa de preço, ordenada por preço |
+
+E faça o Spring Data **criar** esses índices ao subir a aplicação.
+
+**3. Preço como número.** O `preco` tem de ser gravado como `Decimal128` (o `NumberDecimal` acima), e não como texto nem como `double`. Configure isso explicitamente.
+
+**4. Faixa de preço fechada e paginada.** `porFaixaDePreco(categoria, minimo, maximo, pagina)` devolve os produtos da categoria com preço **entre** `minimo` e `maximo`, **incluindo as pontas**, respeitando a paginação e a ordenação do `Pageable`. A consulta vive no repositório, como método derivado do nome.
+
+**5. Busca por atributo, com validação.** `comAtributo(nome, valor)` devolve os produtos com `atributos.<nome>` igual a `valor`, ordenados por `sku`. O nome do atributo vem do usuário e vira parte do **caminho do campo** na consulta: aceite só um nome que comece com letra minúscula, seguida de letras e dígitos (até 31 caracteres). Qualquer outra coisa (`$where`, `cor.x`, `cor x`, vazio, `Cor`) é `IllegalArgumentException`.
+
+**6. Reserva atômica.** `reservar(sku, quantidade)` baixa o estoque **só se houver o suficiente** e devolve `true`; senão, devolve `false` e o estoque não muda. Quarenta pedidos simultâneos de 1 unidade num estoque de 10 vendem **exatamente** 10. Quantidade zero ou negativa é `IllegalArgumentException`.
+
+**7. Avaliações com limite.** `avaliar(sku, avaliacao)` acrescenta a avaliação ao array, mantendo **só as 10 mais recentes** no documento (a mais antiga primeiro), e soma 1 em `totalAvaliacoes` e a nota em `somaDasNotas`. Tudo numa operação só. Sku inexistente é `IllegalArgumentException`.
+
+**8. Resumo por categoria.** `resumoPorCategoria()` devolve, para cada categoria, a quantidade de produtos e o preço médio com **2 casas** (arredondamento bancário, `HALF_EVEN`), em ordem de categoria, calculados **no servidor** (nada de trazer todos os produtos para o Java e somar).
+
+<Callout tipo="erro" titulo="Armadilha: o Between derivado é exclusivo">
+`findByCategoriaAndPrecoBetween(String categoria, BigDecimal minimo, BigDecimal maximo, Pageable p)` parece a resposta óbvia, e compila. Mas, no Spring Data MongoDB, o `Between` com **dois parâmetros** gera `{ preco: { $gt: minimo, $lt: maximo } }`: **exclusivo nas duas pontas**. O produto de R$ 9,90 some da busca "de 9,90 a 100,00", e o teste falha com 2 elementos em vez de 3. Não é o que o nome sugere, e não é o que o `BETWEEN` do SQL faz (lá, as pontas entram). A saída está nas dicas.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] `CatalogoMongoTest` passa (11 testes).
+- [ ] `mongo.indexOps(Produto.class).getIndexInfo()` mostra um índice único em `sku` e um em `categoria, preco`.
+- [ ] Um segundo produto com o mesmo `sku` lança `DuplicateKeyException`.
+- [ ] Livros de 9,90, 10,00, 99,90, 100,01 e 5,00: a faixa de 9,90 a 100,00 traz 3 (e, na página de 2 ordenada por preço, `F-1` e `F-2`); o `preco` no documento bruto é um `Decimal128`.
+- [ ] 40 reservas simultâneas num estoque de 10: exatamente 10 `true`, estoque final zero.
+- [ ] Depois de 15 avaliações, o documento tem 10 (de `leitor6` a `leitor15`), `totalAvaliacoes` é 15 e a média considera as 15.
+- [ ] O resumo de livros a 10,00, 20,00 e 33,33 dá preço médio `21.11`.
+
+## Desafios opcionais
+
+- Rode a busca da faixa com `explain("executionStats")` no `mongosh` (conecte no contêiner do teste, ou num `docker run mongo:8` seu). Aparece `IXSCAN` no índice `categoria_preco`? E se a ordenação for por `nome`?
+- Troque o `Map` de atributos pelo **padrão de atributos** da aula 3: uma lista de `{nome, valor}` com um índice multikey em `atributos.nome, atributos.valor` e busca com `$elemMatch`. O que você ganha em indexação? O que perde em legibilidade?
+- Mova as avaliações antigas para uma coleção `avaliacoes` própria (referência) e deixe só as 10 recentes embutidas: é o *subset pattern*. Como fica a leitura paginada de todas as avaliações de um produto?
+- Crie os índices por código na inicialização (`mongo.indexOps(Produto.class).createIndex(...)`) em vez de `auto-index-creation`. Qual das duas abordagens você levaria para uma coleção com 200 milhões de documentos em produção?
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo `application.properties` e pelas anotações de índice: sem eles, três testes falham por motivos que nada têm a ver com o seu código. Depois faça os métodos na ordem dos requisitos. Para o `reservar` e o `avaliar`, a pergunta é: dá para fazer a verificação e a alteração **numa única operação no servidor**, sem ler o documento em Java?
+</Dica>
+<Dica nivel={2}>
+- Índices: `@Indexed(unique = true)` no componente `sku` do record, e `@CompoundIndex(name = "categoria_preco", def = "{'categoria': 1, 'preco': 1}")` na classe. As anotações não fazem nada sozinhas: a criação automática vem **desligada** desde o Spring Data MongoDB 3.0 (`spring.data.mongodb.auto-index-creation`).
+- Decimal128: `spring.data.mongodb.representation.big-decimal=decimal128`.
+- Faixa: o método derivado aceita um `Range<BigDecimal>` (de `org.springframework.data.domain`) no lugar dos dois parâmetros, e o `Range` diz se cada ponta é inclusiva.
+- Atributo: `Criteria.where("atributos." + nome).is(valor)`, **depois** de validar o nome com um `Pattern`, e `.with(Sort.by("sku"))` na `Query`.
+</Dica>
+<Dica nivel={3}>
+- Repositório: `Page<Produto> findByCategoriaAndPrecoBetween(String categoria, Range<BigDecimal> faixa, Pageable pagina);` e, no serviço, `Range.closed(minimo, maximo)`.
+- Reserva: `mongo.updateFirst(query(where("sku").is(sku).and("estoque").gte(quantidade)), new Update().inc("estoque", -quantidade), Produto.class)`, e `true` se `getModifiedCount() == 1`.
+- Avaliação: `new Update().push("avaliacoes").slice(-AVALIACOES_EMBUTIDAS).each(avaliacao)`, encadeado com `.inc("totalAvaliacoes", 1).inc("somaDasNotas", avaliacao.nota())`. O `$slice` negativo mantém os **últimos** N elementos. Use `getMatchedCount()` (e não `getModifiedCount()`) para saber se o sku existe.
+- Resumo: `newAggregation(Produto.class, group("categoria").count().as("produtos").avg("preco").as("precoMedio"), project("produtos", "precoMedio").and("_id").as("categoria"), sort(Sort.by("categoria")))` e `mongo.aggregate(pipeline, ResumoDaCategoria.class)`. Arredonde o `precoMedio` com `setScale(2, RoundingMode.HALF_EVEN)` no Java.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Produto">
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/documentos/Produto.java" />
+</Tab>
+<Tab rotulo="RepositorioDeProdutos">
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/documentos/RepositorioDeProdutos.java" />
+</Tab>
+<Tab rotulo="ServicoDeCatalogo">
+<CodigoJava caminho="m15-system-design/solucao/src/main/java/dev/trilhajava/m15/documentos/ServicoDeCatalogo.java" />
+</Tab>
+</Tabs>
+
+```properties
+# Exercício 15.02 — MongoDB
+# Cria os índices declarados nas classes (@Indexed, @CompoundIndex) ao subir. Em produção, muitos times
+# preferem criar índices por migração (ex.: Mongock), porque criar um índice numa coleção grande pesa.
+spring.data.mongodb.auto-index-creation=true
+# BigDecimal como Decimal128 (numérico). Já é o padrão no Spring Data MongoDB atual, mas versões anteriores
+# (Spring Boot 3) gravavam como TEXTO, e aí "10.00" < "9.90" e as faixas de preço quebram. Explícito é melhor.
+spring.data.mongodb.representation.big-decimal=decimal128
+```
+
+### Passo a passo
+
+1. **Índice declarado não é índice criado.** `@Indexed` e `@CompoundIndex` são só metadados. Com `auto-index-creation=false` (o padrão), o Spring Data não cria nada, o banco aceita o sku duplicado, e ninguém percebe até a homologação. Foi o primeiro problema do contexto.
+2. **O tipo do preço decide a ordem.** Gravado como texto, o `$gte`/`$lte` compara caracteres, e `"10.00"` fica antes de `"9.90"`. Gravado como `double`, 0,1 + 0,2 volta a assombrar o dinheiro. `Decimal128` é decimal exato, e o MongoDB compara como número. A propriedade explícita documenta a decisão e protege contra uma mudança de padrão entre versões: no Spring Data MongoDB atual o padrão já é `Decimal128`, mas no Spring Boot 3 era texto, e um projeto migrado de lá pode ter os dois formatos na mesma coleção.
+3. **`Range` em vez de dois parâmetros.** `Range.closed(minimo, maximo)` vira `$gte`/`$lte`. O índice composto `(categoria, preco)` atende a consulta inteira: igualdade em `categoria`, faixa e ordenação em `preco`. A paginação vem do `Pageable`, e o `Page` faz uma contagem a mais para o `getTotalElements()`.
+4. **Validar o que vira caminho.** O valor (`"azul"`) vai como parâmetro e não é perigoso. O **nome** vira parte da chave do filtro: com `nome = "$where"` ou `"cor.x"`, o usuário escolhe outro operador ou outro campo. É a injeção de NoSQL. A lista do que é permitido (`[a-z][a-zA-Z0-9]{0,30}`) é mais segura que uma lista do que é proibido.
+5. **Verificar e alterar no mesmo comando.** No `reservar`, o filtro `estoque >= quantidade` e o `$inc` negativo são aplicados pelo servidor numa única operação, atômica por documento. Das 40 requisições, as 10 primeiras encontram estoque e decrementam; as outras 30 não casam com o filtro e recebem `modifiedCount = 0`. Ler, conferir em Java e salvar seriam três passos, e duas threads leriam o mesmo "estoque 1".
+6. **Array com limite e contadores.** `$push` com `$each` e `$slice: -10` acrescenta e corta no mesmo comando: o documento nunca cresce além de 10 avaliações (o limite de um documento é 16 MB, e cada escrita reescreve o documento). Os contadores (`$inc`) mantêm o total e a soma para a média, sem ler as 15.
+7. **Agregar no servidor.** O `$group` com `$avg` calcula a média onde os dados estão. Trazer 1 milhão de produtos para o Java para calcular uma média é tráfego e memória desperdiçados. O arredondamento para 2 casas fica no Java, no mapeamento do resultado.
+
+### Alternativas e trade-offs
+
+- **`@Field(targetType = FieldType.DECIMAL128)`** no `preco` (como na aula 3) em vez da propriedade global: resolve campo a campo, e fica visível na classe. A propriedade vale para todo `BigDecimal` do projeto. Os dois caminhos funcionam; o importante é não depender do padrão.
+- **`@Query` com JSON** (`@Query("{ 'categoria': ?0, 'preco': { $gte: ?1, $lte: ?2 } }")`) em vez do `Range`: explícito, mas perde a verificação do nome do método e mistura JSON com Java. `MongoTemplate` com `Criteria` também resolve, com mais código.
+- **Índices por migração** (Mongock, ou scripts versionados) em vez de `auto-index-creation`: numa coleção grande, criar um índice consome CPU e disco, e fazer isso na subida de cada instância é arriscado. A criação automática é ótima para desenvolvimento e testes.
+- **`findAndModify` com `returnNew`** no `reservar`, se o chamador precisar do estoque resultante: também atômico, mas devolve o documento inteiro.
+- **JSONB no PostgreSQL** para os atributos (aula 3): se o resto do sistema já é relacional, uma coluna `JSONB` com índice GIN resolve os atributos variáveis sem um segundo banco para operar. A escolha pelo MongoDB faz sentido quando o catálogo inteiro tem cara de documento e a escala pede sharding nativo.
+
+### Avalie sua solução
+
+- Seu `comAtributo` aceita `nome = "cor"` e recusa `"cor.x"`? E um nome com 200 caracteres?
+- O que acontece com o `reservar` se o cliente cancelar o pedido depois? Como você devolveria o estoque sem permitir devolver duas vezes (pense no módulo 12 e na idempotência)?
+- Com 15 avaliações, a média considera todas, mas o documento guarda 10. Se uma avaliação for **removida** por moderação, como os contadores ficam corretos?
+- O índice `(categoria, preco)` atende "todos os produtos com preço até 50", sem categoria? Por quê? (Regra ESR, aula 3.)
+
+</Solucao>

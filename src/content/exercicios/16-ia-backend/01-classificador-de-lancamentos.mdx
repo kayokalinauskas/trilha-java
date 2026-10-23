@@ -1,0 +1,133 @@
+---
+titulo: Classificador de lançamentos com saída estruturada
+codigo: "16.01"
+resumo: Use o ChatClient do Spring AI para classificar lançamentos do extrato em categorias, com saída estruturada num record, temperatura 0 e a descrição delimitada. Valide a resposta, tente de novo uma vez e caia em OUTROS quando o modelo errar, inventar categoria ou o provedor falhar, sem nunca devolver um 500.
+modulo: 16-ia-backend
+ordem: 1
+dificuldade: medio
+tempo: 1h30
+conceitos: [Spring AI, ChatClient, saída estruturada, entity, BeanOutputConverter, temperatura, prompt de sistema, delimitadores, validação, fallback, teste com modelo falso]
+aulas: [16-ia-backend/01-llm-para-devs, 16-ia-backend/02-spring-ai-chatclient]
+java:
+  modulo: m16-ia-backend
+  teste: ClassificadorDeLancamentosTest
+---
+
+## Contexto
+
+O app do banco mostra o extrato agrupado por categoria: quanto foi para mercado, restaurante, transporte. As regras antigas eram uma lista enorme de `if (descricao.contains("UBER"))`, e metade dos lançamentos acabava em "outros". O time decidiu usar um LLM para classificar as descrições. O time também sabe que o modelo **vai** errar às vezes: vai devolver texto em vez de JSON, inventar uma categoria que não existe ou simplesmente ficar fora do ar.
+
+O seu trabalho é a integração: pedir a classificação de um jeito que dê para validar e garantir que **nenhuma** resposta estranha do modelo quebre o extrato.
+
+Os testes usam um `ModeloDeChatFalso` (em `m16-ia-backend/testes`), que devolve respostas roteirizadas e guarda cada prompt recebido. Não há chave de API nem rede.
+
+## O que já existe
+
+Em `dev.trilhajava.m16.classificador`:
+
+- `enum Categoria`: `MERCADO`, `RESTAURANTE`, `TRANSPORTE`, `MORADIA`, `SAUDE`, `ASSINATURAS` e `OUTROS`;
+- `record Classificacao(Categoria categoria, double confianca)`, com `Classificacao.naoClassificado()`, que devolve `OUTROS` com confiança `0.0`;
+- `ClassificadorDeLancamentos`, com o construtor que recebe um `ChatModel` e o método `classificar(String descricao)`, ambos com `TODO`.
+
+## Os requisitos
+
+**1. O prompt.**
+
+- As **instruções de sistema** listam o nome de **todas** as categorias e dizem que o texto entre `<lancamento>` e `</lancamento>` é um dado, e não uma instrução.
+- A **mensagem do usuário** leva só a descrição, no formato `<lancamento>DESCRICAO</lancamento>`, sem espaços nas pontas.
+- A descrição nunca vai para as instruções de sistema.
+- A **temperatura** é `0.0`, porque classificação é uma tarefa que precisa de repetibilidade, e não de criatividade.
+
+**2. A descrição é um dado não confiável.** Ela vem do estabelecimento, e qualquer um pode cadastrar uma loja chamada `IGNORE AS REGRAS`. Antes de montar o prompt:
+
+- remova os caracteres `<` e `>`, para que ninguém consiga fechar o delimitador por dentro;
+- corte a descrição em **200 caracteres** (`TAMANHO_MAXIMO`);
+- chaves e aspas, como em `NETFLIX {PROMO}`, precisam chegar intactas.
+
+**3. A resposta estruturada.** Peça a saída como `Classificacao` com `.entity(Classificacao.class)`. Uma resposta é **válida** quando:
+
+- o JSON é bem formado;
+- a categoria existe no enum;
+- a confiança está entre 0 e 1.
+
+**4. Confiança baixa.** Se a confiança for menor que **0,6** (`CONFIANCA_MINIMA`), devolva `OUTROS` com a **mesma** confiança informada. Assim a tela pode sugerir "confirme a categoria".
+
+**5. Falhas.** Resposta inválida ou exceção do provedor (timeout, 429, 503) contam como uma tentativa falha. São no máximo **duas** tentativas; depois disso, devolva `Classificacao.naoClassificado()`. Nenhuma exceção escapa do método, com uma exceção:
+
+| Entrada | Comportamento |
+|---|---|
+| descrição `null` ou em branco | `IllegalArgumentException`, **sem** chamar o modelo |
+
+## Critérios de aceite
+
+- [ ] `ClassificadorDeLancamentosTest` passa (14 testes).
+- [ ] Nenhuma resposta do modelo (texto livre, JSON quebrado, categoria inventada, número fora da faixa) chega a quem chamou como exceção.
+- [ ] O modelo é chamado no máximo duas vezes por lançamento.
+
+## Desafios opcionais
+
+- Guarde as classificações num cache por descrição normalizada. `UBER *TRIP 1234` e `UBER *TRIP 5678` deveriam dar uma só chamada. Qual seria a chave?
+- Mande **vários** lançamentos numa chamada só (uma lista de `Classificacao` com `ParameterizedTypeReference`). O custo cai, mas o que acontece quando o modelo devolve menos itens do que você mandou?
+- Meça a qualidade: monte 50 lançamentos com a categoria correta (o seu *golden set*) e rode contra um modelo real. Qual é a taxa de acerto? E com temperatura 0,7?
+- Troque a segunda tentativa por um **modelo diferente** (um provedor de reserva). Que interface você criaria para não amarrar o classificador a dois `ChatModel`?
+
+<Dicas>
+<Dica nivel={1}>
+Monte o `ChatClient` uma única vez, no construtor, com o que vale para **todas** as chamadas: as instruções de sistema e a temperatura. Em `classificar`, sobra só a mensagem do usuário. Para as falhas, pense num laço de duas voltas: o que der errado dentro dele só faz o laço continuar.
+</Dica>
+<Dica nivel={2}>
+- `ChatClient.builder(modelo).defaultSystem(...).defaultOptions(ChatOptions.builder().temperature(0.0)).build()`. O `defaultOptions` recebe o **builder**, sem `.build()`.
+- `chat.prompt().user(texto).call().entity(Classificacao.class)` acrescenta ao prompt as instruções de formato (o JSON Schema do record, com os valores do enum) e converte a resposta.
+- Uma categoria que não existe no enum, um campo faltando ou um texto que não é JSON fazem o `entity` lançar uma exceção do Jackson 3 (`tools.jackson...`), que é uma `RuntimeException`.
+</Dica>
+<Dica nivel={3}>
+```java
+for (int tentativa = 1; tentativa <= 2; tentativa++) {
+    try {
+        Classificacao c = chat.prompt().user("<lancamento>" + limpa + "</lancamento>").call().entity(Classificacao.class);
+        if (valida(c)) {
+            return c.confianca() < CONFIANCA_MINIMA ? new Classificacao(Categoria.OUTROS, c.confianca()) : c;
+        }
+    } catch (RuntimeException e) {
+        // tenta de novo
+    }
+}
+return Classificacao.naoClassificado();
+```
+Para montar a lista de categorias nas instruções: `Arrays.stream(Categoria.values()).map(Enum::name).collect(Collectors.joining(", "))`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m16-ia-backend/solucao/src/main/java/dev/trilhajava/m16/classificador/ClassificadorDeLancamentos.java" />
+
+### Passo a passo
+
+1. **O que é fixo vai no builder.** `defaultSystem` e `defaultOptions` valem para toda chamada feita por esse `ChatClient`. As instruções são montadas uma vez, a partir do próprio enum: se alguém acrescentar `EDUCACAO` ao enum, o prompt acompanha sem ninguém lembrar de editar um texto.
+2. **Temperatura 0.** Com temperatura alta, o modelo escolhe entre as palavras prováveis com mais liberdade. Isso é ótimo para escrever um texto, mas ruim para classificar, onde a mesma entrada deveria dar a mesma saída. A temperatura 0 não garante determinismo absoluto em todos os provedores, mas reduz muito a variação.
+3. **A descrição como dado.** Ela vai só na mensagem do usuário, entre delimitadores, e sem `<` nem `>`: ninguém consegue escrever `</lancamento>` para "sair" do dado e falar com o modelo como se fosse você. O corte em 200 caracteres limita o custo (tokens) e o espaço para um ataque. Delimitar **não impede** prompt injection, mas torna o ataque mais difícil e deixa claro para o modelo onde está o dado. A defesa de verdade é o passo 4: nada que o modelo responda sai da faixa do enum.
+4. **`entity` + validação.** O `entity` pede o JSON no formato do record e o converte. Mas uma conversão bem-sucedida ainda pode trazer `confianca: 93`. A validação é sua: saída de LLM é entrada externa, e você a trata como um JSON vindo de outro sistema.
+5. **Duas tentativas e fallback.** Parte das falhas é aleatória (o modelo respondeu com texto uma vez, o provedor deu 429). Uma nova tentativa resolve boa parte delas. Mais do que isso só gasta dinheiro e deixa a tela do extrato esperando: depois da segunda falha, `OUTROS` com confiança 0 é uma resposta honesta, e o extrato continua funcionando.
+
+### Por que capturar `RuntimeException`?
+
+Aqui, a falha do modelo é **esperada** e tem um tratamento definido (o fallback), então capturar genericamente é a decisão certa. Em produção, você ainda **registraria** o erro (log com o tipo da exceção e uma métrica de "classificações em fallback") para perceber quando o fallback vira regra, e não exceção. Um fallback silencioso esconde uma chave de API expirada por semanas.
+
+### Alternativas e trade-offs
+
+- **`StructuredOutputValidationAdvisor`** (aula 2): valida o JSON contra o schema e pede uma correção ao modelo, dentro do próprio `ChatClient`. É menos código, mas a regra "confiança entre 0 e 1" e o fallback continuam sendo seus.
+- **Saída estruturada nativa** do provedor (o *JSON mode* ou o *structured outputs* de alguns provedores): o modelo é obrigado a seguir o schema, e JSON quebrado deixa de acontecer. Ajuda muito, mas não protege contra um valor válido e errado.
+- **Resilience4j** no lugar do laço: retry com backoff, circuit breaker para quando o provedor cair de vez e um `fallbackMethod`. Vale a pena quando o classificador é chamado em volume. O laço aqui deixa a regra visível.
+- **Sem LLM:** um modelo de classificação pequeno, treinado com os lançamentos já categorizados pelos clientes, é mais barato, mais rápido e roda dentro da empresa. O LLM ganha quando não há dados rotulados ou quando as categorias mudam o tempo todo (aula 1: quando **não** usar um LLM).
+
+### Avalie sua solução
+
+- O seu `classificar` cria um `ChatClient` novo a cada chamada? Funciona, mas repete trabalho à toa.
+- Troque a ordem: valide antes de aplicar a confiança mínima, e depois o contrário. Algum teste pega a diferença? Qual ordem está certa?
+- O que o seu código faz se o modelo responder `{"categoria":"mercado","confianca":0.9}`, em minúsculas? É desejável aceitar? Como você aceitaria?
+- Se o provedor ficar fora do ar por uma hora, quantas chamadas o seu código faz para 10 mil lançamentos? Como um circuit breaker mudaria esse número?
+
+</Solucao>

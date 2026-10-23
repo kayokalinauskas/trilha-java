@@ -1,0 +1,156 @@
+---
+titulo: Pilhas e filas
+descricao: Quando LIFO e FIFO resolvem o problema — validação de delimitadores, pilha monotônica para "próximo maior", avaliação de expressões e filas para processamento em ordem.
+modulo: 05-algoritmos
+ordem: 4
+duracao: 45
+objetivos:
+  - Usar ArrayDeque como pilha e como fila
+  - Validar estruturas aninhadas com pilha
+  - Aplicar a pilha monotônica em problemas de "próximo maior/menor"
+  - Avaliar expressões pós-fixas e simplificar caminhos
+tags: [pilha, fila, ArrayDeque, pilha monotônica]
+flashcards:
+  - frente: Qual classe usar para pilha e fila em Java?
+    verso: ArrayDeque — push/pop/peek para pilha, offer/poll/peek para fila. Evite Stack (antiga e sincronizada) e LinkedList.
+  - frente: Qual o sinal de que um problema pede pilha?
+    verso: Estruturas aninhadas (parênteses, tags), desfazer/voltar, ou "o próximo elemento maior/menor".
+  - frente: O que é uma pilha monotônica?
+    verso: Uma pilha mantida sempre em ordem (crescente ou decrescente); ao chegar um elemento que quebra a ordem, os do topo são "resolvidos" e removidos. Resolve "próximo maior" em O(n).
+  - frente: Como avaliar notação polonesa reversa (RPN)?
+    verso: Números vão para a pilha; um operador tira dois (b e depois a), calcula a op b e empilha o resultado. No fim, deve sobrar exatamente um valor.
+---
+
+Pilhas (LIFO: último a entrar, primeiro a sair) e filas (FIFO: primeiro a entrar, primeiro a sair) são estruturas simples que resolvem uma família grande de problemas — e aparecem no backend real, da pilha de chamadas da JVM às filas de mensageria do módulo 12.
+
+## `ArrayDeque` para as duas
+
+```java
+Deque<Character> pilha = new ArrayDeque<>();
+pilha.push('(');      // empilha no topo
+pilha.peek();         // olha o topo
+pilha.pop();          // tira do topo
+
+Deque<String> fila = new ArrayDeque<>();
+fila.offer("pedido-1");   // entra no fim
+fila.peek();              // olha o início
+fila.poll();              // sai do início (null se vazia)
+```
+
+<Callout tipo="atencao">
+Não use `java.util.Stack`: é uma classe antiga, sincronizada e que herda de `Vector` (permite acesso por índice, o que quebra a abstração de pilha). A própria documentação da JDK recomenda `ArrayDeque`.
+</Callout>
+
+## Estruturas aninhadas: delimitadores balanceados
+
+> `{"itens": [1, 2, {"x": (3)}]}` está balanceado? E `([)]`?
+
+Cada abertura vai para a pilha; cada fechamento precisa casar com o **topo**:
+
+```java
+for (char c : expressao.toCharArray()) {
+    if (c == '(' || c == '[' || c == '{') {
+        pilha.push(c);
+    } else if (FECHA_PARA_ABRE.containsKey(c)) {
+        if (pilha.isEmpty() || !pilha.pop().equals(FECHA_PARA_ABRE.get(c))) return false;
+    }
+}
+return pilha.isEmpty();   // sobrou alguém aberto?
+```
+
+Três formas de falhar: fechar sem ter aberto (pilha vazia), fechar o tipo errado (`([)]`) e terminar com algo aberto (`((`). Um bom conjunto de testes cobre as três.
+
+<Callout tipo="erro" titulo="Character e ==">
+`pilha.pop() != '('` compara um `Character` (objeto) com `==`. Funciona por causa do cache de caracteres ASCII, mas é o mesmo anti-padrão do `Integer ==` do módulo 01. Use `equals`.
+</Callout>
+
+## Pilha monotônica: "quantos dias até esquentar?"
+
+> Para cada dia, quantos dias até uma temperatura maior? `[73, 74, 75, 71, 69, 72, 76, 73]` → `[1, 1, 4, 2, 1, 1, 0, 0]`
+
+**Força bruta:** para cada dia, procurar à frente. O(n²).
+
+**Pilha monotônica:** guarde os **índices** dos dias ainda "sem resposta", em ordem decrescente de temperatura. Quando chega um dia mais quente, ele **resolve** todos os dias mais frios do topo:
+
+```java
+Deque<Integer> pendentes = new ArrayDeque<>();
+for (int hoje = 0; hoje < t.length; hoje++) {
+    while (!pendentes.isEmpty() && t[hoje] > t[pendentes.peek()]) {
+        int dia = pendentes.pop();
+        resposta[dia] = hoje - dia;
+    }
+    pendentes.push(hoje);
+}
+```
+
+<Figura legenda="Quando o 72 chega, ele resolve 69 e 71, que estavam esperando no topo da pilha">
+<svg viewBox="0 0 620 170" width="620" role="img" aria-label="Pilha com os dias de 75, 71 e 69; chega 72, que resolve 69 e 71; 75 continua esperando">
+  <text x="90" y="22" text-anchor="middle" class="d-title">pilha antes</text>
+  <rect x="40" y="35" width="100" height="36" rx="8" class="d-box"/><text x="90" y="58" text-anchor="middle" class="d-mono">dia4: 69</text>
+  <rect x="40" y="75" width="100" height="36" rx="8" class="d-box"/><text x="90" y="98" text-anchor="middle" class="d-mono">dia3: 71</text>
+  <rect x="40" y="115" width="100" height="36" rx="8" class="d-box"/><text x="90" y="138" text-anchor="middle" class="d-mono">dia2: 75</text>
+  <rect x="230" y="75" width="120" height="44" rx="10" class="d-accent"/><text x="290" y="102" text-anchor="middle" class="d-mono">dia5: 72</text>
+  <text x="440" y="60" class="d-text">dia4 → 5 − 4 = 1</text>
+  <text x="440" y="88" class="d-text">dia3 → 5 − 3 = 2</text>
+  <text x="440" y="116" class="d-label">75 &gt; 72: continua na pilha</text>
+</svg>
+</Figura>
+
+Cada índice entra e sai da pilha **uma vez**: O(n). O mesmo padrão resolve "próximo menor preço", "maior retângulo em histograma" e "cotações até a próxima alta".
+
+## Avaliando expressões
+
+A **notação polonesa reversa** (RPN) coloca o operador depois dos operandos: `3 4 + 2 *` = `(3 + 4) * 2` = 14. Não precisa de parênteses nem de precedência, e é avaliada com uma pilha:
+
+```text
+token 3 → pilha [3]
+token 4 → pilha [3, 4]
+token + → tira 4 e 3, empilha 7 → [7]
+token 2 → [7, 2]
+token * → tira 2 e 7, empilha 14 → [14]
+```
+
+Cuidado com a **ordem** em `-` e `/`: o primeiro `pop` é o operando da **direita**. E valide: operador sem operandos suficientes ou sobra de valores no final indicam expressão malformada.
+
+## Filas: processar na ordem de chegada
+
+Filas aparecem sempre que o trabalho deve ser feito **na ordem em que chegou** ou **nível a nível**:
+
+- a **BFS** (próxima aula) usa uma fila para visitar um grafo em camadas;
+- um processador de tarefas pega o próximo da fila;
+- `PriorityQueue` é a "fila com prioridade": sempre sai o menor (ou o de maior prioridade), em O(log n).
+
+<Callout tipo="entrevista">
+"Valid Parentheses", "Daily Temperatures", "Evaluate Reverse Polish Notation" e "Simplify Path" são quatro dos problemas de pilha mais pedidos em entrevistas — e são exatamente os do exercício 05.03, em cenários de backend.
+</Callout>
+
+<Quiz
+  id="05-pilhas"
+  questoes={[
+    {
+      pergunta: 'Qual estrutura verifica se tags HTML estão corretamente aninhadas?',
+      opcoes: ['Fila', 'Pilha', 'HashSet', 'PriorityQueue'],
+      correta: 1,
+      explicacao: 'A última tag aberta precisa ser a primeira fechada: LIFO.',
+    },
+    {
+      pergunta: 'Na pilha monotônica de "próximo dia mais quente", o que fica guardado na pilha?',
+      opcoes: ['As temperaturas já resolvidas', 'Os índices dos dias que ainda esperam um dia mais quente', 'Todas as temperaturas em ordem crescente', 'As respostas'],
+      correta: 1,
+      explicacao: 'Guardar índices permite calcular a distância (hoje − dia) ao resolver.',
+    },
+    {
+      pergunta: 'Avaliando `10 3 -` em RPN: após os dois pops, qual cálculo fazer?',
+      opcoes: ['3 − 10', '10 − 3', '10 + 3', 'Depende do sistema'],
+      correta: 1,
+      explicacao: 'O primeiro pop (3) é o operando da direita; o segundo (10) é o da esquerda.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `ArrayDeque`: `push/pop/peek` como pilha, `offer/poll/peek` como fila.
+- Aninhamento, desfazer e expressões → **pilha**.
+- "Próximo maior/menor" → **pilha monotônica**, O(n).
+- Ordem de chegada e camadas → **fila**; prioridade → `PriorityQueue`.

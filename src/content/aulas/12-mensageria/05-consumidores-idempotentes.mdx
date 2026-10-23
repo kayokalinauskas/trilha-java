@@ -1,0 +1,688 @@
+---
+titulo: "Consumidores idempotentes: duplicatas, chaves e efeitos que acontecem uma vez"
+descricao: "Por que \"pelo menos uma vez\" significa duplicatas de verdade, e como fazer o efeito acontecer uma vez só: chave de idempotência (id do evento ou chave de negócio), tabela inbox com chave única na mesma transação, operações naturalmente idempotentes, Idempotency-Key em APIs HTTP, janelas de deduplicação, corrida entre réplicas e replay. Com código real rodando no H2, sem Docker."
+modulo: 12-mensageria
+ordem: 5
+duracao: 110
+objetivos:
+  - Listar de onde vêm as duplicatas num sistema com entrega pelo menos uma vez e reproduzir uma delas num teste
+  - Escolher a chave de idempotência certa (id do evento ou chave de negócio) e justificar a escolha
+  - Implementar uma tabela inbox com INSERT ... ON CONFLICT DO NOTHING na mesma transação do efeito e provar, com 8 threads, que só uma réplica aplica o efeito
+  - Transformar um incremento num efeito naturalmente idempotente (set com versão) quando o evento carrega estado
+  - Implementar Idempotency-Key numa API HTTP, devolvendo a mesma resposta na repetição e 422 para a chave reaproveitada com outro corpo
+  - Definir a janela de deduplicação a partir da retenção, da DLQ e do replay, e planejar um reprocessamento sem efeitos duplicados
+tags: [idempotência, deduplicação, inbox, ON CONFLICT, Idempotency-Key, replay, exactly-once]
+flashcards:
+  - frente: O que é um consumidor idempotente?
+    verso: Processar a mesma mensagem uma ou várias vezes deixa o sistema no mesmo estado que processá-la uma vez. É o que torna seguro o "pelo menos uma vez" dos brokers.
+  - frente: Por que a marca de "mensagem processada" precisa estar na mesma transação do efeito?
+    verso: Se for gravada antes, numa transação separada, uma falha no efeito deixa a mensagem marcada e nunca aplicada. Se for gravada depois, separada, uma queda entre os dois aplica o efeito de novo. Na mesma transação, ou os dois existem, ou nenhum.
+  - frente: Por que INSERT ... ON CONFLICT DO NOTHING em vez de "SELECT e, se não existir, INSERT"?
+    verso: O SELECT seguido de INSERT tem uma janela, e duas réplicas veem "não existe" ao mesmo tempo. O INSERT com chave única é atômico. A segunda transação espera a primeira na chave e, quando ela confirma, insere 0 linhas.
+  - frente: Id do evento ou chave de negócio como chave de idempotência?
+    verso: O id do evento pega reentregas da mesma mensagem. A chave de negócio (uma compra, um cashback) pega também o mesmo fato publicado duas vezes com ids diferentes. Quando o efeito tem uma chave de negócio natural, use as duas.
+  - frente: O que é idempotência natural?
+    verso: Uma operação que já dá o mesmo resultado se repetida, como gravar um estado (status = PAGO, nivel = OURO) em vez de somar (saldo = saldo + 10). Com uma versão por agregado, ela também descarta eventos atrasados, sem tabela de deduplicação.
+  - frente: O que a API devolve quando recebe a mesma Idempotency-Key com outro corpo?
+    verso: Pelo rascunho da IETF, 422. A chave reaproveitada para outra operação é erro do cliente. A repetição com o MESMO corpo recebe a resposta guardada da primeira vez.
+  - frente: Como dimensionar a janela de deduplicação?
+    verso: Ela precisa ser maior que o maior intervalo em que uma duplicata ainda pode chegar, somando retenção do tópico, tempo na DLQ e replays planejados. Marcas mais antigas podem ser apagadas, de preferência por partição de tabela.
+  - frente: O exactly-once do Kafka vale para o meu banco?
+    verso: Não. As transações do Kafka garantem exatamente uma vez em fluxos ler-processar-escrever dentro do Kafka. Efeitos em banco, e-mail ou API continuam precisando de idempotência no consumidor.
+---
+
+Sexta-feira de Black Friday, 21h40. O serviço de compras publica um evento `CashbackConcedido` para cada compra aprovada, e o serviço de carteira consome esses eventos e credita o valor na conta do cliente. Às 21h41, o time de plataforma faz um deploy de rotina no serviço de carteira: as réplicas sobem uma a uma, o Kafka redistribui as partições entre elas (um **rebalanceamento**) e, nos poucos segundos dessa troca, centenas de eventos que já tinham sido aplicados no banco, mas ainda não tinham o offset confirmado, são entregues de novo às réplicas novas. Na segunda-feira, o financeiro encontra 1.312 contas com cashback em dobro: R$ 18.430,00 que saíram do caixa sem motivo, e ninguém sabe quais créditos são legítimos.
+
+Não houve bug no Kafka, nem na rede, nem no deploy. O broker fez exatamente o que promete: entregar **pelo menos uma vez**. Quem errou foi o consumidor, que tratou cada entrega como um fato novo. Esta aula é sobre a outra metade do contrato: escrever consumidores que aplicam cada efeito **uma vez só**, por mais vezes que a mensagem chegue. Você vai construir, com código que roda no H2 em memória (sem Docker), um consumidor de cashback com tabela inbox, provar com oito threads simultâneas que só uma réplica credita, transformar um incremento em operação naturalmente idempotente e levar a mesma ideia para uma API HTTP com o cabeçalho `Idempotency-Key`. No fim, você vai saber dimensionar a janela de deduplicação e planejar um replay sem medo.
+
+## A intuição: o cheque compensado
+
+Pense num cheque. Ele tem um número impresso, e o banco guarda os números dos cheques que já compensou. Se alguém deposita o mesmo cheque duas vezes, por engano ou de má-fé, a segunda compensação é recusada: "cheque já compensado". O banco não precisa saber **por que** o cheque voltou (a agência mandou o lote duas vezes, o cliente fotografou duas vezes no aplicativo); ele só confere o número.
+
+Três detalhes dessa analogia são exatamente os desta aula:
+
+- **O número identifica o cheque, e não o depósito.** Depositar duas vezes gera dois depósitos diferentes, mas o cheque é o mesmo. No consumidor, a chave precisa identificar a **mensagem lógica**, e não a entrega (nunca o offset do Kafka, nunca um id gerado ao receber).
+- **Registrar o número e debitar a conta são uma operação só.** Se o banco debitasse e caísse antes de anotar o número, o cheque seria pago de novo amanhã. Se anotasse e caísse antes de debitar, o cheque nunca seria pago. No consumidor, a marca e o efeito ficam **na mesma transação**.
+- **O banco não guarda os números para sempre.** Um cheque tem prazo de apresentação; depois dele, nem precisa conferir. No consumidor, isso é a **janela de deduplicação**.
+
+E há um quarto detalhe que vale guardar: se, em vez de "pague R$ 500,00", o cheque dissesse "deixe o saldo em R$ 1.200,00", depositá-lo duas vezes não faria mal nenhum. Isso é **idempotência natural**, e é a técnica mais barata de todas, quando o domínio permite.
+
+## Vocabulário
+
+| Termo | O que significa nesta aula |
+|---|---|
+| **Pelo menos uma vez** (*at-least-once*) | O broker garante que a mensagem chega, mas pode chegar mais de uma vez. É o modo padrão do Kafka e do RabbitMQ com confirmação manual, e o único que não perde mensagem. |
+| **No máximo uma vez** (*at-most-once*) | Confirma antes de processar: nunca duplica, mas perde a mensagem se o consumidor cair no meio. Aceitável para métricas e telemetria; inaceitável para dinheiro. |
+| **Exatamente uma vez** (*exactly-once*) | O que o negócio quer: o **efeito** acontece uma vez. Não é uma propriedade da entrega, é uma propriedade do sistema inteiro. Chega-se a ela com entrega pelo menos uma vez **mais** consumidor idempotente. |
+| **Idempotente** | Aplicar uma vez ou várias deixa o mesmo estado. `status = 'PAGO'` é idempotente; `saldo = saldo + 10` não é. |
+| **Chave de idempotência** | O valor que identifica "a mesma coisa" entre duas entregas: o id do evento, uma chave de negócio ou o `Idempotency-Key` de uma requisição HTTP. |
+| **Chave de negócio** | Um identificador do próprio domínio que torna o efeito único: um cashback por compra, uma nota fiscal por pedido, um lançamento por boleto. |
+| **Inbox** (tabela de mensagens processadas) | Uma tabela com uma linha por mensagem já aplicada, por consumidor, com chave primária sobre (consumidor, id). É a contraparte da outbox da aula anterior. |
+| **Janela de deduplicação** | Por quanto tempo as marcas ficam guardadas. Uma duplicata que chegar depois dela não é detectada pela inbox. |
+| **Réplica** | Uma instância do mesmo serviço. Num grupo de consumidores do Kafka, cada partição tem um dono por vez, mas, durante um rebalanceamento, duas réplicas podem tocar a mesma mensagem. |
+| **Replay** (reprocessamento) | Reler mensagens antigas de propósito: voltar o offset de um grupo, reenviar a DLQ, subir um consumidor novo desde o começo do tópico. |
+| ***Fingerprint*** | Um resumo (hash) do conteúdo da requisição, guardado junto da chave, para detectar a mesma chave usada com outro conteúdo. |
+
+## De onde vêm as duplicatas
+
+Na [aula 1 do módulo](../../12-mensageria/01-por-que-mensageria/), a conclusão foi: na prática, a entrega é pelo menos uma vez. Vale ver cada origem de duplicata com calma, porque cada uma tem um formato diferente, e a chave de idempotência precisa pegar todas:
+
+1. **O consumidor processou e caiu antes de confirmar.** No Kafka, o offset é confirmado (*commit*) depois que o listener retorna; no RabbitMQ, o `ack` vai depois do processamento. Uma queda, um `OutOfMemoryError` ou um `kill -9` entre o commit do banco e a confirmação do broker faz a mensagem voltar. É o caso mais comum, e a mensagem volta **idêntica**.
+2. **Rebalanceamento.** O grupo de consumidores ganha ou perde uma réplica (deploy, autoscaling, uma réplica que passou do `max.poll.interval.ms` processando um lote lento) e as partições mudam de dono. Os offsets que a réplica antiga não confirmou são entregues de novo à nova. Às vezes as duas processam a mesma mensagem **ao mesmo tempo**, porque a antiga ainda não percebeu que perdeu a partição.
+3. **Retry do próprio listener.** A próxima aula mostra o retry com *backoff*. Se o processamento fez metade do trabalho e lançou exceção, o retry repete a mensagem inteira.
+4. **O relay da outbox.** Como você viu na [aula anterior](../../12-mensageria/04-transactional-outbox/#a-solução-a-outbox-na-mesma-transação), o relay publica e depois marca a linha como enviada. Se cair entre os dois, publica de novo. A outbox troca "perder" por "duplicar", de propósito.
+5. **O produtor reenviou.** Um gateway de pagamento, um parceiro, o próprio serviço de compras: se o produtor não recebeu a confirmação do broker, ele tenta de novo. O produtor idempotente do Kafka resolve isso **só** na escrita para o broker; um produtor que regenera o evento (com outro id) a partir do banco, depois de um erro, cria uma duplicata que o broker não reconhece.
+6. **Reprocessamento intencional.** Alguém reenviou a DLQ, voltou o offset do grupo para ontem, ou subiu um consumidor novo lendo desde o início do tópico.
+
+As origens 1 a 4 entregam a **mesma** mensagem, com o mesmo id. A 5 e a 6 podem entregar o **mesmo fato** com outro id. É por isso que a escolha da chave importa tanto, e você vai vê-la logo adiante.
+
+<Figura legenda="O caso mais comum: a réplica A aplica o efeito e cai antes de confirmar o offset; a réplica B recebe a mesma mensagem, e só a marca na inbox impede o crédito em dobro">
+<svg viewBox="0 0 680 370" width="680" role="img" aria-labelledby="dup-titulo dup-desc">
+  <title id="dup-titulo">Linha do tempo de uma duplicata causada por queda antes da confirmação</title>
+  <desc id="dup-desc">Quatro linhas de vida: broker, réplica A, banco e réplica B. O broker entrega EVT-1 à réplica A. A réplica A faz commit no banco da marca e do crédito de 12,50 e cai antes de confirmar o offset. O broker reentrega EVT-1 à réplica B. A réplica B tenta inserir a marca, o banco responde zero linhas, e a réplica B confirma a mensagem como duplicada. O saldo fica creditado uma vez só.</desc>
+  <defs><marker id="mk-dup" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="25" y="10" width="130" height="40" rx="8" class="d-box"/>
+  <text x="90" y="36" text-anchor="middle" class="d-title">Broker</text>
+  <rect x="195" y="10" width="130" height="40" rx="8" class="d-box"/>
+  <text x="260" y="36" text-anchor="middle" class="d-title">Réplica A</text>
+  <rect x="365" y="10" width="130" height="40" rx="8" class="d-info"/>
+  <text x="430" y="36" text-anchor="middle" class="d-title">Banco</text>
+  <rect x="525" y="10" width="130" height="40" rx="8" class="d-box"/>
+  <text x="590" y="36" text-anchor="middle" class="d-title">Réplica B</text>
+  <path d="M90 50 L90 320" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M260 50 L260 170" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M430 50 L430 320" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M590 50 L590 320" class="d-line" stroke-dasharray="4 4"/>
+  <path d="M90 84 L256 84" class="d-line" marker-end="url(#mk-dup)"/>
+  <text x="175" y="76" text-anchor="middle" class="d-label">entrega EVT-1</text>
+  <path d="M260 124 L426 124" class="d-line" marker-end="url(#mk-dup)"/>
+  <text x="345" y="116" text-anchor="middle" class="d-label" textLength="160" lengthAdjust="spacingAndGlyphs">commit: marca + R$ 12,50</text>
+  <rect x="195" y="146" width="130" height="30" rx="6" class="d-accent"/>
+  <text x="260" y="166" text-anchor="middle" class="d-label">cai antes do ack</text>
+  <path d="M90 214 L586 214" class="d-line" marker-end="url(#mk-dup)"/>
+  <text x="200" y="206" text-anchor="middle" class="d-label">reentrega EVT-1</text>
+  <path d="M590 254 L434 254" class="d-line" marker-end="url(#mk-dup)"/>
+  <text x="510" y="246" text-anchor="middle" class="d-label" textLength="150" lengthAdjust="spacingAndGlyphs">INSERT marca: 0 linhas</text>
+  <path d="M590 296 L94 296" class="d-line" marker-end="url(#mk-dup)"/>
+  <text x="340" y="288" text-anchor="middle" class="d-label">ack (DUPLICADO)</text>
+  <text x="340" y="352" text-anchor="middle" class="d-text">o saldo continua 112,50: o efeito aconteceu uma vez</text>
+</svg>
+</Figura>
+
+## As técnicas, e como escolher
+
+Há três maneiras de tornar um consumidor idempotente. Elas não competem: um consumidor sério costuma combinar duas.
+
+| Técnica | Como | Quando serve | Custo |
+|---|---|---|---|
+| **Idempotência natural** | a operação já é idempotente: gravar o estado (`nivel = 'OURO'`), `PUT` de um documento inteiro, `DELETE` por id | eventos que carregam **estado** | quase zero: nenhuma tabela extra |
+| **Deduplicação (inbox)** | uma tabela com o id de cada mensagem aplicada; se já existe, ignora | efeitos **cumulativos**: créditos, lançamentos, contadores, envio de notificação | uma escrita extra por mensagem e uma tabela que cresce |
+| **Versão ou sequência** | guarda a última versão aplicada por agregado e descarta as menores ou iguais | eventos de estado que podem chegar **fora de ordem** | uma coluna por agregado |
+
+A pergunta que decide é: **o evento descreve um estado ou uma variação?** "O nível do cliente agora é OURO" é estado: gravá-lo duas vezes dá no mesmo. "O cliente ganhou R$ 12,50" é variação: somá-la duas vezes dá prejuízo. Variações precisam de deduplicação. Estados precisam, no máximo, de versão.
+
+### Id do evento ou chave de negócio?
+
+A chave de idempotência precisa identificar "a mesma coisa". Mas qual coisa?
+
+- **O id do evento** (`eventoId`, o `message_id` do AMQP, um UUID gerado pelo produtor quando o fato aconteceu) identifica a **mensagem lógica**. Pega as origens 1 a 4 da lista: queda antes do ack, rebalanceamento, retry, relay da outbox. É genérico: serve para qualquer consumidor, com a mesma tabela.
+- **A chave de negócio** (`compraId`: uma compra gera no máximo um cashback) identifica o **fato**. Pega também as origens 5 e 6: o produtor que regenerou o evento com outro id, o replay de uma fonte que não guardava o id original. Mas é específica de cada efeito, e nem todo efeito tem uma (uma "notificação de lembrete" pode, legitimamente, acontecer duas vezes para a mesma compra).
+
+O que **nunca** serve como chave:
+
+- **O offset do Kafka** ou a *delivery tag* do RabbitMQ: identificam a entrega ou a posição, e a mesma mensagem republicada pela outbox ganha outro offset.
+- **Um id gerado ao receber** (`UUID.randomUUID()` no listener): cada entrega gera um diferente, então nada é duplicado e nada é detectado.
+- **O hash do payload inteiro**, sem cuidado: dois cashbacks legítimos de R$ 12,50 para a mesma conta, em compras diferentes, teriam o mesmo hash se o payload não incluir o id da compra; e o mesmo evento serializado com campos em outra ordem teria hash diferente.
+
+Quando o efeito tem uma chave de negócio natural, use **as duas**: a inbox pelo id do evento, que é genérica e barata de conferir, e uma restrição `UNIQUE` na chave de negócio, que é a última linha de defesa. É exatamente o que o consumidor desta aula faz.
+
+## Deduplicação na mesma transação
+
+Este é o coração da aula. A tabela de mensagens processadas tem uma chave primária composta, e é ela, não o código Java, que garante a unicidade:
+
+```sql
+CREATE TABLE mensagem_processada (
+    consumidor     VARCHAR(50)  NOT NULL,
+    mensagem_id    VARCHAR(64)  NOT NULL,
+    processada_em  TIMESTAMP    NOT NULL,
+    PRIMARY KEY (consumidor, mensagem_id)
+);
+```
+
+A coluna `consumidor` existe porque o mesmo evento é consumido por vários serviços (a carteira credita, o antifraude pontua, o CRM envia um e-mail), e cada um tem a sua própria noção de "já processei". Com uma tabela por banco de serviço, ela também permite que dois consumidores do mesmo serviço (cashback e extrato) compartilhem a tabela.
+
+A forma intuitiva de usar essa tabela é errada. Compare:
+
+<Comparar antes="Verificar e depois gravar" depois="Gravar e ver se gravou">
+
+```java
+if (jaProcessada(id)) {   // SELECT
+    return DUPLICADO;
+}
+aplicarEfeito(evento);
+marcar(id);               // INSERT
+// duas réplicas passam juntas pelo
+// SELECT: as duas aplicam o efeito
+```
+
+```java
+int n = inserirSeNaoExiste(id);   // atômico
+if (n == 0) {
+    return DUPLICADO;
+}
+aplicarEfeito(evento);
+// a 2ª transação ESPERA a 1ª na chave:
+// commit da 1ª → insere 0 linhas
+// rollback da 1ª → insere e aplica
+```
+
+</Comparar>
+
+Três decisões fazem essa versão funcionar:
+
+- **A chave primária faz o trabalho.** Quando duas transações tentam inserir a mesma chave, o banco faz a segunda **esperar** a primeira terminar. Se a primeira confirmar, o `ON CONFLICT DO NOTHING` da segunda insere zero linhas, sem erro. Se a primeira desfizer, a segunda insere e segue. Não sobra janela entre "verificar" e "gravar", porque são a mesma operação.
+- **`ON CONFLICT DO NOTHING`, e não `catch (DuplicateKeyException)`.** No PostgreSQL, um erro dentro de uma transação a deixa **abortada**: qualquer comando seguinte falha até o rollback. Capturar a exceção e continuar não funciona, e mesmo quando funciona (no H2, por exemplo) o código fica dependente de um detalhe do banco. Com `ON CONFLICT`, não há erro para tratar: o número de linhas inseridas já é a resposta.
+- **Mesma transação do efeito.** A marca e o efeito são confirmados juntos. Se o efeito falhar no meio, o rollback desfaz a marca também, e a próxima entrega aplica normalmente. Se o commit acontecer, os dois existem. Não há estado intermediário visível.
+
+<Figura legenda="Duas réplicas recebem o mesmo evento ao mesmo tempo. A chave primária serializa as duas: a primeira insere e aplica; a segunda espera e, depois do commit da primeira, insere zero linhas">
+<svg viewBox="0 0 680 330" width="680" role="img" aria-labelledby="corrida-titulo corrida-desc">
+  <title id="corrida-titulo">Corrida entre réplicas resolvida pela chave primária</title>
+  <desc id="corrida-desc">A réplica A e a réplica B executam INSERT da marca EVT-3 na tabela mensagem_processada, cuja chave primária é consumidor e mensagem_id. A réplica A chega primeiro e fica com o bloqueio da chave; a réplica B espera. A réplica A confirma com uma linha inserida e resultado PROCESSADO. A réplica B, liberada, insere zero linhas e devolve DUPLICADO.</desc>
+  <defs><marker id="mk-corrida" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="16" width="190" height="48" rx="10" class="d-box"/>
+  <text x="115" y="46" text-anchor="middle" class="d-title">Réplica A</text>
+  <rect x="470" y="16" width="190" height="48" rx="10" class="d-box"/>
+  <text x="565" y="46" text-anchor="middle" class="d-title">Réplica B</text>
+  <rect x="210" y="120" width="260" height="76" rx="10" class="d-violet"/>
+  <text x="340" y="150" text-anchor="middle" class="d-mono">mensagem_processada</text>
+  <text x="340" y="176" text-anchor="middle" class="d-label">PK (consumidor, mensagem_id)</text>
+  <path d="M115 64 L240 118" class="d-line" marker-end="url(#mk-corrida)"/>
+  <text x="60" y="104" class="d-label">1. INSERT EVT-3</text>
+  <text x="60" y="122" class="d-label">pega o bloqueio</text>
+  <path d="M565 64 L440 118" class="d-line" marker-end="url(#mk-corrida)"/>
+  <text x="510" y="104" class="d-label">2. INSERT EVT-3</text>
+  <text x="510" y="122" class="d-label">espera...</text>
+  <path d="M240 198 L130 246" class="d-line" marker-end="url(#mk-corrida)"/>
+  <path d="M440 198 L550 246" class="d-line" marker-end="url(#mk-corrida)"/>
+  <rect x="20" y="248" width="220" height="62" rx="10" class="d-ok"/>
+  <text x="130" y="274" text-anchor="middle" class="d-text">1 linha → credita</text>
+  <text x="130" y="296" text-anchor="middle" class="d-mono">PROCESSADO</text>
+  <rect x="440" y="248" width="220" height="62" rx="10" class="d-info"/>
+  <text x="550" y="274" text-anchor="middle" class="d-text">0 linhas → nada</text>
+  <text x="550" y="296" text-anchor="middle" class="d-mono">DUPLICADO</text>
+  <text x="340" y="282" text-anchor="middle" class="d-label">commit de A</text>
+  <text x="340" y="300" text-anchor="middle" class="d-label">libera B</text>
+</svg>
+</Figura>
+
+## O código que vamos construir
+
+Tudo fica no pacote `dev.trilhajava.m12.aulas.idempotencia`, no módulo `java/m12-mensageria/aulas`. Não há Spring Boot nem broker nos testes: o consumidor é uma classe comum que recebe um `JdbcClient` e um `TransactionTemplate`, e os testes montam um H2 em memória no modo PostgreSQL. Isso é proposital. A idempotência é uma propriedade **do consumidor e do banco**, e não do Kafka ou do RabbitMQ; testá-la sem broker deixa o teste rápido e o raciocínio limpo. Ligar a classe a um `@KafkaListener` é uma linha, como você verá no passo 7.
+
+| Classe | Papel |
+|---|---|
+| `CashbackConcedido` | o evento: `eventoId` (a mensagem), `contaId`, `compraId` (a chave de negócio) e `valor` em `BigDecimal` |
+| `ConsumidorDeCashback` | inbox + chave de negócio + incremento do saldo + notificação depois do commit |
+| `Notificador` | o efeito fora do banco (push, e-mail) |
+| `ProjecaoDeNivel` | idempotência natural: grava o estado com versão, sem inbox |
+| `GuardaDeIdempotencia` | `Idempotency-Key` para uma API HTTP de transferências |
+| `LimpezaDaDeduplicacao` | apaga as marcas mais antigas que a janela |
+
+O esquema completo, que roda no PostgreSQL e no H2:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/resources/idempotencia/schema.sql" titulo="aulas/idempotencia/schema.sql" />
+
+Repare na restrição `uk_lancamento_compra`: é a chave de negócio, no banco. E repare que `chave_de_idempotencia` tem chave primária em `(cliente_id, chave)`, e não só em `chave`; o motivo aparece no passo 6.
+
+## Mão na massa
+
+Os testes ficam em `java/m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/`. Para rodar, entre na pasta do módulo e filtre a classe com `-Dtest`:
+
+```bash
+cd java/m12-mensageria/aulas
+mvn test -Dtest=ConsumidorDeCashbackTest     # uma classe
+mvn test "-Dtest=dev.trilhajava.m12.aulas.idempotencia.*Test"   # todas as desta aula
+```
+
+### Passo 1: um banco novo por teste
+
+**O que vamos fazer e por quê.** Cada teste precisa de um banco limpo, com o esquema da aula, e de um relógio fixo (as marcas guardam `processada_em`). Uma classe auxiliar cria tudo isso sem Spring Boot.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/BancoDeTeste.java" semImports />
+
+**O que acabou de acontecer.**
+
+- A URL `jdbc:h2:mem:<uuid>` cria um banco em memória com nome aleatório, então dois testes nunca se enxergam. `DB_CLOSE_DELAY=-1` mantém o banco vivo enquanto a JVM existir, mesmo entre conexões; sem isso, o banco sumiria quando a última conexão fechasse, e o teste de concorrência abre e fecha várias.
+- `MODE=PostgreSQL` liga a compatibilidade com a sintaxe do PostgreSQL, que inclui o `INSERT ... ON CONFLICT DO NOTHING`. Atenção: o H2 entende **só** o `DO NOTHING`; o `ON CONFLICT DO UPDATE` não existe nele (é por isso que o passo 5 usa `MERGE`).
+- `DriverManagerDataSource` abre uma conexão nova a cada pedido. Em produção você usaria o pool HikariCP do Spring Boot; aqui, a simplicidade ganha.
+- `DataSourceTransactionManager` + `TransactionTemplate` é a forma programática de abrir uma transação no Spring. Dentro do `execute`, o `JdbcClient` usa automaticamente a conexão da transação corrente; é o mesmo mecanismo que o `@Transactional` usa por baixo.
+
+Por enquanto não há o que rodar: o passo seguinte usa esta classe.
+
+### Passo 2: o consumidor com inbox e chave de negócio
+
+**O que vamos fazer e por quê.** O consumidor aplica três camadas, nesta ordem: a marca na inbox (pega reentregas da mesma mensagem), o lançamento com chave de negócio (pega o mesmo fato com outro id) e, só então, o incremento do saldo.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/idempotencia/ConsumidorDeCashback.java" destacar="38-46, 50-58, 60-62, 65-70" />
+
+**O que acabou de acontecer, bloco a bloco.**
+
+- **Linhas 38 a 46, a marca.** O `INSERT ... ON CONFLICT DO NOTHING` devolve o número de linhas inseridas. Um significa "sou o primeiro"; zero significa "alguém já aplicou (ou está aplicando e acabou de confirmar)". Não há `SELECT` antes: perguntar e gravar são o mesmo comando.
+- **Linhas 50 a 58, a chave de negócio.** O lançamento tem `UNIQUE (compra_id)`. Se o serviço de compras republicar o mesmo cashback com um `eventoId` novo, a marca passa (o id é inédito), mas o lançamento insere zero linhas, e o consumidor devolve `DUPLICADO`. A marca do id novo fica gravada, o que é correto: aquela mensagem foi processada, com o resultado "nada a fazer".
+- **Linhas 60 a 62, o incremento.** `saldo = saldo + ?` não é idempotente, e mesmo assim está seguro aqui, porque só é alcançado por quem passou pelas duas barreiras. Esse é o padrão geral: **proteja a operação não idempotente com uma operação idempotente que vem antes, na mesma transação**.
+- **Linhas 65 a 70, o efeito externo.** O push "você ganhou R$ 12,50" não pode ser desfeito por um rollback. Por isso ele é registrado como uma sincronização da transação e só roda no `afterCommit`. Se o commit falhar, ninguém é avisado de um crédito que não existe.
+
+Agora o teste do caminho principal:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/ConsumidorDeCashbackTest.java" destacar="33-41" />
+
+O primeiro teste entrega três vezes: o evento original, o **mesmo** evento de novo (reentrega) e um evento **republicado** com outro `eventoId` para a mesma compra. Rode:
+
+```bash
+mvn test -Dtest=ConsumidorDeCashbackTest
+```
+
+Saída esperada (resumida):
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.idempotencia.ConsumidorDeCashbackTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.548 s -- in Consumidor de cashback
+[INFO] BUILD SUCCESS
+```
+
+O saldo vai de 100,00 para 112,50, e não para 137,50; o notificador recebeu um aviso só. As asserções de `saldo` usam `isEqualByComparingTo`, que compara `BigDecimal` pelo valor e ignora a escala: o banco devolve `112.50` com escala 2, e `equals` diria que `112.5` é diferente.
+
+<Callout tipo="info" titulo="Por que o número de linhas, e não uma exceção">
+Muita gente aprende deduplicação com `try { insert } catch (DuplicateKeyException e) { return DUPLICADO; }`. No H2 isso até funciona, porque o H2 desfaz só o comando que falhou. No PostgreSQL, o erro de chave aborta a **transação inteira**: o `return DUPLICADO` parece certo, mas qualquer comando seguinte na mesma transação falha, e um `@Transactional` em volta tenta confirmar uma transação abortada. Com `ON CONFLICT DO NOTHING`, o caminho de duplicata não passa por exceção nenhuma, em nenhum banco.
+</Callout>
+
+### Passo 3: falha no meio, e a marca vai junto
+
+**O que vamos fazer e por quê.** Provar a terceira decisão: se o efeito falhar depois de a marca ter sido inserida, a marca **não** pode sobreviver, senão a mensagem fica "processada" sem ter sido aplicada, e a reentrega é descartada como duplicata. É o pior tipo de bug: o sistema perde o crédito em silêncio.
+
+O segundo teste da mesma classe (`falhaDesfazTudo`) entrega um cashback para a conta `CT-BRUNO`, que ainda não existe. A sequência dentro da transação é: a marca entra, o lançamento viola a chave estrangeira `conta_id → conta(id)`, a exceção sobe, e o `TransactionTemplate` faz rollback de tudo. O teste confere que `mensagem_processada` e `lancamento` estão vazias e que ninguém foi notificado. Depois cria a conta e entrega de novo: agora o resultado é `PROCESSADO`, com saldo de 8,00.
+
+Esse cenário é mais realista do que parece. Num sistema orientado a eventos, `ContaAberta` e `CashbackConcedido` vêm de tópicos diferentes, sem ordem garantida entre eles. A primeira entrega do cashback pode chegar antes da conta existir. Com marca e efeito na mesma transação, o retry da próxima aula resolve: a mensagem volta, e desta vez a conta já está lá.
+
+Ele já rodou junto no passo anterior (`Tests run: 2`). Se quiser ver a exceção real que o teste espera, ela é esta:
+
+```text
+org.springframework.dao.DataIntegrityViolationException: PreparedStatementCallback; SQL [INSERT INTO lancamento (conta_id, compra_id, valor)
+VALUES (?, ?, ?)
+ON CONFLICT DO NOTHING]; Referential integrity constraint violation: "CONSTRAINT_69: public.lancamento FOREIGN KEY(conta_id) REFERENCES public.conta(id) ('CT-BRUNO')"; SQL statement:
+INSERT INTO lancamento (conta_id, compra_id, valor)
+VALUES (?, ?, ?)
+ON CONFLICT DO NOTHING [23506-240]
+```
+
+Repare: `ON CONFLICT DO NOTHING` ignora só conflitos de **unicidade**. Uma violação de chave estrangeira, de `NOT NULL` ou de `CHECK` continua sendo erro, como deve ser.
+
+### Passo 4: a corrida entre réplicas
+
+**O que vamos fazer e por quê.** O teste anterior entregou as duplicatas uma depois da outra. O caso difícil é o do rebalanceamento: duas ou mais réplicas com a mesma mensagem **ao mesmo tempo**. Aqui oito threads, cada uma com a sua conexão e a sua transação, fazem o papel de oito réplicas.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/CorridaEntreReplicasTest.java" destacar="26-35, 42-44" />
+
+**Como o teste força a corrida.** As oito tarefas são enviadas ao pool e ficam paradas em `largada.await()`. O `countDown()` solta todas de uma vez, o que maximiza a chance de colisão. O `try` com recursos fecha o `ExecutorService`, e o `close()` (Java 19 em diante) espera todas as tarefas terminarem. O teste exige exatamente um `PROCESSADO` entre oito resultados e saldo de 5,00.
+
+```bash
+mvn test -Dtest=CorridaEntreReplicasTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m12.aulas.idempotencia.CorridaEntreReplicasTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.033 s -- in Corrida entre réplicas
+[INFO] BUILD SUCCESS
+```
+
+Nenhuma das sete perdedoras lançou exceção: elas esperaram o bloqueio da chave, viram que a linha já existia e inseriram zero linhas. O PostgreSQL se comporta igual no nível de isolamento padrão (*read committed*): o `INSERT` concorrente na mesma chave espera a outra transação terminar, e o `ON CONFLICT DO NOTHING` decide depois.
+
+<Callout tipo="atencao" titulo="Teste de concorrência verde não prova ausência de corrida">
+Um teste com threads pode passar por sorte, porque o escalonador pode ter executado as tarefas em fila. Ele vale porque a garantia está no banco (a chave primária), e o teste só confirma que o código usa essa garantia. Para a versão com `SELECT` antes do `INSERT`, um teste assim às vezes passa e às vezes não; em "Quando dá errado" está a saída de uma execução real dessa versão.
+</Callout>
+
+### Passo 5: idempotência natural, com versão
+
+**O que vamos fazer e por quê.** Nem todo consumidor precisa de inbox. O serviço de fidelidade publica `NivelDoClienteAlterado(clienteId, nivel, versao)` sempre que o nível do cliente muda. O evento carrega o **estado novo inteiro**, e não "suba um nível". A projeção só precisa gravar esse estado, e a versão resolve tanto a repetição quanto a chegada fora de ordem.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/idempotencia/ProjecaoDeNivel.java" destacar="20-27" />
+
+**O que acabou de acontecer.** O `MERGE` do padrão SQL faz o *upsert*: se o cliente não existe, insere; se existe **e** a versão guardada é menor que a do evento, atualiza. Se a versão guardada for igual (repetição) ou maior (o evento chegou atrasado), nenhuma cláusula se aplica e o comando afeta zero linhas. O método devolve `false`, e o chamador pode registrar a métrica de "eventos ignorados".
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/ProjecaoDeNivelTest.java" semImports />
+
+```bash
+mvn test -Dtest=ProjecaoDeNivelTest
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in Projeção de nível (idempotência natural com versão)
+[INFO] BUILD SUCCESS
+```
+
+A sequência do teste conta uma história: PRATA (versão 1), OURO (3), OURO (3) de novo, e por fim BRONZE (2), que se atrasou numa partição lenta. Sem a versão, o cliente terminaria em BRONZE. Com ela, termina em OURO, e as duas últimas entregas não mudam nada.
+
+<Callout tipo="dica" titulo="No PostgreSQL, prefira ON CONFLICT DO UPDATE ... WHERE">
+O `MERGE` desta aula roda no H2 e no PostgreSQL 15 em diante. Mas a documentação do PostgreSQL avisa que, com `MERGE` concorrente, valem as regras normais de isolamento, e sugere considerar `INSERT ... ON CONFLICT` quando há inserções concorrentes: com `MERGE`, duas transações inserindo o mesmo cliente novo podem terminar numa violação de unicidade. Num serviço só PostgreSQL, a forma idiomática é:
+
+```sql
+INSERT INTO nivel_do_cliente (cliente_id, nivel, versao) VALUES (?, ?, ?)
+ON CONFLICT (cliente_id) DO UPDATE
+   SET nivel = EXCLUDED.nivel, versao = EXCLUDED.versao
+ WHERE nivel_do_cliente.versao < EXCLUDED.versao;
+```
+
+O `WHERE` faz o papel do `AND atual.versao < novo.versao`; quando ele é falso, a linha não muda e o comando informa zero linhas.
+</Callout>
+
+Quem define a versão é o **produtor**, que conhece a ordem verdadeira (a versão do agregado, um contador por cliente gravado na mesma transação da mudança). O consumidor não tem como inventar uma ordem que não veio na mensagem; usar o horário de chegada ou o offset como versão é tão errado quanto usá-los como chave de idempotência.
+
+### Passo 6: Idempotency-Key numa API HTTP
+
+**O que vamos fazer e por quê.** O mesmo problema aparece fora da mensageria. O aplicativo do banco envia `POST /transferencias` para um Pix de R$ 150,00, a rede móvel cai antes da resposta chegar, e o aplicativo tenta de novo. Pela [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110#name-idempotent-methods), `POST` não é idempotente: sem cuidado, saem dois Pix. A solução consagrada (prática consolidada em APIs de pagamento e descrita no rascunho da IETF `draft-ietf-httpapi-idempotency-key-header`, que expirou em 2026 sem virar RFC; o cabeçalho continua sendo usado, mas não é padrão oficial) é o cliente gerar uma chave única por **intenção** de operação e enviá-la no cabeçalho `Idempotency-Key`. A repetição usa a mesma chave; uma transferência nova, uma chave nova.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/idempotencia/GuardaDeIdempotencia.java" destacar="35-37, 40-48, 49-55, 66-69" />
+
+**O que acabou de acontecer, bloco a bloco.**
+
+- **Linhas 35 a 37.** Sem chave, a API não tem como proteger a operação. O rascunho da IETF recomenda 400 quando a chave é obrigatória e não veio.
+- **Linhas 40 a 48.** A reserva da chave é o mesmo `INSERT ... ON CONFLICT DO NOTHING` da inbox, agora com o *fingerprint* (SHA-256 do corpo). Zero linhas significa "já vi esta chave".
+- **Linhas 49 a 55.** A operação roda **na mesma transação** da reserva, e a resposta é guardada antes do commit. Se a transferência falhar, a reserva some junto, e o cliente pode tentar de novo com a mesma chave.
+- **Linhas 66 a 69.** A chave repetida com **outro corpo** é erro do cliente (reaproveitou a chave para outra operação): 422, como recomenda o rascunho. Com o mesmo corpo, a resposta guardada volta **igual**, inclusive o status 201 e o id da transferência.
+
+E a chave primária é `(cliente_id, chave)`, e não só `chave`, por segurança: se a chave fosse global, um cliente que adivinhasse (ou copiasse de um log) a chave de outro receberia a resposta guardada da transferência **alheia**. Toda chave de idempotência vale dentro do escopo de quem a criou.
+
+<CodigoJava caminho="m12-mensageria/aulas/src/test/java/dev/trilhajava/m12/aulas/idempotencia/GuardaDeIdempotenciaTest.java" semImports />
+
+```bash
+mvn test -Dtest=GuardaDeIdempotenciaTest
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in Idempotency-Key na API de transferências
+[INFO] BUILD SUCCESS
+```
+
+Num controlador Spring MVC, a ligação ficaria mais ou menos assim (esboço; a parte testada é a guarda):
+
+```java
+@PostMapping("/transferencias")
+ResponseEntity<String> transferir(@RequestHeader(name = "Idempotency-Key", required = false) String chave,
+                                  @RequestBody String corpo, Principal cliente) {
+    RespostaHttp resposta = guarda.executar(cliente.getName(), chave, corpo,
+        () -> servicoDeTransferencias.criar(cliente.getName(), corpo));
+    return ResponseEntity.status(resposta.status()).body(resposta.corpo());
+}
+```
+
+**E a requisição concorrente?** Se o aplicativo dispara a repetição enquanto a primeira ainda está em andamento, a segunda requisição fica esperando no `INSERT`, exatamente como as réplicas do passo 4, e recebe a resposta guardada quando a primeira confirma. Isso só funciona porque a operação inteira cabe numa transação do mesmo banco. Quando a operação chama um sistema externo (o SPI do Banco Central, um gateway de cartão), ela não cabe: aí a guarda faz duas transações (reserva a chave com estado `EM_ANDAMENTO` e confirma; chama o externo; grava a resposta), e a requisição que encontra a chave em andamento recebe **409**, também como recomenda o rascunho. Nesse desenho, a chave precisa ser repassada ao sistema externo, para que ele também deduplique: idempotência é uma corrente, e ela quebra no primeiro elo que não a propaga.
+
+### Passo 7: janela, limpeza e a ligação com o broker
+
+**O que vamos fazer e por quê.** A inbox cresce uma linha por mensagem, para sempre, se ninguém apagar. A classe de limpeza apaga o que é mais antigo que a janela:
+
+<CodigoJava caminho="m12-mensageria/aulas/src/main/java/dev/trilhajava/m12/aulas/idempotencia/LimpezaDaDeduplicacao.java" semImports />
+
+A janela **não** é um número escolhido no chute. Ela precisa ser maior que o maior intervalo entre a primeira entrega de uma mensagem e a última vez que ela ainda pode chegar:
+
+| Origem da duplicata | Até quando ela chega | Exemplo |
+|---|---|---|
+| reentrega por queda ou rebalanceamento | segundos a minutos | o tempo de um deploy |
+| retry com backoff | minutos a horas | a política da próxima aula |
+| DLQ reprocessada | o tempo que a mensagem fica na DLQ até alguém reenviar | dias, se o reenvio é manual |
+| relay da outbox parado e retomado | o tempo de indisponibilidade do relay | horas |
+| replay por reset de offset | a retenção do tópico | 7 dias é o padrão do Kafka (`retention.ms`) |
+
+Para o cashback, uma janela de 14 dias cobre a retenção de 7 dias com folga para uma DLQ esquecida num feriado. A limpeza roda uma vez por dia (um `@Scheduled`, ou um job do Kubernetes) e apaga em lotes, para não segurar bloqueios por muito tempo. Em volume alto, a seção de decisões mostra uma alternativa melhor que o `DELETE`.
+
+E a ligação com o broker, num serviço Spring Boot com Spring Kafka, é só delegar:
+
+```java
+@KafkaListener(topics = "compras.cashback-concedido", groupId = "carteira")
+void aoConcederCashback(CashbackConcedido evento) {
+    consumidor.processar(evento);   // DUPLICADO também é sucesso: o offset é confirmado
+}
+```
+
+O detalhe importante está no comentário: `DUPLICADO` é um resultado **normal**, e o listener retorna sem exceção, para que o offset seja confirmado. No modo de confirmação padrão do Spring Kafka, o offset do lote é confirmado depois que o listener processa os registros sem lançar. Um consumidor que lança exceção ao detectar duplicata transforma uma duplicata inofensiva num loop de retries e, depois, numa mensagem na DLQ.
+
+Por fim, a suíte inteira desta aula:
+
+```bash
+mvn test "-Dtest=dev.trilhajava.m12.aulas.idempotencia.*Test"
+```
+
+```text
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.548 s -- in Consumidor de cashback
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.033 s -- in Corrida entre réplicas
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in Idempotency-Key na API de transferências
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in Projeção de nível (idempotência natural com versão)
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Os tempos variam de máquina para máquina. No terminal do Windows, os acentos dos nomes dos testes podem aparecer trocados por `�`: é só a codificação do console.
+
+## Reprocessamento e replay sem medo
+
+Um dia você vai precisar reprocessar: um bug no consumidor gravou o valor errado durante seis horas, uma projeção nova precisa ser montada desde o começo, a DLQ acumulou 3.000 mensagens durante uma queda do banco. Com consumidores idempotentes, o replay deixa de ser uma operação de risco. Mas há quatro cuidados.
+
+**1. Saiba qual barreira vai segurar cada mensagem.** Ao voltar o offset do grupo `carteira` para ontem (com `kafka-consumer-groups.sh --reset-offsets --to-datetime`, com o grupo parado), as mensagens de ontem ainda estão na inbox, e todas viram `DUPLICADO`. Isso é o que você quer para "reentregar sem medo", e **não** é o que você quer para "corrigir o bug de ontem": a correção não seria aplicada a nada. Replay para corrigir dados exige que a inbox **não** barre as mensagens: um consumidor novo, com outro nome em `consumidor` (`cashback-correcao-0612`), aplicando um efeito que seja idempotente por si só (recalcular e gravar o saldo correto, e não somar de novo).
+
+**2. Replay além da janela.** Se a janela é de 14 dias e o replay é de 30, as marcas dos primeiros 16 dias já foram apagadas. Para essas mensagens, a única proteção é a chave de negócio (`uk_lancamento_compra`). É por isso que a chave de negócio é a última linha de defesa: ela não expira.
+
+**3. Efeitos externos durante o replay.** O banco é protegido pela inbox; o push "você ganhou R$ 12,50" não. Um consumidor reprocessando 30 dias de eventos pela chave de negócio devolve `DUPLICADO` e não notifica, mas um consumidor de correção que recalcula saldos **não** deve notificar ninguém. Um modo de replay explícito (um consumidor separado, sem `Notificador`, ou um `Notificador` nulo injetado só nele) é mais seguro que um `if` espalhado pelo código.
+
+**4. Ordem e versão.** Um replay reaplica eventos antigos. Projeções com versão (passo 5) ignoram tudo o que for mais velho que o estado atual, o que é ótimo para repetir e ruim para reconstruir. Para reconstruir uma projeção do zero, crie a tabela nova vazia, reprocesse do início, compare e só então troque a leitura para ela.
+
+## Quando dá errado
+
+As mensagens abaixo foram geradas de verdade, quebrando o código de propósito e rodando no H2 deste módulo. As do PostgreSQL estão indicadas.
+
+### Sem deduplicação: o saldo errado
+
+Num teste descartável (`ExperimentoTmpTest`, que não ficou no repositório), com o consumidor reduzido a `UPDATE conta SET saldo = saldo + 12.50` e duas entregas da mesma mensagem, a asserção de saldo falha assim:
+
+```text
+[ERROR] ExperimentoTmpTest.semDedup -- Time elapsed: 0.022 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+expected: 112.50
+ but was: 125.00
+```
+
+**Como ler:** o efeito aconteceu duas vezes. Em produção ninguém vê esta mensagem; vê o relatório do financeiro na segunda-feira. **Como corrigir:** inbox com chave única na mesma transação (passo 2), ou transformar o evento em estado (passo 5).
+
+### Verificar e depois gravar: exceções na corrida
+
+No mesmo teste descartável, com a versão "SELECT, se não existe, aplica e INSERT" e oito threads, uma execução real imprimiu isto (`R:` é um resultado, `E:` uma exceção; uma linha por thread, mensagem encurtada):
+
+```text
+R: PROCESSADO
+E: org.springframework.dao.DuplicateKeyException: PreparedStatementCallback; SQL [INSERT INTO mensagem_processada VALUES ('cashback','EVT-3', CURRENT_TIMESTAMP)]; Unique index or primary key violation: "public.CONSTRAINT_C INDEX public.PRIMARY_KEY_C ON public.mensagem_processada(consumidor, mensagem_id) VALUES ( /* key:1 */ 'cashback', 'EVT-3')"; SQL statement: ...
+(mais seis linhas iguais)
+SALDO 5.00
+```
+
+**Como ler:** as oito threads passaram pelo `SELECT` ao mesmo tempo e viram "não processada". As oito somaram o saldo. A que inseriu a marca primeiro confirmou; as outras sete bateram na chave primária, e o rollback desfez o incremento delas. O saldo ficou certo **por acaso**: só porque a marca estava na mesma transação do efeito. Mesmo assim, sete réplicas lançaram exceção, e no mundo real cada uma iria para retry e, quem sabe, para a DLQ. Se a marca estivesse numa transação separada, ou se o efeito fosse um e-mail, o resultado seria efeito em dobro. **Como corrigir:** trocar o par `SELECT` + `INSERT` por um `INSERT ... ON CONFLICT DO NOTHING` e decidir pelo número de linhas.
+
+### Chave estrangeira: o efeito falhou depois da marca
+
+```text
+org.springframework.dao.DataIntegrityViolationException: PreparedStatementCallback; SQL [INSERT INTO lancamento (conta_id, compra_id, valor)
+VALUES (?, ?, ?)
+ON CONFLICT DO NOTHING]; Referential integrity constraint violation: "CONSTRAINT_69: public.lancamento FOREIGN KEY(conta_id) REFERENCES public.conta(id) ('CT-BRUNO')"; SQL statement:
+```
+
+**Como ler:** é o passo 3. A mensagem é "boa" (não é veneno), só chegou cedo demais. **Como corrigir:** nada no consumidor, desde que marca e efeito estejam na mesma transação. Deixe a exceção subir, e o retry com backoff da próxima aula reentrega depois que `ContaAberta` for processado. Se a marca estivesse numa transação própria, este erro faria o crédito sumir.
+
+### PostgreSQL: transação abortada depois do catch
+
+Esta não foi gerada aqui (o Docker desta máquina não sobe o PostgreSQL); são as mensagens que o PostgreSQL produz quando o código captura a violação de chave e tenta continuar na mesma transação:
+
+```text
+ERROR: duplicate key value violates unique constraint "mensagem_processada_pkey"
+ERROR: current transaction is aborted, commands ignored until end of transaction block
+```
+
+**Como ler:** a primeira é a violação que o `catch` engoliu; a segunda vem no comando **seguinte**, e costuma confundir porque aponta para uma linha que não tem nada de errado. **Como corrigir:** `ON CONFLICT DO NOTHING`. Se for impossível (outro banco, outra API), use um *savepoint* em volta do `INSERT`, com o custo de uma ida extra ao banco.
+
+## Armadilhas e quando NÃO usar
+
+<Callout tipo="erro" titulo="Deduplicação em memória">
+Um `Set` ou um cache Caffeine com os ids já vistos funciona no seu notebook e falha em produção: cada réplica tem a sua memória, um restart esquece tudo, e o rebalanceamento entrega justamente para **outra** réplica. A marca precisa estar num armazenamento compartilhado, e no **mesmo** em que o efeito é gravado.
+</Callout>
+
+- **Inbox num armazenamento, efeito em outro.** Marcar no Redis (`SET NX`) e creditar no PostgreSQL parece rápido, mas não há transação entre os dois. Ou você marca primeiro e pode perder o efeito, ou aplica primeiro e pode duplicar. Redis serve para deduplicação **otimista** de efeitos baratos e tolerantes (não reenviar o mesmo push em 10 minutos), nunca para dinheiro.
+- **A chave errada.** Offset, delivery tag, id gerado ao receber, horário de chegada: todos identificam a entrega, e não a mensagem. O sintoma é a inbox crescer normalmente e as duplicatas passarem mesmo assim.
+- **Tratar `DUPLICADO` como erro.** Lançar exceção, logar como `ERROR`, mandar para a DLQ. Duplicata é o caso normal do contrato; registre uma métrica e siga.
+- **Efeito externo dentro da transação.** E-mail, push, chamada HTTP antes do commit: se o commit falhar, o efeito já saiu; se a mensagem voltar, sai de novo. Use `afterCommit`, um `@TransactionalEventListener` (a fase padrão é `AFTER_COMMIT`) ou, se o efeito não pode ser perdido, mais um evento na outbox.
+- ***Fingerprint* frágil.** Hash do JSON bruto muda se o cliente reordenar campos ou trocar espaços. Para APIs públicas, calcule o hash sobre os campos relevantes, normalizados; para clientes seus, o corpo bruto costuma bastar.
+- **Chave de idempotência gerada pelo servidor.** Se a API devolve a chave na primeira resposta, e a primeira resposta é justamente o que se perdeu, o cliente nunca a recebe. Quem gera a chave é o **cliente**, antes da primeira tentativa.
+
+**Quando NÃO usar uma inbox:**
+
+- O evento carrega estado e tem versão: a projeção com versão (passo 5) é mais barata e não cresce.
+- O efeito já tem uma chave de negócio única e é a única coisa que o consumidor faz: o `UNIQUE (compra_id)` sozinho já resolve; a inbox vira redundância. Mantenha-a só se ela for o padrão do time e o custo for irrelevante.
+- O efeito tolera duplicata: métricas aproximadas, cache invalidado ("apague a chave X" é idempotente por natureza), telemetria.
+- O fluxo é inteiramente Kafka para Kafka: o *exactly-once* do Kafka Streams (ou das transações do produtor com `read_committed` no consumidor) resolve dentro do Kafka, sem tabela.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+### O exactly-once que existe, e o que não existe
+
+Em entrevista e em revisão de arquitetura, alguém vai dizer "vamos ligar o exactly-once do Kafka". Saiba exatamente o que ele cobre. O **produtor idempotente** (habilitado por padrão no Kafka 4, com `acks=all`) garante que um reenvio do produtor não grava duas cópias no log. As **transações** (`transactional.id` no produtor, `isolation.level=read_committed` no consumidor) garantem que, num fluxo ler-processar-escrever **dentro do Kafka**, a saída e o offset do consumidor são confirmados juntos. É o que o Kafka Streams usa com `processing.guarantee=exactly_once_v2`.
+
+O limite é o nome: **dentro do Kafka**. O banco da carteira, o push, a API do parceiro estão fora da transação do Kafka. Para eles, o *exactly-once* de ponta a ponta é **entrega pelo menos uma vez + efeito idempotente**. Um time que liga as transações do Kafka achando que resolveu o banco paga a latência e a complexidade operacional das transações e continua duplicando créditos.
+
+### Custo e operação da inbox
+
+Faça a conta antes de propor. Um consumidor com 2.000 mensagens por segundo e janela de 14 dias guarda 2.000 × 86.400 × 14 ≈ **2,4 bilhões** de linhas. Com cerca de 100 bytes por linha mais o índice da chave primária, são centenas de gigabytes, e um `DELETE` diário de 170 milhões de linhas gera *bloat*, pressão no autovacuum e réplicas atrasadas.
+
+Opções, da mais simples para a mais robusta:
+
+- **Volume baixo (até algumas centenas por segundo):** `DELETE` em lotes, por índice em `processada_em`, de madrugada. Simples e suficiente.
+- **Volume alto:** particionar `mensagem_processada` por dia (particionamento declarativo do PostgreSQL) e, em vez de `DELETE`, **descartar a partição** inteira (`DROP TABLE` da partição), que é instantâneo e não gera *bloat*. O custo: a chave primária de uma tabela particionada precisa incluir a coluna de partição, então a unicidade passa a valer **por dia**. Uma duplicata que chegue no dia seguinte não colide. A solução usual é derivar o dia do **evento** (o momento em que ele foi criado, que viaja na mensagem), e não do momento do processamento, para que todas as entregas da mesma mensagem caiam na mesma partição.
+- **Volume altíssimo, efeito simples:** troque a inbox pela chave de negócio ou por idempotência natural, e a tabela some.
+
+Cada marca custa um `INSERT` com índice na transação do consumidor: em geral, uma fração de milissegundo, e quase sempre irrelevante perto do efeito. Se a inbox virar gargalo, o problema costuma ser a chave (UUID aleatório espalha as inserções pelo índice; um UUID v7, ordenado por tempo, é mais amigável à árvore B).
+
+### Onde a garantia mora
+
+A regra que resume a aula: **a garantia de unicidade mora numa restrição do banco, no mesmo banco do efeito**. Código Java (um `if`, um `synchronized`, um lock distribuído) só ajuda a não chegar à restrição; não substitui. Um `synchronized` protege uma JVM, não oito réplicas. Um lock distribuído (Redis, ZooKeeper) tem prazo de expiração, e uma pausa de *garbage collection* maior que o prazo faz dois donos do mesmo lock. A chave primária não expira nem sofre pausa.
+
+Quando o efeito está em **outro sistema** (o gateway de pagamento, o serviço de notificações de outro time), a garantia precisa ser propagada: envie a sua chave de idempotência como `Idempotency-Key` para ele. Se o sistema externo não aceita nenhuma chave, você não tem *exactly-once* com ele, e precisa de reconciliação: um processo que compara periodicamente o que você pediu com o que ele fez e corrige as diferenças. Diga isso explicitamente no desenho; é melhor que prometer uma garantia que não existe.
+
+### Observabilidade
+
+Meça a taxa de duplicatas por consumidor (um contador com o resultado `PROCESSADO`, `DUPLICADO` ou `IGNORADO`). Em regime normal, ela fica perto de zero; picos coincidem com deploys e rebalanceamentos. Um pico **fora** desses momentos é sintoma: um produtor republicando em loop, um consumidor ultrapassando o `max.poll.interval.ms` a cada lote (e sendo expulso do grupo), um relay da outbox que não consegue marcar. A taxa de duplicatas é um dos sinais mais baratos de que algo está errado na cadeia de mensageria.
+
+### Segurança
+
+- O escopo da `Idempotency-Key` é o cliente autenticado (a chave primária do passo 6). Sem isso, a resposta guardada vaza entre clientes.
+- Limite o tamanho da chave (o rascunho da IETF sugere UUID) e a quantidade de chaves por cliente, para que a tabela não vire vetor de abuso.
+- Guarde na resposta só o que o cliente já poderia ver. A resposta guardada é um dado sensível com prazo; inclua-a na política de retenção, e na LGPD, se tiver dados pessoais.
+- Publique a política de expiração (o rascunho recomenda): o cliente precisa saber que a mesma chave, depois de 24 horas, executa de novo.
+
+### Como justificar para o time e quando trocar
+
+A proposta para o time cabe em três frases: "o broker entrega pelo menos uma vez, e a gente já teve duplicatas (mostre a métrica ou o incidente); a inbox custa um `INSERT` por mensagem e uma limpeza diária; sem ela, cada duplicata vira um efeito em dobro que só aparece na conciliação". Para eventos de estado, proponha versão no lugar da inbox: é mais barato e resolve a ordem de quebra.
+
+Troque de abordagem quando: o volume tornar a inbox cara (vá para chave de negócio ou idempotência natural); o fluxo for todo Kafka para Kafka (Kafka Streams com *exactly-once*); o domínio pedir histórico completo e ordem forte (*event sourcing* com versão esperada no agregado, em que a própria tabela de eventos tem `UNIQUE (agregado_id, versao)` e a duplicata é rejeitada na escrita).
+
+<Callout tipo="entrevista">
+"Como você garante que um pagamento (ou crédito) não é processado duas vezes?" é pergunta certa para Pleno e Sênior em vaga com mensageria. Uma boa resposta tem estes pontos, nesta ordem:
+
+1. **A entrega é pelo menos uma vez**, então duplicatas vão acontecer: queda antes do ack, rebalanceamento, retry, outbox, replay.
+2. **Chave de idempotência** que identifica a mensagem lógica (o id do evento) e, quando existe, a chave de negócio como última defesa; nunca o offset.
+3. **Tabela inbox com chave única na mesma transação do efeito**, com `INSERT ... ON CONFLICT DO NOTHING` e decisão pelo número de linhas; sem `SELECT` antes e sem `catch` de chave duplicada.
+4. **Idempotência natural** quando o evento carrega estado, com versão para descartar atrasados.
+5. **Efeitos externos depois do commit** (ou pela outbox), e a chave propagada para sistemas externos.
+6. **Janela de deduplicação** maior que retenção + DLQ + replay, com limpeza (partições em volume alto).
+
+Perguntas de aprofundamento comuns: "e o exactly-once do Kafka?" (vale dentro do Kafka; fora, idempotência), "e se duas réplicas pegarem ao mesmo tempo?" (a chave primária serializa; a segunda insere zero linhas), "como você faz um replay para corrigir dados se a inbox barra tudo?" (consumidor com outro nome e efeito idempotente por si só), "e numa API HTTP?" (`Idempotency-Key` com escopo por cliente, *fingerprint*, 422 e 409).
+</Callout>
+
+## Checkpoint
+
+O time de fidelidade descobriu que, durante 3 dias, o serviço de compras calculou o cashback com a alíquota errada: 1% em vez de 2%. O serviço de compras já foi corrigido e vai **republicar** os eventos `CashbackConcedido` das compras afetadas, com o valor correto e **novos** `eventoId`. O tópico tem retenção de 7 dias, e a janela da inbox é de 14 dias.
+
+**O desafio:** com o `ConsumidorDeCashback` desta aula, o que acontece com cada evento republicado? O cliente recebe a diferença? Proponha uma correção que credite exatamente a diferença, uma vez, mesmo que a republicação aconteça duas vezes, e diga qual chave de idempotência ela usa.
+
+<details>
+<summary>Ver uma solução</summary>
+
+**O que acontece hoje.** Cada evento republicado tem `eventoId` novo, então passa pela inbox. Mas o lançamento tem `UNIQUE (compra_id)`, e a compra já tem um lançamento (o de 1%). O `INSERT` do lançamento insere zero linhas, e o consumidor devolve `DUPLICADO`. **Ninguém recebe a diferença.** A chave de negócio fez o trabalho dela (impediu um segundo cashback para a mesma compra), e é justamente por isso que uma correção não pode ser "mais um `CashbackConcedido`".
+
+**Correção 1: um evento de ajuste, com chave de negócio própria.** O serviço de compras publica `CashbackAjustado(eventoId, contaId, compraId, valorAnterior, valorCorreto)`. Um consumidor novo (`consumidor = 'cashback-ajuste'`) grava um lançamento de ajuste com `UNIQUE (compra_id, tipo)`, por exemplo numa coluna `tipo` com `CASHBACK` e `AJUSTE`, e soma `valorCorreto − valorAnterior` ao saldo. A chave de idempotência é **a compra mais o tipo de lançamento**: a segunda republicação insere zero linhas no ajuste e devolve `DUPLICADO`. É a solução mais explícita, e deixa no extrato um lançamento "ajuste de cashback" que o cliente e a auditoria entendem.
+
+**Correção 2: tornar o lançamento um estado.** O consumidor passa a tratar o cashback de uma compra como estado: `INSERT ... ON CONFLICT (compra_id) DO UPDATE SET valor = EXCLUDED.valor WHERE lancamento.valor <> EXCLUDED.valor`, e ajusta o saldo pela diferença na mesma transação. É idempotência natural (gravar o valor correto duas vezes dá no mesmo), mas exige ler o valor anterior para calcular a diferença do saldo, e perde o histórico do valor errado no extrato.
+
+**Por que a janela não importa aqui.** A republicação acontece dentro dos 7 dias de retenção, mas isso é irrelevante: a barreira que decide é a chave de negócio, que não expira. Se a correção fosse feita por reset de offset (mesmos `eventoId`), a inbox barraria tudo como `DUPLICADO`, e o reset não corrigiria nada.
+
+A correção 1 é a que a maioria dos times financeiros escolhe: efeitos corretivos explícitos, cada um com a sua chave, e nenhum dado reescrito.
+
+</details>
+
+<Quiz
+  id="12-idempotencia"
+  questoes={[
+    {
+      pergunta: 'Qual destas escolhas de chave de idempotência pega também o mesmo fato republicado com outro id de evento?',
+      opcoes: ['O offset do Kafka', 'Um UUID gerado no listener ao receber', 'A chave de negócio, como o id da compra que gerou o cashback', 'O horário de chegada da mensagem'],
+      correta: 2,
+      explicacao: 'O id do evento pega reentregas da mesma mensagem. A chave de negócio identifica o fato, então pega também a republicação com id novo. Offset, UUID gerado ao receber e horário identificam a entrega, e não servem.',
+    },
+    {
+      pergunta: 'Oito réplicas recebem o mesmo evento ao mesmo tempo. O consumidor faz `INSERT ... ON CONFLICT DO NOTHING` na inbox, na mesma transação do efeito. O que acontece?',
+      opcoes: ['As oito aplicam o efeito e sete lançam exceção', 'Uma insere e aplica; as outras esperam o bloqueio da chave e, depois do commit, inserem zero linhas, sem exceção', 'O banco escolhe uma aleatoriamente e descarta as outras mensagens do broker', 'Todas falham por deadlock'],
+      correta: 1,
+      explicacao: 'A chave primária serializa as inserções da mesma chave. A primeira confirma; as demais veem a linha e inserem zero linhas. É o que o teste com oito threads mostrou.',
+    },
+    {
+      pergunta: 'O efeito falhou (violação de chave estrangeira) depois de a marca ser inserida, na mesma transação. O que deve acontecer?',
+      opcoes: ['A marca fica, para a mensagem não ser reprocessada', 'O rollback desfaz a marca e o efeito, e a reentrega processa normalmente', 'A mensagem vai direto para a DLQ, sem retry', 'O consumidor captura a exceção e devolve DUPLICADO'],
+      correta: 1,
+      explicacao: 'Marca e efeito na mesma transação: ou existem os dois, ou nenhum. Se a marca sobrevivesse, a reentrega seria descartada como duplicata e o efeito se perderia.',
+    },
+    {
+      pergunta: 'Uma API recebe `POST /transferencias` com uma Idempotency-Key já usada, mas com outro valor no corpo. O que devolver?',
+      opcoes: ['A resposta guardada da primeira requisição', 'Executar a nova transferência normalmente', '422, porque a chave foi reaproveitada para outra operação', '500'],
+      correta: 2,
+      explicacao: 'O fingerprint (hash do corpo) é diferente: é erro do cliente. O rascunho da IETF recomenda 422. Com o mesmo corpo, devolve-se a resposta guardada; com a primeira ainda em andamento, 409.',
+    },
+    {
+      pergunta: 'A retenção do tópico é 7 dias e a DLQ pode ficar até 5 dias sem reenvio. Qual janela de deduplicação faz sentido?',
+      opcoes: ['1 hora, porque reentregas acontecem em segundos', '7 dias, igual à retenção', 'Algo acima de 12 dias, por exemplo 14, somando retenção, DLQ e folga', 'Para sempre, sem limpeza'],
+      correta: 2,
+      explicacao: 'A janela precisa cobrir o maior intervalo em que uma duplicata ainda pode chegar. Guardar para sempre faz a tabela crescer sem limite; uma janela curta deixa passar replays e reenvios da DLQ.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Entrega **pelo menos uma vez** significa duplicatas de verdade: queda antes do ack, rebalanceamento, retry, relay da outbox, produtor que reenvia, replay. O *exactly-once* é do **efeito**, e se consegue com consumidor idempotente.
+- A chave identifica a **mensagem lógica** (id do evento) e, quando existe, o **fato** (chave de negócio, que não expira). Nunca o offset nem um id gerado ao receber.
+- Inbox com chave primária `(consumidor, mensagem_id)`, `INSERT ... ON CONFLICT DO NOTHING` e decisão pelo número de linhas, **na mesma transação** do efeito. Sem `SELECT` antes, sem `catch` de chave duplicada.
+- Uma operação não idempotente (incremento) fica segura atrás de uma idempotente na mesma transação. Eventos de **estado** dispensam a inbox: gravar o estado com versão é idempotência natural.
+- Efeitos externos depois do commit (`afterCommit`, `@TransactionalEventListener`) ou pela outbox; e a chave propagada para sistemas externos.
+- Em APIs HTTP, `Idempotency-Key` gerada pelo cliente, com escopo por cliente e *fingerprint*: repetição recebe a mesma resposta; outro corpo, 422; em andamento, 409.
+- A janela de deduplicação cobre retenção + DLQ + replay; em volume alto, partições descartadas em vez de `DELETE`. Replay para **corrigir** exige outro consumidor ou um evento de ajuste.
+
+## Próximo passo
+
+Nesta aula, a falha de chave estrangeira subiu como exceção e "o retry resolve depois". Na [próxima aula, Retry e DLQ](../../12-mensageria/06-retry-e-dlq/), você vai configurar esse retry de verdade no Spring Kafka: backoff exponencial, quais exceções merecem nova tentativa e quais vão direto para o tópico de mensagens mortas, e como reprocessar a DLQ com segurança, agora que o consumidor aguenta a repetição. Antes, pratique no [exercício 12.04, Consumidor idempotente de pagamentos](../../../exercicios/12-mensageria/04-consumidor-idempotente/): eventos duplicados **e** fora de ordem, oito cópias simultâneas e notificação só depois do commit, contra um PostgreSQL real.
+
+## Referências
+
+- [PostgreSQL 18: INSERT (cláusula ON CONFLICT)](https://www.postgresql.org/docs/18/sql-insert.html)
+- [PostgreSQL 18: MERGE](https://www.postgresql.org/docs/18/sql-merge.html)
+- [PostgreSQL 18: particionamento de tabelas](https://www.postgresql.org/docs/18/ddl-partitioning.html)
+- [Spring Framework: Transaction-bound Events](https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html)
+- [Spring Framework: JdbcClient](https://docs.spring.io/spring-framework/reference/data-access/jdbc/core.html#jdbc-JdbcClient)
+- [Spring for Apache Kafka: Committing Offsets](https://docs.spring.io/spring-kafka/reference/kafka/receiving-messages/message-listener-container.html#committing-offsets)
+- [Apache Kafka: Message Delivery Semantics](https://kafka.apache.org/documentation/#semantics)
+- [Apache Kafka: configurações do produtor (enable.idempotence)](https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence)
+- [IETF: The Idempotency-Key HTTP Header Field (draft-ietf-httpapi-idempotency-key-header)](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+- [RFC 9110: HTTP Semantics, métodos idempotentes](https://www.rfc-editor.org/rfc/rfc9110#name-idempotent-methods)

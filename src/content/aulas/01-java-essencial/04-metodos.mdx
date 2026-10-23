@@ -1,0 +1,238 @@
+---
+titulo: Métodos pequenos, nomes claros
+descricao: Assinatura, parâmetros e retorno, passagem por valor (inclusive de referências), sobrecarga, static, escopo e como escrever métodos que se explicam sozinhos.
+modulo: 01-java-essencial
+ordem: 4
+duracao: 50
+objetivos:
+  - Declarar métodos com assinaturas claras e responsabilidade única
+  - Explicar por que Java sempre passa parâmetros por valor
+  - Usar sobrecarga e métodos static com critério
+  - Refatorar um método longo em métodos menores
+tags: [métodos, static, clean code]
+flashcards:
+  - frente: Java passa parâmetros por valor ou por referência?
+    verso: Sempre por valor. Para objetos, o valor copiado é a referência — por isso dá para alterar o objeto, mas não fazer a variável de fora apontar para outro.
+  - frente: O que define a assinatura de um método?
+    verso: O nome e a lista de tipos dos parâmetros. O tipo de retorno não faz parte da assinatura para fins de sobrecarga.
+  - frente: O que é sobrecarga (overload)?
+    verso: Vários métodos com o mesmo nome e parâmetros diferentes na mesma classe, resolvidos em tempo de compilação.
+  - frente: Quando um método deve ser static?
+    verso: Quando não depende do estado de um objeto — funções utilitárias puras, como Math.max ou os validadores dos exercícios.
+  - frente: O que é uma função pura?
+    verso: Uma função cujo resultado depende só dos parâmetros e que não tem efeitos colaterais (não altera estado externo, não faz I/O).
+---
+
+Um método é uma **unidade de comportamento com nome**. Um bom método faz uma coisa só, tem um nome que diz o quê, e pode ser entendido sem ler o resto do código. Isso parece estética, mas é engenharia: código é lido dez vezes mais do que é escrito, e quem lê é o seu time (e você mesmo, daqui a seis meses).
+
+## Anatomia
+
+```java
+public static BigDecimal calcularParcela(BigDecimal total, int parcelas) {
+    return total.divide(BigDecimal.valueOf(parcelas), 2, RoundingMode.HALF_EVEN);
+}
+```
+
+| Parte | Neste exemplo |
+|---|---|
+| Modificador de acesso | `public` (quem pode chamar) |
+| `static` | pertence à classe, não a um objeto |
+| Tipo de retorno | `BigDecimal` (ou `void`, se não devolve nada) |
+| Nome | `calcularParcela` — verbo no infinitivo, em *camelCase* |
+| Parâmetros | `(BigDecimal total, int parcelas)` |
+| Corpo | entre chaves |
+
+A **assinatura** é o nome junto com os tipos dos parâmetros: `calcularParcela(BigDecimal, int)`.
+
+## Nomes que se explicam
+
+<Comparar antes="Obscuro" depois="Claro">
+```java
+double calc(double v, int t) { ... }
+boolean check(String s) { ... }
+void process(List<Pedido> l) { ... }
+```
+
+```java
+BigDecimal aplicarJurosCompostos(BigDecimal valor, int meses) { ... }
+boolean ehCpfValido(String cpf) { ... }
+void notificarPedidosAtrasados(List<Pedido> pedidos) { ... }
+```
+</Comparar>
+
+Convenções que o mercado segue:
+
+- Métodos são **verbos** (`calcular`, `buscar`, `enviar`). Métodos que devolvem `boolean` costumam começar com `eh`/`is`, `tem`/`has`, `pode`/`can`.
+- Nada de abreviações que só você entende. O nome longo e claro ganha do curto e ambíguo.
+- Se o nome precisa de "e" (`validarESalvar`), o método provavelmente faz duas coisas.
+
+## Parâmetros: sempre por valor
+
+Esta é uma das perguntas mais clássicas de entrevista Java. A resposta curta: **Java sempre passa por valor**. A longa é o que confunde:
+
+```java
+void zerar(int numero) {
+    numero = 0;              // altera a CÓPIA
+}
+
+int saldo = 100;
+zerar(saldo);
+System.out.println(saldo);   // 100
+```
+
+Com objetos, o "valor" copiado é a **referência** (o "endereço" do objeto). As duas variáveis apontam para o **mesmo objeto**:
+
+```java
+void adicionarItem(List<String> itens) {
+    itens.add("brinde");     // altera o objeto apontado: visível lá fora
+    itens = new ArrayList<>(); // troca só a cópia da referência: invisível lá fora
+}
+
+List<String> carrinho = new ArrayList<>(List.of("café"));
+adicionarItem(carrinho);
+System.out.println(carrinho); // [café, brinde]
+```
+
+<Figura legenda="A referência é copiada; o objeto não">
+<svg viewBox="0 0 620 170" width="620" role="img" aria-label="Duas variáveis, carrinho (fora do método) e itens (parâmetro), apontam para o mesmo objeto ArrayList">
+  <defs><marker id="s5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="25" width="170" height="50" rx="10" class="d-info"/>
+  <text x="105" y="56" text-anchor="middle" class="d-mono">carrinho ●</text>
+  <rect x="20" y="100" width="170" height="50" rx="10" class="d-violet"/>
+  <text x="105" y="131" text-anchor="middle" class="d-mono">itens (cópia) ●</text>
+  <rect x="360" y="55" width="240" height="64" rx="12" class="d-accent"/>
+  <text x="480" y="84" text-anchor="middle" class="d-title">ArrayList</text>
+  <text x="480" y="104" text-anchor="middle" class="d-mono">["café", "brinde"]</text>
+  <path d="M170 50 C260 50, 280 80, 356 84" class="d-line" marker-end="url(#s5)"/>
+  <path d="M185 125 C260 125, 280 100, 356 94" class="d-line" marker-end="url(#s5)"/>
+  <text x="270" y="160" text-anchor="middle" class="d-label">dois "ponteiros", um só objeto</text>
+</svg>
+</Figura>
+
+A consequência prática: **métodos podem modificar os objetos que recebem**. Isso é poderoso e perigoso. Por isso, no módulo 02, você vai aprender a proteger objetos com imutabilidade e cópias defensivas.
+
+## Retorno e efeitos colaterais
+
+Um método pode **devolver um resultado** ou **causar um efeito** (alterar um objeto, gravar no banco, enviar um e-mail). Os que só devolvem resultado, sem efeitos, são chamados de **funções puras**, e são os mais fáceis de testar e de entender:
+
+```java
+// Pura: mesmo input, mesmo output, nenhum efeito
+static BigDecimal comDesconto(BigDecimal preco, BigDecimal percentual) {
+    return preco.subtract(preco.multiply(percentual));
+}
+```
+
+Todos os exercícios do módulo 01 são funções puras. Não é coincidência: elas são o melhor lugar para começar a testar.
+
+<Callout tipo="atencao">
+Evite métodos que **fingem** ser consultas mas alteram estado, como um `getSaldo()` que também registra auditoria no banco. Quem lê o nome não espera o efeito colateral.
+</Callout>
+
+## Sobrecarga (overload)
+
+Vários métodos com o **mesmo nome** e **parâmetros diferentes**:
+
+```java
+static BigDecimal reais(String valor)  { return new BigDecimal(valor); }
+static BigDecimal reais(long centavos) { return BigDecimal.valueOf(centavos, 2); }
+
+reais("19.90");   // chama a versão String
+reais(1990L);     // chama a versão long
+```
+
+O compilador escolhe qual chamar **em tempo de compilação**, olhando os tipos dos argumentos. O tipo de retorno **não** diferencia sobrecargas. Use com moderação: duas sobrecargas que fazem coisas diferentes confundem.
+
+## `static` ou não?
+
+- Métodos **de instância** usam o estado do objeto (`conta.sacar(valor)` usa o saldo daquela conta).
+- Métodos **`static`** não dependem de nenhum objeto (`Math.max(a, b)`, `Integer.parseInt(s)`).
+
+Neste módulo, todos os exercícios usam `static` porque são funções puras sobre os parâmetros. A partir do módulo 02, o comportamento passa a viver **dentro dos objetos**, e `static` vira exceção.
+
+## Escopo de variáveis
+
+Uma variável existe do ponto em que é declarada até o fim do bloco (`{ }`) que a contém:
+
+```java
+for (int i = 0; i < 3; i++) {
+    String rotulo = "item " + i;
+}
+System.out.println(i);       // não compila: i não existe aqui
+```
+
+Declare variáveis **o mais perto possível de onde são usadas** e com o menor escopo possível. Menos coisas "vivas" ao mesmo tempo significa menos para manter na cabeça.
+
+## Refatorando um método longo
+
+Métodos longos misturam níveis de abstração. Veja uma rotina que valida e formata um telefone:
+
+<Comparar antes="Tudo junto" depois="Um nível por método">
+```java
+static String formatarTelefone(String t) {
+    if (t == null) throw new IllegalArgumentException();
+    String d = "";
+    for (char c : t.toCharArray())
+        if (Character.isDigit(c)) d += c;
+    if (d.length() != 10 && d.length() != 11)
+        throw new IllegalArgumentException();
+    if (d.length() == 11)
+        return "(" + d.substring(0,2) + ") "
+            + d.substring(2,7) + "-" + d.substring(7);
+    return "(" + d.substring(0,2) + ") "
+        + d.substring(2,6) + "-" + d.substring(6);
+}
+```
+
+```java
+static String formatarTelefone(String telefone) {
+    String digitos = somenteDigitos(telefone);
+    exigirTamanhoValido(digitos);
+    return ehCelular(digitos)
+            ? mascarar(digitos, 7)
+            : mascarar(digitos, 6);
+}
+
+static boolean ehCelular(String digitos) {
+    return digitos.length() == 11;
+}
+// somenteDigitos, exigirTamanhoValido, mascarar...
+```
+</Comparar>
+
+A versão da direita se lê como uma receita: limpa, valida e formata. Cada detalhe mora num método pequeno com nome próprio, que pode ser testado sozinho.
+
+<Callout tipo="entrevista">
+"Java passa por valor ou por referência?" — responda **"sempre por valor; no caso de objetos, o valor é a referência"** e dê o exemplo de `list.add` (visível fora) versus `list = new ArrayList<>()` (invisível fora). Essa resposta mostra que você entende o modelo de memória, não só decorou a frase.
+</Callout>
+
+<Quiz
+  id="01-metodos"
+  questoes={[
+    {
+      pergunta: 'Depois de `void m(StringBuilder sb) { sb.append("!"); sb = new StringBuilder("x"); }`, o que acontece com o StringBuilder original passado com "oi"?',
+      opcoes: ['Continua "oi"', 'Vira "oi!"', 'Vira "x"', 'Vira "x!"'],
+      correta: 1,
+      explicacao: 'O `append` age no objeto compartilhado ("oi!"). A reatribuição só troca a cópia local da referência.',
+    },
+    {
+      pergunta: 'Qual par de métodos NÃO é uma sobrecarga válida na mesma classe?',
+      opcoes: ['`int soma(int a, int b)` e `double soma(double a, double b)`', '`int soma(int a, int b)` e `long soma(int a, int b)`', '`void log(String m)` e `void log(String m, int nivel)`', '`void log(Object o)` e `void log(String s)`'],
+      correta: 1,
+      explicacao: 'Só o tipo de retorno difere; a assinatura (nome + tipos dos parâmetros) é idêntica. Não compila.',
+    },
+    {
+      pergunta: 'Qual é uma função pura?',
+      opcoes: ['Um método que salva o pedido no banco', '`static int dobro(int x) { return x * 2; }`', 'Um método que incrementa um contador global', 'Um método que lê um arquivo'],
+      correta: 1,
+      explicacao: 'O resultado depende só do parâmetro e não há efeitos colaterais.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Um método, uma responsabilidade, um nome que diz o quê.
+- Java **sempre passa por valor**; para objetos, o valor é a referência.
+- Prefira funções puras quando possível: são fáceis de testar.
+- Sobrecarga é resolvida na compilação; o retorno não diferencia sobrecargas.
+- Métodos longos viram vários métodos pequenos, cada um em um nível de abstração.

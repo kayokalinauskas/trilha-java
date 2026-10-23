@@ -1,0 +1,108 @@
+---
+titulo: Exceções no sistema de empréstimos da biblioteca
+codigo: "03.03"
+resumo: Projete uma hierarquia de exceções de negócio com códigos estáveis, regras de empréstimo e multa, e um importador de acervo com exceção checked, try-with-resources e política tudo-ou-nada.
+modulo: 03-colecoes-generics-excecoes
+ordem: 3
+dificuldade: medio
+tempo: 2–3h
+conceitos: [exceções, checked vs unchecked, try-with-resources, tradução de exceção, Map]
+aulas: [03-colecoes-generics-excecoes/05-excecoes]
+java:
+  modulo: m03-colecoes-generics-excecoes
+  teste: BibliotecaTest
+---
+
+## Contexto
+
+A rede de bibliotecas municipais vai expor uma API para o app de empréstimos. O time de front-end fez um pedido claro: **"quando algo der errado, precisamos de um código de erro estável para mostrar a mensagem certa"**. Hoje, o sistema lança `RuntimeException("erro")` para tudo, e o app mostra "Algo deu errado" até para "você já tem 3 livros emprestados".
+
+Além disso, o acervo é carregado de um CSV enviado pela equipe de catalogação, e um arquivo com uma linha quebrada já deixou o acervo **pela metade** em produção.
+
+## Requisitos
+
+### Hierarquia de exceções
+
+| Exceção | Código | Quando |
+|---|---|---|
+| `BibliotecaException` (abstrata) | — | Superclasse de todas as falhas de negócio; expõe `codigo()` |
+| `LivroNaoEncontradoException` | `LIVRO_NAO_ENCONTRADO` | ISBN não existe no acervo |
+| `LivroIndisponivelException` | `LIVRO_INDISPONIVEL` | Todos os exemplares emprestados |
+| `LimiteEmprestimosException` | `LIMITE_EMPRESTIMOS` | Usuário já tem 3 empréstimos ativos |
+| `UsuarioComAtrasoException` | `USUARIO_COM_ATRASO` | Usuário tem empréstimo vencido |
+| `EmprestimoNaoEncontradoException` | `EMPRESTIMO_NAO_ENCONTRADO` | Devolução de empréstimo inexistente ou já devolvido |
+| `ArquivoAcervoInvalidoException` | — (checked) | Problema no arquivo de importação; expõe `linha()` |
+
+### Regras de empréstimo (`Biblioteca`)
+
+- Prazo: **14 dias**. Limite: **3** empréstimos ativos por usuário.
+- Ordem das verificações em `emprestar`: livro existe → usuário sem atraso → limite → exemplar disponível.
+- Uma tentativa recusada **não altera nada** (nem estoque, nem empréstimos).
+- `devolver` devolve a **multa**: R$ 2,00 por dia de atraso, com teto de R$ 50,00.
+
+### Importação (`ImportadorAcervo`)
+
+Formato: `isbn;titulo;exemplares`, com cabeçalho na primeira linha e linhas em branco ignoradas.
+
+- **Tudo ou nada:** se qualquer linha for inválida, **nenhum** livro é cadastrado.
+- A mensagem de erro indica a linha: `"Linha 3: esperadas 3 colunas..."`, e `linha()` devolve 3.
+- `exemplares` não numérico: a `NumberFormatException` original é a **causa**.
+- `importar(Path)` abre o arquivo com **try-with-resources**; um `IOException` vira `ArquivoAcervoInvalidoException` **com a causa preservada**.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `BibliotecaTest` passam.
+- [ ] Todas as exceções de negócio herdam de `BibliotecaException`, que é abstrata.
+- [ ] As mensagens incluem o contexto (ISBN, usuário, limite).
+- [ ] Nenhum `catch` vazio e nenhuma exceção relançada sem a causa.
+- [ ] Você consegue justificar, em duas frases, por que `ArquivoAcervoInvalidoException` é checked e as outras não.
+
+## Desafios opcionais
+
+- **Fila de espera:** quando o livro estiver indisponível, o usuário entra em uma fila (`Deque`) e é notificado na devolução.
+- **Relatório de importação** com **todos** os erros do arquivo, e não só o primeiro. Pense em como a exceção carregaria uma lista de problemas.
+
+<Dicas>
+<Dica nivel={1}>
+Escreva primeiro a `BibliotecaException` abstrata com o campo `codigo` e um construtor `protected (String codigo, String mensagem)`. Cada exceção concreta vira uma classe de 5 linhas que chama `super("CODIGO", "mensagem com " + contexto)`.
+</Dica>
+<Dica nivel={2}>
+Na `Biblioteca`, três mapas resolvem o estado: acervo (`isbn → Livro`), disponíveis (`isbn → Integer`) e empréstimos ativos (`id → Emprestimo`). Faça **todas** as validações antes de mexer em qualquer mapa. Para a multa: `ChronoUnit.DAYS.between(prevista, devolucao)` e `multa.min(TETO)`.
+</Dica>
+<Dica nivel={3}>
+No importador, separe em duas fases: (1) ler e **validar** todas as linhas, guardando os resultados numa lista; (2) só então cadastrar. Para o arquivo: `try (Reader r = Files.newBufferedReader(arquivo)) { return importar(r); } catch (IOException e) { throw new ArquivoAcervoInvalidoException("...", 0, e); }`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A raiz da hierarquia
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/biblioteca/BibliotecaException.java" />
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/biblioteca/LimiteEmprestimosException.java" />
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/biblioteca/ArquivoAcervoInvalidoException.java" />
+
+### A biblioteca
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/biblioteca/Biblioteca.java" />
+
+### O importador
+
+<CodigoJava caminho="m03-colecoes-generics-excecoes/solucao/src/main/java/dev/trilhajava/m03/biblioteca/ImportadorAcervo.java" />
+
+### Decisões de design
+
+- **Unchecked para negócio, checked para arquivo.** Um livro indisponível é tratado no topo da aplicação (a API converte o código em uma resposta HTTP 409 ou 422). Já um arquivo inválido é uma situação esperada, em que quem chama tem uma ação clara: avisar o operador e pedir um arquivo corrigido. O compilador obrigar esse tratamento é uma vantagem.
+- **Validar tudo, depois mudar o estado.** Em `emprestar`, nenhum mapa é alterado antes de todas as regras passarem. No importador, a lista `linhas` é preenchida e validada por completo antes do primeiro `cadastrar`. É o mesmo princípio de atomicidade do exercício 02.01, e o mesmo que transações de banco garantem no módulo 09.
+- **Tradução de exceções.** `IOException` e `NumberFormatException` nunca escapam do importador: viram `ArquivoAcervoInvalidoException` com a **linha** e a **causa**. Quem usa o importador só precisa conhecer uma exceção.
+- **`catch (NumberFormatException)` antes de `catch (IllegalArgumentException)`.** A primeira é subclasse da segunda. Com a ordem invertida, o código nem compila.
+
+### Avalie sua solução
+
+- Você tem algum `catch (Exception e)`? Consegue trocá-lo por tipos específicos?
+- Na sua versão, um arquivo com erro na linha 50 deixa as 49 anteriores cadastradas?
+- Sua `LimiteEmprestimosException` diz **qual** é o limite e **qual** usuário?
+
+</Solucao>

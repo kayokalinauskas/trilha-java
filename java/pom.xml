@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Projeto de prática da Trilha Java Backend.
+
+  Estrutura de cada módulo da trilha:
+    mNN-nome/
+      testes/   → testes JUnit compartilhados (a "especificação executável")
+      starter/  → código inicial com stubs: é aqui que você trabalha
+      solucao/  → solução de referência (passa em todos os testes; roda no CI)
+
+  Comandos úteis:
+    mvn verify                          → compila e testa todas as SOLUÇÕES (o que o CI faz)
+    mvn -P starters test-compile        → garante que os starters compilam
+    cd m02-poo/starter && mvn test -Dtest=ContaCorrenteTest   → roda os testes de um exercício
+
+  Versão do Java: o alvo é o Java 25 (LTS). Se você ainda tem o JDK 21 instalado,
+  rode com -Djava.release=21 — o código dos módulos 00 a 03 é compatível.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.trilhajava</groupId>
+  <artifactId>trilha-java-parent</artifactId>
+  <version>2.0.0</version>
+  <packaging>pom</packaging>
+  <name>Trilha Java Backend :: exercícios</name>
+
+  <properties>
+    <java.release>25</java.release>
+    <maven.compiler.release>${java.release}</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <junit.version>6.1.3</junit.version>
+    <assertj.version>3.27.7</assertj.version>
+    <h2.version>2.5.252</h2.version>
+  </properties>
+
+  <modules>
+    <module>m00-comece-aqui/solucao</module>
+    <module>m01-java-essencial/solucao</module>
+    <module>m02-poo/solucao</module>
+    <module>m03-colecoes-generics-excecoes/solucao</module>
+    <module>m04-java-moderno/solucao</module>
+    <module>m05-algoritmos/solucao</module>
+    <module>m06-concorrencia/solucao</module>
+    <module>m07-sql/solucao</module>
+    <module>spring-parent</module>
+    <module>m08-spring-boot/solucao</module>
+    <module>m09-persistencia/solucao</module>
+    <module>m10-testes/solucao</module>
+    <module>m10-testes/aulas</module>
+    <module>m11-seguranca/solucao</module>
+    <module>m11-seguranca/aulas</module>
+    <module>m12-mensageria/solucao</module>
+    <module>m12-mensageria/aulas</module>
+    <module>m13-arquitetura/solucao</module>
+    <module>m13-arquitetura/aulas</module>
+    <module>m14-devops/solucao</module>
+    <module>m15-system-design/solucao</module>
+    <module>m16-ia-backend/solucao</module>
+    <module>projeto-integrador/solucao-marco-1</module>
+    <module>projeto-integrador/solucao-marco-2</module>
+    <module>projeto-integrador/solucao-marco-3</module>
+    <module>projeto-integrador/solucao-marco-4</module>
+    <module>projeto-integrador/solucao-marco-5</module>
+    <module>projeto-integrador/solucao-marco-6</module>
+  </modules>
+
+  <profiles>
+    <profile>
+      <id>starters</id>
+      <modules>
+        <module>m00-comece-aqui/starter</module>
+        <module>m01-java-essencial/starter</module>
+        <module>m02-poo/starter</module>
+        <module>m03-colecoes-generics-excecoes/starter</module>
+        <module>m04-java-moderno/starter</module>
+        <module>m05-algoritmos/starter</module>
+        <module>m06-concorrencia/starter</module>
+        <module>m07-sql/starter</module>
+        <module>m08-spring-boot/starter</module>
+        <module>m09-persistencia/starter</module>
+        <module>m10-testes/starter</module>
+        <module>m11-seguranca/starter</module>
+        <module>m12-mensageria/starter</module>
+        <module>m13-arquitetura/starter</module>
+        <module>m14-devops/starter</module>
+        <module>m15-system-design/starter</module>
+        <module>m16-ia-backend/starter</module>
+        <module>projeto-integrador/starter</module>
+      </modules>
+    </profile>
+  </profiles>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <version>${assertj.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.14.1</version>
+          <configuration>
+            <compilerArgs>
+              <arg>-Xlint:all</arg>
+            </compilerArgs>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.4</version>
+          <configuration>
+            <trimStackTrace>true</trimStackTrace>
+            <statelessTestsetReporter implementation="org.apache.maven.plugin.surefire.extensions.junit5.JUnit5Xml30StatelessReporter">
+              <usePhrasedTestCaseMethodName>true</usePhrasedTestCaseMethodName>
+            </statelessTestsetReporter>
+            <consoleOutputReporter implementation="org.apache.maven.plugin.surefire.extensions.junit5.JUnit5ConsoleOutputReporter">
+              <usePhrasedFileName>true</usePhrasedFileName>
+            </consoleOutputReporter>
+          </configuration>
+        </plugin>
+        <!-- O aluno roda o próprio programa antes dos testes: mvn -q compile exec:java -Dexec.mainClass=... -->
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>3.6.2</version>
+          <configuration>
+            <cleanupDaemonThreads>false</cleanupDaemonThreads>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <!-- Os testes ficam em ../testes e são compartilhados entre starter e solução. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>3.6.1</version>
+        <executions>
+          <execution>
+            <id>testes-compartilhados</id>
+            <phase>generate-test-sources</phase>
+            <goals>
+              <goal>add-test-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/../testes</source>
+              </sources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

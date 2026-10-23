@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.trilhajava</groupId>
+    <artifactId>trilha-spring-parent</artifactId>
+    <version>2.0.0</version>
+    <relativePath>../../spring-parent/pom.xml</relativePath>
+  </parent>
+  <artifactId>m10-testes-aulas</artifactId>
+  <name>Trilha Java :: m10-testes :: exemplos das aulas</name>
+  <description>
+    O código completo que as aulas do módulo 10 mostram, passo a passo. Roda no CI:
+    o que aparece no site é exatamente o que compila e passa.
+  </description>
+
+  <!-- Aula 10.08: versões do JMH e do Gatling (fora do BOM do Spring Boot) e o filtro de benchmarks. -->
+  <properties>
+    <jmh.version>1.37</jmh.version>
+    <gatling.version>3.16.0</gatling.version>
+    <gatling-maven-plugin.version>4.21.12</gatling-maven-plugin.version>
+    <jmh.filtro>Benchmark</jmh.filtro>
+    <!-- Aula 10.07 -->
+    <spring-cloud-contract.version>5.0.3</spring-cloud-contract.version>
+  </properties>
+  <!-- Aula 10.07 (testes de contrato): Spring Cloud Contract 5.0 (trem Spring Cloud 2025.1, compatível com o Boot 4.1). -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-contract-dependencies</artifactId>
+        <version>${spring-cloud-contract.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Aula 10.04 (testes de fatia): uma API de produtos com web, validação e JPA sobre H2 em memória. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <!-- H2: banco da 10.04 e, na 10.05, a comparação lado a lado com o PostgreSQL. -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <!-- Aula 10.05 (Testcontainers): JdbcClient, Flyway e PostgreSQL -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-flyway</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- 10.06: testes de arquitetura (as anotações do Spring da mini-aplicação vêm do starter webmvc da 10.04) -->
+    <dependency>
+      <groupId>com.tngtech.archunit</groupId>
+      <artifactId>archunit-junit5</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Aula 10.07: o provedor verifica os contratos (testes gerados) e o consumidor roda contra os stubs. -->
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-contract-verifier</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-contract-stub-runner</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- Aula 10.08: microbenchmarks com JMH e teste de carga com Gatling (Java DSL). Só compilam no build normal. -->
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>${jmh.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.gatling.highcharts</groupId>
+      <artifactId>gatling-charts-highcharts</artifactId>
+      <version>${gatling.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <!--
+          Testes de mutação (aula 10.01). Não roda no build normal, só quando chamado:
+          mvn test-compile org.pitest:pitest-maven:mutationCoverage -DtargetTests=...
+        -->
+        <plugin>
+          <groupId>org.pitest</groupId>
+          <artifactId>pitest-maven</artifactId>
+          <version>1.30.0</version>
+          <dependencies>
+            <dependency>
+              <groupId>org.pitest</groupId>
+              <artifactId>pitest-junit5-plugin</artifactId>
+              <version>1.2.3</version>
+            </dependency>
+          </dependencies>
+          <configuration>
+            <targetClasses>
+              <param>dev.trilhajava.m10.aulas.fundamentos.*</param>
+            </targetClasses>
+            <excludedClasses>
+              <param>dev.trilhajava.m10.aulas.fundamentos.ConferenciaManual</param>
+            </excludedClasses>
+            <outputFormats>
+              <param>HTML</param>
+            </outputFormats>
+            <timestampedReports>false</timestampedReports>
+          </configuration>
+        </plugin>
+        <!--
+          Aula 10.08: os benchmarks do JMH rodam numa JVM separada, só quando chamados:
+          mvn test-compile exec:exec@jmh -Djmh.filtro=RestricaoDeEntrega
+          mvn test-compile exec:exec@ingenua
+        -->
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <executions>
+            <execution>
+              <id>jmh</id>
+              <configuration>
+                <executable>${java.home}/bin/java</executable>
+                <classpathScope>test</classpathScope>
+                <arguments>
+                  <argument>-classpath</argument>
+                  <classpath/>
+                  <argument>org.openjdk.jmh.Main</argument>
+                  <argument>${jmh.filtro}</argument>
+                </arguments>
+              </configuration>
+            </execution>
+            <execution>
+              <id>ingenua</id>
+              <configuration>
+                <executable>${java.home}/bin/java</executable>
+                <classpathScope>test</classpathScope>
+                <arguments>
+                  <argument>-classpath</argument>
+                  <classpath/>
+                  <argument>dev.trilhajava.m10.aulas.desempenho.MedicaoIngenua</argument>
+                </arguments>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+    <plugins>
+      <!-- Aula 10.07: lê src/test/resources/contracts, gera os testes do provedor e os stubs WireMock (target/stubs). -->
+      <plugin>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-contract-maven-plugin</artifactId>
+        <version>${spring-cloud-contract.version}</version>
+        <extensions>true</extensions>
+        <configuration>
+          <testFramework>JUNIT5</testFramework>
+          <testMode>MOCKMVC</testMode>
+          <baseClassForTests>dev.trilhajava.m10.aulas.contrato.frete.ContratoDeFreteBase</baseClassForTests>
+          <basePackageForTests>dev.trilhajava.m10.aulas.contrato.frete.gerados</basePackageForTests>
+        </configuration>
+      </plugin>
+      <!-- Aula 10.08: o gerador de código do JMH roda na compilação dos testes (no JDK 23+ ele precisa ser declarado). -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>default-testCompile</id>
+            <configuration>
+              <annotationProcessorPaths>
+                <path>
+                  <groupId>org.openjdk.jmh</groupId>
+                  <artifactId>jmh-generator-annprocess</artifactId>
+                  <version>${jmh.version}</version>
+                </path>
+              </annotationProcessorPaths>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- Os exemplos têm os próprios testes em src/test/java; os testes dos exercícios (../testes) ficam de fora. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>testes-compartilhados</id>
+            <phase>none</phase>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!--
+      Aula 10.08: teste de carga. Sobe a AplicacaoDeFrete, roda o Gatling contra ela e a derruba:
+      mvn -P carga verify -DskipTests -Dversao=v1 -Dtaxa=100
+    -->
+    <profile>
+      <id>carga</id>
+      <properties>
+        <carga.porta>8088</carga.porta>
+        <carga.jmx>9088</carga.jmx>
+        <carga.jvm>-Xmx512m</carga.jvm>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+            <configuration>
+              <mainClass>dev.trilhajava.m10.aulas.desempenho.AplicacaoDeFrete</mainClass>
+              <jvmArguments>${carga.jvm}</jvmArguments>
+              <arguments>
+                <argument>--server.port=${carga.porta}</argument>
+                <!-- A cada 30 s o HikariCP registra "Pool stats": conexões ativas, livres e quem espera. -->
+                <argument>--logging.level.com.zaxxer.hikari.pool.HikariPool=debug</argument>
+              </arguments>
+              <!-- Porta JMX que o plugin usa para saber quando a aplicação subiu e para derrubá-la. -->
+              <jmxPort>${carga.jmx}</jmxPort>
+            </configuration>
+            <executions>
+              <execution>
+                <id>subir-aplicacao</id>
+                <goals>
+                  <goal>start</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>derrubar-aplicacao</id>
+                <goals>
+                  <goal>stop</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>io.gatling</groupId>
+            <artifactId>gatling-maven-plugin</artifactId>
+            <version>${gatling-maven-plugin.version}</version>
+            <configuration>
+              <simulationClass>dev.trilhajava.m10.aulas.desempenho.CotacaoDeFreteSimulation</simulationClass>
+              <jvmArgs>
+                <jvmArg>-Durl=http://localhost:${carga.porta}</jvmArg>
+              </jvmArgs>
+            </configuration>
+            <executions>
+              <!--
+                Como o Failsafe: a falha das asserções não interrompe o build em integration-test
+                (senão a aplicação ficaria no ar); quem reprova o build é o gatling:verify, depois do stop.
+              -->
+              <execution>
+                <id>teste-de-carga</id>
+                <phase>integration-test</phase>
+                <goals>
+                  <goal>test</goal>
+                </goals>
+                <configuration>
+                  <failOnError>false</failOnError>
+                </configuration>
+              </execution>
+              <execution>
+                <id>conferir-assercoes</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>verify</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

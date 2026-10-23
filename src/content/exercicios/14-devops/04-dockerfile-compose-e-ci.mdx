@@ -1,0 +1,351 @@
+---
+titulo: Da revisão reprovada à entrega pronta — Dockerfile, Compose e CI
+codigo: "14.04"
+resumo: Conserte três arquivos de entrega que funcionam mas não passariam numa revisão — um Dockerfile de um estágio só, com latest e root; um Compose com senha escrita e sem esperar o banco; e um pipeline que pula os testes — e valide cada um de verdade com mvn, docker build e docker compose.
+modulo: 14-devops
+ordem: 4
+dificuldade: medio
+tempo: 2–3h
+conceitos: [Docker, multi-stage, camadas do Spring Boot, .dockerignore, Docker Compose, healthcheck, GitHub Actions, CI]
+aulas: [14-devops/02-maven-e-gradle, 14-devops/03-docker, 14-devops/04-ci-cd-github-actions]
+java:
+  modulo: m14-devops
+  teste: EntregaTest
+---
+
+## Contexto
+
+Um colega abriu o pull request "containerizar a aplicação" com três arquivos. Tudo funciona na máquina dele. A revisão, feita por alguém do time de plataforma, voltou com uma frase: "funciona, mas não vai para produção assim".
+
+Os três arquivos estão em `java/m14-devops/starter/entrega/`:
+
+```dockerfile
+# Dockerfile
+FROM eclipse-temurin:latest
+COPY target/*.jar app.jar
+ENTRYPOINT java -jar app.jar
+```
+
+```text
+# Dockerfile.dockerignore
+target/
+```
+
+```yaml
+# compose.yaml (resumido)
+services:
+  app:
+    build: { context: .., dockerfile: entrega/Dockerfile }
+    environment:
+      SPRING_DATASOURCE_PASSWORD: trilha123
+    depends_on:
+      - postgres
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_PASSWORD: trilha123
+```
+
+```yaml
+# ci.yml
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: "21" }
+      - run: mvn package -DskipTests
+```
+
+Sua missão é reescrever os três (quatro, com o `.dockerignore`) até passarem na revisão, que aqui é o `EntregaTest`.
+
+## Como o teste funciona
+
+O `EntregaTest` **não roda o Docker nem o GitHub Actions**. Ele lê os arquivos de `entrega/` (relativo à pasta do starter) e verifica a estrutura: as instruções do Dockerfile (sem comentários, com as continuações `\` juntadas) e o YAML do Compose e do CI, lido com o SnakeYAML. Ele garante que as decisões certas estão no arquivo; a seção [Validando de verdade](#validando-de-verdade) mostra como confirmar que elas funcionam.
+
+## Os requisitos
+
+### Dockerfile (7 testes)
+
+| O teste verifica | Por quê |
+|---|---|
+| pelo menos dois `FROM`, o primeiro com nome (`AS extrator`, por exemplo) | **multi-stage**: um estágio prepara, o último vai para produção só com o necessário |
+| toda imagem base com tag explícita, nunca `latest` | `latest` muda sem aviso: o mesmo Dockerfile gera imagens diferentes em dias diferentes, e um rollback não volta ao que estava |
+| o último `FROM` é um **JRE** (sem `jdk`, sem `maven`) | compilador e ferramentas na imagem final são centenas de MB e mais superfície de ataque |
+| usa `-Djarmode=tools` com `extract` e `--layers`, e copia `/dependencies` **antes** de `/application` | o Docker reaproveita camadas: as dependências (dezenas de MB) mudam pouco, o código muda a cada commit. Na ordem certa, um build novo envia só a camada pequena |
+| o estágio final tem `USER` que não é `root`, `0` nem `0:0` | se alguém explorar a aplicação, não ganha root no container |
+| `EXPOSE 8080`, `ENTRYPOINT` em formato exec (`["java", ...]`) e `MaxRAMPercentage` no estágio final | no formato shell (`ENTRYPOINT java ...`), o PID 1 é o `sh`, que não repassa o SIGTERM: o `docker stop` espera 10 s e mata a JVM sem desligamento gracioso. O `MaxRAMPercentage` dimensiona o heap pelo limite de memória do **container**, e não da máquina |
+| o `Dockerfile.dockerignore` tem `.git` e `.env`, e **não** tem `target`, `target/`, `target/*` nem `*.jar` | o `.git` deixa o contexto enorme e o `.env` tem segredos. O `target/` do starter tira do contexto justamente o jar que o `COPY` precisa |
+
+<Callout tipo="info" titulo="Por que Dockerfile.dockerignore, e não .dockerignore">
+Com o BuildKit (o builder padrão do Docker), um arquivo `<nome-do-Dockerfile>.dockerignore` **ao lado do Dockerfile** tem precedência sobre o `.dockerignore` da raiz do contexto. Como o Dockerfile fica em `entrega/` e o contexto é a pasta do starter, é assim que as regras dele ficam junto com ele. Os padrões continuam relativos à **raiz do contexto**: `src/` ignora a pasta `src` do starter.
+</Callout>
+
+### compose.yaml (4 testes)
+
+| O teste verifica | Por quê |
+|---|---|
+| serviços `app` e `postgres`; o Postgres com tag fixa | mesmo motivo do `latest` no Dockerfile: uma versão nova do Postgres pode exigir migração dos dados do volume |
+| o `postgres` tem `healthcheck` com `pg_isready` | o container "subiu" alguns segundos antes de o Postgres aceitar conexões |
+| a `app` tem `build` e `depends_on.postgres.condition: service_healthy` | a forma curta (`depends_on: [postgres]`) espera só o container **iniciar**; é a causa do "às vezes a app cai na subida" |
+| toda variável com `PASSWORD` no nome começa com `${` | senha escrita no arquivo vai para o Git. Vinda do ambiente (`${POSTGRES_PASSWORD:?mensagem}`), o Compose ainda **falha** com a mensagem se a variável não existir |
+
+### ci.yml (3 testes)
+
+| O teste verifica | Por quê |
+|---|---|
+| o gatilho `on` tem `push` **e** `pull_request` | sem `pull_request`, o código só é testado depois de entrar na branch principal |
+| o passo `actions/setup-java@...` tem `java-version: "25"`, `distribution: temurin` e `cache: maven` | a versão do CI tem de ser a do projeto (o starter tem 21); o cache do `~/.m2` economiza minutos a cada execução |
+| o **primeiro** passo é `actions/checkout@...`, e algum passo roda `mvn` com `-B` e `verify` | sem checkout, não há código. `verify` compila, **roda os testes** e empacota (o `-DskipTests` do starter transforma o CI num compilador caro). `-B` é o modo batch: log sem cores nem barra de progresso |
+
+<Callout tipo="erro" titulo="Armadilha: on vira true">
+O SnakeYAML (como vários leitores de YAML 1.1) lê a chave `on` **sem aspas** como o booleano `true`, e não como o texto `"on"`. O GitHub Actions entende os dois, e o teste também (procura `"on"` e, se não achar, `true`). Se você escrever um script próprio para ler workflows, lembre disso: `ci.get("on")` devolve `null`.
+</Callout>
+
+## Critérios de aceite
+
+- [ ] `EntregaTest` passa (14 testes).
+- [ ] `docker build` gera a imagem, e a imagem roda como um usuário que não é root (veja abaixo).
+- [ ] `docker compose up` sobe a app **depois** do Postgres saudável, e falha com uma mensagem clara sem `POSTGRES_PASSWORD`.
+
+## Validando de verdade
+
+O teste estático garante a estrutura. Para ver os arquivos funcionando, rode os comandos a partir de `java/m14-devops/starter`.
+
+<Callout tipo="info" titulo="De onde vem o jar executável">
+Sem o `spring-boot-maven-plugin` com o goal `repackage`, o `mvn verify` gera um jar **comum**: só as suas classes, sem as dependências e sem o launcher. O `-Djarmode=tools` não consegue extrair esse jar. O POM pai só declara a versão do plugin, e quem liga o plugin é o `pom.xml` do módulo. O `m14-devops` tem três aplicações de exercício (`LogsApplication`, `MetricasApplication`, `SaudeApplication`), então o plugin precisa saber qual delas vai para o container:
+
+```xml
+<build>
+  <plugins>
+    <plugin>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-maven-plugin</artifactId>
+      <configuration>
+        <mainClass>dev.trilhajava.m14.saude.SaudeApplication</mainClass>
+      </configuration>
+      <executions>
+        <execution>
+          <goals>
+            <goal>repackage</goal>
+          </goals>
+        </execution>
+      </executions>
+    </plugin>
+  </plugins>
+</build>
+```
+
+Esse trecho já está no `pom.xml` do starter e da solução. A aplicação do Compose não usa banco (o m14 não tem driver JDBC): as variáveis `SPRING_DATASOURCE_*` ficam lá como seriam num projeto real, mas aqui são ignoradas.
+</Callout>
+
+**1. O jar.** Com os exercícios 14.01 a 14.04 prontos, `mvn -B verify` passa e gera o jar em `target/`. Antes disso, gere só o jar com `mvn -B package -DskipTests`.
+
+**2. A imagem.**
+
+```bash
+docker build -f entrega/Dockerfile -t trilha-m14:dev .
+docker run --rm --entrypoint id trilha-m14:dev        # uid=1001(app): não é root
+docker image ls trilha-m14                            # compare com a imagem do Dockerfile original
+docker run --rm -p 8080:8080 trilha-m14:dev           # em outro terminal: curl localhost:8080/actuator/health
+```
+
+Para ver o cache das camadas: altere uma linha de qualquer classe Java, gere o jar de novo e repita o `docker build`. Na saída, os `COPY` das dependências aparecem como `CACHED`; só a camada `application` é refeita. E para conferir o desligamento gracioso: `docker stop` no container deve terminar em bem menos que os 10 s do timeout (no formato shell do original, ele espera os 10 s e mata a JVM).
+
+**3. O Compose.**
+
+```bash
+docker compose -f entrega/compose.yaml up --build                        # falha: defina POSTGRES_PASSWORD
+POSTGRES_PASSWORD=segredo docker compose -f entrega/compose.yaml up --build
+docker compose -f entrega/compose.yaml ps                                # postgres: (healthy)
+docker compose -f entrega/compose.yaml down                              # o volume "dados" continua; -v apaga
+```
+
+No PowerShell, defina a variável antes: `$env:POSTGRES_PASSWORD = "segredo"`. Observe a ordem no log: a `app` só começa depois de o `postgres` ficar `healthy`.
+
+**4. O CI.** O `ci.yml` só roda de verdade no GitHub: num repositório seu, ele vai para `.github/workflows/ci.yml`, e cada push e pull request aparece na aba **Actions**. Para pegar erros antes do push, o [`actionlint`](https://github.com/rhysd/actionlint) valida a sintaxe e as expressões do workflow localmente.
+
+## Desafios opcionais
+
+- Adicione um `HEALTHCHECK` ao Dockerfile. O que você usaria para chamar o `/actuator/health`, se a imagem do JRE não garante `curl`? (Compare com o `healthcheck` do Compose e com as probes do Kubernetes do 14.03.)
+- Gere a imagem sem Dockerfile, com `mvn spring-boot:build-image` (Buildpacks), e compare tamanho, usuário e camadas.
+- No CI, publique a imagem no GitHub Container Registry só nos pushes na `main` (`if: github.event_name == 'push'`), com a tag do commit.
+
+<Dicas>
+<Dica nivel={1}>
+Rode o `EntregaTest` logo de início: são 14 falhas, e cada nome de teste é um item da revisão. Conserte um arquivo por vez, começando pelo `ci.yml` (o menor), depois o Compose, e o Dockerfile por último.
+</Dica>
+<Dica nivel={2}>
+- Dockerfile: um estágio `FROM eclipse-temurin:25-jre-noble AS extrator` que copia o jar e roda `java -Djarmode=tools -jar aplicacao.jar extract --layers --destination extraido`; depois um segundo `FROM eclipse-temurin:25-jre-noble` que copia as quatro pastas de `extraido/`.
+- Compose: `depends_on` na forma longa (um mapa com `postgres: { condition: service_healthy }`) e `healthcheck.test: ["CMD-SHELL", "pg_isready -U trilha -d trilha"]`.
+- CI: `on:` com duas chaves, `push` e `pull_request`.
+</Dica>
+<Dica nivel={3}>
+- As camadas, na ordem: `dependencies`, `spring-boot-loader`, `snapshot-dependencies`, `application`. Cada uma com `COPY --from=extrator /build/extraido/<camada>/ ./`.
+- Usuário: `RUN groupadd --system app && useradd --system --gid app --uid 1001 app` e, depois dos `COPY`, `USER app`.
+- `ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"` e `ENTRYPOINT ["java", "-jar", "aplicacao.jar"]`.
+- `.dockerignore`: tire o `target/` e ignore só o que não é o jar (`target/classes/`, `target/test-classes/`, `target/surefire-reports/`), além de `.git`, `.env`, `src/` e arquivos de IDE.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Dockerfile">
+
+```dockerfile
+# Exercício 14.04 — imagem de produção de uma aplicação Spring Boot.
+# Pré-requisito: o jar executável já foi gerado (mvn -B verify) em target/.
+# Build: docker build -f entrega/Dockerfile -t trilha-m14:dev .
+
+# Estágio 1: extrai o jar em camadas. Dependências mudam pouco; o código muda sempre.
+# Separando as duas, o docker reaproveita a camada de dependências (dezenas de MB) entre builds.
+FROM eclipse-temurin:25-jre-noble AS extrator
+WORKDIR /build
+ARG JAR=target/*.jar
+COPY ${JAR} aplicacao.jar
+RUN java -Djarmode=tools -jar aplicacao.jar extract --layers --destination extraido
+
+# Estágio 2: só o JRE (sem JDK, sem Maven, sem código-fonte).
+FROM eclipse-temurin:25-jre-noble
+WORKDIR /app
+# Usuário sem privilégios: se alguém explorar a aplicação, não vira root no container.
+RUN groupadd --system app && useradd --system --gid app --uid 1001 app
+# Da camada que menos muda para a que mais muda.
+COPY --from=extrator /build/extraido/dependencies/ ./
+COPY --from=extrator /build/extraido/spring-boot-loader/ ./
+COPY --from=extrator /build/extraido/snapshot-dependencies/ ./
+COPY --from=extrator /build/extraido/application/ ./
+USER app
+EXPOSE 8080
+# A JVM respeita o limite de memória do container; 75% para o heap, o resto para metaspace, threads etc.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
+# Formato exec (JSON): o java é o PID 1 e recebe o SIGTERM do docker stop (desligamento gracioso).
+ENTRYPOINT ["java", "-jar", "aplicacao.jar"]
+```
+
+</Tab>
+<Tab rotulo="Dockerfile.dockerignore">
+
+```text
+# Fica ao lado do Dockerfile e tem precedência sobre o .dockerignore da raiz do contexto.
+# Só o jar entra no contexto do build; o resto só deixa o build lento (ou vaza segredo).
+.git
+.idea
+.vscode
+*.iml
+.env
+*.log
+src/
+target/classes/
+target/test-classes/
+target/surefire-reports/
+```
+
+</Tab>
+<Tab rotulo="compose.yaml">
+
+```yaml
+# Exercício 14.04 — ambiente local: aplicação + PostgreSQL.
+# Uso: POSTGRES_PASSWORD=segredo docker compose -f entrega/compose.yaml up --build
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: entrega/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/trilha
+      SPRING_DATASOURCE_USERNAME: trilha
+      # Senha vem do ambiente; o compose falha se ela não for definida.
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        # "started" não basta: o Postgres demora alguns segundos para aceitar conexões.
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: trilha
+      POSTGRES_USER: trilha
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trilha -d trilha"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - dados:/var/lib/postgresql
+
+volumes:
+  dados:
+```
+
+</Tab>
+<Tab rotulo="ci.yml">
+
+```yaml
+# Exercício 14.04 — pipeline de CI. No repositório, fica em .github/workflows/ci.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          # Guarda ~/.m2 entre execuções, com chave pelo hash dos pom.xml.
+          cache: maven
+
+      # -B: modo batch (sem cores nem barra de progresso no log).
+      # verify: compila, roda os testes (inclusive Testcontainers) e empacota o jar.
+      - name: Testes e empacotamento
+        run: mvn -B verify
+
+      - name: Imagem Docker
+        run: docker build -f entrega/Dockerfile -t trilha-m14:${{ github.sha }} .
+```
+
+</Tab>
+</Tabs>
+
+### Passo a passo
+
+1. **O jar é construído fora do Docker.** O Dockerfile recebe o jar pronto do `mvn -B verify`. Assim os testes rodam uma vez só (no CI, com cache do Maven), e a imagem não precisa de JDK nem de Maven em nenhum estágio.
+2. **O primeiro estágio só extrai.** `-Djarmode=tools extract --layers` separa o jar do Spring Boot nas quatro camadas e deixa um `aplicacao.jar` pequeno na camada `application`, que referencia as bibliotecas em `lib/`. Esse estágio é descartado; só as pastas copiadas com `--from=extrator` chegam à imagem final.
+3. **A ordem dos `COPY` é a ordem de mudança.** O Docker invalida uma camada e **todas as seguintes** quando o conteúdo muda. Dependências primeiro, código por último: um commit que muda só código reaproveita tudo até a última camada.
+4. **O usuário é criado antes dos `COPY` e ativado depois.** Os arquivos pertencem ao root (só leitura para o `app`), e o processo roda como `app`. A aplicação não consegue alterar o próprio código, mesmo se for explorada.
+5. **Exec form e memória.** Com `["java", ...]`, a JVM é o PID 1 e recebe o SIGTERM: o Spring Boot tira a readiness do ar (14.03), termina as requisições em andamento e fecha. `JAVA_TOOL_OPTIONS` é lida pela JVM automaticamente, sem mudar o `ENTRYPOINT`.
+6. **O Compose espera a saúde, não o início.** `service_healthy` usa o `healthcheck` do `postgres`. A senha vem do ambiente com `:?`, que transforma "esqueci de definir" num erro claro em vez de um Postgres sem senha.
+7. **O CI testa o que vai para produção.** Checkout, Java 25 com cache, `mvn -B verify` (os testes são um passo obrigatório, e não opcional) e o build da imagem com a tag do commit (`github.sha`): toda imagem é rastreável até o código que a gerou.
+
+### Alternativas e trade-offs
+
+- **Compilar dentro do Docker** (um estágio `maven:3-eclipse-temurin-25` que roda `mvn package`): o build fica reproduzível em qualquer máquina com Docker, mas os testes rodariam de novo (ou seriam pulados), e o cache do Maven exige `--mount=type=cache`. Com um CI que já compila, construir fora é mais simples.
+- **Imagens distroless ou Alpine**: menores e com menos pacotes (menos CVEs), mas sem shell para depurar e, no Alpine, com musl no lugar da glibc. A `-jre-noble` é um meio-termo seguro.
+- **Buildpacks** (`spring-boot:build-image`): sem Dockerfile, com camadas, usuário sem privilégios e ajuste de memória já prontos. Você perde o controle fino e ganha menos arquivos para manter.
+- **Fixar por digest** (`eclipse-temurin:25-jre-noble@sha256:...`): a tag `25-jre-noble` ainda recebe atualizações de segurança (o que é bom), mas o digest garante bit a bit a mesma imagem. Ferramentas como o Dependabot atualizam o digest por pull request.
+
+### Avalie sua solução
+
+- Rode `docker history trilha-m14:dev`. Qual camada é a maior? Ela muda em um commit comum?
+- Se o `Dockerfile.dockerignore` tivesse `*.jar`, o que o `docker build` diria? E se não tivesse `.env`, onde o segredo apareceria?
+- O `ci.yml` constrói a imagem, mas não a publica. O que falta para o marco 6 do Fintech Core (registro, credenciais como *secrets*, publicação só na `main`)?
+
+</Solucao>

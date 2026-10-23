@@ -1,0 +1,249 @@
+---
+titulo: "Docker: imagens enxutas para Spring Boot e o ambiente local com Compose"
+descricao: Imagem × container, camadas e cache de build, Dockerfile multi-stage com a extração em camadas do Spring Boot, imagem final só com JRE, usuário não-root, tags fixas, ENTRYPOINT em formato exec e desligamento gracioso, memória da JVM no container, .dockerignore, Buildpacks e Docker Compose com healthcheck.
+modulo: 14-devops
+ordem: 3
+duracao: 65
+objetivos:
+  - Distinguir imagem e container e explicar como as camadas e o cache de build funcionam
+  - Escrever um Dockerfile multi-stage para Spring Boot, com camadas, JRE, usuário não-root e ENTRYPOINT em formato exec
+  - Ajustar a memória da JVM ao limite do container e controlar o contexto de build com .dockerignore
+  - Subir a aplicação e o PostgreSQL com Docker Compose, esperando o banco ficar saudável
+tags: [docker, dockerfile, multi-stage, camadas, jarmode, JRE, docker compose, healthcheck, buildpacks]
+flashcards:
+  - frente: Imagem × container
+    verso: A imagem é um pacote imutável, feito de camadas somente leitura (sistema base, JRE, dependências, sua aplicação). O container é uma instância em execução da imagem, com uma camada gravável por cima que some quando ele é removido.
+  - frente: Por que separar as dependências do código em camadas?
+    verso: O Docker reaproveita do cache toda camada que não mudou. As dependências (dezenas de MB) mudam pouco; o código muda a cada commit. Com camadas separadas, um build ou um push novo só transfere a camada pequena da aplicação.
+  - frente: Por que ENTRYPOINT em formato exec (JSON)?
+    verso: No formato exec, o java é o PID 1 e recebe o SIGTERM do docker stop ou do Kubernetes, e o Spring Boot faz o desligamento gracioso. No formato shell, quem recebe o sinal é o /bin/sh, que não o repassa; depois do prazo, o processo é morto com SIGKILL.
+  - frente: Para que serve -XX:MaxRAMPercentage?
+    verso: A JVM lê o limite de memória do container, e o padrão é usar só 25% dele para o heap. MaxRAMPercentage=75 dá 75% ao heap e deixa o resto para metaspace, pilhas das threads e buffers.
+  - frente: Por que nunca usar a tag latest?
+    verso: latest é só um nome que aponta para a imagem mais recente publicada; muda sem aviso. O mesmo Dockerfile gera imagens diferentes em dias diferentes, e um rollback não volta ao que estava rodando. Fixe a versão (e, se quiser rigor total, o digest).
+  - frente: O que o depends_on com condition service_healthy resolve?
+    verso: Sem ele, o Compose só espera o container do banco INICIAR, e a aplicação tenta conectar enquanto o PostgreSQL ainda sobe. Com o healthcheck (pg_isready) e service_healthy, a aplicação só começa quando o banco aceita conexões.
+---
+
+"Na minha máquina funciona" costuma significar: outro Java, outra variável de ambiente, outro PostgreSQL. Um **container** empacota a aplicação com tudo que ela precisa para rodar, e a mesma imagem vai do seu notebook para o CI e para produção. Nesta aula você entende a imagem que o exercício 14.04 constrói, linha por linha.
+
+**Pré-requisitos:** gerar o jar executável com `mvn -B verify` (aula 2) e ter o Docker instalado (Docker Desktop no Windows e no macOS).
+
+## Intuição: o contêiner de navio
+
+Antes dos contêineres padronizados, cada carga era embarcada de um jeito. Depois deles, o navio, o guindaste e o caminhão não precisam saber o que há dentro: só manipulam caixas do mesmo formato. A imagem Docker é essa caixa. O Kubernetes, o CI e o seu notebook só precisam saber executar **imagens**.
+
+## Imagem, container e camadas
+
+- **Imagem**: um pacote **imutável**, feito de **camadas** somente leitura empilhadas. Cada instrução `FROM`, `COPY` ou `RUN` gera uma camada.
+- **Container**: uma imagem **em execução**, com uma camada gravável por cima. Remova o container e o que foi gravado nela some; dados que precisam sobreviver vão para um **volume**.
+- **Cache de build**: se uma instrução e seus arquivos de entrada não mudaram, o Docker reaproveita a camada. Se uma camada muda, **todas as seguintes** são refeitas. Por isso, a ordem certa é **do que muda menos para o que muda mais**.
+
+<Figura legenda="As camadas da imagem do exercício 14.04. Um commit que só muda o código refaz apenas a camada de cima">
+<svg viewBox="0 0 680 290" width="680" role="img" aria-label="Pilha de camadas: Ubuntu e JRE, dependências, spring-boot-loader, snapshot-dependencies e application, com a frequência de mudança de cada uma">
+  <rect x="20" y="20" width="360" height="40" rx="6" class="d-accent"/><text x="200" y="45" text-anchor="middle" class="d-mono">application/ (suas classes)</text>
+  <rect x="20" y="66" width="360" height="40" rx="6" class="d-info"/><text x="200" y="91" text-anchor="middle" class="d-mono">snapshot-dependencies/</text>
+  <rect x="20" y="112" width="360" height="40" rx="6" class="d-info"/><text x="200" y="137" text-anchor="middle" class="d-mono">spring-boot-loader/</text>
+  <rect x="20" y="158" width="360" height="40" rx="6" class="d-ok"/><text x="200" y="183" text-anchor="middle" class="d-mono">dependencies/ (dezenas de MB)</text>
+  <rect x="20" y="204" width="360" height="40" rx="6" class="d-box"/><text x="200" y="229" text-anchor="middle" class="d-mono">eclipse-temurin:25-jre-noble</text>
+  <text x="400" y="45" class="d-label">muda a cada commit</text>
+  <text x="400" y="84" class="d-label">muda quando uma</text>
+  <text x="400" y="100" class="d-label">dependência -SNAPSHOT muda</text>
+  <text x="400" y="137" class="d-label">muda com a versão do Boot</text>
+  <text x="400" y="183" class="d-label">muda quando o pom muda</text>
+  <text x="400" y="229" class="d-label">muda quando você troca a base</text>
+  <text x="20" y="275" class="d-label">De baixo para cima: da camada que menos muda para a que mais muda.</text>
+</svg>
+</Figura>
+
+## O Dockerfile multi-stage do exercício 14.04
+
+Um **multi-stage build** usa um estágio para preparar os arquivos e outro, limpo, para a imagem final. Só o que você copia com `COPY --from` chega ao final.
+
+```dockerfile
+# Estágio 1: extrai o jar em camadas
+FROM eclipse-temurin:25-jre-noble AS extrator
+WORKDIR /build
+ARG JAR=target/*.jar
+COPY ${JAR} aplicacao.jar
+RUN java -Djarmode=tools -jar aplicacao.jar extract --layers --destination extraido
+
+# Estágio 2: só o JRE (sem JDK, sem Maven, sem código-fonte)
+FROM eclipse-temurin:25-jre-noble
+WORKDIR /app
+RUN groupadd --system app && useradd --system --gid app --uid 1001 app
+COPY --from=extrator /build/extraido/dependencies/ ./
+COPY --from=extrator /build/extraido/spring-boot-loader/ ./
+COPY --from=extrator /build/extraido/snapshot-dependencies/ ./
+COPY --from=extrator /build/extraido/application/ ./
+USER app
+EXPOSE 8080
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
+ENTRYPOINT ["java", "-jar", "aplicacao.jar"]
+```
+
+```bash
+mvn -B verify                                          # gera target/*.jar
+docker build -f entrega/Dockerfile -t trilha-m14:dev .
+docker run --rm -p 8080:8080 -m 512m trilha-m14:dev
+```
+
+Cada decisão, com o porquê:
+
+| Linha | Por quê |
+|---|---|
+| `-Djarmode=tools … extract --layers` | O jar do Spring Boot sabe se dividir nas quatro camadas (`dependencies`, `spring-boot-loader`, `snapshot-dependencies`, `application`). O resultado continua executável com `java -jar aplicacao.jar`, que acha as bibliotecas em `lib/`. |
+| `COPY` das camadas em ordem | Dependências antes do código: um commit comum refaz e transfere só a camada `application`. |
+| imagem final `-jre` | O JDK (compilador, ferramentas) não é necessário para **executar**; a imagem fica menor e com menos pacotes para ter vulnerabilidade. |
+| `USER app` (uid 1001) | Por padrão, o processo roda como **root** no container. Se alguém explorar uma falha da aplicação, ganha menos poder. |
+| tag `25-jre-noble` | Versão fixa do Java e do sistema (Ubuntu 24.04). **Nunca `latest`**: ela muda sem aviso e quebra a reprodutibilidade e o rollback. |
+| `ENTRYPOINT [...]` (exec) | O `java` vira o **PID 1** e recebe o `SIGTERM`. |
+| `MaxRAMPercentage=75.0` | A JVM respeita o limite do container, mas por padrão usa só **25%** dele para o heap. |
+
+<Callout tipo="atencao" titulo="Formato shell engole o SIGTERM">
+`ENTRYPOINT java -jar aplicacao.jar` (sem colchetes) roda como `/bin/sh -c "java -jar …"`. O PID 1 passa a ser o `sh`, que não repassa o sinal ao `java`. O `docker stop` espera o prazo (10 s por padrão) e mata tudo com `SIGKILL`: requisições em andamento são cortadas no meio. No formato exec, o Spring Boot recebe o `SIGTERM` e faz o **desligamento gracioso** (padrão desde o Boot 3.4): para de aceitar requisições novas e termina as que estão em andamento.
+</Callout>
+
+### Alternativa: compilar dentro do Docker
+
+O exercício compila **fora** (o CI já rodou `mvn -B verify`) e só empacota. Quando não há CI, é comum um primeiro estágio com o JDK que roda o build, copiando o `pom.xml` antes do `src/` para cachear as dependências:
+
+```dockerfile
+FROM eclipse-temurin:25-jdk-noble AS build
+WORKDIR /build
+COPY mvnw pom.xml ./
+COPY .mvn .mvn
+RUN ./mvnw -B dependency:go-offline      # camada cacheada enquanto o pom não mudar
+COPY src src
+RUN ./mvnw -B package -DskipTests        # os testes rodam no CI, não no build da imagem
+```
+
+## O contexto de build e o .dockerignore
+
+`docker build ... .` envia o diretório `.` inteiro (o **contexto**) para o Docker. Sem filtro, vão junto `.git`, `target/classes`, logs e, pior, o `.env` com senhas, que poderia acabar dentro de uma camada. O `.dockerignore` resolve:
+
+```text
+.git
+.idea
+.env
+*.log
+src/
+target/classes/
+target/test-classes/
+```
+
+Repare que **`target/` inteiro não é ignorado**: o jar mora lá. No exercício, o arquivo se chama `entrega/Dockerfile.dockerignore`: um arquivo `<nome-do-Dockerfile>.dockerignore` **ao lado do Dockerfile** tem precedência sobre o `.dockerignore` da raiz do contexto. É útil quando o Dockerfile fica numa subpasta ou quando há vários Dockerfiles no mesmo repositório.
+
+## Buildpacks: imagem sem Dockerfile
+
+```bash
+mvn spring-boot:build-image            # Gradle: ./gradlew bootBuildImage
+```
+
+O plugin do Spring Boot usa **Cloud Native Buildpacks** (Paketo) para gerar uma imagem OCI já em camadas, com usuário não-root e a memória da JVM calculada. Precisa de um Docker rodando. Vantagem: o time de plataforma atualiza a base sem você mexer em nada. Desvantagem: menos controle e uma caixa-preta a mais. Os dois caminhos são aceitos; em entrevista, saber explicar o Dockerfile vale mais.
+
+## Docker Compose: aplicação + PostgreSQL
+
+```yaml
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: entrega/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/trilha
+      SPRING_DATASOURCE_USERNAME: trilha
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: trilha
+      POSTGRES_USER: trilha
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trilha -d trilha"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - dados:/var/lib/postgresql
+volumes:
+  dados:
+```
+
+```bash
+POSTGRES_PASSWORD=segredo docker compose -f entrega/compose.yaml up --build
+docker compose -f entrega/compose.yaml down        # para; "down -v" apaga também o volume
+```
+
+- **Rede**: os serviços se enxergam pelo **nome** (`postgres:5432`), não por `localhost`. Dentro do container, `localhost` é o próprio container.
+- **`depends_on` + `service_healthy`**: sem a condição, o Compose só espera o container do banco *iniciar*, e a aplicação tenta conectar enquanto o PostgreSQL ainda sobe. O `pg_isready` diz quando ele aceita conexões.
+- **`${VAR:?mensagem}`**: a senha vem do ambiente, e o Compose **se recusa a subir** se ela não estiver definida. Nada de senha escrita no arquivo versionado.
+- **`SPRING_DATASOURCE_URL`**: o Spring Boot converte variáveis de ambiente em propriedades (*relaxed binding*), então ela vale como `spring.datasource.url`.
+- **Volume**: a partir da imagem `postgres:18`, o volume é montado em `/var/lib/postgresql` (e não mais em `/var/lib/postgresql/data`, como nas versões anteriores), porque os dados passaram a ficar numa subpasta por versão.
+
+O Compose é para **desenvolvimento e testes locais**. Em produção, quem orquestra os containers é o Kubernetes ou um serviço gerenciado (aula 6).
+
+## Armadilhas comuns
+
+- **Imagem com JDK e Maven**: centenas de MB a mais e mais superfície de ataque. Separe build e execução.
+- **`COPY . .` antes de baixar as dependências**: qualquer mudança no código invalida o cache e o build baixa tudo de novo.
+- **`ARG JAR=target/*.jar` com dois jars** em `target/` (por exemplo, um `-plain.jar`): o `COPY` falha. Garanta um único jar ou use o nome exato.
+- **Container rodando como root** e **tag `latest`**: os dois são reprovados em qualquer revisão de segurança.
+- **Heap fixo (`-Xmx`) maior que o limite do container**: o sistema mata o processo (OOMKilled) sem nenhum `OutOfMemoryError` no log.
+- **Senha no `compose.yaml` ou no `Dockerfile`** (`ENV SENHA=...`): fica no Git e nas camadas da imagem, visível com `docker history`.
+
+<Callout tipo="entrevista">
+"Como você colocaria uma aplicação Spring Boot num container?" Descreva o **multi-stage** com camadas (dependências antes do código, por causa do cache), a imagem final **só com JRE**, **usuário não-root**, **tag fixa**, `ENTRYPOINT` em **formato exec** (sinal e desligamento gracioso) e `MaxRAMPercentage`. Se perguntarem "imagem × container", responda com a analogia de classe × objeto: a imagem é o molde imutável; o container, a instância em execução.
+</Callout>
+
+<Quiz
+  id="14-docker"
+  questoes={[
+    {
+      pergunta: 'Você mudou uma linha de um controller e reconstruiu a imagem. Quais camadas o Docker refaz?',
+      opcoes: ['Todas', 'Só a camada application e as que vierem depois dela', 'Só a camada dependencies', 'Nenhuma, o cache cobre tudo'],
+      correta: 1,
+      explicacao: 'As camadas anteriores (base, dependencies, loader) vêm do cache. Por isso a ordem do COPY vai do que muda menos para o que muda mais.',
+    },
+    {
+      pergunta: 'Com ENTRYPOINT java -jar app.jar (sem colchetes), o que acontece num docker stop?',
+      opcoes: ['A aplicação desliga graciosamente', 'O sh recebe o SIGTERM, não o repassa, e depois do prazo tudo é morto com SIGKILL', 'O container não para', 'O Docker reinicia o container'],
+      correta: 1,
+      explicacao: 'No formato shell, o PID 1 é o /bin/sh. Use o formato exec para o java ser o PID 1.',
+    },
+    {
+      pergunta: 'Um container com limite de 1 GB roda a JVM sem opções de memória. Qual o heap máximo aproximado?',
+      opcoes: ['1 GB', '750 MB', '256 MB', 'A memória toda da máquina'],
+      correta: 2,
+      explicacao: 'A JVM respeita o limite do container, mas o padrão de MaxRAMPercentage é 25%. Por isso o Dockerfile define 75.',
+    },
+    {
+      pergunta: 'A aplicação sobe antes do PostgreSQL aceitar conexões e falha. O que corrige no Compose?',
+      opcoes: ['depends_on simples', 'healthcheck com pg_isready e depends_on com condition service_healthy', 'restart: always no banco', 'Um sleep no ENTRYPOINT'],
+      correta: 1,
+      explicacao: 'O depends_on simples só espera o container iniciar. A condição service_healthy espera o healthcheck passar.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Imagem** é imutável, feita de camadas; **container** é a instância em execução. O cache reaproveita camadas que não mudaram.
+- **Multi-stage** + `-Djarmode=tools … extract --layers`: dependências antes do código, imagem final **só JRE**.
+- **Usuário não-root**, **tag fixa**, **`ENTRYPOINT` exec** (PID 1 recebe o `SIGTERM`) e **`MaxRAMPercentage`**.
+- **`.dockerignore`** (ou `Dockerfile.dockerignore` ao lado do Dockerfile) controla o contexto e evita vazar segredos.
+- **Buildpacks** (`spring-boot:build-image`) geram a imagem sem Dockerfile.
+- **Compose**: healthcheck + `service_healthy`, senhas por `${VAR:?erro}`, serviços pelo nome; é ferramenta de ambiente local.
+
+## Referências
+
+- Documentação do Docker — *Multi-stage builds*, *Build cache*, *Build context* (inclui os arquivos `.dockerignore` específicos de Dockerfile) e *Dockerfile reference* (docs.docker.com)
+- Documentação do Docker Compose — *Control startup order* e *Interpolation* (docs.docker.com)
+- Documentação do Spring Boot — *Efficient Container Images*, *Dockerfiles* e *Cloud Native Buildpacks* (docs.spring.io)
+- Imagem oficial do PostgreSQL no Docker Hub — seção *PGDATA* (hub.docker.com/_/postgres)

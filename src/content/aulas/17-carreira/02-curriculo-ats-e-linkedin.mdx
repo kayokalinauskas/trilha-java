@@ -1,0 +1,176 @@
+---
+titulo: "Currículo, ATS e LinkedIn"
+descricao: Como escrever um currículo de uma página que passa pela triagem automática e convence quem lê em poucos segundos. Cobre como os sistemas de recrutamento (ATS) funcionam de verdade, bullets de impacto no formato ação + contexto + resultado, adaptação para cada vaga, o currículo em inglês para vagas internacionais, dados pessoais que não devem aparecer e um perfil do LinkedIn que recrutadores encontram.
+modulo: 17-carreira
+ordem: 2
+duracao: 50
+objetivos:
+  - Explicar o que um ATS faz (e o que não faz) e montar um currículo que ele lê sem perder informação
+  - Reescrever responsabilidades genéricas como bullets de impacto com ação, contexto e resultado
+  - Adaptar o currículo a uma vaga específica a partir da descrição, sem inventar experiência
+  - Preparar uma versão em inglês adequada a vagas internacionais
+  - Configurar o LinkedIn para ser encontrado por recrutadores
+tags: [carreira, currículo, ATS, Gupy, LinkedIn, resume, inglês]
+flashcards:
+  - frente: O que um ATS faz com o seu currículo?
+    verso: Extrai o texto para campos estruturados (experiência, formação, habilidades), permite que recrutadores busquem e filtrem por palavras-chave e requisitos, e em muitas plataformas ordena candidatos por aderência à vaga. Se o texto não é extraído direito, você some das buscas.
+  - frente: Que formato de currículo o ATS lê melhor?
+    verso: Uma coluna, títulos de seção padrão (Experiência, Formação, Habilidades), texto selecionável em PDF ou DOCX, sem tabelas, caixas de texto, ícones ou texto dentro de imagens, datas num formato consistente.
+  - frente: Qual a estrutura de um bullet de impacto?
+    verso: Verbo de ação + o que você fez e com o quê + resultado ou escala. Ex. "Reduzi de 2,1 s para 180 ms o p95 do extrato eliminando consultas N+1 com JOIN FETCH e projeções."
+  - frente: O que não colocar num currículo, no Brasil ou fora?
+    verso: CPF, RG, idade ou data de nascimento, estado civil, endereço completo e, em geral, foto. Bastam cidade/país, e-mail, telefone, LinkedIn e GitHub. Em vagas nos EUA e no Reino Unido, foto e idade são mal vistas por questões de discriminação.
+  - frente: Como adaptar o currículo a uma vaga sem mentir?
+    verso: Use os mesmos termos da descrição para o que você realmente sabe (ex. "APIs REST" se a vaga diz assim), reordene os bullets e projetos pela relevância e corte o que não interessa àquela vaga. Nunca inclua uma tecnologia que você não sabe defender numa pergunta.
+---
+
+O currículo tem um trabalho só: **conseguir a primeira conversa**. Ele não precisa contar sua vida; precisa convencer, em poucos segundos, que vale a pena falar com você. E, antes de chegar a uma pessoa, ele quase sempre passa por um sistema.
+
+## Como o ATS funciona de verdade
+
+ATS (*Applicant Tracking System*) é o sistema onde a empresa publica a vaga e recebe as candidaturas. No Brasil, a Gupy é uma das plataformas mais usadas por empresas médias e grandes; em vagas internacionais aparecem Greenhouse, Lever, Workday, Ashby e outros.
+
+Circula muito o mito de que "o robô reprova 75% dos currículos". A realidade é mais sutil e mais útil:
+
+1. **Extração.** O ATS lê o arquivo e tenta preencher campos: cargos, empresas, datas, formação, habilidades. Currículo em duas colunas, com tabelas ou com texto em imagem sai embaralhado ou vazio.
+2. **Busca e filtro.** Recrutadores filtram por perguntas eliminatórias (inglês, cidade, modelo de trabalho, pretensão) e **buscam por palavras**: "Spring Boot", "Kafka", "PostgreSQL". Se a palavra não está no seu texto, você não aparece.
+3. **Ordenação.** Muitas plataformas atribuem uma nota de aderência à vaga. Quem aparece no topo é lido primeiro; numa vaga com 800 candidatos, o fim da lista pode nunca ser lido.
+
+Conclusão: você não precisa "enganar" um robô. Precisa de um arquivo **legível por máquina** e com os **termos certos**, escritos com verdade. E, nas perguntas eliminatórias do formulário, responda com precisão: são elas que mais eliminam.
+
+<Callout tipo="atencao" titulo="Truques que prejudicam">
+Palavras-chave em fonte branca, listas de 60 tecnologias ou o texto da vaga colado no rodapé. O ATS mostra o texto extraído para quem recruta, e o truque vira o primeiro motivo de descarte. O que funciona é o termo certo **dentro de uma frase que prova que você usou**.
+</Callout>
+
+## O formato
+
+- **Uma página** para Jr e para quem está em transição. Duas páginas só com experiência que justifique.
+- **Uma coluna**, fonte comum, títulos padrão: *Resumo*, *Experiência*, *Projetos*, *Formação*, *Habilidades*, *Idiomas*.
+- **PDF com texto selecionável** (exportado do editor, não escaneado). Se a vaga pede DOCX, mande DOCX.
+- **Nome do arquivo** útil: `nome-sobrenome-backend-java.pdf`.
+- **Cabeçalho**: nome, cidade e país, e-mail, telefone, LinkedIn e GitHub (links clicáveis e curtos).
+
+Não inclua CPF, RG, foto, idade, estado civil ou endereço completo. Ninguém precisa disso para marcar uma entrevista, e expor esses dados é um risco que você não precisa correr. Pela LGPD, a empresa também deveria coletar só o necessário.
+
+## O conteúdo, de cima para baixo
+
+**Resumo (2–3 linhas).** Quem você é profissionalmente e o que busca, com as palavras da vaga. "Desenvolvedor backend Java em transição de carreira, com projeto completo em Spring Boot 4, PostgreSQL, Kafka e Docker. Busco vaga de Jr em produto financeiro." Nada de "proativo, comunicativo e apaixonado por tecnologia": qualquer um escreve isso.
+
+**Experiência.** Mesmo experiência fora de TI conta, porque mostra responsabilidade e contexto de negócio. Um analista financeiro que virou dev entende de conciliação; diga isso. Para cada cargo: empresa, cargo, período e **bullets de impacto**.
+
+**Projetos.** Para quem não tem experiência em desenvolvimento, esta seção vem **antes** da experiência. O Fintech Core entra aqui, com link e três bullets.
+
+**Formação e cursos.** Graduação (em andamento conta), cursos relevantes, certificações. A trilha pode entrar como formação complementar, mas o que convence é o projeto que ela produziu.
+
+**Habilidades.** Agrupadas e honestas: *Linguagens*: Java 25, SQL. *Frameworks*: Spring Boot 4, Spring Security, Spring Data JPA. *Dados e mensageria*: PostgreSQL, Redis, Kafka. *Ferramentas*: Git, Docker, GitHub Actions, JUnit, Testcontainers.
+
+## Bullets de impacto
+
+A diferença entre um currículo esquecido e um que gera entrevista costuma estar nos bullets. A fórmula: **verbo de ação + o que e com o quê + resultado ou escala**.
+
+<Comparar antes="Responsabilidade" depois="Impacto">
+
+```text
+- Responsável pelo desenvolvimento de APIs.
+- Participação em projetos com Spring Boot.
+- Conhecimento em testes e Docker.
+- Atuei com banco de dados.
+```
+
+```text
+- Implementei a API de transferências com lock
+  otimista, sem saldo negativo em 50 threads
+  simultâneas (Spring Boot 4, PostgreSQL).
+- Reduzi de 2,1 s para 180 ms o p95 do extrato
+  eliminando N+1 com JOIN FETCH e projeções.
+- Criei a pipeline de CI (GitHub Actions) que roda
+  testes de integração com Testcontainers a cada PR.
+```
+
+</Comparar>
+
+Não tem números de produção? Use números do projeto, desde que verdadeiros e medidos: tempo de resposta num teste de carga, quantidade de testes, tempo de build. E se não há número, descreva o **problema resolvido**: "impedi débitos duplicados em reentregas de mensagens com um consumidor idempotente".
+
+Todo bullet precisa passar num teste: **você consegue falar dele por cinco minutos numa entrevista?** Se não, reescreva ou corte.
+
+## Adaptar para cada vaga
+
+Mandar o mesmo arquivo para cem vagas rende menos do que mandar um arquivo ajustado para vinte. O ajuste leva 15 minutos:
+
+1. Leia a vaga e marque os **requisitos** e os **termos** usados (a vaga diz "microsserviços" ou "sistemas distribuídos"? "AWS" ou "cloud"?).
+2. Para cada requisito que você **realmente** tem, garanta que o termo aparece no currículo, dentro de um bullet ou nas habilidades.
+3. Reordene bullets e projetos: o mais relevante para aquela vaga vem primeiro.
+4. Ajuste o resumo para o cargo e o domínio da vaga.
+5. Para os requisitos que você não tem, **não invente**. Se for um "desejável", deixe de fora; se for central, talvez a vaga não seja para agora, ou vale uma linha no resumo ("estudando AWS").
+
+Não se desanime com listas longas de requisitos: muitas descrevem o candidato ideal, não o mínimo. Atender à maior parte do obrigatório já justifica a candidatura.
+
+## O currículo em inglês
+
+Para vagas internacionais, o *resume* segue algumas convenções próprias:
+
+- **Sem foto, idade, estado civil ou nacionalidade** (nos EUA e no Reino Unido isso é visto como convite à discriminação e pode até fazer o recrutador descartar o arquivo).
+- Localização e disponibilidade: "São Paulo, Brazil (UTC−3) · Open to remote".
+- Bullets no passado, com verbos fortes: *built, designed, reduced, migrated, automated, led*. Sem "I" no início das frases.
+- Formação traduzida com o equivalente: "B.Sc. in Computer Science (in progress)"; para cursos técnicos, "Associate degree" costuma ser a aproximação mais usada.
+- Nível de inglês honesto, de preferência numa escala conhecida: "English: professional working proficiency (C1)".
+- Peça para alguém revisar, ou use um corretor, mas **releia**: frases traduzidas literalmente ("I have 2 years of experience with...") são aceitáveis; erros de concordância em todo bullet, não.
+
+## LinkedIn
+
+Recrutadores **procuram** candidatos no LinkedIn com filtros e palavras, então o perfil precisa ser encontrável:
+
+- **Título** (headline): não só "Estudante". Algo como "Desenvolvedor Backend Java | Spring Boot · PostgreSQL · Kafka | Em busca da primeira vaga Jr".
+- **Sobre**: 4–6 linhas, com o projeto âncora e as tecnologias, em português e/ou inglês, conforme as vagas que você quer.
+- **Experiência e projetos** coerentes com o currículo (datas iguais!).
+- **Habilidades**: as principais, na ordem de importância.
+- **"Open to work"**: pode ser visível só para recrutadores, se você está empregado.
+- **Localização e idioma do perfil**: para vagas internacionais, um perfil secundário em inglês ajuda.
+- **Publicar** de vez em quando (o que você aprendeu, um problema resolvido, o README do projeto) aumenta a visibilidade. Não é obrigatório, mas ajuda quem não tem rede.
+
+Por último, **indicação** continua sendo o caminho mais curto até a entrevista. Participe de comunidades (grupos de Java, meetups, eventos), converse com pessoas da área e peça indicação quando conhecer alguém da empresa. Um currículo indicado costuma ser lido por uma pessoa, e não só pelo ATS.
+
+<Callout tipo="entrevista">
+Em muitas entrevistas, a primeira pergunta técnica sai do currículo: "aqui diz que você usou Kafka; como você garantiu que uma mensagem não fosse processada duas vezes?". Releia o currículo antes de cada entrevista como se fosse o entrevistador e prepare uma história para cada bullet. O que você não consegue explicar vira ponto negativo, mesmo que o resto seja ótimo.
+</Callout>
+
+<Quiz
+  id="17-curriculo-ats"
+  questoes={[
+    {
+      pergunta: 'Seu currículo tem duas colunas, ícones e uma tabela de habilidades. Qual o risco no ATS?',
+      opcoes: ['Nenhum, o ATS lê imagens', 'O texto é extraído fora de ordem ou vazio, e você deixa de aparecer nas buscas por palavra-chave', 'O arquivo fica grande demais', 'O recrutador vê cores diferentes'],
+      correta: 1,
+      explicacao: 'Layouts complexos quebram a extração de texto. Uma coluna, títulos padrão e texto selecionável são a forma mais segura.',
+    },
+    {
+      pergunta: 'Qual bullet é mais forte?',
+      opcoes: ['Responsável por testes automatizados', 'Conhecimento em JUnit e Mockito', 'Escrevi 120 testes (JUnit 6 e Testcontainers) cobrindo as regras de transferência, e a CI passou a barrar PRs que quebram o saldo', 'Participei da criação de testes'],
+      correta: 2,
+      explicacao: 'Ação concreta, ferramentas e o efeito. É verificável e dá assunto para a entrevista.',
+    },
+    {
+      pergunta: 'A vaga pede Kafka como obrigatório e você só leu sobre o assunto. O que fazer no currículo?',
+      opcoes: ['Incluir "Kafka" nas habilidades para passar no filtro', 'Não afirmar experiência que você não tem; se possível, fazer um projeto pequeno com Kafka e então incluí-lo com o que foi feito', 'Colar a descrição da vaga em fonte branca', 'Mentir e estudar antes da entrevista'],
+      correta: 1,
+      explicacao: 'O que está no currículo vira pergunta. Construir evidência (o m12 e o marco 5 servem exatamente para isso) resolve o problema sem mentir.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- O currículo serve para conseguir a **primeira conversa**. Uma página, uma coluna, títulos padrão, PDF com texto.
+- O ATS **extrai, filtra e ordena**. Você precisa de texto legível por máquina, dos termos certos e de respostas precisas nas perguntas eliminatórias.
+- Bullets de impacto: **ação + o que e com o quê + resultado**. Todo bullet precisa aguentar cinco minutos de entrevista.
+- Ajuste para cada vaga com os termos dela, **sem inventar**.
+- Sem CPF, foto, idade, estado civil. Em inglês: sem foto, verbos no passado, localização e fuso.
+- LinkedIn encontrável: título com as tecnologias, "Sobre" com o projeto âncora, dados coerentes com o currículo. E busque indicações.
+
+## Referências
+
+- Gupy — central de ajuda para candidatos (como funcionam as etapas e a triagem)
+- Greenhouse e Lever — documentação pública sobre busca e filtros de candidatos
+- LinkedIn Help — *Open to Work* e *Profile headline*
+- Lei nº 13.709/2018 (LGPD), art. 6º, princípio da necessidade
+- Gayle Laakmann McDowell — *The Google Resume* (sobre resumes para empresas dos EUA)

@@ -1,0 +1,106 @@
+---
+titulo: Busca de imóveis com filtros dinâmicos
+codigo: "09.04"
+resumo: Construa a busca de um portal imobiliário com seis filtros opcionais combináveis, paginação e ordenação por lista branca — usando Specifications, sem concatenar uma única string de consulta.
+modulo: 09-persistencia
+ordem: 4
+dificuldade: medio
+tempo: 2–3h
+conceitos: [Specifications, paginação, ordenação, lista branca, SQL injection]
+aulas: [09-persistencia/03-spring-data-jpa]
+java:
+  modulo: m09-persistencia
+  teste: BuscaDeImoveisTest
+---
+
+## Contexto
+
+Um portal de imóveis tem uma tela de busca com filtros por cidade, tipo, faixa de preço, quartos, garagem e bairros — todos opcionais. A implementação atual monta a consulta concatenando strings (`"... AND cidade = '" + cidade + "'"`), já sofreu uma injeção de SQL e deixa ordenar por qualquer coluna, inclusive colunas sem índice que travam o banco.
+
+## O que já existe
+
+- A entidade `Imovel` (tabela `imovel`, 36 imóveis de exemplo em 4 cidades).
+- O record `FiltroDeImoveis(cidade, tipo, precoMin, precoMax, quartosMin, comGaragem, bairros)` — **qualquer campo nulo significa "não filtrar"**.
+- O record `ImovelResumo(id, titulo, cidade, bairro, preco, quartos)`.
+
+## Requisitos
+
+Implemente `BuscaDeImoveis.buscar(filtro, pagina, tamanho, ordenacao)` devolvendo `Page<ImovelResumo>`:
+
+| Filtro | Regra |
+|---|---|
+| `cidade` | igual, **sem diferenciar maiúsculas** (`"são paulo"` encontra `"São Paulo"`) |
+| `tipo` | igual (`APARTAMENTO`, `CASA`, `STUDIO`) |
+| `precoMin` / `precoMax` | faixa inclusiva |
+| `quartosMin` | pelo menos N quartos |
+| `comGaragem` | `true` = pelo menos 1 vaga; `false` = nenhuma vaga |
+| `bairros` | o imóvel está em um dos bairros do conjunto |
+
+| Ordenação | Critério (empates por **id crescente**) |
+|---|---|
+| `recentes` (padrão, se `null`) | `publicadoEm` decrescente |
+| `menor-preco` / `maior-preco` | preço |
+| `maior-area` | área decrescente |
+
+Outra ordenação → `IllegalArgumentException`. Página < 0 ou tamanho fora de 1..50 → `IllegalArgumentException`.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `BuscaDeImoveisTest` passam.
+- [ ] Um filtro = uma `Specification` pequena; filtro ausente não restringe.
+- [ ] Nenhuma string de consulta montada com `+`.
+- [ ] A busca sem filtros faz no máximo 2 comandos SQL (consulta + contagem).
+
+## Desafios opcionais
+
+- Troque `Page` por `Slice` numa versão "rolagem infinita" e veja a consulta de contagem sumir.
+- Acrescente o filtro "texto livre" (título contém, sem diferenciar maiúsculas). Qual índice o PostgreSQL precisaria para isso não ser um *seq scan*? (Dica: `pg_trgm`.)
+- Exponha `GET /imoveis?cidade=...&ordem=menor-preco` com Spring MVC, validando os parâmetros.
+
+<Dicas>
+<Dica nivel={1}>
+Faça o repositório estender `JpaRepository<Imovel, Long>` **e** `JpaSpecificationExecutor<Imovel>`. Isso dá `findAll(Specification, Pageable)`. Depois escreva um método estático por filtro, que devolve `Specification.unrestricted()` quando o valor é nulo.
+</Dica>
+<Dica nivel={2}>
+Uma `Specification` é uma lambda `(raiz, consulta, cb) -> predicado`. Exemplos: `cb.equal(cb.lower(raiz.get("cidade")), cidade.toLowerCase(Locale.ROOT))`, `cb.greaterThan(raiz.get("vagasGaragem"), 0)`, `raiz.get("bairro").in(bairros)`. Junte todas com `Specification.allOf(...)`.
+</Dica>
+<Dica nivel={3}>
+Ordenação por lista branca:
+
+```java
+private static final Map<String, Sort> ORDENACOES = Map.of(
+        "recentes", Sort.by(Sort.Order.desc("publicadoEm"), Sort.Order.asc("id")),
+        "menor-preco", Sort.by(Sort.Order.asc("preco"), Sort.Order.asc("id")), ...);
+```
+
+`PageRequest.of(pagina, tamanho, ORDENACOES.get(...))` e, no fim, `.map(imovel -> new ImovelResumo(...))`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Specifications">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/imoveis/EspecificacoesDeImovel.java" />
+</Tab>
+<Tab rotulo="Busca">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/imoveis/BuscaDeImoveis.java" />
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/imoveis/ImovelRepository.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Um filtro, uma função**: cada `Specification` é pequena, tem nome de negócio e pode ser reutilizada (a "cidade" da busca é a mesma do relatório). Combinar com `allOf` evita a explosão de métodos derivados.
+- **Parâmetros, nunca concatenação**: os valores entram na Criteria API como parâmetros vinculados. O teste com `x' or '1'='1` devolve zero resultados.
+- **Lista branca de ordenação com desempate por id**: o cliente escolhe um nome de negócio, e a ordem é estável entre páginas.
+- **Projeção no final**: `ImovelResumo` expõe só o que o card precisa. Para telas com muito tráfego, uma projeção direto na consulta (sem carregar a entidade) economiza ainda mais.
+
+### Avalie sua solução
+
+- Quais índices ajudariam as combinações de filtros mais comuns? (Veja o que a migração cria.)
+- Sua busca com `bairros = Set.of()` (vazio) devolve tudo ou nada? Qual deveria ser o comportamento?
+
+</Solucao>

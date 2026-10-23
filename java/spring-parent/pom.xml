@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  POM pai dos módulos que usam Spring Boot (08 em diante e o projeto integrador).
+
+  Herda do trilha-java-parent (Java, encoding, surefire, testes compartilhados em ../testes)
+  e importa o BOM do Spring Boot, que define as versões de Spring, Hibernate, Jackson,
+  Flyway, Testcontainers etc. Assim cada módulo declara só o que usa, sem versões.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>dev.trilhajava</groupId>
+    <artifactId>trilha-java-parent</artifactId>
+    <version>2.0.0</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+  <artifactId>trilha-spring-parent</artifactId>
+  <packaging>pom</packaging>
+  <name>Trilha Java :: pai dos módulos Spring Boot</name>
+
+  <properties>
+    <spring-boot.version>4.1.1</spring-boot.version>
+    <springdoc.version>3.1.1</springdoc.version>
+    <archunit.version>1.5.1</archunit.version>
+    <!-- Preenchido pelo JaCoCo quando o módulo usa cobertura; vazio nos demais. -->
+    <argLine></argLine>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springdoc</groupId>
+        <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+        <version>${springdoc.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit-junit5</artifactId>
+        <version>${archunit.version}</version>
+      </dependency>
+      <!-- O Spring Modulith traz o ArchUnit como dependência: a mesma versão para tudo. -->
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit</artifactId>
+        <version>${archunit.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-maven-plugin</artifactId>
+          <version>${spring-boot.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <configuration>
+            <!-- Saída dos testes limpa: sem banner e só avisos/erros do Spring. Ajuste o nível para depurar. -->
+            <systemPropertyVariables>
+              <spring.main.banner-mode>off</spring.main.banner-mode>
+              <logging.level.root>WARN</logging.level.root>
+              <logging.level.org.springframework.web.servlet.mvc.support>ERROR</logging.level.org.springframework.web.servlet.mvc.support>
+            </systemPropertyVariables>
+            <!-- O Mockito se anexa como agente em tempo de execução; isto evita os avisos da JVM. -->
+            <argLine>@{argLine} -XX:+EnableDynamicAgentLoading -Xshare:off</argLine>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <configuration>
+            <!-- Mantém os nomes dos parâmetros (necessário para @PathVariable/@RequestParam sem nome explícito). -->
+            <parameters>true</parameters>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

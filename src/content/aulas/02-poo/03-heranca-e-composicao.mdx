@@ -1,0 +1,206 @@
+---
+titulo: Herança versus composição
+descricao: extends, super e @Override, o Princípio de Substituição de Liskov, os problemas da herança profunda e por que "prefira composição" é o conselho mais repetido em POO.
+modulo: 02-poo
+ordem: 3
+duracao: 50
+objetivos:
+  - Usar herança corretamente com extends, super e @Override
+  - Reconhecer quando a herança viola o Princípio de Substituição de Liskov
+  - Substituir herança por composição e delegação
+tags: [herança, composição, Liskov, override]
+flashcards:
+  - frente: O que o Princípio de Substituição de Liskov (LSP) diz?
+    verso: Onde se espera a superclasse, qualquer subclasse deve funcionar sem surpresas — sem enfraquecer garantias nem exigir mais do que a superclasse exige.
+  - frente: "O que significa \"prefira composição a herança\"?"
+    verso: Em vez de herdar comportamento (relação é-um), monte o objeto com outros objetos e delegue (relação tem-um). É mais flexível e menos acoplado.
+  - frente: Para que serve @Override?
+    verso: Diz ao compilador que o método sobrescreve um da superclasse ou interface. Se a assinatura estiver errada, dá erro de compilação em vez de criar um método novo por engano.
+  - frente: O que é o problema da classe base frágil?
+    verso: Mudanças internas na superclasse quebram subclasses que dependiam de detalhes de implementação dela.
+  - frente: O que significa uma classe final?
+    verso: Que ela não pode ser estendida. Útil para classes que não foram projetadas para herança (como String).
+---
+
+Herança é o recurso de POO que mais aparece nos cursos e o que mais causa problema nos sistemas reais. Nesta aula você vai aprender a usá-la corretamente e, principalmente, a reconhecer quando **não** usá-la.
+
+## O básico: `extends`, `super`, `@Override`
+
+```java
+public class Funcionario {
+    protected final String nome;
+    protected final BigDecimal salarioBase;
+
+    public Funcionario(String nome, BigDecimal salarioBase) {
+        this.nome = nome;
+        this.salarioBase = salarioBase;
+    }
+
+    public BigDecimal salarioMensal() {
+        return salarioBase;
+    }
+}
+
+public class Vendedor extends Funcionario {
+    private final BigDecimal comissao;
+
+    public Vendedor(String nome, BigDecimal salarioBase, BigDecimal comissao) {
+        super(nome, salarioBase);          // chama o construtor da superclasse
+        this.comissao = comissao;
+    }
+
+    @Override
+    public BigDecimal salarioMensal() {
+        return super.salarioMensal().add(comissao);   // reaproveita e estende
+    }
+}
+```
+
+- **`extends`**: `Vendedor` **é um** `Funcionario` e herda seus atributos e métodos.
+- **`super(...)`** chama o construtor da superclasse (no Java 25 ele pode vir depois de validações — você vê isso na aula 6).
+- **`@Override`** marca a sobrescrita. Se você errar a assinatura (`salarioMensal(int x)`), o compilador avisa, em vez de criar silenciosamente um método novo.
+- Java tem **herança simples**: uma classe estende no máximo **uma** outra.
+
+## Polimorfismo pela herança
+
+```java
+List<Funcionario> equipe = List.of(
+        new Funcionario("Ana", new BigDecimal("5000")),
+        new Vendedor("Bruno", new BigDecimal("3000"), new BigDecimal("1500")));
+
+BigDecimal folha = BigDecimal.ZERO;
+for (Funcionario f : equipe) {
+    folha = folha.add(f.salarioMensal());   // chama a versão certa de cada um
+}
+```
+
+O laço não sabe nem quer saber qual é o tipo concreto. A JVM decide **em tempo de execução** qual `salarioMensal()` chamar (*dynamic dispatch*). Esse é o valor real da herança: **tratar coisas diferentes de forma uniforme**.
+
+## Quando a herança dá errado
+
+### O quadrado que não é um retângulo
+
+O exemplo clássico, e ele acontece de verdade em sistemas:
+
+```java
+class Retangulo {
+    protected int largura, altura;
+    void setLargura(int l) { largura = l; }
+    void setAltura(int a) { altura = a; }
+    int area() { return largura * altura; }
+}
+
+class Quadrado extends Retangulo {   // "todo quadrado é um retângulo", certo?
+    @Override void setLargura(int l) { largura = l; altura = l; }
+    @Override void setAltura(int a) { largura = a; altura = a; }
+}
+
+void dobrarLargura(Retangulo r) {
+    r.setLargura(r.largura * 2);
+    // quem escreveu isto espera que a área dobre...
+}
+```
+
+Passe um `Quadrado` 3×3 para `dobrarLargura`: a área vai de 9 para **36**, não 18. O código que funcionava com `Retangulo` **quebra** com a subclasse.
+
+Isso viola o **Princípio de Substituição de Liskov** (o "L" do SOLID): *em qualquer lugar onde se espera a superclasse, uma subclasse deve funcionar sem surpresas*. "É um" na linguagem do dia a dia não garante "é um" no comportamento.
+
+### Herança acopla demais
+
+- A subclasse depende de **detalhes internos** da superclasse. Mudou a implementação lá, quebrou aqui (o problema da **classe base frágil**).
+- A hierarquia é **fixa**: um `Vendedor` que vira `Gerente` precisaria "trocar de classe" — impossível sem criar outro objeto.
+- Combinações explodem: `FuncionarioCLT`, `FuncionarioPJ`, `VendedorCLT`, `VendedorPJ`, `GerenteCLT`…
+
+## Composição: montar em vez de herdar
+
+A alternativa é **composição**: o objeto **tem** outros objetos e **delega** a eles parte do trabalho.
+
+<Comparar antes="Herança combinatória" depois="Composição">
+```java
+class VendedorCLT extends Vendedor { ... }
+class VendedorPJ extends Vendedor { ... }
+class GerenteCLT extends Gerente { ... }
+class GerentePJ extends Gerente { ... }
+// cada nova combinação = nova classe
+```
+
+```java
+class Funcionario {
+    private final String nome;
+    private final Cargo cargo;          // Vendedor, Gerente...
+    private final Contrato contrato;    // CLT, PJ...
+
+    BigDecimal salarioMensal() {
+        BigDecimal bruto = cargo.remuneracao();
+        return contrato.aplicarEncargos(bruto);
+    }
+}
+```
+</Comparar>
+
+`Cargo` e `Contrato` são **interfaces** (próxima aula), com implementações independentes. Novas combinações não exigem novas classes, e trocar o contrato de alguém é trocar um objeto. É a mesma ideia do **decorator** que você vai usar no exercício 02.02: uma regra de preço que **embrulha** outra.
+
+<Callout tipo="dica" titulo="Quando herança faz sentido">
+Use herança quando: (1) a relação "é um" vale **no comportamento**, não só no nome; (2) você controla as duas classes; (3) a superclasse foi **projetada** para ser estendida. Na dúvida, comece com composição. Marque com `final` as classes que não foram pensadas para herança — é o que a JDK faz com `String`.
+</Callout>
+
+## Classes abstratas: herança com contrato
+
+Uma classe `abstract` não pode ser instanciada e pode ter métodos sem corpo, que as subclasses **são obrigadas** a implementar:
+
+```java
+public abstract class Notificacao {
+    private final String destinatario;
+
+    protected Notificacao(String destinatario) {
+        this.destinatario = Objects.requireNonNull(destinatario);
+    }
+
+    // Template Method: o esqueleto é fixo, os detalhes variam
+    public final void enviar(String mensagem) {
+        String conteudo = formatar(mensagem);
+        transmitir(destinatario, conteudo);
+    }
+
+    protected abstract String formatar(String mensagem);
+    protected abstract void transmitir(String destinatario, String conteudo);
+}
+```
+
+É útil quando várias classes compartilham **estado e um algoritmo em comum**. Se só compartilham um **contrato**, prefira uma interface.
+
+<Callout tipo="entrevista">
+"Herança ou composição?" é pergunta certa de entrevista Pleno. Uma boa resposta cita o **LSP**, o **acoplamento** com a superclasse e dá um exemplo concreto de refatoração de herança para composição. Mencionar que o próprio *Effective Java* (Joshua Bloch) tem um item chamado "prefira composição a herança" também ajuda.
+</Callout>
+
+<Quiz
+  id="02-heranca"
+  questoes={[
+    {
+      pergunta: 'Qual o papel do `@Override`?',
+      opcoes: ['Torna o método mais rápido', 'Faz o compilador verificar que o método realmente sobrescreve outro', 'Impede que subclasses sobrescrevam o método', 'É obrigatório para herança funcionar'],
+      correta: 1,
+      explicacao: 'Sem ele, um erro na assinatura cria um método novo em silêncio. Com ele, o compilador acusa o erro.',
+    },
+    {
+      pergunta: 'Um `ContaPoupanca extends ContaCorrente` sobrescreve `sacar` para lançar exceção sempre que o saldo ficaria negativo, ignorando o limite do cheque especial. O que isso pode violar?',
+      opcoes: ['Encapsulamento', 'O Princípio de Substituição de Liskov', 'A sobrecarga de métodos', 'Nada'],
+      correta: 1,
+      explicacao: 'Código que usa ContaCorrente conta com o limite. A subclasse enfraquece essa garantia, surpreendendo quem a usa como ContaCorrente.',
+    },
+    {
+      pergunta: 'Por que composição costuma ser mais flexível que herança?',
+      opcoes: ['Porque usa menos memória', 'Porque as partes podem ser trocadas e combinadas em tempo de execução, sem hierarquias fixas', 'Porque o Java não suporta herança múltipla', 'Porque é mais rápida'],
+      correta: 1,
+      explicacao: 'Com composição, trocar um comportamento é trocar um objeto; com herança, a relação é fixada na compilação.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `extends` cria uma relação "é um"; `super` acessa a superclasse; `@Override` protege a sobrescrita.
+- Herança permite polimorfismo, mas **acopla** a subclasse aos detalhes da superclasse.
+- O **LSP** é o teste: a subclasse precisa funcionar em qualquer lugar onde a superclasse funciona.
+- **Prefira composição**: monte objetos com partes intercambiáveis e delegue.
+- Classes abstratas servem para compartilhar estado e algoritmo; para compartilhar só contrato, use interfaces.

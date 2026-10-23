@@ -1,0 +1,194 @@
+---
+titulo: "Caça-mutantes com Mockito: a suíte de testes do checkout"
+codigo: "10.02"
+resumo: Escreva os testes de um checkout pronto que reserva estoque, cobra, salva e notifica, com mocks para as quatro dependências. Os 14 defeitos que a sua suíte precisa pegar só aparecem verificando interações, argumentos e ordem.
+modulo: 10-testes
+ordem: 2
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [Mockito, BDDMockito, stubs, verify, ArgumentCaptor, InOrder, Clock, testes de mutação]
+aulas: [10-testes/03-mockito, 10-testes/01-por-que-e-como-testar, 10-testes/02-junit-e-assertj]
+java:
+  modulo: m10-testes
+  arquivos: [src/test/java/dev/trilhajava/m10/checkout/ServicoDeCheckoutTest.java]
+---
+
+## Contexto
+
+O checkout de um e-commerce de cafés tem um histórico de incidentes caros: estoque que ficou "preso" depois de pagamentos recusados (produtos indisponíveis por dias), clientes avisados de pedidos que nunca foram salvos, e uma cobrança que somava os preços **sem multiplicar pela quantidade**. Todos esses bugs passaram por testes que verificavam só o retorno do método.
+
+O problema é que quase tudo o que o checkout faz é **efeito colateral** em outra peça: reservar e liberar estoque, cobrar no gateway, salvar o pedido, avisar o cliente. Um teste que só olha o retorno não vê nada disso. O `ServicoDeCheckout` está pronto e correto; o seu trabalho é a suíte que teria pegado cada um desses bugs, e mais alguns.
+
+## O que você vai praticar
+
+- **Dublês de teste e Mockito.** As dependências do serviço são interfaces; nos testes, você as substitui por *mocks* com `@Mock` e `@ExtendWith(MockitoExtension.class)`. Um *stub* programa uma resposta (`given(estoque.reservar("CAFE-1KG", 2)).willReturn(true)`); um *verify* confere que uma chamada aconteceu (`then(estoque).should().liberar("CAFE-1KG", 2)`). Veja [Dublês de teste com Mockito](../../../aulas/10-testes/03-mockito/).
+- **Simular falhas.** `willReturn(ResultadoPagamento.recusado("..."))` e `willThrow(new GatewayIndisponivelException("timeout"))` levam o serviço aos caminhos de erro, que são os que menos rodam em produção até o dia em que rodam. Veja a [aula de Mockito](../../../aulas/10-testes/03-mockito/).
+- **Capturar argumentos e verificar a ordem.** `ArgumentCaptor` pega o objeto que o serviço passou para o mock, para você conferir os campos com AssertJ. `inOrder(repositorio, notificador)` verifica que uma chamada veio **antes** da outra. Veja a [aula de Mockito](../../../aulas/10-testes/03-mockito/).
+- **Quando NÃO mockar e quando NÃO verificar.** Não se mocka tipo de valor (`Pedido`, `Item`, `BigDecimal`); o tempo entra com `Clock.fixed(...)`, um *fake*, não um mock. E verifica-se **efeito** (cobrar, liberar, salvar, notificar), não **passo** (consultar, calcular). Veja a [aula de Mockito](../../../aulas/10-testes/03-mockito/) e [Por que testar, e o que é um bom teste](../../../aulas/10-testes/01-por-que-e-como-testar/).
+- **Testes de mutação, à mão.** A lista de defeitos deste exercício é a ideia dos *mutantes*: versões do código com um defeito cada. Uma boa suíte fica vermelha em todas.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m10.checkout` (em `src/main/java`, pronto e correto; não precisa mudar):
+
+- `ServicoDeCheckout` — a classe que você vai testar. Construtor `ServicoDeCheckout(Estoque, GatewayDePagamento, RepositorioDePedidos, Notificador, Clock)` e um único método público: `PedidoConfirmado finalizar(Pedido pedido)`.
+- As quatro dependências, todas interfaces:
+  - `Estoque` — `boolean reservar(String sku, int quantidade)` (devolve `false` se não há estoque) e `void liberar(String sku, int quantidade)`;
+  - `GatewayDePagamento` — `ResultadoPagamento cobrar(String clienteId, BigDecimal valor)`, que pode lançar `GatewayIndisponivelException`;
+  - `RepositorioDePedidos` — `void salvar(PedidoConfirmado pedido)`;
+  - `Notificador` — `void pedidoConfirmado(String clienteId, String numeroDoPedido)` e `void pagamentoRecusado(String clienteId, String motivo)`.
+- Os tipos de valor (records): `Pedido(clienteId, itens)`, `Item(sku, quantidade, precoUnitario)`, `PedidoConfirmado(numero, clienteId, total, codigoAutorizacao, confirmadoEm)` e `ResultadoPagamento`, com as fábricas `ResultadoPagamento.aprovado(codigo)` e `ResultadoPagamento.recusado(motivo)`.
+- As exceções: `EstoqueInsuficienteException` (a mensagem contém o SKU), `PagamentoRecusadoException` (a mensagem contém o motivo) e `GatewayIndisponivelException`.
+- (`Checkout` e `Checkouts` também estão lá, mas você não precisa deles.)
+
+### O que você implementa
+
+A classe de teste `ServicoDeCheckoutTest`, em `src/test/java/dev/trilhajava/m10/checkout/` (a classe já existe, vazia), com mocks para as quatro dependências e um `Clock` fixo. Ela precisa **passar** no serviço como está e **falhar** em cada um dos defeitos listados em **Regras**.
+
+As regras do checkout (também estão no Javadoc do serviço):
+
+| # | Situação | O que o serviço faz |
+|---|---|---|
+| R1 | pedido sem itens, ou item com quantidade ≤ 0 | `IllegalArgumentException`, **sem tocar** em nenhuma dependência |
+| R2 | reserva | reserva cada item, na ordem do pedido |
+| R3 | falta estoque de um item | libera **todos os já reservados**, com as **mesmas quantidades** (não o que faltou), lança `EstoqueInsuficienteException` e **não cobra** |
+| R4 | cobrança | cobra o cliente pelo **total**: a soma de quantidade × preço unitário |
+| R5 | gateway fora do ar (exceção) | libera todas as reservas e deixa a exceção sair; não salva nem notifica |
+| R6 | pagamento recusado | libera todas as reservas, avisa `pagamentoRecusado(cliente, motivo)` e lança `PagamentoRecusadoException`; não salva nem confirma |
+| R7 | pagamento aprovado | salva o `PedidoConfirmado` (número `PED-...`, cliente, total, código de autorização e `confirmadoEm` = o instante do `Clock`), **só depois** avisa `pedidoConfirmado(cliente, número)` e devolve o pedido salvo; não libera nada |
+
+Um pedido de exemplo e o que se espera dele: `cliente-7` com `CAFE-1KG` × 2 a R$ 89,90 e `MOEDOR` × 1 a R$ 149,00. O total é 2 × 89,90 + 149,00 = **R$ 328,80**. Se o pagamento for recusado, o estoque recebe `liberar("CAFE-1KG", 2)` e `liberar("MOEDOR", 1)`.
+
+## Regras
+
+**Os defeitos que a sua suíte precisa pegar.** Cada item descreve uma versão errada do serviço. Para cada um, se alguém introduzir aquele defeito (e só ele), **pelo menos um** teste seu deve falhar.
+
+| # | Defeito | Regra que ele quebra |
+|---|---|---|
+| D1 | aceita pedido **sem itens** | R1 |
+| D2 | aceita item com quantidade **zero** ou **negativa** | R1 |
+| D3 | ignora a falta de estoque e segue para a cobrança | R3 |
+| D4 | quando falta estoque, libera **só o último** item reservado | R3 |
+| D5 | libera sempre **1 unidade**, qualquer que seja a quantidade reservada | R3, R5, R6 |
+| D6 | quando falta estoque, libera **também o item que faltou** | R3 |
+| D7 | cobra a soma dos preços, **ignorando as quantidades** | R4 |
+| D8 | com o gateway fora do ar, **não libera** as reservas | R5 |
+| D9 | com o pagamento recusado, **não libera** o estoque | R6 |
+| D10 | com o pagamento recusado, **não avisa** o cliente | R6 |
+| D11 | com o pagamento recusado, avisa **também** `pedidoConfirmado` | R6 |
+| D12 | com o pagamento recusado, **salva** um pedido | R6 |
+| D13 | usa `Instant.now()` em vez do `Clock` injetado em `confirmadoEm` | R7 |
+| D14 | avisa a confirmação **antes** de salvar o pedido | R7 |
+
+**Exigências sobre a suíte**
+
+1. **Mocks só para as quatro dependências.** `Pedido`, `Item`, `ResultadoPagamento` e `BigDecimal` são objetos de verdade; o tempo é `Clock.fixed(Instant.parse("2026-09-28T13:00:00Z"), ZoneOffset.UTC)`.
+2. **Stubs só do que o cenário usa.** Com o `MockitoExtension`, os *strict stubs* estão ligados: um `given` que o teste não usa gera `UnnecessaryStubbingException`. A suíte roda sem nenhum.
+3. **Verifique efeitos, com os argumentos exatos.** `liberar("CAFE-1KG", 2)`, não `liberar(anyString(), anyInt())`: o D5 só aparece com a quantidade conferida. Onde o efeito **não** pode acontecer, diga isso: `should(never())` ou `verifyNoInteractions(...)`.
+4. **Não verifique passos.** Não confira quantas vezes `reservar` foi chamado no caminho feliz, nem use `verifyNoMoreInteractions` em todo teste: isso acopla a suíte à implementação sem proteger nenhuma regra, e ela quebra numa refatoração que não muda nada para o cliente.
+5. **Capture o que é montado dentro do serviço.** O `PedidoConfirmado` é criado pelo serviço; use `ArgumentCaptor` para conferir o que foi salvo (total, autorização, `confirmadoEm`). Compare o total com `isEqualByComparingTo`, não com `equals` (`328.80` e `328.8` são o mesmo valor, com escalas diferentes).
+6. **Ordem só onde a ordem é regra.** `InOrder` para "salva, depois avisa" (R7); em nenhum outro lugar.
+7. **Dados que tornam os defeitos visíveis.** Itens com quantidade maior que 1; um pedido com três itens em que falta o **último**. Com um único item de quantidade 1, metade dos defeitos passaria.
+8. **Nomes que descrevem o comportamento**, com `@DisplayName`: "pagamento recusado: libera tudo, avisa o cliente com o motivo e não salva". `@Nested` ajuda a agrupar o caminho feliz, que compartilha os mesmos stubs.
+
+## Passo a passo sugerido
+
+1. **Monte a classe.** `@ExtendWith(MockitoExtension.class)`, quatro campos `@Mock` e um `@BeforeEach` que cria o serviço com `new ServicoDeCheckout(..., Clock.fixed(...))`. Rode: nenhum teste ainda, tudo verde.
+2. **Caminho feliz, o total (R4).** Programe `reservar` para devolver `true` e `cobrar` para aprovar. Finalize o pedido de exemplo e verifique a cobrança de R$ 328,80. Sabote o cálculo do total (D7) e veja o teste falhar.
+3. **Caminho feliz, o pedido salvo (R7).** Capture o `PedidoConfirmado` salvo e confira os campos, inclusive `confirmadoEm`. Depois, a ordem "salva, depois avisa", com `InOrder`. Agrupe os testes do caminho feliz num `@Nested` com os stubs no `@BeforeEach` dele.
+4. **Falta de estoque (R3).** Três itens, o terceiro sem estoque. Verifique a exceção, a liberação dos dois primeiros com as quantidades certas, que o terceiro não foi liberado e que ninguém foi cobrado.
+5. **Pagamento recusado (R6).** O que acontece e o que **não** acontece: liberar, avisar, não salvar, não confirmar.
+6. **Gateway fora do ar (R5).** `willThrow` e as verificações.
+7. **Pedido inválido (R1).** Sem itens, quantidade zero, quantidade negativa, e nenhuma dependência tocada.
+8. **Cace os defeitos.** Para cada linha da tabela de defeitos, sabote o serviço (veja **Experimente**), rode a suíte e desfaça. Se ficar tudo verde, falta uma verificação.
+
+## Experimente
+
+**Rodando a sua suíte.** No IntelliJ, com o starter aberto pelo `pom.xml`, clique no ▶ ao lado de `class ServicoDeCheckoutTest`. Pelo terminal:
+
+```bash
+cd java/m10-testes/starter
+mvn test "-Dtest=ServicoDeCheckoutTest*"
+```
+
+O `*` inclui as classes `@Nested`. Sem o `-Dtest`, o Maven roda também os testes dos outros exercícios do módulo.
+
+**Sabotando de propósito.** Abra `ServicoDeCheckout` (em `src/main/java`) e introduza **um** defeito por vez. Por exemplo, o D5, no método `liberar`:
+
+```java
+estoque.liberar(item.sku(), item.quantidade());   // correto
+estoque.liberar(item.sku(), 1);                   // defeito D5
+```
+
+Rode a suíte: ao menos um teste precisa ficar vermelho. A mensagem do Mockito (`Argument(s) are different!`) mostra a chamada esperada, `liberar("CAFE-1KG", 2)`, e a que de fato aconteceu, `liberar("CAFE-1KG", 1)`. Depois, **desfaça** a alteração e rode de novo, para ter certeza de que voltou ao verde.
+
+| Cenário | Resultado esperado |
+|---|---|
+| a suíte no serviço como veio | todos os testes passam, sem `UnnecessaryStubbingException` |
+| cada defeito D1 a D14, introduzido sozinho | pelo menos um teste falha |
+| o defeito desfeito | todos os testes voltam a passar |
+
+## Critérios de aceite
+
+- [ ] A suíte passa no `ServicoDeCheckout` como ele veio, sem avisos de stubs desnecessários.
+- [ ] Cada um dos 14 defeitos da tabela, introduzido sozinho, faz pelo menos um teste falhar (você conferiu sabotando o código).
+- [ ] Só as quatro dependências são mocks; o tempo vem de um `Clock.fixed`.
+- [ ] Você sabe explicar, para cada `verify` da sua suíte, qual regra de negócio ele protege.
+
+## Desafios opcionais
+
+- **Rode o PIT de verdade.** Acrescente o plugin `org.pitest:pitest-maven` (com o `pitest-junit5-plugin`) ao `pom.xml` do starter e rode `mvn test-compile org.pitest:pitest-maven:mutationCoverage -DtargetClasses=dev.trilhajava.m10.checkout.*`. O PIT remove chamadas a métodos `void` (como `liberar` e `salvar`) automaticamente: veja quais mutantes a sua suíte deixa vivos.
+- Reescreva a suíte **sem Mockito**, com *fakes* (`EstoqueEmMemoria`, `GatewayProgramavel`, `NotificadorQueGuarda`...). Compare a legibilidade, a quantidade de código e quais defeitos cada versão pega.
+- Acrescente ao serviço a regra "pedidos acima de R$ 10.000 exigem aprovação manual" com TDD: primeiro o teste vermelho, depois o código.
+
+<Dicas>
+<Dica nivel={1}>
+Organize por cenário: aprovado, sem estoque, recusado, gateway fora, inválido. Em cada um, pergunte: que efeitos **precisam** acontecer, e quais **não podem** acontecer? Estoque liberado? Com qual quantidade? Cobrança feita? Pedido salvo? Cliente avisado, e de quê? Cada resposta vira uma linha `then(...).should(...)`.
+</Dica>
+<Dica nivel={2}>
+- Para o total, capture o valor cobrado: `ArgumentCaptor<BigDecimal>` e `then(gateway).should().cobrar(eq("cliente-7"), valor.capture())`. Ao misturar um captor com um valor fixo, o valor fixo vai dentro de `eq(...)`.
+- Para "avisa só depois de salvar": `InOrder ordem = inOrder(repositorio, notificador)`, e depois `ordem.verify(...)` na ordem esperada.
+- Para "sem tocar em nada": `verifyNoInteractions(estoque, gateway, repositorio, notificador)`.
+- Para o `confirmadoEm`: compare com o mesmo `Instant` que você passou ao `Clock.fixed`.
+</Dica>
+<Dica nivel={3}>
+Os defeitos mais traiçoeiros:
+- D4 (libera só o último) e D6 (libera também o que faltou): um pedido com **três** itens em que o terceiro falta; verifique a liberação **dos dois primeiros** e `should(never()).liberar(eq("BULE"), anyInt())`;
+- D5 (libera sempre 1): itens com quantidade maior que 1, e `liberar("CAFE-1KG", 2)` com a quantidade exata;
+- D3 (ignora a falta de estoque): com o stub de `reservar` devolvendo `false`, `assertThatThrownBy(...).isInstanceOf(EstoqueInsuficienteException.class)` e `verifyNoInteractions(gateway, ...)`;
+- D13 (`Instant.now()`): `assertThat(salvo.confirmadoEm()).isEqualTo(AGORA)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A suíte de referência
+
+<CodigoJava caminho="m10-testes/solucao/src/test/java/dev/trilhajava/m10/checkout/ServicoDeCheckoutTest.java" />
+
+Ela foi conferida contra os 14 defeitos: cada um, introduzido sozinho, faz ao menos um teste falhar.
+
+### Por que assim
+
+- **Verificações onde a interação é o comportamento.** Liberar estoque, cobrar o valor exato, salvar e avisar são os efeitos pelos quais o negócio paga. Verificar `reservar` no caminho feliz não protegeria nenhuma regra a mais e acoplaria o teste à implementação.
+- **O "não" também é verificado.** Metade dos defeitos é algo que acontece quando não devia (cobrar sem estoque, salvar um pedido recusado, confirmar um recusado). `never()` e `verifyNoInteractions` transformam essas proibições em testes.
+- **Dados que tornam os defeitos visíveis.** O café com quantidade 2 pega o D5; o pedido de três itens com o último em falta pega o D4 e o D6.
+- **`Clock.fixed` é um fake, não um mock.** O tempo vira um dado do teste, e o D13 aparece na comparação do `confirmadoEm`.
+- **`@Nested` para o caminho feliz.** Os stubs comuns ficam num `@BeforeEach` só, e cada teste diz apenas o que verifica. Como todos os testes do grupo usam os dois stubs, os strict stubs não reclamam.
+- **Captor para o total, com `isEqualByComparingTo`.** `cobrar("cliente-7", new BigDecimal("328.80"))` funcionaria hoje, mas quebraria se o serviço passasse a somar com outra escala sem mudar o valor.
+
+### Alternativas
+
+- **Fakes em vez de mocks.** Um `EstoqueEmMemoria` com saldo por SKU deixa o teste conferir o **estado final** ("o saldo voltou a 10") em vez das chamadas. Os testes ficam mais resistentes a refatorações, mas "avisa só depois de salvar" é mais difícil de expressar sem um registro de eventos.
+- **Mockito "clássico"** (`when(...).thenReturn(...)` e `verify(...)`) em vez do BDDMockito: é o mesmo mecanismo com outros nomes. O BDD deixa o given/when/then mais visível.
+- **`verifyNoMoreInteractions(estoque)` no teste de recusa** pegaria um defeito extra (liberar duas vezes o mesmo item), com o custo de quebrar se o serviço passar a consultar o estoque por outro motivo. Use onde uma chamada a mais seria um bug de verdade.
+
+### Avalie sua solução
+
+- Se alguém trocar a ordem de reserva dos itens (o último primeiro), algum teste quebra? Deveria quebrar?
+- Quantos dos seus testes quebrariam se o serviço passasse a salvar o pedido **antes** de cobrar (e desfizesse em caso de recusa)? O comportamento visto pelo cliente mudou?
+- Tire um `never()` da sua suíte: qual defeito da tabela passa a sobreviver?
+
+</Solucao>

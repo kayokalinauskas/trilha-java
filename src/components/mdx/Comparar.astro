@@ -1,0 +1,54 @@
+---
+/**
+ * Comparação lado a lado ("antes / depois", "errado / certo").
+ * Coloque exatamente dois blocos de código (ou parágrafos) como filhos.
+ */
+interface Props {
+  antes?: string;
+  depois?: string;
+}
+const { antes = 'Evite', depois = 'Prefira' } = Astro.props;
+---
+
+<div class="comparar" style={`--antes:"${antes}";--depois:"${depois}"`}>
+  <slot />
+</div>
+
+<style>
+  .comparar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin-block: 1.6em;
+    max-width: none;
+  }
+  .comparar > :global(*) {
+    position: relative;
+    margin: 0 !important;
+    min-width: 0;
+  }
+  .comparar > :global(*)::before {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .comparar > :global(*:nth-child(1))::before {
+    content: '✕ ' var(--antes);
+    color: var(--danger);
+  }
+  .comparar > :global(*:nth-child(2))::before {
+    content: '✓ ' var(--depois);
+    color: var(--ok);
+  }
+  @media (max-width: 900px) {
+    .comparar {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

@@ -1,0 +1,92 @@
+---
+titulo: Cotação de frete paralela com timeout
+codigo: "06.03"
+resumo: Consulte várias transportadoras em paralelo com CompletableFuture, ignore as que falham ou demoram demais e devolva as cotações ordenadas pelo preço.
+modulo: 06-concorrencia
+ordem: 3
+dificuldade: medio
+tempo: 1,5–2h
+conceitos: [CompletableFuture, timeout, tratamento de falhas, virtual threads]
+aulas: [06-concorrencia/04-completablefuture]
+java:
+  modulo: m06-concorrencia
+  teste: CotadorDeFreteTest
+---
+
+## Contexto
+
+O checkout de um e-commerce mostra o frete de cinco transportadoras. Hoje, elas são consultadas **uma depois da outra**: cada API leva de 200 a 800 ms, e o checkout demora até 4 segundos só no frete. Quando uma transportadora fica fora do ar, a página inteira dá erro. O time de produto definiu:
+
+- consultar **todas em paralelo**;
+- **no máximo X ms** por transportadora; quem não responder a tempo fica de fora;
+- quem **falhar** também fica de fora, sem derrubar as outras;
+- mostrar as cotações **da mais barata para a mais cara**.
+
+## O modelo (pronto)
+
+```java
+interface Transportadora {
+    String nome();
+    BigDecimal cotar(String cepDestino, double pesoKg);   // bloqueante, pode demorar ou lançar exceção
+}
+record Cotacao(String transportadora, BigDecimal preco) { }
+```
+
+## Requisitos
+
+`CotadorDeFrete(transportadoras, executor, timeoutPorCotacao)` com:
+
+| Método | Comportamento |
+|---|---|
+| `cotarTodas(cep, peso)` | Cotações que responderam a tempo, ordenadas por preço |
+| `maisBarata(cep, peso)` | `Optional` com a mais barata; vazio se ninguém respondeu |
+
+## Os testes
+
+- **5 transportadoras de 300 ms** devem responder em **menos de 1 s** no total (em sequência seriam 1,5 s).
+- Uma que responde em 50 ms, uma **quebrada** (lança exceção) e uma **lerda** (5 s) com timeout de 500 ms: só a primeira aparece, em menos de 2 s.
+
+O executor recebido nos testes usa **virtual threads**.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `CotadorDeFreteTest` passam.
+- [ ] As chamadas usam o `Executor` recebido (nunca o `ForkJoinPool` comum).
+- [ ] Nenhuma exceção escapa de `cotarTodas`.
+
+## Desafios opcionais
+
+- Registre em log cada falha e cada timeout, com o nome da transportadora.
+- Devolva também a lista de transportadoras que **não** responderam, para o painel de monitoramento.
+
+<Dicas>
+<Dica nivel={1}>
+Cada transportadora vira um `CompletableFuture<Cotacao>` criado com `supplyAsync(tarefa, executor)`. Depois, você espera todos e fica só com os que deram certo.
+</Dica>
+<Dica nivel={2}>
+`.orTimeout(ms, MILLISECONDS)` faz o future falhar se passar do tempo; `.exceptionally(erro -> null)` transforma qualquer falha (inclusive o timeout) em "sem cotação". Assim, o `join()` nunca lança.
+</Dica>
+<Dica nivel={3}>
+Cuidado com a preguiça das Streams: crie **todos** os futures com `.toList()` primeiro e só depois faça `futuros.stream().map(CompletableFuture::join).filter(Objects::nonNull).sorted(comparing(Cotacao::preco)).toList()`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m06-concorrencia/solucao/src/main/java/dev/trilhajava/m06/CotadorDeFrete.java" />
+
+### Pontos-chave
+
+- **`toList()` antes do `join`** dispara todas as chamadas antes de esperar qualquer uma. Sem ele, o paralelismo some.
+- **`orTimeout` + `exceptionally`** isolam cada transportadora: o pior caso do checkout passa a ser o timeout, não a soma dos tempos.
+- **Executor injetado**: o chamador decide onde as tarefas rodam (virtual threads em produção, algo controlado em testes).
+- **O timeout não cancela a chamada HTTP**: a tarefa "lerda" continua rodando até terminar. Em produção, configure também o timeout do cliente HTTP — no teste, o `shutdownNow` do executor interrompe a thread.
+
+### Avalie sua solução
+
+- Quanto tempo o teste `paralelo` leva na sua máquina? Deveria ficar perto de 300 ms.
+- Se você esquecer o `exceptionally`, o que acontece com a transportadora "Quebrada"?
+
+</Solucao>

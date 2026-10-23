@@ -1,0 +1,410 @@
+---
+import Base from '../layouts/Base.astro';
+import Icon from '../components/Icon.astro';
+import { getAulas, getModulos, pad2 } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const [modulos, aulas] = await Promise.all([getModulos(), getAulas()]);
+const titulo = new Map(modulos.map((m) => [m.id, `${pad2(m.data.numero)} · ${m.data.titulo}`]));
+const cartoes = aulas.flatMap((a) =>
+  a.data.flashcards.map((f, i) => ({
+    id: `${a.id}#${i}`,
+    aula: a.id,
+    aulaTitulo: a.data.titulo,
+    aulaUrl: url(`aulas/${a.id}`),
+    modulo: a.data.modulo.id,
+    moduloTitulo: titulo.get(a.data.modulo.id),
+    frente: f.frente,
+    verso: f.verso,
+  })),
+);
+const modulosComCartoes = modulos.filter((m) => cartoes.some((c) => c.modulo === m.id));
+---
+
+<Base title="Flashcards" description="Revisão espaçada dos conceitos das aulas: cinco minutos por dia valem mais que horas na véspera.">
+  <section class="head">
+    <div class="container">
+      <p class="eyebrow">Revisão espaçada</p>
+      <h1>Flashcards</h1>
+      <p class="lead">
+        Cada cartão volta logo antes de você esquecer: amanhã, em 3 dias, em uma semana… Os cartões de uma aula entram na fila quando você a
+        marca como concluída.
+      </p>
+    </div>
+  </section>
+
+  <div class="container fc">
+    <div class="stats" aria-live="polite">
+      <div class="stat"><span data-s="hoje">0</span><small>para revisar hoje</small></div>
+      <div class="stat"><span data-s="novos">0</span><small>novos</small></div>
+      <div class="stat"><span data-s="dominados">0</span><small>dominados (≥ 21 dias)</small></div>
+      <div class="stat"><span data-s="bloqueados">0</span><small>de aulas não concluídas</small></div>
+    </div>
+
+    <div class="controles">
+      <label class="sel">
+        <span>Módulo</span>
+        <select id="f-modulo">
+          <option value="">Todos</option>
+          {modulosComCartoes.map((m) => <option value={m.id}>{titulo.get(m.id)}</option>)}
+        </select>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="f-todos" />
+        <span>Incluir cartões de aulas ainda não concluídas</span>
+      </label>
+    </div>
+
+    <div class="palco">
+      <div class="cartao" id="cartao" hidden>
+        <p class="c-origem"><a data-origem href="#"></a></p>
+        <div class="c-frente" data-frente></div>
+        <div class="c-verso" data-verso hidden></div>
+        <div class="c-acoes">
+          <button type="button" class="btn btn-primary" id="virar"><Icon name="rotate" size={16} /> Mostrar resposta <kbd>Espaço</kbd></button>
+          <div class="notas" id="notas" hidden>
+            <button type="button" data-q="0" class="n0">Errei <small>de novo agora</small><kbd>1</kbd></button>
+            <button type="button" data-q="3" class="n3">Difícil <small data-prev="3"></small><kbd>2</kbd></button>
+            <button type="button" data-q="4" class="n4">Bom <small data-prev="4"></small><kbd>3</kbd></button>
+            <button type="button" data-q="5" class="n5">Fácil <small data-prev="5"></small><kbd>4</kbd></button>
+          </div>
+        </div>
+        <p class="restantes"><span data-restantes></span></p>
+      </div>
+
+      <div class="vazio card" id="vazio" hidden>
+        <Icon name="check-circle" size={28} />
+        <h2 data-vazio-t>Tudo em dia!</h2>
+        <p class="muted" data-vazio-p>Nenhum cartão para revisar agora. Volte amanhã — ou conclua uma nova aula para liberar mais cartões.</p>
+        <a class="btn" href={url('')}>Ir para a trilha</a>
+      </div>
+    </div>
+  </div>
+</Base>
+
+<script type="application/json" id="cartoes" set:html={JSON.stringify(cartoes)} />
+
+<script>
+  import { hoje, ler, proximoEstado, revisarCartao, type CartaoSRS, type Qualidade } from '../lib/progresso';
+
+  type Cartao = { id: string; aula: string; aulaTitulo: string; aulaUrl: string; modulo: string; frente: string; verso: string };
+  const todos: Cartao[] = JSON.parse(document.getElementById('cartoes')!.textContent || '[]');
+  const el = {
+    cartao: document.getElementById('cartao')!,
+    vazio: document.getElementById('vazio')!,
+    frente: document.querySelector<HTMLElement>('[data-frente]')!,
+    verso: document.querySelector<HTMLElement>('[data-verso]')!,
+    origem: document.querySelector<HTMLAnchorElement>('[data-origem]')!,
+    virar: document.getElementById('virar') as HTMLButtonElement,
+    notas: document.getElementById('notas')!,
+    restantes: document.querySelector<HTMLElement>('[data-restantes]')!,
+    modulo: document.getElementById('f-modulo') as HTMLSelectElement,
+    todos: document.getElementById('f-todos') as HTMLInputElement,
+  };
+
+  let fila: Cartao[] = [];
+  let atual: Cartao | undefined;
+
+  const fmt = (s: string) =>
+    s
+      .replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!)
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  function montarFila() {
+    const p = ler();
+    const d = hoje();
+    const disponiveis = todos.filter((c) => (!el.modulo.value || c.modulo === el.modulo.value) && (el.todos.checked || p.aulas[c.aula]));
+    const vencidos = disponiveis.filter((c) => p.flashcards[c.id] && p.flashcards[c.id].proxima <= d);
+    const novos = disponiveis.filter((c) => !p.flashcards[c.id]);
+    fila = [...vencidos, ...novos.slice(0, 20)]; // no máximo 20 novos por sessão
+
+    const doModulo = todos.filter((c) => !el.modulo.value || c.modulo === el.modulo.value);
+    set('hoje', vencidos.length);
+    set('novos', novos.length);
+    set('dominados', doModulo.filter((c) => (p.flashcards[c.id]?.intervalo ?? 0) >= 21).length);
+    set('bloqueados', doModulo.filter((c) => !p.aulas[c.aula]).length);
+
+    const semNada = disponiveis.length === 0;
+    document.querySelector('[data-vazio-t]')!.textContent = semNada ? 'Nenhum cartão liberado ainda' : 'Tudo em dia!';
+    document.querySelector('[data-vazio-p]')!.textContent = semNada
+      ? 'Conclua uma aula (botão no fim da página) para liberar os cartões dela — ou marque "Incluir cartões de aulas ainda não concluídas".'
+      : 'Nenhum cartão para revisar agora. Volte amanhã — ou conclua uma nova aula para liberar mais cartões.';
+    proximo();
+  }
+
+  function set(chave: string, valor: number) {
+    document.querySelector(`[data-s="${chave}"]`)!.textContent = String(valor);
+  }
+
+  function previsao(estado: CartaoSRS | undefined, q: Qualidade) {
+    const dias = proximoEstado(estado, q).intervalo;
+    return dias >= 30 ? `${Math.round(dias / 30)} mês(es)` : `${dias} dia${dias > 1 ? 's' : ''}`;
+  }
+
+  function proximo() {
+    atual = fila.shift();
+    el.cartao.hidden = !atual;
+    el.vazio.hidden = !!atual;
+    if (!atual) return;
+    const estado = ler().flashcards[atual.id];
+    el.frente.innerHTML = fmt(atual.frente);
+    el.verso.innerHTML = fmt(atual.verso);
+    el.verso.hidden = true;
+    el.notas.hidden = true;
+    el.virar.hidden = false;
+    el.origem.textContent = atual.aulaTitulo;
+    el.origem.href = atual.aulaUrl;
+    el.restantes.textContent = `${fila.length} restante(s) nesta sessão`;
+    document.querySelectorAll<HTMLElement>('[data-prev]').forEach((s) => (s.textContent = previsao(estado, Number(s.dataset.prev) as Qualidade)));
+    el.cartao.classList.remove('entrou');
+    void el.cartao.offsetWidth;
+    el.cartao.classList.add('entrou');
+    el.virar.focus();
+  }
+
+  function virar() {
+    if (!atual || !el.verso.hidden) return;
+    el.verso.hidden = false;
+    el.virar.hidden = true;
+    el.notas.hidden = false;
+    el.notas.querySelector<HTMLButtonElement>('[data-q="4"]')?.focus();
+  }
+
+  function responder(q: Qualidade) {
+    if (!atual) return;
+    revisarCartao(atual.id, q);
+    if (q === 0) fila.push(atual); // errou: volta ainda nesta sessão
+    proximo();
+  }
+
+  el.virar.addEventListener('click', virar);
+  el.notas.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-q]');
+    if (b) responder(Number(b.dataset.q) as Qualidade);
+  });
+  document.addEventListener('keydown', (e) => {
+    if ((e.target as HTMLElement).closest('input, select, textarea, dialog')) return;
+    if (e.key === ' ' && !el.cartao.hidden && el.verso.hidden) {
+      e.preventDefault();
+      virar();
+    } else if (!el.notas.hidden && ['1', '2', '3', '4'].includes(e.key)) {
+      responder(([0, 3, 4, 5] as const)[Number(e.key) - 1]);
+    }
+  });
+  el.modulo.addEventListener('change', montarFila);
+  el.todos.addEventListener('change', montarFila);
+  montarFila();
+</script>
+
+<style>
+  .head {
+    padding-block: 40px 28px;
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(700px 260px at 90% 0%, var(--ok-soft), transparent 70%);
+  }
+  h1 {
+    font-size: var(--step-3);
+    margin-block: 8px 12px;
+  }
+  .lead {
+    max-width: 66ch;
+  }
+  .fc {
+    padding-top: 28px;
+    max-width: 55rem;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .stat {
+    display: grid;
+    padding: 14px 16px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .stat span {
+    font-family: var(--font-display);
+    font-size: 1.8rem;
+    font-weight: 700;
+    line-height: 1.1;
+  }
+  .stat:first-child span {
+    color: var(--accent);
+  }
+  .stat small {
+    font-size: 0.78rem;
+    color: var(--text-3);
+  }
+  .controles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: end;
+    margin-block: 20px 24px;
+  }
+  .sel {
+    display: grid;
+    gap: 4px;
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .sel select {
+    min-height: 36px;
+    padding: 4px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 0.88rem;
+  }
+  .check {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 0.88rem;
+    color: var(--text-2);
+    cursor: pointer;
+    min-height: 24px;
+  }
+  .check input {
+    accent-color: var(--accent);
+    width: 16px;
+    height: 16px;
+  }
+  .cartao {
+    position: relative;
+    min-height: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: clamp(24px, 5vw, 44px);
+    border-radius: var(--radius-xl);
+    border: 1px solid var(--border-strong);
+    background:
+      radial-gradient(500px 200px at 50% -20%, var(--accent-soft), transparent 70%),
+      var(--surface);
+    box-shadow: var(--shadow-lift);
+  }
+  .cartao.entrou {
+    animation: entrar 0.35s var(--ease);
+  }
+  @keyframes entrar {
+    from {
+      opacity: 0;
+      transform: translateY(10px) scale(0.99);
+    }
+  }
+  .c-origem {
+    font-size: 0.8rem;
+  }
+  .c-origem a {
+    color: var(--text-3);
+    text-decoration: none;
+  }
+  .c-origem a:hover {
+    color: var(--accent);
+  }
+  .c-frente {
+    font-family: var(--font-display);
+    font-size: var(--step-2);
+    font-weight: 650;
+    line-height: 1.3;
+    text-wrap: balance;
+  }
+  .c-verso {
+    padding-top: 18px;
+    border-top: 1px dashed var(--border-strong);
+    font-size: 1.08rem;
+    line-height: 1.65;
+    color: var(--text-2);
+    animation: entrar 0.3s var(--ease);
+  }
+  .c-frente :global(code),
+  .c-verso :global(code) {
+    padding: 0.1em 0.35em;
+    border-radius: 6px;
+    background: var(--surface-3);
+    font-size: 0.85em;
+  }
+  .c-acoes {
+    margin-top: auto;
+  }
+  .notas {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .notas button {
+    display: grid;
+    gap: 2px;
+    justify-items: center;
+    padding: 10px 6px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    font-weight: 700;
+    font-size: 0.92rem;
+    transition: transform 0.12s var(--ease), border-color 0.15s;
+  }
+  .notas button:hover {
+    transform: translateY(-2px);
+  }
+  .notas small {
+    font-weight: 500;
+    font-size: 0.75rem;
+    color: var(--text-3);
+  }
+  .notas kbd {
+    margin-top: 2px;
+  }
+  .n0:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .n3:hover {
+    border-color: var(--warn);
+    color: var(--warn);
+  }
+  .n4:hover {
+    border-color: var(--ok);
+    color: var(--ok);
+  }
+  .n5:hover {
+    border-color: var(--info);
+    color: var(--info);
+  }
+  .restantes {
+    font-size: 0.8rem;
+    color: var(--text-3);
+    text-align: center;
+  }
+  .vazio {
+    display: grid;
+    justify-items: center;
+    gap: 10px;
+    padding: 48px 24px;
+    text-align: center;
+    color: var(--ok);
+  }
+  .vazio h2 {
+    color: var(--text);
+    font-size: 1.4rem;
+  }
+  .vazio p {
+    max-width: 48ch;
+  }
+  @media (max-width: 640px) {
+    .stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .notas {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .notas kbd,
+    #virar kbd {
+      display: none;
+    }
+  }
+</style>

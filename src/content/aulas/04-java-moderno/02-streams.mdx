@@ -1,0 +1,208 @@
+---
+titulo: Streams do jeito certo
+descricao: O pipeline fonte → operações intermediárias → operação terminal, avaliação preguiçosa, map, filter, flatMap, sorted, reduce, streams de primitivos e quando NÃO usar streams.
+modulo: 04-java-moderno
+ordem: 2
+duracao: 55
+objetivos:
+  - Montar pipelines de Stream legíveis e sem efeitos colaterais
+  - Explicar a avaliação preguiçosa e o curto-circuito
+  - Diferenciar map de flatMap e usar reduce corretamente
+  - Reconhecer quando um laço comum é melhor que uma Stream
+tags: [Streams, map, filter, flatMap, reduce]
+flashcards:
+  - frente: Quais são as três partes de um pipeline de Stream?
+    verso: Uma fonte (coleção, array, Stream.of), zero ou mais operações intermediárias (filter, map, sorted...) e uma operação terminal (toList, collect, sum, findFirst...).
+  - frente: O que significa dizer que streams são preguiçosas (lazy)?
+    verso: As operações intermediárias não executam nada até a operação terminal ser chamada; e cada elemento percorre o pipeline inteiro antes do próximo.
+  - frente: Qual a diferença entre map e flatMap?
+    verso: map transforma cada elemento em exatamente um; flatMap transforma cada elemento em uma stream e achata todas em uma só (1 → N).
+  - frente: Uma Stream pode ser consumida duas vezes?
+    verso: Não. Depois da operação terminal ela é fechada; reutilizar lança IllegalStateException.
+  - frente: Por que preferir mapToInt/sum a map + reduce com Integer?
+    verso: IntStream trabalha com primitivos (sem boxing) e já tem sum, average, max, summaryStatistics.
+  - frente: Qual a diferença entre Stream.toList() e collect(Collectors.toList())?
+    verso: Stream.toList() (Java 16+) devolve uma lista imutável; Collectors.toList() não garante mutabilidade nem imutabilidade (na prática, um ArrayList mutável).
+---
+
+Uma **Stream** é uma forma **declarativa** de processar coleções: você descreve **o que** quer ("os pedidos pagos, convertidos em valor, somados") em vez de **como** percorrer ("crie um acumulador, faça um for, teste o status…"). Bem usada, deixa o código mais curto e mais legível. Mal usada, vira um enigma de uma linha só.
+
+## O pipeline
+
+```java
+BigDecimal faturamento = pedidos.stream()        // 1. fonte
+        .filter(Pedido::pago)                    // 2. intermediária: mantém só os pagos
+        .map(Pedido::valor)                      // 2. intermediária: Pedido → BigDecimal
+        .reduce(BigDecimal.ZERO, BigDecimal::add); // 3. terminal: combina tudo em um valor
+```
+
+<Figura legenda="Cada pedido percorre o pipeline inteiro; nada roda antes da operação terminal">
+<svg viewBox="0 0 700 150" width="700" role="img" aria-label="Fonte pedidos passa por filter pago, map valor e reduce soma, produzindo o faturamento">
+  <defs><marker id="st1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="45" width="120" height="60" rx="12" class="d-info"/><text x="70" y="72" text-anchor="middle" class="d-title">fonte</text><text x="70" y="92" text-anchor="middle" class="d-mono">pedidos</text>
+  <rect x="165" y="45" width="130" height="60" rx="12" class="d-box"/><text x="230" y="72" text-anchor="middle" class="d-title">filter</text><text x="230" y="92" text-anchor="middle" class="d-mono">pago</text>
+  <rect x="330" y="45" width="130" height="60" rx="12" class="d-box"/><text x="395" y="72" text-anchor="middle" class="d-title">map</text><text x="395" y="92" text-anchor="middle" class="d-mono">valor</text>
+  <rect x="495" y="45" width="190" height="60" rx="12" class="d-accent"/><text x="590" y="72" text-anchor="middle" class="d-title">reduce (terminal)</text><text x="590" y="92" text-anchor="middle" class="d-mono">ZERO, add</text>
+  <path d="M130 75 H161" class="d-line" marker-end="url(#st1)"/><path d="M295 75 H326" class="d-line" marker-end="url(#st1)"/><path d="M460 75 H491" class="d-line" marker-end="url(#st1)"/>
+  <text x="350" y="138" text-anchor="middle" class="d-label">intermediárias: preguiçosas · terminal: dispara a execução</text>
+</svg>
+</Figura>
+
+- **Fonte**: `colecao.stream()`, `Arrays.stream(array)`, `Stream.of(a, b, c)`, `IntStream.range(0, 10)`, `Files.lines(caminho)`.
+- **Operações intermediárias** devolvem outra Stream: `filter`, `map`, `flatMap`, `distinct`, `sorted`, `limit`, `skip`, `peek`.
+- **Operação terminal** produz o resultado: `toList`, `collect`, `forEach`, `reduce`, `count`, `sum`, `min`, `max`, `findFirst`, `anyMatch`, `allMatch`, `noneMatch`.
+
+## Preguiçosa e com curto-circuito
+
+As operações intermediárias **não fazem nada** até a terminal ser chamada. E cada elemento percorre o pipeline **inteiro** antes do próximo:
+
+```java
+Optional<Pedido> primeiroGrande = pedidos.stream()
+        .filter(p -> p.valor().compareTo(MIL) > 0)
+        .findFirst();
+```
+
+Se o terceiro pedido já passa no filtro, o quarto nunca é avaliado. `findFirst`, `anyMatch`, `limit` e similares são **curto-circuito**: param assim que têm a resposta. É por isso que uma Stream pode percorrer até uma fonte infinita (`Stream.iterate(1, n -> n + 1).limit(10)`).
+
+## As operações que você mais vai usar
+
+```java
+List<String> clientesVip = pedidos.stream()
+        .filter(p -> p.valor().compareTo(MIL) >= 0)
+        .map(Pedido::cliente)
+        .distinct()
+        .sorted()
+        .toList();
+
+boolean temCancelado = pedidos.stream().anyMatch(p -> p.status() == CANCELADO);
+long pendentes = pedidos.stream().filter(p -> p.status() == PENDENTE).count();
+
+Optional<Pedido> maior = pedidos.stream().max(Comparator.comparing(Pedido::valor));
+List<Pedido> top3 = pedidos.stream()
+        .sorted(Comparator.comparing(Pedido::valor).reversed())
+        .limit(3)
+        .toList();
+```
+
+### `map` versus `flatMap`
+
+`map` transforma **um em um**. `flatMap` transforma **um em vários** e achata:
+
+```java
+// Cada pedido tem vários itens. Quero TODOS os itens de TODOS os pedidos:
+List<Item> itens = pedidos.stream()
+        .flatMap(p -> p.itens().stream())      // Stream<Pedido> → Stream<Item>
+        .toList();
+
+// Com map, eu teria uma Stream<List<Item>> — uma lista de listas.
+```
+
+### `reduce`
+
+`reduce` combina todos os elementos em um só, com um **valor inicial** (a identidade) e uma **função associativa**:
+
+```java
+BigDecimal total = valores.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+```
+
+Para somas de números primitivos, prefira as **streams de primitivos**.
+
+## Streams de primitivos
+
+`IntStream`, `LongStream` e `DoubleStream` evitam o custo de embrulhar cada número em `Integer`/`Long`/`Double` e têm métodos estatísticos prontos:
+
+```java
+int totalItens = pedidos.stream().mapToInt(Pedido::quantidade).sum();
+OptionalDouble media = notas.stream().mapToDouble(Double::doubleValue).average();
+IntSummaryStatistics stats = pedidos.stream().mapToInt(Pedido::quantidade).summaryStatistics();
+// stats.getMin(), getMax(), getAverage(), getSum(), getCount()
+
+IntStream.rangeClosed(1, 12).mapToObj(mes -> YearMonth.of(2026, mes)).toList();
+```
+
+`BigDecimal` não tem stream primitiva: para dinheiro, use `map(...).reduce(ZERO, BigDecimal::add)`.
+
+## Regras de ouro
+
+<Comparar antes="Evite" depois="Prefira">
+```java
+List<String> nomes = new ArrayList<>();
+pedidos.stream()
+       .filter(Pedido::pago)
+       .forEach(p -> nomes.add(p.cliente()));
+
+Stream<Pedido> s = pedidos.stream();
+s.count();
+s.findFirst();   // IllegalStateException
+```
+
+```java
+List<String> nomes = pedidos.stream()
+       .filter(Pedido::pago)
+       .map(Pedido::cliente)
+       .toList();
+
+long total = pedidos.stream().count();
+Optional<Pedido> p = pedidos.stream().findFirst();
+```
+</Comparar>
+
+1. **Sem efeitos colaterais** nas intermediárias. `forEach` que alimenta uma lista externa é um laço disfarçado — e quebra com streams paralelas. Use um coletor.
+2. **Uma Stream, um uso.** Depois da operação terminal, ela está fechada.
+3. **`Stream.toList()`** (Java 16+) devolve uma lista **imutável**. É o que você quer quase sempre.
+4. **Uma operação por linha**, alinhadas pelo ponto. Pipelines de 12 operações pedem métodos auxiliares com nome.
+
+## Quando NÃO usar Streams
+
+Streams não são "o jeito moderno" que substitui todo laço. Prefira um `for` quando:
+
+- você precisa **sair no meio** com lógica complexa, ou de **índices** (comparar com o elemento anterior, como no exercício 01.03);
+- o corpo lança **exceções checked** (lambdas não podem lançá-las sem embrulhar);
+- o laço **modifica** estruturas externas por natureza;
+- a versão com Stream ficou **mais difícil de ler** que o laço.
+
+<Callout tipo="atencao" titulo="parallelStream não é turbo">
+`parallelStream()` divide o trabalho entre threads do `ForkJoinPool` comum. Em coleções pequenas, fica **mais lento** (o custo de dividir é maior que o ganho); com operações bloqueantes (I/O), pode travar outras partes da aplicação que usam o mesmo pool. Só use depois de medir, em trabalho CPU-bound sobre coleções grandes.
+</Callout>
+
+<Callout tipo="entrevista">
+Perguntas típicas: "diferença entre `map` e `flatMap`", "o que são operações intermediárias e terminais", "streams são preguiçosas — o que isso significa?". Uma resposta madura também diz **quando não usar**: exceções checked, lógica com índice e a armadilha do `parallelStream`.
+</Callout>
+
+<Quiz
+  id="04-streams"
+  questoes={[
+    {
+      pergunta: 'O que este código imprime? `Stream.of(1, 2, 3).filter(n -> { System.out.println(n); return n > 1; });`',
+      opcoes: ['1 2 3', '2 3', 'Nada', '1'],
+      correta: 2,
+      explicacao: 'Sem operação terminal, nenhuma operação intermediária é executada: streams são preguiçosas.',
+    },
+    {
+      pergunta: 'Você tem `List<Pedido>` e cada pedido tem `List<String> cupons()`. Como obter todos os cupons em uma lista?',
+      opcoes: ['`pedidos.stream().map(Pedido::cupons).toList()`', '`pedidos.stream().flatMap(p -> p.cupons().stream()).toList()`', '`pedidos.stream().reduce(Pedido::cupons)`', '`pedidos.cupons().stream()`'],
+      correta: 1,
+      explicacao: 'flatMap achata as listas; com map você teria uma List<List<String>>.',
+    },
+    {
+      pergunta: 'Qual a melhor forma de somar a quantidade (int) de itens de todos os pedidos?',
+      opcoes: ['`map(Pedido::quantidade).reduce(0, Integer::sum)`', '`mapToInt(Pedido::quantidade).sum()`', '`forEach` com uma variável acumuladora', '`collect(Collectors.toList()).size()`'],
+      correta: 1,
+      explicacao: 'IntStream evita boxing e já tem sum(). A opção com forEach nem compila (effectively final).',
+    },
+    {
+      pergunta: 'O que `pedidos.stream().filter(...).toList().add(x)` faz?',
+      opcoes: ['Adiciona x', 'Lança UnsupportedOperationException', 'Não compila', 'Adiciona x à lista original'],
+      correta: 1,
+      explicacao: 'Stream.toList() devolve uma lista imutável.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Pipeline = **fonte → intermediárias (preguiçosas) → terminal**.
+- `filter`, `map`, `flatMap`, `distinct`, `sorted`, `limit` + `toList`, `reduce`, `count`, `anyMatch`, `findFirst`.
+- Streams de primitivos (`mapToInt`, `sum`, `summaryStatistics`) para números; `reduce(ZERO, add)` para `BigDecimal`.
+- Sem efeitos colaterais, uma Stream por uso, `toList()` imutável.
+- Laço comum quando há índices, exceções checked ou quando fica mais legível.

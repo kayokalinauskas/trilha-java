@@ -1,0 +1,202 @@
+---
+titulo: Sealed types e pattern matching
+descricao: Hierarquias fechadas com sealed interfaces, switch exaustivo com padrões de tipo e de record, guardas com when, e os construtores flexíveis do Java 25.
+modulo: 02-poo
+ordem: 6
+duracao: 55
+objetivos:
+  - Modelar alternativas fechadas com sealed interfaces e records
+  - Usar switch com type patterns, record patterns e guardas when
+  - Decidir entre polimorfismo e switch exaustivo
+  - Validar argumentos antes de super(...) com construtores flexíveis
+tags: [sealed, pattern matching, switch, Java 21, Java 25]
+flashcards:
+  - frente: O que uma sealed interface faz?
+    verso: Restringe quais classes podem implementá-la (cláusula permits). O compilador passa a conhecer todas as alternativas.
+  - frente: Qual a vantagem de um switch sobre um tipo sealed?
+    verso: Pode ser exaustivo sem default — se uma nova alternativa for adicionada, todo switch que não a trata para de compilar.
+  - frente: O que é um record pattern?
+    verso: "Um padrão que testa o tipo e desestrutura os componentes de um record: case Pix(String chave) -> ..."
+  - frente: Para que serve o when em um case?
+    verso: É uma guarda — uma condição extra para o case casar (case Pedido p when p.total() > 1000 -> ...).
+  - frente: O que são construtores flexíveis (Java 25)?
+    verso: Permitem executar instruções (validação, cálculo) antes de chamar super(...) ou this(...), desde que não usem o objeto em construção.
+  - frente: Polimorfismo ou switch sobre sealed?
+    verso: Polimorfismo quando novos TIPOS aparecem com frequência; switch sobre sealed quando os tipos são estáveis e novas OPERAÇÕES aparecem com frequência.
+---
+
+Na aula de interfaces, você viu que polimorfismo elimina cadeias de `instanceof`. Agora vai ver o outro lado: situações em que decidir **pelo tipo** é exatamente o certo — desde que o compilador garanta que nenhum caso foi esquecido. É isso que `sealed` + *pattern matching* oferecem, e é o que há de mais moderno na linguagem.
+
+## O problema: alternativas de um conceito
+
+Um pagamento pode ser **Pix**, **cartão** ou **boleto**. Cada alternativa tem **dados diferentes**:
+
+- Pix: chave e txid.
+- Cartão: bandeira, últimos 4 dígitos, parcelas.
+- Boleto: linha digitável e vencimento.
+
+E existem **muitas operações** sobre pagamentos: calcular taxa, gerar comprovante, descrever para o extrato, decidir se permite estorno, mapear para o JSON da API… Colocar tudo isso como métodos em cada classe (polimorfismo) espalha cada regra de negócio por três arquivos. Às vezes, você quer ver **uma regra inteira em um lugar só**.
+
+## `sealed`: uma hierarquia fechada
+
+```java
+public sealed interface Pagamento permits Pix, Cartao, Boleto { }
+
+public record Pix(String chave, String txid) implements Pagamento { }
+public record Cartao(String bandeira, String final4, int parcelas) implements Pagamento { }
+public record Boleto(String linhaDigitavel, LocalDate vencimento) implements Pagamento { }
+```
+
+`sealed ... permits` diz ao compilador: **estas são todas as implementações possíveis**. Nenhuma outra classe pode implementar `Pagamento`. As implementações precisam ser `final` (records já são), `sealed` ou `non-sealed`.
+
+## `switch` com padrões
+
+Com a hierarquia fechada, o `switch` pode decidir pelo **tipo** e ser **exaustivo**:
+
+```java
+BigDecimal taxa(Pagamento pagamento, BigDecimal valor) {
+    return switch (pagamento) {
+        case Pix p -> BigDecimal.ZERO;
+        case Cartao c -> valor.multiply(c.parcelas() > 1 ? TAXA_PARCELADO : TAXA_A_VISTA);
+        case Boleto b -> new BigDecimal("3.50");
+    };
+}
+```
+
+- `case Cartao c` testa o tipo **e** já declara a variável `c` com o tipo certo. Nada de cast.
+- **Sem `default`.** O compilador sabe que só existem três tipos. Se amanhã alguém adicionar `Criptomoeda` ao `permits`, **este switch para de compilar** até que a regra seja definida. Esse é o grande ganho: o compilador vira um *checklist* das regras de negócio.
+
+<Callout tipo="atencao" titulo="Não coloque default">
+Um `default ->` em um switch sobre tipo sealed desliga a verificação de exaustividade: a nova alternativa cai no default em silêncio. Deixe o compilador trabalhar para você.
+</Callout>
+
+### Record patterns: desestruturar
+
+Você pode "abrir" o record direto no `case`:
+
+```java
+String descrever(Pagamento pagamento) {
+    return switch (pagamento) {
+        case Pix(String chave, String txid) -> "Pix para " + chave;
+        case Cartao(String bandeira, String final4, int parcelas) ->
+                "%s final %s em %dx".formatted(bandeira, final4, parcelas);
+        case Boleto(String linha, LocalDate vencimento) -> "Boleto vence em " + vencimento;
+    };
+}
+```
+
+<Callout tipo="novidade" titulo="Java 22+: variáveis sem nome">
+Quando um componente não interessa, use `_`: `case Pix(String chave, _) -> ...`. O recurso é oficial desde o Java 22 e deixa claro que o valor foi ignorado de propósito.
+</Callout>
+
+### Guardas com `when`
+
+```java
+String classificar(Pagamento pagamento) {
+    return switch (pagamento) {
+        case Cartao c when c.parcelas() > 6 -> "Parcelado longo";
+        case Cartao c -> "Cartão";
+        case Pix p -> "Instantâneo";
+        case Boleto b when b.vencimento().isBefore(LocalDate.now()) -> "Boleto vencido";
+        case Boleto b -> "Boleto";
+    };
+}
+```
+
+A **ordem importa**: o caso mais específico (com guarda) vem antes do geral. Se inverter, o compilador acusa que o segundo `case` nunca seria alcançado.
+
+### `instanceof` com padrão
+
+Fora do `switch`, o mesmo recurso simplifica os `instanceof` que ainda forem necessários:
+
+```java
+if (obj instanceof Cartao c && c.parcelas() > 1) {
+    // c já é Cartao aqui
+}
+```
+
+## Polimorfismo ou switch? O problema da expressão
+
+Os dois estilos resolvem o mesmo problema com trade-offs opostos:
+
+| | Polimorfismo (método em cada classe) | Sealed + switch |
+|---|---|---|
+| Adicionar um **tipo** novo | Fácil: uma classe nova | Difícil: todo switch precisa mudar (mas o compilador aponta onde) |
+| Adicionar uma **operação** nova | Difícil: método novo em todas as classes | Fácil: um método novo com um switch |
+| Onde fica a regra | Espalhada pelas classes | Concentrada em um lugar |
+
+Na literatura isso se chama **problema da expressão**. Na prática:
+
+- **Tipos mudam muito, operações pouco** → polimorfismo (ex.: formas do exercício 02.02, plugins, estratégias).
+- **Tipos estáveis, operações crescem** → sealed + switch (ex.: meios de pagamento, eventos de domínio, resultados de operação como `Sucesso | Falha`).
+
+O exercício 02.04 usa o segundo estilo para o cálculo de frete.
+
+## Construtores flexíveis (Java 25)
+
+Até o Java 24, `super(...)` precisava ser **a primeira instrução** do construtor. Isso obrigava a truques para validar argumentos antes de passá-los para a superclasse. No Java 25, você pode executar código antes, desde que não use o objeto que está sendo construído:
+
+<Comparar antes="Até o Java 24" depois="Java 25 (JEP 513)">
+```java
+class ContaPJ extends Conta {
+    ContaPJ(String cnpj, BigDecimal limite) {
+        // validação só DEPOIS do super...
+        super(normalizar(cnpj), limite);
+        if (limite.signum() < 0) {
+            throw new IllegalArgumentException();
+        }
+    }
+}
+```
+
+```java
+class ContaPJ extends Conta {
+    ContaPJ(String cnpj, BigDecimal limite) {
+        if (limite.signum() < 0) {      // antes do super!
+            throw new IllegalArgumentException("limite negativo");
+        }
+        String normalizado = normalizar(cnpj);
+        super(normalizado, limite);
+    }
+}
+```
+</Comparar>
+
+O ganho é *fail-fast* de verdade: o objeto nem começa a ser construído com dados inválidos, e a superclasse nunca recebe lixo.
+
+<Callout tipo="entrevista">
+Recursos do Java moderno são um diferencial forte em entrevistas, porque muitos candidatos ainda escrevem "Java 8". Se perguntarem o que mudou do 17 ao 25, cite: **records e sealed types com pattern matching no switch** (21), **virtual threads** (21, módulo 06), **Stream Gatherers** (24) e **arquivos-fonte compactos, construtores flexíveis e scoped values** (25).
+</Callout>
+
+<Quiz
+  id="02-sealed"
+  questoes={[
+    {
+      pergunta: 'Você adiciona `record Cripto(...) implements Pagamento` e o inclui no `permits`. O que acontece com um switch exaustivo sem default sobre Pagamento?',
+      opcoes: ['Continua compilando e ignora Cripto', 'Para de compilar até tratar Cripto', 'Lança exceção em tempo de execução', 'Cai no primeiro case'],
+      correta: 1,
+      explicacao: 'O compilador verifica a exaustividade. Essa é a principal vantagem de sealed + switch.',
+    },
+    {
+      pergunta: 'Qual a ordem correta dos cases?',
+      opcoes: ['`case Cartao c ->` antes de `case Cartao c when c.parcelas() > 6 ->`', '`case Cartao c when c.parcelas() > 6 ->` antes de `case Cartao c ->`', 'A ordem não importa', 'Não é permitido repetir o tipo'],
+      correta: 1,
+      explicacao: 'O caso mais específico precisa vir primeiro; senão o geral captura tudo e o específico é inalcançável (erro de compilação).',
+    },
+    {
+      pergunta: 'Em qual cenário sealed + switch é mais indicado que polimorfismo?',
+      opcoes: ['Plugins de terceiros que adicionam novos formatos', 'Um conjunto estável de eventos de domínio sobre os quais surgem novas regras com frequência', 'Estratégias de desconto criadas pelo marketing toda semana', 'Nunca'],
+      correta: 1,
+      explicacao: 'Tipos estáveis e operações crescentes favorecem o switch; tipos crescentes favorecem o polimorfismo.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `sealed interface ... permits` fecha a hierarquia: o compilador conhece todas as alternativas.
+- `switch` com **type patterns**, **record patterns** e **`when`** decide pelo tipo sem casts e de forma **exaustiva** (sem `default`!).
+- Polimorfismo para tipos que mudam; sealed + switch para operações que mudam.
+- Java 25: validações **antes** de `super(...)` com construtores flexíveis.
+
+Com isso, você tem as ferramentas de modelagem do Java moderno. Os exercícios do módulo aplicam tudo: encapsulamento (02.01), polimorfismo e decorator (02.02), value objects com record (02.03) e sealed com pattern matching (02.04).

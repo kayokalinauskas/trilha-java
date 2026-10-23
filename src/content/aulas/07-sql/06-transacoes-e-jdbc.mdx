@@ -1,0 +1,171 @@
+---
+titulo: Transações, isolamento e JDBC
+descricao: ACID, commit e rollback, níveis de isolamento e as anomalias que cada um evita, UPDATE condicional contra race conditions, e como o Java conversa com o banco via JDBC com PreparedStatement.
+modulo: 07-sql
+ordem: 6
+duracao: 60
+objetivos:
+  - Explicar ACID e usar transações com commit e rollback
+  - Relacionar níveis de isolamento às anomalias que evitam
+  - Evitar race conditions no banco com UPDATE condicional e locks
+  - Usar JDBC com PreparedStatement, try-with-resources e controle de transação
+tags: [transações, ACID, isolamento, JDBC, PreparedStatement]
+flashcards:
+  - frente: O que significa ACID?
+    verso: Atomicidade (tudo ou nada), Consistência (constraints válidas), Isolamento (transações concorrentes não se atrapalham) e Durabilidade (confirmado não se perde).
+  - frente: Qual o nível de isolamento padrão do PostgreSQL?
+    verso: READ COMMITTED — cada comando vê o que já foi confirmado no início do comando.
+  - frente: O que é "lost update"?
+    verso: Duas transações leem o mesmo valor, calculam e gravam; a segunda sobrescreve a primeira. Evite com UPDATE condicional/atômico, lock otimista ou SELECT ... FOR UPDATE.
+  - frente: Por que PreparedStatement evita SQL injection?
+    verso: O SQL e os parâmetros vão separados ao banco; o valor é tratado sempre como dado, nunca interpretado como parte do comando.
+  - frente: Como fazer uma transação com JDBC?
+    verso: connection.setAutoCommit(false), executar os comandos, commit() no final e rollback() em qualquer exceção.
+---
+
+Transferir dinheiro envolve dois `UPDATE`s: debitar uma conta e creditar outra. Se o servidor cai entre os dois, o dinheiro some. **Transações** existem para que isso nunca aconteça.
+
+## ACID
+
+| Propriedade | Significa | Exemplo |
+|---|---|---|
+| **Atomicidade** | tudo ou nada | débito e crédito juntos, ou nenhum |
+| **Consistência** | a transação leva o banco de um estado válido a outro | `CHECK (saldo >= 0)` nunca é violado |
+| **Isolamento** | transações simultâneas não enxergam o "meio" umas das outras | ninguém vê o débito sem o crédito |
+| **Durabilidade** | confirmado é permanente | depois do `COMMIT`, sobrevive a uma queda |
+
+```sql
+BEGIN;
+UPDATE conta SET saldo = saldo - 100 WHERE id = 1;
+UPDATE conta SET saldo = saldo + 100 WHERE id = 2;
+COMMIT;          -- ou ROLLBACK, para desfazer tudo
+```
+
+## Isolamento e anomalias
+
+Isolamento total (como se as transações rodassem uma de cada vez) custa desempenho. Os níveis de isolamento trocam garantias por concorrência:
+
+| Nível | Evita | Ainda permite |
+|---|---|---|
+| READ UNCOMMITTED | (no PostgreSQL, age como READ COMMITTED) | — |
+| **READ COMMITTED** (padrão PostgreSQL) | ler dados não confirmados (*dirty read*) | leitura não repetível, *lost update* por leitura + escrita na aplicação |
+| REPEATABLE READ | leitura não repetível | no PostgreSQL, conflitos viram erro de serialização a tratar |
+| SERIALIZABLE | todas as anomalias | exige *retry* das transações que falharem |
+
+A anomalia que mais aparece no backend é o **lost update**:
+
+```text
+T1: SELECT saldo → 100          T2: SELECT saldo → 100
+T1: UPDATE saldo = 100 - 30      T2: UPDATE saldo = 100 - 50
+                     resultado: 50 (deveria ser 20)
+```
+
+É o *check-then-act* do módulo 06, agora no banco.
+
+## Três formas de evitar o lost update
+
+**1. Atualização atômica e condicional** — a mais simples, quando cabe:
+
+```sql
+UPDATE conta SET saldo = saldo - 30 WHERE id = 1 AND saldo >= 30;
+-- 1 linha afetada: debitou. 0 linhas: saldo insuficiente (ou conta inexistente).
+```
+
+O banco lê e grava a linha de forma atômica, travando-a durante o comando. É o que o exercício 07.04 usa.
+
+**2. Lock pessimista** — trava a linha ao ler:
+
+```sql
+SELECT saldo FROM conta WHERE id = 1 FOR UPDATE;   -- outras transações esperam
+UPDATE conta SET saldo = ... WHERE id = 1;
+```
+
+**3. Lock otimista** — uma coluna `versao`; o `UPDATE ... WHERE versao = ?` falha se alguém mudou antes, e a aplicação tenta de novo. O JPA faz isso com `@Version` (módulo 09).
+
+## JDBC: o Java falando com o banco
+
+O **JDBC** é a API básica do Java para bancos relacionais. JPA, Spring Data e `JdbcTemplate` são camadas em cima dele — entender o JDBC é entender o que elas fazem por você.
+
+```java
+String sql = "SELECT saldo FROM conta WHERE id = ?";
+try (Connection c = dataSource.getConnection();
+     PreparedStatement ps = c.prepareStatement(sql)) {
+    ps.setLong(1, contaId);                      // parâmetros começam em 1
+    try (ResultSet rs = ps.executeQuery()) {
+        return rs.next() ? Optional.of(rs.getBigDecimal("saldo")) : Optional.empty();
+    }
+}
+```
+
+- **`DataSource`**: fornece conexões (em produção, de um **pool**, como o HikariCP).
+- **`PreparedStatement` com `?`**: os valores vão **separados** do SQL. Isso evita **SQL injection** e deixa o banco reaproveitar o plano.
+- **try-with-resources** fecha `ResultSet`, `PreparedStatement` e `Connection`, que devolve a conexão ao pool. Uma conexão não fechada é um vazamento que derruba a aplicação quando o pool esgota.
+
+<Comparar antes="SQL injection" depois="Seguro">
+```java
+String sql = "SELECT * FROM cliente WHERE nome = '"
+           + nome + "'";
+// nome = "x' OR '1'='1" → devolve todos
+statement.executeQuery(sql);
+```
+
+```java
+PreparedStatement ps = c.prepareStatement(
+    "SELECT * FROM cliente WHERE nome = ?");
+ps.setString(1, nome);   // sempre dado, nunca SQL
+ps.executeQuery();
+```
+</Comparar>
+
+### Transação com JDBC
+
+```java
+try (Connection c = dataSource.getConnection()) {
+    c.setAutoCommit(false);                // por padrão, cada comando é commitado sozinho
+    try {
+        debitar(c, origem, valor);
+        creditar(c, destino, valor);
+        c.commit();
+    } catch (RuntimeException | SQLException e) {
+        c.rollback();                      // desfaz tudo que foi feito nesta conexão
+        throw e;
+    }
+}
+```
+
+**Todos os comandos da transação precisam usar a mesma conexão.** É exatamente isso que o `@Transactional` do Spring gerencia para você no módulo 09: ele liga uma conexão à thread, desliga o autocommit e faz commit ou rollback no final.
+
+<Callout tipo="entrevista">
+"Como você garante que uma transferência não deixa o sistema inconsistente?" — **transação** (atomicidade), **atualização condicional ou lock** (contra lost update), **constraint** `CHECK (saldo >= 0)` como última defesa, e **idempotência** se a requisição puder ser repetida. Quatro camadas, cada uma cobrindo uma falha diferente.
+</Callout>
+
+<Quiz
+  id="07-transacoes"
+  questoes={[
+    {
+      pergunta: 'O que o `UPDATE conta SET saldo = saldo - 30 WHERE id = 1 AND saldo >= 30` resolve?',
+      opcoes: ['Nada, é igual a ler e depois gravar', 'Verifica e debita atomicamente, evitando lost update e saldo negativo', 'Só melhora desempenho', 'Cria um índice'],
+      correta: 1,
+      explicacao: 'A condição e a escrita acontecem no mesmo comando, com a linha travada.',
+    },
+    {
+      pergunta: 'Por que PreparedStatement protege contra SQL injection?',
+      opcoes: ['Porque criptografa a consulta', 'Porque os valores são enviados separados do SQL e tratados como dados', 'Porque remove aspas', 'Porque só aceita números'],
+      correta: 1,
+      explicacao: 'O comando é compilado com placeholders; nenhum valor é interpretado como SQL.',
+    },
+    {
+      pergunta: 'Numa transferência com JDBC, o crédito falha. O que precisa acontecer?',
+      opcoes: ['Nada, o débito já foi', 'rollback() na mesma conexão, desfazendo o débito', 'Um novo UPDATE somando o valor de volta', 'Fechar a conexão sem commit resolve sempre'],
+      correta: 1,
+      explicacao: 'Com autocommit desligado, o rollback desfaz tudo o que a transação fez.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **ACID**: tudo ou nada, constraints válidas, isolamento e durabilidade.
+- PostgreSQL usa **READ COMMITTED**; o **lost update** exige atualização condicional, lock pessimista ou otimista.
+- JDBC: `PreparedStatement` com `?` (nunca concatenar), try-with-resources para tudo.
+- Transação JDBC: `setAutoCommit(false)`, mesma conexão, `commit` no fim, `rollback` em qualquer erro — o que o `@Transactional` faz por você.

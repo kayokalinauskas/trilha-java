@@ -1,0 +1,197 @@
+---
+titulo: Interfaces e polimorfismo
+descricao: Interfaces como contratos, métodos default e static, polimorfismo sem instanceof, programar para a interface e o Princípio Aberto/Fechado na prática.
+modulo: 02-poo
+ordem: 4
+duracao: 50
+objetivos:
+  - Definir contratos com interfaces e implementá-los em classes diferentes
+  - Eliminar cadeias de if/instanceof usando polimorfismo
+  - Programar para a interface, não para a implementação
+  - Decidir entre interface e classe abstrata
+tags: [interfaces, polimorfismo, OCP]
+flashcards:
+  - frente: O que é uma interface em Java?
+    verso: Um contrato — um conjunto de métodos que uma classe se compromete a implementar. Uma classe pode implementar várias interfaces.
+  - frente: "O que significa \"programar para a interface\"?"
+    verso: Declarar variáveis, parâmetros e retornos com o tipo da interface (List, Precificacao), não da implementação (ArrayList, PrecoPorM2), para poder trocá-la sem mudar quem usa.
+  - frente: O que o Princípio Aberto/Fechado (OCP) diz?
+    verso: O código deve estar aberto para extensão e fechado para modificação — adicionar um comportamento novo deve ser criar uma classe, não editar as existentes.
+  - frente: Interface ou classe abstrata?
+    verso: Interface para contratos (vários, sem estado). Classe abstrata para compartilhar estado e implementação entre classes muito relacionadas.
+  - frente: Para que servem os métodos default em interfaces?
+    verso: Para oferecer uma implementação padrão sem obrigar as classes existentes a mudar — foi assim que a JDK adicionou métodos a List e Collection no Java 8.
+---
+
+Se herança diz "**é um**", interface diz "**sabe fazer**". Uma interface é um **contrato**: um conjunto de operações que qualquer classe pode prometer cumprir. É a ferramenta mais importante de design em Java — e, você vai ver no módulo 08, a base de como o Spring funciona.
+
+## Um contrato, várias implementações
+
+```java
+public interface MeioDePagamento {
+    Autorizacao autorizar(BigDecimal valor);
+}
+
+public class Pix implements MeioDePagamento {
+    @Override
+    public Autorizacao autorizar(BigDecimal valor) { /* gera QR code, chave... */ }
+}
+
+public class CartaoDeCredito implements MeioDePagamento {
+    @Override
+    public Autorizacao autorizar(BigDecimal valor) { /* chama o adquirente... */ }
+}
+
+public class Boleto implements MeioDePagamento {
+    @Override
+    public Autorizacao autorizar(BigDecimal valor) { /* registra no banco... */ }
+}
+```
+
+O checkout só conhece o contrato:
+
+```java
+public class Checkout {
+    public Pedido finalizar(Carrinho carrinho, MeioDePagamento meio) {
+        Autorizacao auth = meio.autorizar(carrinho.total());   // polimorfismo
+        // ...
+    }
+}
+```
+
+`Checkout` funciona com Pix, cartão, boleto **e com qualquer meio de pagamento que ainda não existe**. Diferentemente da herança, uma classe pode implementar **várias** interfaces (`class Pix implements MeioDePagamento, Estornavel`).
+
+## Polimorfismo mata o `instanceof`
+
+Compare:
+
+<Comparar antes="Decidir pelo tipo" depois="Deixar o objeto decidir">
+```java
+BigDecimal area(Object forma) {
+    if (forma instanceof Circulo c) {
+        return PI.multiply(c.raio().pow(2));
+    } else if (forma instanceof Retangulo r) {
+        return r.largura().multiply(r.altura());
+    } else if (forma instanceof Triangulo t) {
+        return t.base().multiply(t.altura()).divide(DOIS);
+    }
+    throw new IllegalArgumentException();
+}
+```
+
+```java
+interface Forma {
+    double area();
+}
+
+// cada forma sabe calcular a própria área
+double total = 0;
+for (Forma f : formas) {
+    total += f.area();
+}
+```
+</Comparar>
+
+Na versão da esquerda, **toda forma nova exige editar esse método** — e todos os outros métodos que fazem a mesma cadeia de `if`. Na da direita, uma forma nova é **uma classe nova**, e nenhum código existente muda.
+
+Esse é o **Princípio Aberto/Fechado** (o "O" do SOLID): *aberto para extensão, fechado para modificação*. O exercício 02.02 testa isso literalmente: o teste cria uma forma que você nunca viu (um hexágono) e o seu `Orcamento` precisa funcionar com ela sem nenhuma mudança.
+
+<Callout tipo="atencao" titulo="Mas e o switch com pattern matching?">
+Na aula 6 você vai ver `sealed interfaces` com `switch`, que **decide pelo tipo** de propósito. Não é contradição: quando o conjunto de tipos é **fechado e conhecido** (e as regras mudam mais do que os tipos), o `switch` exaustivo é melhor. Quando novos tipos aparecem com frequência, o polimorfismo é melhor. Saber escolher é o que diferencia um Pleno.
+</Callout>
+
+## Programe para a interface
+
+```java
+ArrayList<String> nomes = new ArrayList<>();   // amarrado à implementação
+List<String> nomes = new ArrayList<>();        // depende só do contrato
+```
+
+Declare variáveis, parâmetros e retornos com o **tipo mais abstrato que resolve o problema**. Assim, trocar `ArrayList` por `LinkedList`, ou `PrecoPorMetroQuadrado` por `DescontoProgressivo`, não exige mudar quem usa. O mesmo vale para as suas classes: `Orcamento.valorTotal(Precificacao p)` aceita qualquer regra de preço.
+
+Isso também é o que torna o código **testável**: nos testes, você passa uma implementação falsa (*fake* ou *mock*) da interface, sem banco de dados nem serviço externo. Você vai fazer muito isso no módulo 10.
+
+## Métodos `default` e `static`
+
+Desde o Java 8, interfaces podem ter métodos com corpo:
+
+```java
+public interface Precificacao {
+    BigDecimal precoPara(double areaM2);
+
+    default Precificacao comDesconto(BigDecimal percentual, double acimaDe) {
+        return new DescontoProgressivo(this, acimaDe, percentual);
+    }
+
+    static Precificacao porMetroQuadrado(String preco) {
+        return new PrecoPorMetroQuadrado(new BigDecimal(preco));
+    }
+}
+
+Precificacao regra = Precificacao.porMetroQuadrado("45.00").comDesconto(new BigDecimal("0.10"), 10);
+```
+
+- **`default`**: implementação padrão, herdada por todas as classes que implementam a interface. Foi assim que a JDK adicionou `forEach`, `removeIf` e `stream()` às coleções sem quebrar o código existente.
+- **`static`**: métodos utilitários ou "fábricas" ligados à interface.
+
+Interfaces continuam **sem estado** (atributos de instância). Se você precisa de estado compartilhado, é sinal de classe abstrata ou de composição.
+
+## Interface ou classe abstrata?
+
+| | Interface | Classe abstrata |
+|---|---|---|
+| Uma classe pode ter… | várias | uma |
+| Estado (atributos de instância) | Não | Sim |
+| Construtor | Não | Sim |
+| Métodos com corpo | `default`, `static`, `private` | Qualquer |
+| Use quando | Quer definir um **contrato** que classes diversas podem cumprir | Quer compartilhar **estado e implementação** entre classes muito próximas |
+
+Na dúvida, **comece com interface**. É o caminho mais flexível e o mais usado em código Spring moderno.
+
+## Interfaces funcionais: uma prévia
+
+Uma interface com **um único método abstrato** pode ser implementada com uma **lambda**:
+
+```java
+@FunctionalInterface
+interface RegraDeFrete {
+    BigDecimal calcular(Pedido pedido);
+}
+
+RegraDeFrete gratisAcimaDe199 = pedido ->
+        pedido.total().compareTo(new BigDecimal("199")) >= 0 ? BigDecimal.ZERO : new BigDecimal("15.00");
+```
+
+A lambda é só uma forma curta de escrever uma classe que implementa a interface. Esse é o assunto central do módulo 04.
+
+<Quiz
+  id="02-interfaces"
+  questoes={[
+    {
+      pergunta: 'Você precisa suportar um novo meio de pagamento (Apple Pay). Em um design com interface `MeioDePagamento`, o que muda?',
+      opcoes: ['O Checkout ganha um novo else-if', 'Cria-se uma classe ApplePay implements MeioDePagamento; o Checkout não muda', 'Todas as classes de pagamento mudam', 'É preciso uma nova superclasse'],
+      correta: 1,
+      explicacao: 'É o Princípio Aberto/Fechado: extensão por nova classe, sem modificar o código existente.',
+    },
+    {
+      pergunta: 'Qual declaração segue "programe para a interface"?',
+      opcoes: ['`ArrayList<Pedido> pedidos = new ArrayList<>();`', '`List<Pedido> pedidos = new ArrayList<>();`', '`Object pedidos = new ArrayList<>();`', '`var pedidos = new Object();`'],
+      correta: 1,
+      explicacao: 'List é o contrato. ArrayList é um detalhe que pode ser trocado sem afetar o resto do código.',
+    },
+    {
+      pergunta: 'Uma interface pode ter atributos de instância?',
+      opcoes: ['Sim, como qualquer classe', 'Não; só constantes (static final) e métodos', 'Sim, se forem private', 'Só em Java 25'],
+      correta: 1,
+      explicacao: 'Interfaces não têm estado de instância. Campos declarados nelas são implicitamente public static final.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Interface é **contrato**: "sabe fazer". Uma classe pode implementar várias.
+- **Polimorfismo** substitui cadeias de `if`/`instanceof`: cada objeto sabe executar a própria regra.
+- **Aberto/Fechado**: comportamento novo = classe nova, sem mexer no código existente.
+- **Programe para a interface** (`List`, não `ArrayList`) — mais flexível e mais testável.
+- `default` e `static` em interfaces dão conveniência sem estado.

@@ -1,0 +1,124 @@
+---
+titulo: "Banco de histórias STAR, em português e em inglês"
+codigo: "17.03"
+resumo: Transforme um relato desorganizado de um bug real do Fintech Core numa resposta STAR de dois minutos, em português e em inglês. Depois monte o seu banco com cinco histórias próprias, mapeadas às perguntas comportamentais que mais caem, e ensaie em voz alta com gravação.
+modulo: 17-carreira
+ordem: 3
+dificuldade: medio
+tempo: 2h–3h
+conceitos: [entrevista comportamental, STAR, behavioral interview, inglês, comunicação, banco de histórias]
+aulas: [17-carreira/03-processo-seletivo, 17-carreira/04-vagas-internacionais-e-ingles]
+---
+
+## Contexto
+
+Em entrevistas comportamentais, a diferença entre uma resposta fraca e uma forte raramente está na história. Está em **como** ela é contada. Veja o relato que um estudante escreveu, do jeito que lembrou, para responder "me conte sobre um problema técnico difícil que você resolveu":
+
+> "Então, a gente tava fazendo o projeto da trilha, o Fintech Core, e tinha a parte de transferência, que é tipo o Pix, sabe? Aí eu fiz tudo, os testes passavam, tudo certo. Só que aí no marco de mensageria eu fiz um teste de carga meio por curiosidade, com umas 50 transferências ao mesmo tempo da mesma conta, e o saldo ficou negativo, tipo -350. Eu fiquei um tempão sem entender, achei que era o Kafka, depois achei que era o banco. Fiquei uns dois dias nisso. Aí eu li sobre lost update, que é quando duas transações leem o mesmo saldo e as duas escrevem por cima, e percebi que era isso. A gente tinha o `@Transactional` mas isso não resolve. Eu coloquei `@Version` na conta, que é lock otimista, e uma nova tentativa quando dá conflito, e também um teste com 50 threads que roda no CI. Depois disso nunca mais deu problema. Aprendi bastante sobre transação e também que teste de concorrência é importante. Ah, e também escrevi um ADR explicando por que não usei lock pessimista."
+
+A história é boa. A resposta, não: começa pelo contexto errado, fala "a gente" num projeto individual, esconde o que foi difícil, e o aprendizado vem no fim, apressado.
+
+## O que entregar
+
+**1. Diagnóstico.** Liste o que está fraco no relato: estrutura, pronomes, termos vagos, o que falta.
+
+**2. A resposta STAR em português.** Entre 1min30 e 2min falada (cerca de 250 a 320 palavras), com as quatro partes identificadas e a Ação como maior parte.
+
+**3. A mesma resposta em inglês.** Não traduza palavra por palavra: reescreva em inglês natural, usando frases de ligação da aula 4.
+
+**4. Seu banco de histórias.** Cinco histórias suas (de projetos, trabalho, faculdade ou voluntariado), cada uma resumida em uma linha por parte do STAR, e uma tabela que mapeia cada história para as perguntas abaixo. Cada pergunta precisa de pelo menos uma história, e cada história deve servir para pelo menos duas perguntas.
+
+- Um problema técnico difícil que você resolveu.
+- Um erro seu e o que aprendeu.
+- Um desacordo com alguém (ou quando você questionou uma decisão).
+- Algo que você precisou aprender rápido.
+- Um prazo apertado ou uma prioridade conflitante.
+- Algo de que você se orgulha.
+- Uma situação com requisitos pouco claros.
+
+**5. Ensaio.** Grave-se respondendo duas perguntas, uma em português e uma em inglês. Ouça e anote: tempo total, quantas vezes disse "a gente"/"we", onde travou.
+
+## Critérios de aceite
+
+- [ ] A resposta começa com contexto em no máximo duas frases.
+- [ ] A Ação é a parte mais longa e usa a primeira pessoa do singular.
+- [ ] O resultado tem um fato verificável (número, teste no CI, documento).
+- [ ] O aprendizado é específico ("passei a escrever teste de concorrência para toda operação que altera saldo") e não genérico ("aprendi bastante").
+- [ ] A versão em inglês usa "I" para as ações e evita falsos cognatos.
+- [ ] O banco cobre as sete perguntas.
+
+<Dicas>
+<Dica nivel={1}>
+Separe o relato em pedaços e marque cada um com S, T, A ou R. Você vai ver que a Ação está espalhada, que parte do texto não é nenhum dos quatro ("sabe?", "tipo") e que o resultado quase não aparece.
+</Dica>
+<Dica nivel={2}>
+O que torna a história **difícil**, e portanto interessante, é que o bug não aparecia nos testes normais e a primeira hipótese estava errada. Conte isso na Ação: "primeiro suspeitei do Kafka, porque..., descartei quando...". Mostrar como você investigou vale mais do que a solução em si.
+</Dica>
+<Dica nivel={3}>
+Estrutura: **S** (1 frase: o projeto e a funcionalidade) → **T** (1 frase: o que você queria garantir) → **A** (5–7 frases: o teste de carga, o sintoma, as hipóteses descartadas, a causa lost update, a correção com `@Version` e nova tentativa, o teste de 50 threads no CI, o ADR) → **R** (2–3 frases: o teste passa desde então, o que mudou no seu jeito de trabalhar).
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### 1. Diagnóstico
+
+- **Estrutura**: começa com "então, a gente tava fazendo..." e leva quatro frases até o problema aparecer; o resultado se reduz a "nunca mais deu problema".
+- **"A gente"** num projeto individual: soa como se outra pessoa tivesse feito o trabalho.
+- **Vago**: "fiquei um tempão", "umas 50", "aprendi bastante", "meio por curiosidade".
+- **Esconde o melhor**: a investigação (hipóteses descartadas) aparece em meia frase; é o que mostra raciocínio.
+- **Falta o porquê**: por que `@Transactional` não bastava? Por que lock otimista e não pessimista? O ADR aparece como "ah, e também".
+- **Muletas**: "tipo", "sabe?", "aí".
+
+### 2. Resposta STAR em português
+
+> **(S)** No projeto de conta digital que construí para o meu portfólio, eu tinha implementado a transferência entre contas, e todos os testes passavam.
+>
+> **(T)** Antes de integrar a mensageria, eu quis ter certeza de que a transferência era segura sob concorrência, porque num sistema financeiro o saldo nunca pode ficar negativo.
+>
+> **(A)** Escrevi um teste que dispara 50 transferências simultâneas da mesma conta, e o saldo terminou em menos 350 reais. Minha primeira hipótese foi o Kafka, mas desliguei a publicação de eventos e o erro continuou. Depois suspeitei do isolamento do banco. Lendo sobre anomalias de transação, reconheci um *lost update*: duas transações liam o mesmo saldo, cada uma subtraía o seu valor e a segunda gravava por cima da primeira. O `@Transactional` garante atomicidade, mas não impede isso no nível de isolamento padrão do PostgreSQL. Avaliei duas soluções: lock pessimista, com `SELECT FOR UPDATE`, e lock otimista, com uma coluna de versão. Escolhi o otimista, com uma nova tentativa limitada em caso de conflito, porque transferências simultâneas da mesma conta são raras e ele não segura linhas bloqueadas. Registrei essa decisão num ADR, com o cenário em que eu trocaria para o pessimista.
+>
+> **(R)** O teste de 50 transferências roda no CI a cada push e nunca mais falhou. O maior aprendizado foi que testes de caminho feliz não pegam problemas de concorrência: hoje, toda operação que altera saldo ganha um teste concorrente desde o início.
+
+(cerca de 270 palavras, ou 1min50 falando com calma)
+
+### 3. Em inglês
+
+> **(S)** In the digital account API I built for my portfolio, I had implemented transfers between accounts, and all the tests were passing.
+>
+> **(T)** Before adding messaging, I wanted to make sure transfers were safe under concurrency, because in a financial system a balance should never go negative.
+>
+> **(A)** I wrote a test that fires 50 concurrent transfers from the same account, and the balance ended up at minus 350. My first guess was Kafka, but I turned off event publishing and the problem was still there. Then I suspected the database isolation level. Reading about transaction anomalies, I recognized a *lost update*: two transactions read the same balance, each subtracted its amount, and the second one overwrote the first. `@Transactional` gives you atomicity, but it doesn't prevent this under PostgreSQL's default isolation level. I compared two options: pessimistic locking with `SELECT FOR UPDATE`, and optimistic locking with a version column. I chose optimistic locking with a limited retry on conflict, because concurrent transfers from the same account are rare and it doesn't keep rows locked. I documented the decision in an ADR, including when I would switch to pessimistic locking.
+>
+> **(R)** The 50-transfer test runs in CI on every push and hasn't failed since. My main takeaway was that happy-path tests don't catch concurrency bugs, so now every operation that changes a balance gets a concurrent test from day one.
+
+Observe: *"My first guess was..."*, *"I compared two options..."*, *"My main takeaway was..."*: frases que organizam a resposta e ganham tempo. E "eventually" não aparece em lugar nenhum, felizmente.
+
+### 4. Um banco de histórias (exemplo)
+
+| # | História | S / T / A / R em uma linha cada |
+|---|---|---|
+| H1 | Lost update na transferência | projeto de portfólio / garantir saldo não negativo / teste de carga, hipóteses, `@Version` + retry, ADR / teste no CI, novo hábito |
+| H2 | Automação da conciliação (trabalho anterior) | 3 dias de fechamento manual / reduzir o tempo / script que cruza extrato e ERP, validado com a equipe / 4 horas, usado por 5 pessoas |
+| H3 | Discordância sobre o escopo num trabalho em grupo da faculdade | grupo queria microsserviços / entregar no prazo / propus monólito modular com argumento de prazo e tamanho, aceitei revisão / entregue no prazo, nota máxima |
+| H4 | Segredo commitado | commitei a senha do banco no projeto / corrigir o vazamento / troquei a senha, movi para variável de ambiente, liguei push protection / nunca mais aconteceu, virou item do meu checklist |
+| H5 | Aprender Kafka em uma semana | marco de mensageria com prazo pessoal / publicar eventos de forma confiável / estudei a documentação, fiz um protótipo, depois o outbox / eventos sem perda e um post explicando o que aprendi |
+
+| Pergunta | Histórias |
+|---|---|
+| Problema técnico difícil | H1, H5 |
+| Um erro seu | H4, H1 |
+| Desacordo | H3 |
+| Aprender rápido | H5, H1 |
+| Prazo ou prioridade | H3, H2 |
+| Orgulho | H2, H1 |
+| Requisitos pouco claros | H2 (ninguém sabia exatamente quais divergências importavam), H3 |
+
+### 5. Ensaio: o que costuma aparecer
+
+- Respostas de **3 a 4 minutos** na primeira gravação: corte o contexto, não a Ação.
+- **"A gente"/"we"** escapa mesmo sabendo da regra; a gravação mostra quantas vezes.
+- Travamentos em inglês nos **verbos de ação** (*investigated*, *ruled out*, *documented*): monte a sua lista de verbos e treine.
+- Final fraco: termine com o aprendizado específico e **pare de falar**. O silêncio depois de uma boa resposta é normal.
+
+</Solucao>

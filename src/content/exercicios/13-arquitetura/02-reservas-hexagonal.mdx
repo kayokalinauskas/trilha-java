@@ -1,0 +1,427 @@
+---
+titulo: Reserva de salas em arquitetura hexagonal
+codigo: "13.02"
+resumo: Construa um sistema de reserva de salas com o núcleo no centro — regras no domínio, casos de uso atrás de portas de entrada, persistência e notificação atrás de portas de saída — e os adaptadores (REST, memória, log) por fora. Você exercita o núcleo com fakes e sem Spring, a API por HTTP, e confere a arquitetura com ArchUnit.
+modulo: 13-arquitetura
+ordem: 2
+dificuldade: dificil
+tempo: 4–5h
+conceitos: [arquitetura hexagonal, portas e adaptadores, regra da dependência, Clock, ArchUnit, onion architecture, ProblemDetail]
+aulas: [13-arquitetura/03-hexagonal]
+java:
+  modulo: m13-arquitetura
+  arquivos:
+    - src/main/java/dev/trilhajava/m13/reservas/dominio/Periodo.java
+    - src/main/java/dev/trilhajava/m13/reservas/dominio/Reserva.java
+    - src/main/java/dev/trilhajava/m13/reservas/aplicacao/ServicoDeReservas.java
+---
+
+## Contexto
+
+O escritório tem três salas de reunião, e a reserva hoje é uma planilha compartilhada: reuniões sobrepostas, gente reservando o auditório para duas pessoas, reservas "fantasma" que ninguém cancela. O time de facilities quer uma API. O time de plataforma, que vai integrar com o calendário corporativo e com o Slack no ano que vem, fez uma exigência: **as regras não podem depender de nenhuma tecnologia**. Trocar a persistência, ou ganhar uma segunda porta de entrada (uma fila, por exemplo), não pode mexer numa linha das regras.
+
+## O que você vai praticar
+
+- **Portas e adaptadores.** O núcleo (domínio + casos de uso) define *portas*: interfaces nos termos dele. As de **entrada** dizem o que a aplicação sabe fazer (`ReservarSala`); as de **saída**, do que ela precisa do mundo (`RepositorioDeReservas`). Os *adaptadores* ficam por fora e traduzem tecnologia (HTTP, memória, log) para as portas. Veja [Arquitetura hexagonal](../../../aulas/13-arquitetura/03-hexagonal/).
+- **A regra da dependência.** As dependências apontam para dentro: adaptadores conhecem a aplicação, a aplicação conhece o domínio, e o domínio não conhece ninguém. O núcleo não importa nada do Spring.
+- **Montagem fora das camadas.** Se o `ServicoDeReservas` não pode ter `@Service`, alguém precisa registrá-lo como bean: uma classe de configuração no pacote raiz, a única que conhece o núcleo e o Spring ao mesmo tempo.
+- **O tempo como dependência.** "Agora" vem de um `java.time.Clock` injetado, e nunca de `LocalDateTime.now()` sem argumento. Assim, "no futuro" e "antes do início" ficam testáveis com um relógio parado.
+- **Erros HTTP no adaptador.** O domínio lança exceções de negócio; o adaptador web decide que `ConflitoDeHorarioException` vira `409`, com um `@RestControllerAdvice` e `ProblemDetail` (RFC 9457).
+- **Arquitetura verificada.** O ArchUnit lê o bytecode e confere as camadas em cebola (*onion architecture*), a ausência do Spring no núcleo e o uso exclusivo das portas.
+
+## Requisitos
+
+### O que já existe
+
+No código inicial, em `dev.trilhajava.m13.reservas` (não precisa mudar):
+
+| Pacote | Conteúdo |
+|---|---|
+| `dominio` | `Sala(id, nome, capacidade)`, `StatusDaReserva` (`ATIVA`, `CANCELADA`), as exceções `NaoEncontradoException`, `ConflitoDeHorarioException`, `ReservaInvalidaException` e `OperacaoNaoPermitidaException`, `Periodo(inicio, fim)` (recusa `fim` igual ou anterior a `inicio` com `ReservaInvalidaException`; tem `duracao()`) e `Reserva` (construtor, `ativa()` e os acessores `id()`, `sala()`, `responsavel()`, `participantes()`, `periodo()`, `status()`) |
+| `aplicacao.porta.entrada` | `ReservarSala` (com o record `PedidoDeReserva(sala, responsavel, participantes, inicio, fim)`), `CancelarReserva`, `ConsultarAgenda` |
+| `aplicacao.porta.saida` | `RepositorioDeReservas` (`salvar`, `buscar(UUID)`, `daSalaNoDia(sala, dia)`: todas as reservas, ativas ou não, que **começam** no dia), `CatalogoDeSalas` (`buscar(id)`), `Notificador` (`reservaConfirmada`, `reservaCancelada`) |
+| raiz | `ReservasApplication`, com um bean `Clock` de São Paulo |
+
+### O que você implementa
+
+Os métodos de regra em `Periodo` e `Reserva`, o `ServicoDeReservas` (já criado, vazio e **sem** anotações), a montagem e os três adaptadores. Os nomes das classes novas são seus; os **pacotes** são fixos, porque a arquitetura é conferida por eles.
+
+```java
+// dominio.Periodo — assinatura fixa
+public boolean sobrepoe(Periodo outro)                                              // regra 6
+
+// dominio.Reserva — assinaturas fixas
+public static Reserva nova(Sala sala, String responsavel, int participantes,
+        Periodo periodo, LocalDateTime agora)                                       // regras 1 a 4
+public void cancelar(String solicitante, LocalDateTime agora)                       // regra 8
+public boolean conflitaCom(Reserva outra)                                           // regra 6
+
+// aplicacao.ServicoDeReservas — Java puro, sem Spring
+public class ServicoDeReservas implements ReservarSala, CancelarReserva, ConsultarAgenda
+public ServicoDeReservas(RepositorioDeReservas reservas, CatalogoDeSalas salas,
+        Notificador notificador, Clock relogio)                                     // construtor fixo
+public Reserva reservar(PedidoDeReserva pedido)                                     // regras 1 a 7
+public void cancelar(UUID reserva, String solicitante)                              // regras 8 e 9
+public List<Reserva> agenda(String sala, LocalDate dia)                             // regra 10
+
+// pacote raiz: uma @Configuration com um @Bean que faz new ServicoDeReservas(...)   // regra 14
+// adaptador.web: o controller e a tradução de exceções para HTTP                   // regras 11 a 13
+// adaptador.persistencia: RepositorioDeReservas e CatalogoDeSalas em memória       // regra 15
+// adaptador.notificacao: um Notificador que escreve no log                         // regra 15
+```
+
+Um resumo da API HTTP (o responsável vem do header `X-Usuario`):
+
+| Rota | Sucesso | Erros |
+|---|---|---|
+| `POST /reservas` com `{"sala","participantes","inicio","fim"}` | `201`, `Location: /reservas/{id}` e o JSON da reserva | `404` sala, `409` conflito, `422` regra violada, `400` sem `X-Usuario` |
+| `DELETE /reservas/{id}` | `204` | `404`, `403` (outra pessoa), `422` (já começou) |
+| `GET /salas/{sala}/agenda?dia=2026-10-08` | `200` e a lista | `404` sala |
+
+## Regras
+
+Nos exemplos, "agora" é quinta, 1º de outubro de 2026, 9h em São Paulo, e as reservas são para o dia 2, no aquário (6 pessoas) ou no foco (2 pessoas), salvo quando dito.
+
+**Reservar** (no domínio, em `Reserva.nova`, e no caso de uso)
+
+1. **A sala existe.** Senão, `NaoEncontradoException`. Exemplo: `cozinha` → `NaoEncontradoException: sala cozinha`.
+2. **Horário.** Começa **depois de agora** (`inicio` estritamente posterior); começa e termina **no mesmo dia**; dentro do expediente, das **8h às 20h** (início às 8h ou depois; fim às 20h ou antes). Exemplos: dia 1º, 8h–8h45 → inválida (passado); 7h45–8h30 → inválida; 19h30–20h15 → inválida; 19h–20h → **válida**; dia 2 às 19h até dia 3 às 9h → inválida.
+3. **Granularidade e duração.** Início e fim em **múltiplos de 15 minutos** (e sem segundos); duração de **30 minutos a 4 horas**, inclusive. Exemplos: 10h10–11h → inválida; 10h–10h15 → inválida (15 min); 10h–14h15 → inválida; 10h–14h → **válida**.
+4. **Capacidade.** De **1 pessoa até a capacidade** da sala. Exemplos: foco com 3 → inválida; foco com 0 → inválida; aquário com 6 → **válida**. Responsável em branco também é inválido.
+
+   Toda violação das regras 2 a 4 é `ReservaInvalidaException`, com uma mensagem que diga o que está errado.
+5. **Estado inicial.** A reserva criada tem um `UUID` novo e status `ATIVA`, é salva no repositório, e o `Notificador` recebe `reservaConfirmada`.
+6. **Sem sobreposição.** Uma reserva nova não pode sobrepor outra reserva **ativa** da **mesma sala**: `ConflitoDeHorarioException`. Os intervalos são semiabertos (`[inicio, fim)`): o fim é exclusivo. Exemplos, com a ana no aquário das 10h às 11h: bia 10h45–11h15 → conflito; bia 9h–12h → conflito; bia **11h–11h30 → válida** (encostada); caio no **foco** 10h–11h → válida (outra sala).
+7. **Uma verificação por vez.** Verificar o conflito e salvar não podem se intercalar entre duas requisições simultâneas na mesma instância (um `synchronized` no caso de uso resolve; veja os desafios para o caso de várias instâncias).
+
+**Cancelar e consultar**
+
+8. **Cancelar: só o responsável, só antes do início.** Outra pessoa → `OperacaoNaoPermitidaException`. Depois do início (agora igual ou posterior ao `inicio`) → `ReservaInvalidaException`. Reserva inexistente → `NaoEncontradoException`.
+9. **Cancelar de novo não muda nada.** A segunda chamada do responsável não lança exceção, não salva nada diferente e **não** avisa o `Notificador` de novo. A reserva cancelada libera o horário: depois de a ana cancelar 10h–11h, a bia consegue reservar 10h–11h.
+10. **Agenda:** as reservas **ativas** da sala, que começam no dia, em ordem de início. Sala inexistente → `NaoEncontradoException`. Exemplo: ativas às 15h (ana) e às 9h (bia), cancelada às 11h (caio), outra no dia 3 e outra no foco → `[bia 9h, ana 15h]`.
+
+**HTTP** (adaptador web)
+
+11. **`POST /reservas`** recebe `{"sala": "auditorio", "participantes": 30, "inicio": "2026-10-07T14:00", "fim": "2026-10-07T16:00"}` com `X-Usuario: ana` e responde `201`, `Location` terminando em `/reservas/{id}` e o corpo `{"id":"…","sala":"auditorio","responsavel":"ana","participantes":30,"inicio":"2026-10-07T14:00:00","fim":"2026-10-07T16:00:00","status":"ATIVA"}`.
+12. **Erros viram Problem Details**, com estes status: `NaoEncontradoException` → `404`; `ConflitoDeHorarioException` → `409`; `ReservaInvalidaException` → `422` (`HttpStatus.UNPROCESSABLE_CONTENT`); `OperacaoNaoPermitidaException` → `403`. Exemplo: `{"detail":"a sala auditorio já está reservada nesse horário","instance":"/reservas","status":409,"title":"Conflito de horário"}`. Sem o header `X-Usuario` → `400` (o corpo é o erro padrão do Spring Boot; os títulos são livres).
+13. **`DELETE /reservas/{id}`** → `204` sem corpo; **`GET /salas/{sala}/agenda?dia=AAAA-MM-DD`** → `200` com uma lista de objetos no mesmo formato da regra 11.
+
+**Arquitetura**
+
+14. **O núcleo não depende do Spring.** Nada em `dominio` ou `aplicacao` importa `org.springframework`. O `ServicoDeReservas` vira bean por uma classe `@Configuration` **no pacote raiz** `dev.trilhajava.m13.reservas`, com um `@Bean` que faz `new ServicoDeReservas(...)`.
+15. **Camadas em cebola.** `dominio` não depende de ninguém; `aplicacao` só de `dominio`; cada adaptador (`adaptador.web`, `adaptador.persistencia`, `adaptador.notificacao`) só do núcleo, e nunca de outro adaptador. O catálogo em memória tem `aquario` ("Aquário", 6), `auditorio` ("Auditório", 40) e `foco` ("Sala de foco", 2).
+16. **Pelas portas.** Nenhum adaptador usa o `ServicoDeReservas` diretamente: o controller recebe `ReservarSala`, `CancelarReserva` e `ConsultarAgenda` no construtor. As portas são interfaces.
+17. **Nenhum `now()` sem relógio.** Todo "agora" é `LocalDateTime.now(relogio)`.
+
+## Passo a passo sugerido
+
+1. **O domínio (regras 2 a 4 e 6).** `Periodo.sobrepoe`, depois `Reserva.nova`, `cancelar` e `conflitaCom`, em Java puro.
+2. **O caso de uso (regras 1, 5 a 10).** `ServicoDeReservas`, com o construtor fixo. Rode a parte 1 do programa do **Experimente** (comente as chamadas `api()` e `arquitetura()` enquanto os adaptadores não existem): ela usa fakes e um relógio parado, sem Spring.
+3. **Os adaptadores de saída (regra 15).** Repositório e catálogo em memória (um `ConcurrentHashMap` basta) e o notificador no log.
+4. **A montagem (regra 14).** A `@Configuration` no pacote raiz.
+5. **O adaptador web (regras 11 a 13).** O controller com records próprios para o corpo da requisição e da resposta, e o `@RestControllerAdvice`.
+6. **A arquitetura (regras 15 a 17).** Rode o programa inteiro.
+
+## Experimente
+
+O programa abaixo tem três partes: (1) o núcleo com fakes e um relógio parado, sem Spring; (2) a aplicação de verdade numa porta livre, chamada por HTTP, com reservas para **amanhã** (ela usa o relógio do sistema); (3) as regras da arquitetura com ArchUnit. Salve-o em `src/test/java/dev/trilhajava/m13/reservas/ExperimenteReservas.java` e rode pelo ▶ do IntelliJ, ou no terminal, na pasta do starter:
+
+```bash
+mvn -q test-compile exec:java "-Dexec.mainClass=dev.trilhajava.m13.reservas.ExperimenteReservas" "-Dexec.classpathScope=test"
+```
+
+```java
+package dev.trilhajava.m13.reservas;
+
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
+import static com.tngtech.archunit.library.Architectures.onionArchitecture;
+
+import com.tngtech.archunit.base.DescribedPredicate;
+import com.tngtech.archunit.core.domain.JavaClass;
+import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.importer.ClassFileImporter;
+import com.tngtech.archunit.core.importer.ImportOption;
+import dev.trilhajava.m13.reservas.aplicacao.ServicoDeReservas;
+import dev.trilhajava.m13.reservas.aplicacao.porta.entrada.ReservarSala.PedidoDeReserva;
+import dev.trilhajava.m13.reservas.aplicacao.porta.saida.CatalogoDeSalas;
+import dev.trilhajava.m13.reservas.aplicacao.porta.saida.Notificador;
+import dev.trilhajava.m13.reservas.aplicacao.porta.saida.RepositorioDeReservas;
+import dev.trilhajava.m13.reservas.dominio.Reserva;
+import dev.trilhajava.m13.reservas.dominio.Sala;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import org.springframework.boot.Banner;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+
+public class ExperimenteReservas {
+
+    static final ZoneId SP = ZoneId.of("America/Sao_Paulo");
+    static final HttpClient HTTP = HttpClient.newHttpClient();
+
+    public static void main(String[] args) throws Exception {
+        nucleoSemSpring();
+        api();
+        arquitetura();
+    }
+
+    /** 1. O núcleo com fakes e um relógio parado em 1º/10/2026, 9h: sem Spring, sem HTTP, sem banco. */
+    static void nucleoSemSpring() {
+        Map<UUID, Reserva> dados = new HashMap<>();
+        RepositorioDeReservas reservas = new RepositorioDeReservas() {
+            @Override public void salvar(Reserva r) { dados.put(r.id(), r); }
+            @Override public Optional<Reserva> buscar(UUID id) { return Optional.ofNullable(dados.get(id)); }
+            @Override public List<Reserva> daSalaNoDia(String sala, LocalDate dia) {
+                return dados.values().stream()
+                        .filter(r -> r.sala().equals(sala) && r.periodo().inicio().toLocalDate().equals(dia)).toList();
+            }
+        };
+        CatalogoDeSalas salas = id -> switch (id) {
+            case "aquario" -> Optional.of(new Sala("aquario", "Aquário", 6));
+            case "foco" -> Optional.of(new Sala("foco", "Foco", 2));
+            default -> Optional.empty();
+        };
+        Notificador notificador = new Notificador() {
+            @Override public void reservaConfirmada(Reserva r) { System.out.println("   [aviso] confirmada: " + r.responsavel()); }
+            @Override public void reservaCancelada(Reserva r) { System.out.println("   [aviso] cancelada: " + r.responsavel()); }
+        };
+        Clock relogio = Clock.fixed(Instant.parse("2026-10-01T12:00:00Z"), SP);
+        var servico = new ServicoDeReservas(reservas, salas, notificador, relogio);
+
+        System.out.println("== o núcleo, sem Spring");
+        Reserva daAna = reservar(servico, "ana 10h–11h no aquário", "aquario", "ana", 4, "10:00", "11:00");
+        reservar(servico, "bia 10h45–11h15 (sobrepõe)", "aquario", "bia", 2, "10:45", "11:15");
+        reservar(servico, "bia 11h–11h30 (encostada)", "aquario", "bia", 2, "11:00", "11:30");
+        reservar(servico, "caio 7h45–8h30", "aquario", "caio", 2, "07:45", "08:30");
+        reservar(servico, "caio 10h10–11h", "foco", "caio", 1, "10:10", "11:00");
+        reservar(servico, "caio 10h–10h15 (15 min)", "foco", "caio", 1, "10:00", "10:15");
+        reservar(servico, "caio com 3 pessoas no foco", "foco", "caio", 3, "10:00", "11:00");
+        reservar(servico, "caio na cozinha", "cozinha", "caio", 2, "10:00", "11:00");
+        tentar("ana hoje, 8h–8h45 (já passou)", () -> servico.reservar(new PedidoDeReserva("aquario", "ana", 2,
+                LocalDateTime.parse("2026-10-01T08:00"), LocalDateTime.parse("2026-10-01T08:45"))));
+        tentar("bia cancela a reserva da ana", () -> cancelar(servico, daAna.id(), "bia"));
+        tentar("ana cancela", () -> cancelar(servico, daAna.id(), "ana"));
+        tentar("ana cancela de novo", () -> cancelar(servico, daAna.id(), "ana"));
+        System.out.println("agenda do aquário em 2/10: " + servico.agenda("aquario", LocalDate.parse("2026-10-02"))
+                .stream().map(r -> r.responsavel() + " " + r.periodo().inicio().toLocalTime()).toList());
+    }
+
+    /** 2. A aplicação de verdade, numa porta livre, com o relógio do sistema: as reservas são para amanhã. */
+    static void api() throws Exception {
+        try (var contexto = new SpringApplicationBuilder(ReservasApplication.class)
+                .bannerMode(Banner.Mode.OFF).logStartupInfo(false).properties("server.port=0").run()) {
+            String base = "http://localhost:" + contexto.getEnvironment().getProperty("local.server.port");
+            String amanha = LocalDate.now(SP).plusDays(1).toString();
+            System.out.println("== a API (" + base + "), reservas para " + amanha);
+
+            HttpResponse<String> criada = post(base, "ana", "auditorio", 30, amanha + "T14:00", amanha + "T16:00");
+            String location = criada.headers().firstValue("Location").orElse("(sem Location)");
+            System.out.println("POST ana auditório 14h–16h      " + criada.statusCode() + " " + location);
+            System.out.println("   " + criada.body());
+            exibir("POST bia auditório 15h–15h30", post(base, "bia", "auditorio", 10, amanha + "T15:00", amanha + "T15:30"));
+            exibir("POST bia auditório 21h–22h", post(base, "bia", "auditorio", 10, amanha + "T21:00", amanha + "T22:00"));
+            exibir("POST bia cozinha", post(base, "bia", "cozinha", 2, amanha + "T10:00", amanha + "T11:00"));
+            exibir("POST sem X-Usuario", post(base, null, "foco", 1, amanha + "T10:00", amanha + "T11:00"));
+            exibir("GET agenda do auditório", enviar(HttpRequest.newBuilder(
+                    URI.create(base + "/salas/auditorio/agenda?dia=" + amanha)).GET(), null));
+            exibir("DELETE pela bia", enviar(HttpRequest.newBuilder(URI.create(location)).DELETE(), "bia"));
+            exibir("DELETE pela ana", enviar(HttpRequest.newBuilder(URI.create(location)).DELETE(), "ana"));
+            exibir("DELETE de reserva inexistente", enviar(HttpRequest.newBuilder(
+                    URI.create(base + "/reservas/" + UUID.randomUUID())).DELETE(), "ana"));
+        }
+    }
+
+    /** 3. As regras da arquitetura, conferidas no bytecode com ArchUnit. */
+    static void arquitetura() {
+        JavaClasses classes = new ClassFileImporter()
+                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+                .importPackages("dev.trilhajava.m13.reservas");
+        onionArchitecture()
+                .domainModels("dev.trilhajava.m13.reservas.dominio..")
+                .applicationServices("dev.trilhajava.m13.reservas.aplicacao..")
+                .adapter("web", "dev.trilhajava.m13.reservas.adaptador.web..")
+                .adapter("persistencia", "dev.trilhajava.m13.reservas.adaptador.persistencia..")
+                .adapter("notificacao", "dev.trilhajava.m13.reservas.adaptador.notificacao..")
+                .withOptionalLayers(true)   // não há a camada "domain services": tudo bem
+                .ignoreDependency(JavaClass.Predicates.resideInAPackage("dev.trilhajava.m13.reservas"),
+                        DescribedPredicate.alwaysTrue())
+                .check(classes);
+        noClasses().that().resideInAnyPackage("..reservas.dominio..", "..reservas.aplicacao..")
+                .should().dependOnClassesThat().resideInAPackage("org.springframework..")
+                .check(classes);
+        noClasses().that().resideInAPackage("..reservas.adaptador..")
+                .should().dependOnClassesThat().haveSimpleName("ServicoDeReservas")
+                .check(classes);
+        System.out.println("== arquitetura: ok");
+    }
+
+    static Reserva reservar(ServicoDeReservas servico, String cenario, String sala, String quem, int pessoas,
+            String inicio, String fim) {
+        return tentar(cenario, () -> servico.reservar(new PedidoDeReserva(sala, quem, pessoas,
+                LocalDateTime.parse("2026-10-02T" + inicio), LocalDateTime.parse("2026-10-02T" + fim))));
+    }
+
+    static Reserva cancelar(ServicoDeReservas servico, UUID id, String quem) {
+        servico.cancelar(id, quem);
+        return null;
+    }
+
+    static Reserva tentar(String cenario, Callable<Reserva> acao) {
+        try {
+            Reserva r = acao.call();
+            System.out.printf("%-32s ok%s%n", cenario, r == null ? "" : ", " + r.status());
+            return r;
+        } catch (Exception e) {
+            System.out.printf("%-32s %s: %s%n", cenario, e.getClass().getSimpleName(), e.getMessage());
+            return null;
+        }
+    }
+
+    static HttpResponse<String> post(String base, String usuario, String sala, int pessoas, String inicio, String fim)
+            throws Exception {
+        String json = """
+                {"sala": "%s", "participantes": %d, "inicio": "%s", "fim": "%s"}""".formatted(sala, pessoas, inicio, fim);
+        return enviar(HttpRequest.newBuilder(URI.create(base + "/reservas"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(json)), usuario);
+    }
+
+    static HttpResponse<String> enviar(HttpRequest.Builder requisicao, String usuario) throws Exception {
+        if (usuario != null) {
+            requisicao.header("X-Usuario", usuario);
+        }
+        return HTTP.send(requisicao.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    static void exibir(String cenario, HttpResponse<String> resposta) {
+        System.out.printf("%-32s %d %s%n", cenario, resposta.statusCode(), resposta.body());
+    }
+}
+```
+
+A saída esperada, executada em 6 de outubro de 2026 (as linhas de log da subida foram omitidas):
+
+```text
+== o núcleo, sem Spring
+   [aviso] confirmada: ana
+ana 10h–11h no aquário           ok, ATIVA
+bia 10h45–11h15 (sobrepõe)       ConflitoDeHorarioException: a sala aquario já está reservada nesse horário
+   [aviso] confirmada: bia
+bia 11h–11h30 (encostada)        ok, ATIVA
+caio 7h45–8h30                   ReservaInvalidaException: o prédio funciona das 8h às 20h
+caio 10h10–11h                   ReservaInvalidaException: início e fim em múltiplos de 15 minutos
+caio 10h–10h15 (15 min)          ReservaInvalidaException: a reserva dura de 30 minutos a 4 horas
+caio com 3 pessoas no foco       ReservaInvalidaException: a sala foco comporta de 1 a 2 pessoas
+caio na cozinha                  NaoEncontradoException: sala cozinha
+ana hoje, 8h–8h45 (já passou)    ReservaInvalidaException: não dá para reservar no passado
+bia cancela a reserva da ana     OperacaoNaoPermitidaException: só quem reservou pode cancelar
+   [aviso] cancelada: ana
+ana cancela                      ok
+ana cancela de novo              ok
+agenda do aquário em 2/10: [bia 11:00]
+== a API (http://localhost:63646), reservas para 2026-10-07
+POST ana auditório 14h–16h      201 http://localhost:63646/reservas/9baf6fa0-a43e-4536-85ca-2ec58f799dff
+   {"id":"9baf6fa0-a43e-4536-85ca-2ec58f799dff","sala":"auditorio","responsavel":"ana","participantes":30,"inicio":"2026-10-07T14:00:00","fim":"2026-10-07T16:00:00","status":"ATIVA"}
+POST bia auditório 15h–15h30     409 {"detail":"a sala auditorio já está reservada nesse horário","instance":"/reservas","status":409,"title":"Conflito de horário"}
+POST bia auditório 21h–22h       422 {"detail":"o prédio funciona das 8h às 20h","instance":"/reservas","status":422,"title":"Reserva inválida"}
+POST bia cozinha                 404 {"detail":"sala cozinha","instance":"/reservas","status":404,"title":"Não encontrado"}
+POST sem X-Usuario               400 {"timestamp":"2026-10-06T13:10:54.844Z","status":400,"error":"Bad Request","path":"/reservas"}
+GET agenda do auditório          200 [{"id":"9baf6fa0-a43e-4536-85ca-2ec58f799dff","sala":"auditorio","responsavel":"ana","participantes":30,"inicio":"2026-10-07T14:00:00","fim":"2026-10-07T16:00:00","status":"ATIVA"}]
+DELETE pela bia                  403 {"detail":"só quem reservou pode cancelar","instance":"/reservas/9baf6fa0-a43e-4536-85ca-2ec58f799dff","status":403,"title":"Operação não permitida"}
+DELETE pela ana                  204 
+DELETE de reserva inexistente    404 {"detail":"reserva ce2b49fd-de21-4234-80e2-2414e06f9ef8","instance":"/reservas/ce2b49fd-de21-4234-80e2-2414e06f9ef8","status":404,"title":"Não encontrado"}
+== arquitetura: ok
+```
+
+O que pode variar: a porta, os `UUID`s, a data de amanhã, o `timestamp` do `400`, os textos das mensagens e dos títulos, e a ordem dos campos do `ProblemDetail`. O que **não** pode variar: os status, as linhas com `ok` e o nome de cada exceção. Repare que a primeira parte roda em milissegundos e não sobe nada: é a vantagem concreta de um núcleo sem framework.
+
+Quando a arquitetura é violada, o ArchUnit lança um `AssertionError` que começa com `Architecture Violation [Priority: MEDIUM]` e lista cada dependência proibida. Por exemplo, se o controller receber o `ServicoDeReservas` em vez das portas, a terceira regra aponta o construtor do controller.
+
+## Critérios de aceite
+
+- [ ] O programa do **Experimente** produz os mesmos status e os mesmos resultados das tabelas acima, e termina com `== arquitetura: ok`.
+- [ ] `ServicoDeReservas` não tem nenhuma anotação e é criado com `new` na parte 1, sem Spring.
+- [ ] Nenhum `LocalDateTime.now()` sem o `Clock`.
+- [ ] Você consegue explicar por que o `ServicoDeReservas` não tem `@Service` e, mesmo assim, é um bean.
+
+## Desafios opcionais
+
+- Um adaptador de persistência com JDBC (ou JPA) e uma *exclusion constraint* do PostgreSQL (`EXCLUDE USING gist`) que impede sobreposição no próprio banco. Troque o adaptador sem mudar uma linha do núcleo.
+- Um segundo adaptador de entrada: um consumidor de fila que recebe pedidos de reserva do calendário corporativo.
+- Com duas instâncias da API, o `synchronized` do serviço não evita duas reservas conflitantes. Por quê? O que resolve?
+- Escreva a sua própria suíte: testes do núcleo com fakes (sem Spring), testes HTTP com `@SpringBootTest`, `@AutoConfigureMockMvc` e `MockMvcTester` (com um `Clock` fixo marcado como `@Primary`) e as três regras de arquitetura como testes.
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo domínio: `Periodo.sobrepoe` e `Reserva.nova` com as regras. Depois o serviço, exercitado pela parte 1 do programa. Só então os adaptadores: quando o núcleo estiver pronto, eles são pequenos.
+</Dica>
+<Dica nivel={2}>
+- Sobreposição de intervalos semiabertos: `inicio < outro.fim && outro.inicio < fim` (com `isBefore`).
+- O conflito depende de **outras** reservas, então fica no caso de uso: `reservas.daSalaNoDia(sala, dia).stream().anyMatch(nova::conflitaCom)`, e `conflitaCom` só considera reservas ativas da mesma sala.
+- O controller recebe as **portas de entrada** no construtor (`ReservarSala`, `CancelarReserva`, `ConsultarAgenda`). O Spring encontra o `ServicoDeReservas`, que implementa as três.
+- Para tirar o `@Service`: uma classe `@Configuration` no pacote raiz com um `@Bean` que faz `new ServicoDeReservas(...)`. Os parâmetros do método `@Bean` são as portas de saída e o `Clock`: o Spring injeta os adaptadores.
+</Dica>
+<Dica nivel={3}>
+- `422` no Spring 7: `HttpStatus.UNPROCESSABLE_CONTENT` (o nome da RFC 9110).
+- Um `@RestControllerAdvice` no adaptador web traduz cada exceção do domínio: `ProblemDetail.forStatusAndDetail(status, e.getMessage())` e `setTitle(...)`.
+- Para o `Location`: receba um `UriComponentsBuilder` no método do controller e use `ResponseEntity.created(uri.path("/reservas/{id}").buildAndExpand(id).toUri())`.
+- A regra "cebola" do ArchUnit reclama da classe de montagem se ela não estiver no pacote raiz: ela é a única que pode conhecer tudo.
+- "Cancelar de novo não avisa": guarde se a reserva estava ativa **antes** de cancelar, e só notifique nesse caso.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Domínio">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/dominio/Reserva.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/dominio/Periodo.java" />
+</Tab>
+<Tab rotulo="Aplicação">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/aplicacao/ServicoDeReservas.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/MontagemDoNucleo.java" />
+</Tab>
+<Tab rotulo="Adaptador web">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/adaptador/web/ReservaController.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/adaptador/web/ErrosHttp.java" />
+</Tab>
+<Tab rotulo="Adaptadores de saída">
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/adaptador/persistencia/RepositorioDeReservasEmMemoria.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/adaptador/persistencia/CatalogoDeSalasEmMemoria.java" />
+<CodigoJava caminho="m13-arquitetura/solucao/src/main/java/dev/trilhajava/m13/reservas/adaptador/notificacao/NotificadorNoLog.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Regras no domínio, orquestração na aplicação.** `Reserva.nova` valida tudo o que depende só da reserva (horário, duração, capacidade). O conflito depende de **outras** reservas, então fica no caso de uso, que tem acesso ao repositório.
+- **Núcleo sem framework.** A parte 1 do programa roda em milissegundos, com uma lambda como catálogo de salas e duas classes anônimas como fakes. Nenhum contexto do Spring.
+- **A montagem é a única que conhece tudo.** `MontagemDoNucleo` liga as portas aos adaptadores. É o "main" da arquitetura, e fica fora das camadas.
+- **Os erros HTTP são do adaptador.** O domínio lança `ConflitoDeHorarioException`; quem decide que isso é 409 é o `ErrosHttp`. Um adaptador de fila traduziria a mesma exceção para uma DLQ.
+- **O `Clock` é uma dependência.** "Agora" vem de fora: com o relógio parado em 1º de outubro de 2026, 9h, as regras de "no futuro" e "antes do início" ficam determinísticas.
+
+### Os testes da solução
+
+A solução de referência tem 15 testes (`ReservasHexagonalTest`, em `java/m13-arquitetura/solucao/src/test/java`): 8 do núcleo com fakes, 4 de HTTP com `MockMvcTester` e um `Clock` fixo, e 3 de arquitetura.
+
+### Avalie sua solução
+
+- Quantos arquivos você mexeria para trocar a persistência em memória por PostgreSQL? E para trocar o REST por gRPC?
+- O `PedidoDeReserva` é um record da porta de entrada; o `NovaReserva` é um record do controller. Por que não usar um só?
+- O `400` sem `X-Usuario` sai no formato padrão do Spring Boot, diferente dos outros erros. Como você deixaria todos os erros da API no mesmo formato?
+
+</Solucao>

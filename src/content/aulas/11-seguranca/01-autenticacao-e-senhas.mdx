@@ -1,0 +1,879 @@
+---
+titulo: Autenticação e senhas do jeito certo
+descricao: "Como um backend guarda e confere senhas sem virar manchete: autenticação × autorização, as ameaças reais (credential stuffing, força bruta, vazamento de base, tempo de resposta), Argon2id e BCrypt com custo medido, DelegatingPasswordEncoder e migração de hashes legados, política do NIST SP 800-63B rev. 4, senhas vazadas com k-anonimato, bloqueio progressivo, recuperação de senha segura, MFA e passkeys."
+modulo: 11-seguranca
+ordem: 1
+duracao: 120
+objetivos:
+  - Diferenciar autenticação de autorização e responder 401 ou 403 conforme o caso
+  - Explicar por que SHA-256 não serve para senhas e o papel do salt, do pepper e do fator de custo
+  - Configurar um DelegatingPasswordEncoder com Argon2id e formatos legados, e migrar hashes no login com upgradeEncoding
+  - Calibrar o custo do hash medindo o tempo no hardware de produção
+  - Escrever uma política de senhas conforme a NIST SP 800-63B rev. 4, incluindo a checagem de senhas vazadas por k-anonimato
+  - Implementar e testar, com um Clock injetado, um bloqueio progressivo que não revela quais e-mails existem
+  - Implementar uma recuperação de senha com token de uso único, expiração e hash do token
+  - Comparar MFA por TOTP e passkeys (WebAuthn) e justificar a escolha para o time
+tags: [autenticação, senhas, Argon2id, BCrypt, DelegatingPasswordEncoder, NIST, OWASP, MFA, passkeys]
+flashcards:
+  - frente: Por que SHA-256, mesmo com salt, não serve para guardar senhas?
+    verso: "É rápido demais: uma única chamada leva frações de microssegundo, e uma GPU testa bilhões por segundo. Hash de senha precisa ser lento de propósito e ajustável (Argon2id, BCrypt, scrypt, PBKDF2)."
+  - frente: O que o salt resolve e o que ele NÃO resolve?
+    verso: "Resolve: senhas iguais geram hashes diferentes, o que inutiliza tabelas pré-calculadas e obriga a quebrar cada hash separadamente. Não resolve: a velocidade do algoritmo. Isso é papel do fator de custo."
+  - frente: O que é pepper e onde ele fica?
+    verso: "Um segredo único do sistema aplicado com HMAC (ou cifrando o hash). Fica FORA do banco (cofre de segredos, HSM). Quem rouba só o banco não consegue nem começar a testar senhas. Custo: girar o pepper exige que cada pessoa troque a senha."
+  - frente: O que acontece com uma senha de mais de 72 bytes no BCryptPasswordEncoder do Spring Security 7?
+    verso: "O encode lança IllegalArgumentException (password cannot be more than 72 bytes). O matches compara só os 72 primeiros bytes, então senha certa + qualquer sufixo confere. Limite o tamanho na política ou use Argon2id."
+  - frente: Como o DelegatingPasswordEncoder permite trocar de algoritmo sem invalidar senhas?
+    verso: "Cada hash leva o prefixo {id} do algoritmo. O matches escolhe o codificador pelo prefixo; o encode usa sempre o atual. No login com sucesso, upgradeEncoding(hash) diz se o hash é antigo, e você regrava com encode(senha)."
+  - frente: O que a NIST SP 800-63B rev. 4 exige de uma senha usada como fator único?
+    verso: "Mínimo de 15 caracteres (8 se for parte de MFA), aceitar pelo menos 64, contar code points Unicode, NÃO exigir composição nem troca periódica, comparar com lista de senhas vazadas, palavras de dicionário e do contexto, e não truncar."
+  - frente: Como funciona a checagem de senhas vazadas por k-anonimato?
+    verso: "Calcula-se o SHA-1 da senha e envia-se só os 5 primeiros caracteres. A API devolve todos os sufixos com esse prefixo (centenas), e a comparação final acontece no seu servidor. A senha e o hash completo nunca saem."
+  - frente: Quais três cuidados tornam um token de recuperação de senha seguro?
+    verso: "Gerado com SecureRandom (256 bits), guardado só como hash (SHA-256) e de uso único com expiração curta (ex. 20 min). Além disso, a solicitação responde igual para e-mail cadastrado ou não."
+---
+
+Numa segunda-feira, o time de uma rede de clínicas recebe um e-mail de um pesquisador de segurança: um arquivo com 80 mil linhas no formato `email,sha1` está à venda num fórum. É a tabela de usuários do portal do paciente antigo, onde as pessoas marcam consultas e baixam resultados de exames. Em menos de uma hora, o pesquisador "quebrou" 61% das senhas com uma placa de vídeo de jogos, porque SHA-1 sem salt é quase o mesmo que texto puro. Na mesma semana, o novo portal começa a receber 40 tentativas de login por segundo vindas de milhares de IPs diferentes: são as senhas vazadas de **outros** sites sendo testadas contra o seu, na esperança de que as pessoas repitam senha (e elas repetem). E alguém percebe que a tela de login responde "e-mail não cadastrado" para quem não tem conta, o que transforma o formulário num serviço gratuito de "este e-mail é paciente da clínica?". Para uma clínica, só essa informação já é um dado sensível.
+
+Nada disso exige um atacante genial: são falhas de **autenticação**, fáceis de automatizar. Nesta aula você vai construir, com código real e testado, o núcleo de autenticação por senha do portal do paciente: hash com **Argon2id** e custo medido, **migração** dos hashes legados sem obrigar ninguém a trocar a senha, política de senhas da **NIST**, checagem de senhas vazadas sem enviar a senha a ninguém, **bloqueio progressivo** que não denuncia quais e-mails existem, **recuperação de senha** com token de uso único e uma visão de **MFA e passkeys**. Tudo com o `PasswordEncoder` do Spring Security 7, sem subir o Spring: as peças são classes comuns, que a aula seguinte liga ao `SecurityFilterChain`.
+
+## A intuição: o cofre de um condomínio
+
+Pense na portaria de um condomínio que guarda uma cópia da chave de cada apartamento. Há três jeitos de organizar isso.
+
+No primeiro, as cópias ficam num quadro de pregos na parede, com o número do apartamento embaixo de cada uma. Quem entra na portaria por cinco minutos sai com todas. É **senha em texto puro**, ou criptografada com uma chave que fica na mesma sala.
+
+No segundo, em vez da chave, a portaria guarda um **molde de gesso** de cada uma. O molde não abre porta nenhuma, mas, para conferir se uma chave é a certa, basta encaixá-la no molde. Parece seguro, até você perceber que fazer um molde leva um segundo: quem rouba os moldes pode pegar um saco com um milhão de chaves comuns e testar todas contra todos os moldes em uma tarde. Pior: dois apartamentos com a mesma fechadura têm moldes idênticos, então quebrar um é quebrar os dois. É o **hash rápido sem salt** (MD5, SHA-1, SHA-256).
+
+No terceiro, cada molde é feito num material diferente, sorteado na hora (o **salt**), e o processo de encaixe foi desenhado para demorar um quarto de segundo e exigir uma mesa grande (o **custo** de tempo e de memória). Para o porteiro, que confere uma chave por vez, um quarto de segundo não é nada. Para o ladrão, que quer testar um milhão de chaves contra 80 mil moldes, a conta passa de uma tarde para séculos. E, se o porteiro guardar parte do processo num cofre fora da portaria (o **pepper**), roubar só os moldes nem permite começar.
+
+O resto da aula é sobre fazer o terceiro cofre direito, e não deixar a portaria responder "esse apartamento não existe" para quem pergunta.
+
+## Vocabulário
+
+| Termo | O que é | Exemplo no portal |
+|---|---|---|
+| **Fator** | Uma categoria de prova: algo que você **sabe**, **tem** ou **é** | Senha (sabe), celular com o aplicativo (tem), digital (é) |
+| **Hash de senha** | Hash lento de propósito, com salt e custo ajustável | Argon2id, BCrypt, scrypt, PBKDF2 |
+| **Salt** | Valor aleatório por senha, guardado junto do hash | 16 bytes sorteados no `encode` |
+| **Pepper** | Segredo do sistema, guardado **fora** do banco | Chave de HMAC num cofre de segredos |
+| **Fator de custo** | Parâmetro que deixa o hash mais lento (e caro em memória) | BCrypt custo 12; Argon2id `m=19456,t=2` |
+| **Credential stuffing** | Testar em massa pares e-mail/senha vazados de outros sites | 40 tentativas/s de milhares de IPs |
+| **Força bruta** | Testar muitas senhas contra **uma** conta | `123456`, `senha123`... contra a conta da Marta |
+| **Password spraying** | Testar **poucas** senhas comuns contra **muitas** contas | `Clinica@2026` contra 80 mil e-mails |
+| **Enumeração de usuários** | Descobrir quais contas existem pelas respostas | "E-mail não cadastrado" |
+| **Ataque de tempo** (*timing attack*) | Descobrir algo medindo quanto a resposta demora | E-mail inexistente responde em 2 ms; existente, em 60 ms |
+| **MFA** | Autenticação com dois ou mais fatores diferentes | Senha + código TOTP |
+| **Passkey** | Credencial WebAuthn: um par de chaves preso ao site | Login com a digital, sem senha |
+
+### Autenticação × autorização
+
+As duas palavras são parecidas e vivem juntas, mas respondem perguntas diferentes, e a diferença aparece no código de status HTTP:
+
+| | Autenticação | Autorização |
+|---|---|---|
+| Pergunta | Quem é você? | Você pode fazer **isto**, **neste** recurso? |
+| Quando roda | Uma vez por requisição (ou por sessão) | Em **cada** decisão |
+| Falhou | **401 Unauthorized** (o nome é histórico: significa "não autenticado") | **403 Forbidden**, ou **404** quando nem a existência do recurso deve vazar |
+
+A maioria das falhas graves de API é de autorização (a aula 4 trata de BOLA, o acesso ao objeto de outra pessoa), mas nenhuma autorização se sustenta sobre uma autenticação fraca: se qualquer um entra como a Marta, a regra "só a Marta vê os exames da Marta" não protege nada.
+
+### As ameaças reais
+
+Antes de escolher algoritmos, vale saber contra o que você está se defendendo. Cada defesa desta aula existe por causa de um ataque concreto:
+
+| Ameaça | Como acontece | Defesa principal |
+|---|---|---|
+| **Vazamento da base** | Backup exposto, SQL injection, funcionário, fornecedor | Hash de senha lento com salt; pepper fora do banco |
+| **Credential stuffing** | Listas com bilhões de pares vazados, testadas por robôs | Bloquear senhas vazadas no cadastro; limite por IP; MFA |
+| **Força bruta numa conta** | Muitas senhas contra um e-mail | Bloqueio progressivo por conta |
+| **Password spraying** | Uma senha comum contra muitas contas | Política que recusa senhas comuns; limite global e por IP |
+| **Enumeração de usuários** | Mensagens, status ou tempos diferentes | Mesma resposta e mesmo trabalho em todos os caminhos |
+| **Phishing** | Página falsa captura senha e código | Passkeys (presas à origem do site) |
+| **Sequestro pela recuperação** | Token previsível, reutilizável ou sem expiração | Token aleatório, de uso único, com hash e prazo curto |
+
+Repare que o vazamento da base é tratado como **quando**, não **se**. Uma boa arquitetura de senhas parte do princípio de que um dia alguém vai ler a tabela de contas, e garante que, nesse dia, o estrago seja o menor possível.
+
+## Guardar senhas: a regra de ouro
+
+Você **nunca** precisa saber a senha de ninguém. Só precisa conferir se a senha digitada agora é a mesma do cadastro. Por isso senhas são guardadas como **hash**, uma função de mão única: da senha se chega ao hash, mas do hash não se volta à senha. Para conferir, você calcula o hash da senha digitada e compara.
+
+Daí sai a primeira regra: **criptografia não serve para senhas**. Criptografia é reversível por definição; quem tem a chave lê todas as senhas. E, na prática, quem rouba o banco costuma roubar a chave junto, porque ela está no mesmo servidor, na mesma variável de ambiente ou no mesmo backup.
+
+Um bom hash de senha tem três propriedades:
+
+1. **Mão única.** Do hash não se obtém a senha, só se testa candidatas.
+2. **Salt.** Um valor aleatório por senha, guardado junto do hash. Duas pessoas com a senha `bolo de fubá` ficam com hashes diferentes. Sem salt, quem quebra uma quebra as duas, e tabelas pré-calculadas (*rainbow tables*, que trazem o hash de milhões de senhas comuns já calculado) funcionam direto. O salt **não é segredo**: ele fica na mesma coluna do hash. Seu papel é obrigar o atacante a trabalhar senha por senha. A NIST pede pelo menos 32 bits; os codificadores do Spring usam 16 bytes (128 bits).
+3. **Lentidão ajustável.** O ponto que mais gente erra. SHA-256 é **rápido**: na calibração que você vai rodar no passo 2, uma chamada levou 0,0002 ms. Numa GPU, são bilhões por segundo. Um algoritmo de senha é lento **de propósito**, com um **fator de custo** que você aumenta conforme o hardware fica mais rápido.
+
+### Por que não SHA-256, mesmo com salt
+
+O argumento costuma aparecer em code review: "mas eu uso `SHA-256(salt + senha)`, o salt resolve". Não resolve. Faça a conta com os números da calibração. Um atacante com a base vazada tenta, para cada conta, as 10 milhões de senhas mais comuns:
+
+| Algoritmo | Tempo por tentativa (1 núcleo) | 10 milhões de tentativas, 1 conta |
+|---|---|---|
+| SHA-256 | 0,0002 ms | 2 segundos |
+| BCrypt custo 12 | 288 ms | 33 dias |
+| Argon2id 19 MiB, t=2 | 58 ms | 7 dias |
+
+Com SHA-256, as 80 mil contas caem em dois dias num único núcleo, e em minutos numa GPU. Com Argon2id, o mesmo ataque custa mais de 1.500 anos de núcleo. As senhas do topo da lista ainda caem rápido, mas o custo por conta passa a ser alto o bastante para que só alvos muito valiosos compensem.
+
+E há um motivo para o Argon2id ser melhor que um hash rápido repetido muitas vezes: GPUs e chips dedicados têm milhares de núcleos, mas pouca memória por núcleo. Um algoritmo que exige **memória** (*memory-hard*), como Argon2id e scrypt, tira essa vantagem: 19 MiB por tentativa, vezes milhares em paralelo, não cabe na placa.
+
+### Os algoritmos
+
+| Algoritmo | Quando usar | Parâmetros mínimos da OWASP | No Spring Security 7 |
+|---|---|---|---|
+| **Argon2id** | Primeira escolha | `m=19456` (19 MiB), `t=2`, `p=1` (ou combinações equivalentes) | `Argon2PasswordEncoder` (precisa do Bouncy Castle) |
+| **scrypt** | Quando não há Argon2id | `N=2^17` (128 MiB), `r=8`, `p=1` | `SCryptPasswordEncoder` (precisa do Bouncy Castle) |
+| **BCrypt** | Sistemas existentes; onipresente | custo 10 no mínimo | `BCryptPasswordEncoder`; **72 bytes** de entrada no máximo |
+| **PBKDF2** | Quando exigem FIPS-140 | 600.000 iterações com HMAC-SHA256 | `Pbkdf2PasswordEncoder`, sem dependência extra |
+| MD5, SHA-1, SHA-256, SHA-512 | **Nunca** para senhas | — | Só existem para conferir legado |
+
+Os três parâmetros do Argon2id: `m` é a memória em KiB, `t` é o número de passadas sobre essa memória (iterações) e `p` é o paralelismo (quantos fios de execução). A OWASP lista cinco combinações de força equivalente, de `m=47104,t=1` a `m=7168,t=5`: mais memória e menos passadas, ou o contrário. A escolha depende do que o seu servidor tem de sobra, RAM ou CPU.
+
+<Callout tipo="atencao" titulo="O limite de 72 bytes do BCrypt">
+O BCrypt só considera os primeiros **72 bytes** da senha. Em UTF-8, uma letra acentuada ocupa 2 bytes, então 40 letras acentuadas já passam do limite. No Spring Security 7, o `encode` lança `IllegalArgumentException` com a mensagem `password cannot be more than 72 bytes`, mas o `matches` **compara só os 72 primeiros bytes**: o teste do passo 1 mostra que `"a"` × 72 seguido de qualquer texto confere com o hash de `"a"` × 72. A NIST proíbe truncar a senha na verificação. Com BCrypt, limite o tamanho em bytes na política e recuse no login o que passar disso; com Argon2id, o problema não existe.
+</Callout>
+
+### Salt, pepper e fator de custo, cada um no seu papel
+
+Os três são confundidos com frequência, então vale separar:
+
+- O **salt** é por senha, aleatório e público. Defende contra pré-cálculo e contra "quebrar uma, quebrar todas iguais".
+- O **fator de custo** é por algoritmo e configurável. Defende contra a velocidade do atacante.
+- O **pepper** é um segredo único do sistema, guardado fora do banco (num cofre de segredos ou num HSM, um hardware que guarda chaves sem deixá-las sair). A NIST recomenda (*SHOULD*) uma passada extra de hash com chave ou de cifra usando um segredo assim. A OWASP descreve duas formas: aplicar um HMAC com o pepper na senha antes do hash, ou cifrar o hash depois de calculado. Ele defende contra o vazamento **só do banco**: sem o pepper, o atacante nem consegue começar a testar senhas.
+
+O pepper tem um custo operacional: como ele participa do hash, **girá-lo** exige que cada pessoa digite a senha de novo. A saída usual é versionar o pepper (um identificador no prefixo, como o `{id}` que você vai ver a seguir) e conviver com dois por um tempo. Se ele vazar junto com o banco, não ajuda, mas também não enfraquece o hash.
+
+<Figura legenda="Anatomia de um hash guardado pelo portal: cada pedaço tem um papel, e tudo o que é preciso para conferir a senha (menos a própria senha) está na mesma string">
+<svg viewBox="0 0 760 300" width="760" role="img" aria-labelledby="anat-titulo anat-desc">
+  <title id="anat-titulo">As partes de um hash Argon2id com prefixo do DelegatingPasswordEncoder</title>
+  <desc id="anat-desc">Seis linhas. Na esquerda, cada pedaço do hash; na direita, o que ele significa. O prefixo entre chaves argon2id é lido pelo DelegatingPasswordEncoder para escolher o codificador. Cifrão argon2id é a variante do algoritmo. v igual a 19 é a versão. m igual a 19456, t igual a 2, p igual a 1 são o custo em memória, iterações e paralelismo. Depois vêm o salt de 16 bytes em Base64 e o hash de 32 bytes em Base64.</desc>
+  <text x="20" y="26" class="d-title">o pedaço</text>
+  <text x="300" y="26" class="d-title">o que significa</text>
+  <rect x="20" y="40" width="250" height="34" rx="6" class="d-accent"/>
+  <text x="32" y="62" class="d-mono">{'{argon2id}'}</text>
+  <text x="300" y="62" class="d-text">id do DelegatingPasswordEncoder (escolhe quem confere)</text>
+  <rect x="20" y="82" width="250" height="34" rx="6" class="d-box"/>
+  <text x="32" y="104" class="d-mono">$argon2id</text>
+  <text x="300" y="104" class="d-text">variante do algoritmo (id: híbrida, resistente a GPU)</text>
+  <rect x="20" y="124" width="250" height="34" rx="6" class="d-box"/>
+  <text x="32" y="146" class="d-mono">$v=19</text>
+  <text x="300" y="146" class="d-text">versão do Argon2 (0x13)</text>
+  <rect x="20" y="166" width="250" height="34" rx="6" class="d-info"/>
+  <text x="32" y="188" class="d-mono">$m=19456,t=2,p=1</text>
+  <text x="300" y="188" class="d-text">custo: 19 MiB de memória, 2 passadas, 1 fio</text>
+  <rect x="20" y="208" width="250" height="34" rx="6" class="d-violet"/>
+  <text x="32" y="230" class="d-mono">$JAl70pVzmZhQlUL4OCQUiQ</text>
+  <text x="300" y="230" class="d-text">salt: 16 bytes aleatórios, públicos, um por senha</text>
+  <rect x="20" y="250" width="250" height="34" rx="6" class="d-ok"/>
+  <text x="32" y="272" class="d-mono">$SnScHiSxgo…bKt+EnCqi4</text>
+  <text x="300" y="272" class="d-text">o hash: 32 bytes em Base64 (resultado do custo)</text>
+</svg>
+</Figura>
+
+Repare no que a figura mostra: os **parâmetros de custo ficam dentro do hash**. É isso que permite aumentar o custo amanhã sem quebrar os hashes de hoje: cada hash antigo continua sendo conferido com os parâmetros com que foi criado, e o codificador sabe dizer que ele está "fraco" em relação ao padrão atual.
+
+## No Spring: `PasswordEncoder`
+
+O Spring Security reduz tudo isso a uma interface de três métodos, no módulo `spring-security-crypto` (que vem com o `spring-boot-starter-security`):
+
+| Método | O que faz |
+|---|---|
+| `String encode(CharSequence senha)` | Sorteia um salt, calcula o hash com o custo configurado e devolve tudo numa string |
+| `boolean matches(CharSequence senha, String hash)` | Lê salt e custo do hash, recalcula e compara |
+| `boolean upgradeEncoding(String hash)` | Diz se esse hash deveria ser recalculado (algoritmo ou custo antigos); o padrão da interface é `false` |
+
+No Spring Security 7, os codificadores da biblioteca estendem `AbstractValidatingPasswordEncoder`, que trata `null` de forma uniforme: `encode(null)` devolve `null` e `matches(null, hash)` devolve `false`, sem exceção.
+
+### `DelegatingPasswordEncoder` e o prefixo `{id}`
+
+Algoritmos envelhecem. O MD5 já foi recomendado para senhas; o SHA-1 também. Um sistema que vive dez anos vai trocar de algoritmo pelo menos uma vez, e não pode obrigar todo mundo a redefinir a senha no mesmo dia. O `DelegatingPasswordEncoder` resolve isso com uma convenção simples: **cada hash começa com o id do algoritmo entre chaves**.
+
+- No `encode`, ele usa sempre o codificador do **id atual** (`idForEncode`) e acrescenta o prefixo: `{argon2id}$argon2id$v=19$...`.
+- No `matches`, ele lê o prefixo e delega ao codificador daquele id. Um `{bcrypt}$2a$10$...` de 2019 continua conferindo.
+- No `upgradeEncoding`, ele devolve `true` se o id do hash **não** é o atual; se for o atual, pergunta ao próprio codificador (que compara o custo do hash com o configurado).
+
+O jeito mais rápido de obter um é `PasswordEncoderFactories.createDelegatingPasswordEncoder()`, que usa `bcrypt` como id atual e conhece `noop`, `pbkdf2`, `scrypt`, `argon2`, `sha256` e outros formatos antigos, inclusive as variantes `@SpringSecurity_v5_8` com parâmetros mais fortes. Para um sistema novo, vale montar o seu, com a lista exata de ids que você aceita: é o que o portal faz, e você vai ver no passo 1.
+
+### Migração de hash no login
+
+O único momento em que o sistema tem a senha da pessoa em mãos é o login bem-sucedido. É aí que a migração acontece:
+
+```java
+if (codificador.matches(senha, hash)) {
+    if (codificador.upgradeEncoding(hash)) {
+        contas.salvar(conta.comHash(codificador.encode(senha)));   // regrava com o algoritmo atual
+    }
+    // ... segue o login
+}
+```
+
+No Spring Security integrado (a aula 02), isso já vem pronto: o `DaoAuthenticationProvider` chama `upgradeEncoding` depois de um login com sucesso e, se houver um bean `UserDetailsPasswordService`, chama `updatePassword(usuario, novoHash)` para você gravar. Aqui você escreve as três linhas à mão para entender o que acontece por baixo.
+
+Quem nunca mais entrar fica com o hash antigo para sempre. Para hashes rápidos como SHA-1, isso é inaceitável, e a saída é uma **migração em lote** com o "hash em camadas" do passo 6.
+
+## Política de senhas: o que o NIST recomenda
+
+A diretriz de referência é a **NIST SP 800-63B**, cuja **revisão 4** saiu em 26 de agosto de 2025. Ela desmonta vários hábitos antigos com base em evidência: regras de composição produzem `Senha@2026`, e troca obrigatória a cada 90 dias produz `Senha@2026` → `Senha@2027`. Os pontos que viram código:
+
+| Faça | Não faça |
+|---|---|
+| Exija **15 caracteres** quando a senha é o único fator; **8** é o mínimo quando ela faz parte de MFA (*SHALL*) | Exigir "maiúscula, número e símbolo" (*SHALL NOT*) |
+| Aceite pelo menos **64** caracteres (*SHOULD*) | Forçar troca periódica sem indício de comprometimento (*SHALL NOT*) |
+| Aceite Unicode e conte cada **code point** como um caractere (*SHOULD* aceitar; *SHALL* contar assim) | Dicas de senha e perguntas secretas (*SHALL NOT*) |
+| Compare com uma lista de bloqueio: senhas de vazamentos, palavras de dicionário e **palavras do contexto** (nome do serviço, nome de usuário) | Truncar a senha na verificação (*SHALL NOT*) |
+| Permita colar (gerenciadores de senha) | Bloquear o campo para colar |
+| Force a troca quando houver **evidência** de comprometimento (*SHALL*) | |
+| Limite as falhas seguidas numa conta a **no máximo 100** (*SHALL*) | |
+
+Dois detalhes técnicos: "caractere" para a NIST é **code point** Unicode, não `char` do Java (um emoji como 🌵 tem `length()` 2, mas é um code point; use `codePointCount`). E a política devolve **todos** os problemas de uma vez, para a pessoa não corrigir um erro por tentativa.
+
+### Senhas vazadas sem enviar a senha: k-anonimato
+
+A lista de bloqueio mais útil é a de senhas que já apareceram em vazamentos. A maior base pública é o *Pwned Passwords*, do Have I Been Pwned, com uma API gratuita, sem chave e sem limite de requisições. O problema óbvio: você não pode mandar a senha da pessoa para um serviço de terceiros. Nem o hash completo, que seria quase o mesmo.
+
+A solução se chama **k-anonimato** (*k-anonymity*): você calcula o SHA-1 da senha e envia só os **5 primeiros caracteres** hexadecimais. A API devolve **todos** os sufixos que começam com aquele prefixo, normalmente centenas, cada um com a contagem de aparições, e a comparação final acontece no seu servidor. A API não sabe qual deles você testava. Com o cabeçalho `Add-Padding: true`, a resposta vem preenchida com sufixos falsos (contagem 0) até 800 a 1.000 linhas, para que nem o tamanho revele algo.
+
+<Figura legenda="K-anonimato: só um prefixo de 5 caracteres sai do servidor; a decisão é tomada localmente">
+<svg viewBox="0 0 760 220" width="760" role="img" aria-labelledby="kanon-titulo kanon-desc">
+  <title id="kanon-titulo">Consulta de senha vazada por faixa de hash</title>
+  <desc id="kanon-desc">À esquerda, o portal calcula o SHA-1 da senha e separa o prefixo de 5 caracteres do sufixo de 35. Uma seta leva só o prefixo 5BAA6 até a API Pwned Passwords, à direita. A API devolve centenas de linhas sufixo dois-pontos contagem. O portal procura o próprio sufixo nessa lista: se encontrar com contagem maior que zero, a senha é recusada.</desc>
+  <defs><marker id="mk-kanon" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="20" width="300" height="180" rx="10" class="d-box"/>
+  <text x="160" y="46" text-anchor="middle" class="d-title">Portal (seu servidor)</text>
+  <text x="26" y="78" class="d-label">SHA-1 da senha:</text>
+  <rect x="26" y="88" width="56" height="28" rx="5" class="d-accent"/>
+  <text x="54" y="107" text-anchor="middle" class="d-mono">5BAA6</text>
+  <text x="90" y="107" class="d-mono">1E4C9B…7EE68FD8</text>
+  <text x="26" y="140" class="d-label">o sufixo (35 caracteres) nunca sai daqui</text>
+  <text x="26" y="172" class="d-text">sufixo na lista e contagem maior</text>
+  <text x="26" y="190" class="d-text">que 0? → senha recusada</text>
+  <rect x="470" y="20" width="280" height="180" rx="10" class="d-info"/>
+  <text x="610" y="46" text-anchor="middle" class="d-title">API Pwned Passwords</text>
+  <text x="486" y="78" class="d-label">GET /range/5BAA6 → centenas de linhas:</text>
+  <text x="486" y="104" class="d-mono">1D2DA4053E…B5E2A:2</text>
+  <text x="486" y="124" class="d-mono">1E4C9B93F3…68FD8:52256179</text>
+  <text x="486" y="144" class="d-mono">1E7C6BA67F…C0C3D:0</text>
+  <text x="486" y="172" class="d-label">não sabe qual delas você testou;</text>
+  <text x="486" y="190" class="d-label">contagem 0 = linha de preenchimento</text>
+  <path d="M312 92 L466 92" class="d-line" marker-end="url(#mk-kanon)"/>
+  <text x="389" y="84" text-anchor="middle" class="d-label">só o prefixo</text>
+  <path d="M466 140 L312 140" class="d-line" marker-end="url(#mk-kanon)"/>
+  <text x="389" y="132" text-anchor="middle" class="d-label">todos os sufixos</text>
+</svg>
+</Figura>
+
+O Spring Security tem uma implementação pronta, o `HaveIBeenPwnedRestApiPasswordChecker` (um `CompromisedPasswordChecker`, no `spring-security-web`). Aqui você escreve a sua, para entender o protocolo e decidir explicitamente o que acontece com a API fora do ar.
+
+## Não entregue informação ao atacante
+
+Um formulário de login tem três jeitos de vazar informação, e você precisa fechar os três.
+
+**Pela mensagem.** "E-mail não cadastrado" e "senha incorreta" são duas respostas diferentes para dois estados diferentes. Para quem testa uma lista de e-mails, a primeira resposta diz "pule este" e a segunda diz "este existe, vale insistir". A resposta certa é uma só: "e-mail ou senha inválidos", com o **mesmo status HTTP** e o **mesmo corpo**.
+
+**Pelo tempo.** Mesmo com mensagens iguais, o código ingênuo só calcula o hash quando a conta existe: o e-mail inexistente responde em 2 ms, o existente gasta os 60 ms do Argon2id. Um script separa os dois grupos mesmo com o ruído da rede, repetindo algumas vezes e olhando a mediana. A defesa é fazer **o mesmo trabalho** nos dois caminhos: quando o e-mail não existe, conferir a senha contra um **hash fictício**, calculado uma vez com o algoritmo e o custo atuais.
+
+**Pelos efeitos colaterais.** O bloqueio é o caso clássico. Se só contas existentes ficam bloqueadas depois de N falhas, o atacante erra N vezes de propósito e observa: "bloqueou" significa "existe". A defesa é contar falhas **por e-mail digitado**, exista a conta ou não. O mesmo vale para o cadastro ("este e-mail já está em uso") e para o "esqueci a senha" ("e-mail não encontrado"). No cadastro, a resposta pública é sempre "enviamos um e-mail de confirmação", e quem já tinha conta recebe um aviso na própria caixa de entrada. Na recuperação, "se o e-mail estiver cadastrado, você vai receber um link".
+
+### Bloqueio progressivo e limite de requisições
+
+Contra força bruta numa conta, há duas escolas:
+
+- **Bloqueio fixo**: 5 falhas, 15 minutos fora. Simples, mas qualquer pessoa trava a conta de outra de propósito, errando cinco vezes a cada 15 minutos: negação de serviço contra o usuário.
+- **Bloqueio progressivo** (*throttling*): as primeiras falhas são livres; depois, a espera entre tentativas **cresce** a cada falha, até um teto. Quem errou duas vezes não percebe nada; quem testa milhares de senhas fica, na prática, impedido.
+
+A NIST exige ainda um limite **absoluto**: no máximo 100 falhas seguidas antes de desativar aquela senha, e aí a conta só volta pela recuperação. O portal combina as duas coisas.
+
+O bloqueio por conta não basta contra *credential stuffing* e *password spraying*, que testam **poucas** senhas em **muitas** contas. Para isso existe o **limite de requisições** por IP, por faixa de IP e global, assunto da aula 6. O bloqueio protege cada conta; o limite de requisições protege o sistema.
+
+## O código que vamos construir
+
+Tudo o que a aula mostra está em `java/m11-seguranca/aulas`, no pacote `dev.trilhajava.m11.aulas.senhas`, e roda no CI com 45 testes. São classes comuns, sem `@Component` e sem subir o Spring: cada uma recebe as dependências pelo construtor, e os testes montam tudo com `new`.
+
+| Classe | Responsabilidade |
+|---|---|
+| `Conta`, `RepositorioDeContas` (+ `EmMemoria`) | O e-mail e o hash da senha; onde ficam guardados |
+| `Codificadores` | Monta o `DelegatingPasswordEncoder` do portal |
+| `EnvelopeSha1Legado`, `MigracaoDeHashesLegados` | O hash em camadas para o SHA-1 do sistema antigo |
+| `CalibracaoDeCusto` | Programa que mede o custo de cada algoritmo na máquina |
+| `PoliticaDeSenha`, `VerificadorDeSenhasVazadas`, `PwnedPasswordsPorFaixa` | A política da NIST e a checagem por k-anonimato |
+| `ControleDeTentativas` | O bloqueio progressivo, com `Clock` injetado |
+| `ServicoDeAcesso`, `ResultadoDaEntrada` | Cadastro e login |
+| `MedicaoDoLogin` | Programa que mede o tempo do login como um atacante mediria |
+| `RecuperacaoDeSenha`, `CaixaDeEmail` | "Esqueci a senha" com token de uso único |
+
+O fluxo de login, que é o coração do pacote, fica assim:
+
+<Figura legenda="O login do portal: o mesmo trabalho em todos os caminhos de falha, e a migração do hash só no caminho do sucesso">
+<svg viewBox="0 0 760 470" width="760" role="img" aria-labelledby="login-titulo login-desc">
+  <title id="login-titulo">Fluxo do método entrar do ServicoDeAcesso</title>
+  <desc id="login-desc">O fluxo começa normalizando o e-mail. Primeiro pergunta se o e-mail exige recuperação, com 100 falhas: se sim, responde ExigeRedefinicao. Depois pergunta se há espera em curso: se sim, responde AguardeAte. Depois busca a conta; se não existir, usa o hash fictício. Em seguida confere a senha com matches, sempre exatamente uma vez. Se não conferir ou a conta não existir, registra a falha por e-mail e responde Recusada. Se conferir, limpa as falhas, pergunta upgradeEncoding e, se for verdadeiro, regrava o hash com Argon2id. Por fim responde Autenticada.</desc>
+  <defs><marker id="mk-login" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="180" y="10" width="300" height="40" rx="8" class="d-box"/>
+  <text x="330" y="35" text-anchor="middle" class="d-text">normalizar o e-mail</text>
+  <path d="M330 50 L330 68" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="180" y="70" width="300" height="40" rx="8" class="d-box"/>
+  <text x="330" y="95" text-anchor="middle" class="d-text">100 falhas seguidas?</text>
+  <path d="M480 90 L548 90" class="d-line" marker-end="url(#mk-login)"/>
+  <text x="514" y="82" text-anchor="middle" class="d-label">sim</text>
+  <rect x="550" y="70" width="200" height="40" rx="8" class="d-violet"/>
+  <text x="650" y="95" text-anchor="middle" class="d-mono">ExigeRedefinicao</text>
+  <path d="M330 110 L330 128" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="180" y="130" width="300" height="40" rx="8" class="d-box"/>
+  <text x="330" y="155" text-anchor="middle" class="d-text">espera em curso?</text>
+  <path d="M480 150 L548 150" class="d-line" marker-end="url(#mk-login)"/>
+  <text x="514" y="142" text-anchor="middle" class="d-label">sim</text>
+  <rect x="550" y="130" width="200" height="40" rx="8" class="d-violet"/>
+  <text x="650" y="155" text-anchor="middle" class="d-mono">AguardeAte(t)</text>
+  <path d="M330 170 L330 188" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="180" y="190" width="300" height="40" rx="8" class="d-box"/>
+  <text x="330" y="215" text-anchor="middle" class="d-text">buscar a conta (ou o hash fictício)</text>
+  <path d="M330 230 L330 248" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="180" y="250" width="300" height="40" rx="8" class="d-accent"/>
+  <text x="330" y="275" text-anchor="middle" class="d-mono">matches: sempre 1 vez</text>
+  <path d="M480 270 L548 270" class="d-line" marker-end="url(#mk-login)"/>
+  <text x="514" y="262" text-anchor="middle" class="d-label">não</text>
+  <rect x="550" y="250" width="200" height="40" rx="8" class="d-violet"/>
+  <text x="650" y="275" text-anchor="middle" class="d-mono">falha → Recusada</text>
+  <path d="M330 290 L330 308" class="d-line" marker-end="url(#mk-login)"/>
+  <text x="340" y="303" class="d-label">sim</text>
+  <rect x="180" y="310" width="300" height="40" rx="8" class="d-box"/>
+  <text x="330" y="335" text-anchor="middle" class="d-text">limpar as falhas do e-mail</text>
+  <path d="M330 350 L330 368" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="180" y="370" width="300" height="40" rx="8" class="d-info"/>
+  <text x="330" y="395" text-anchor="middle" class="d-mono">upgradeEncoding(hash)?</text>
+  <path d="M180 390 L112 390" class="d-line" marker-end="url(#mk-login)"/>
+  <text x="146" y="382" text-anchor="middle" class="d-label">sim</text>
+  <rect x="10" y="370" width="100" height="40" rx="8" class="d-info"/>
+  <text x="60" y="395" text-anchor="middle" class="d-label">regravar</text>
+  <path d="M330 410 L330 428" class="d-line" marker-end="url(#mk-login)"/>
+  <rect x="200" y="430" width="260" height="34" rx="8" class="d-ok"/>
+  <text x="330" y="452" text-anchor="middle" class="d-mono">Autenticada(email)</text>
+</svg>
+</Figura>
+
+Duas decisões de desenho aparecem já na figura. A espera é verificada **antes** de conferir a senha: durante o bloqueio, o atacante não ganha nenhuma informação, nem que acertou. E o resultado é um tipo selado (`sealed interface`) com quatro casos, nenhum deles "e-mail não existe":
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/ResultadoDaEntrada.java" semImports />
+
+O controller da aula 02 traduz cada caso em HTTP: `Autenticada` vira a sessão ou o token; `Recusada`, um 401 com "e-mail ou senha inválidos"; `AguardeAte`, um 429 com o cabeçalho `Retry-After`; `ExigeRedefinicao`, um 401 com orientação para o "esqueci a senha".
+
+## Mão na massa
+
+Os comandos rodam a partir da pasta do módulo:
+
+```bash
+cd java/m11-seguranca/aulas
+mvn test -Dtest=HashDeSenhaTest        # uma classe
+mvn test                               # o módulo inteiro
+```
+
+### Passo 1: o codificador do portal
+
+**O que vamos fazer e por quê.** O portal novo grava Argon2id. Mas a base tem contas de duas gerações anteriores: as da versão 2019 do portal, em BCrypt custo 10, e as do sistema legado, em SHA-1 sem salt (que o passo 6 vai envelopar). Precisamos de um `DelegatingPasswordEncoder` que grave só Argon2id e confira os três formatos.
+
+O `Argon2PasswordEncoder` do Spring usa a implementação do Bouncy Castle, que não vem no starter. A dependência entra no `pom.xml`:
+
+```xml
+<!-- Aula 11.01: o Argon2PasswordEncoder do Spring Security usa a implementação do Bouncy Castle -->
+<dependency>
+  <groupId>org.bouncycastle</groupId>
+  <artifactId>bcprov-jdk18on</artifactId>
+  <version>1.84</version>
+</dependency>
+```
+
+O BOM do Spring Boot não gerencia a versão do Bouncy Castle, por isso ela aparece explícita. Num projeto real, ela entra no controle de atualizações de dependências (Dependabot, Renovate), como qualquer biblioteca de criptografia.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/Codificadores.java" semImports />
+
+Rode os testes que exploram os codificadores:
+
+```bash
+mvn test -Dtest=HashDeSenhaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.HashDeSenhaTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.879 s
+[INFO] BUILD SUCCESS
+```
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/HashDeSenhaTest.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `sha256SemSalt`: a Ana e o Beto, com a mesma senha, têm o **mesmo** hash. `argon2idComSalt`: hashes diferentes, os dois conferindo, e o começo `$argon2id$v=19$m=19456,t=2,p=1$` é a parte pública da figura de anatomia.
+- `bcryptSetentaEDoisBytes` documenta o Spring Security 7: `encode` recusa, `matches` trunca. É por isso que a política do portal limita o tamanho mesmo com Argon2id: os hashes `{bcrypt}` antigos são conferidos pelo BCrypt até migrarem.
+- `delegatingPadrao`: o codificador de fábrica grava `{bcrypt}` (68 caracteres, 8 do prefixo e 60 do BCrypt) e confere `{noop}` (texto puro), pedindo upgrade.
+- `upgradePorCusto`: `upgradeEncoding` olha também o custo. Um BCrypt custo 10 precisa de upgrade num codificador de custo 12; é assim que se aumenta o custo sem trocar de algoritmo.
+- `semPrefixo` registra o erro mais comum de quem adota o `DelegatingPasswordEncoder` numa base existente (veja "Quando dá errado").
+
+### Passo 2: calibrar o custo medindo
+
+**O que vamos fazer e por quê.** "Use custo 12" é um conselho sem contexto: 12 pode ser 200 ms num servidor e 1 segundo noutro. O custo certo é o **mais alto que o seu servidor aguenta** no pico de logins, e isso se descobre medindo, na máquina (ou no tipo de instância) de produção.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/CalibracaoDeCusto.java" semImports />
+
+Rode o programa com o plugin `exec` do Maven:
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m11.aulas.senhas.CalibracaoDeCusto
+```
+
+Saída num notebook de desenvolvimento (os seus números vão ser outros, e devem ser):
+
+```text
+algoritmo e parâmetros                mediana
+BCrypt custo 10                         52 ms
+BCrypt custo 11                        107 ms
+BCrypt custo 12                        288 ms
+BCrypt custo 13                       1032 ms
+Argon2id m=19 MiB t=2 p=1               58 ms
+Argon2id m=46 MiB t=1 p=1               84 ms
+Argon2id m=64 MiB t=3 p=1              363 ms
+PBKDF2-SHA256 600.000 iterações        384 ms
+SHA-256 puro (1 hash)               0,0002 ms
+```
+
+**O que acabou de acontecer.**
+
+- O **custo do BCrypt é um expoente**: são 2^custo rodadas. Cada ponto a mais dobra o tempo (52 → 107 → 288 ms; o salto maior entre 12 e 13 vem do ruído de uma máquina ocupada). O `CalibracaoDeCustoTest` confere essa propriedade com uma margem larga, para não ficar instável no CI.
+- A **mediana** de sete medições, depois de uma de aquecimento, filtra a compilação JIT e os picos do sistema operacional. Uma única medição mente.
+- O SHA-256 é mais de **250 mil vezes** mais rápido que o Argon2id do portal. Essa é a vantagem que você tira do atacante.
+
+**Como decidir.** A documentação do Spring Security sugere ajustar o custo para cerca de 1 segundo por verificação, e a OWASP, para menos de 1 segundo; em APIs, 100 a 500 ms é o comum. Faça a conta da capacidade: a 58 ms, um núcleo confere cerca de 17 logins por segundo; o pico do portal é de 20 por segundo; com 4 núcleos dedicados, sobra margem. A memória entra na mesma conta: 19 MiB vezes 20 logins simultâneos são 380 MiB, que precisam caber no limite do contêiner. O portal ficou nos parâmetros mínimos da OWASP porque eles já custam 58 ms; com memória sobrando, `m=47104,t=1` seria a escolha.
+
+### Passo 3: a política de senhas e a checagem de vazadas
+
+**O que vamos fazer e por quê.** A política traduz a tabela da NIST em código: 15 a 64 code points, nenhuma regra de composição, recusa de senhas vazadas e de palavras do contexto. A checagem de vazadas fica atrás de uma interface funcional, para que a política não saiba se do outro lado há uma API, um arquivo ou um `Set` de teste.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/PoliticaDeSenha.java" semImports />
+
+E a implementação por k-anonimato:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/PwnedPasswordsPorFaixa.java" semImports />
+
+```bash
+mvn test -Dtest="PoliticaDeSenhaTest,PwnedPasswordsPorFaixaTest"
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.PoliticaDeSenhaTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.161 s
+[INFO] Running dev.trilhajava.m11.aulas.senhas.PwnedPasswordsPorFaixaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.248 s
+[INFO] BUILD SUCCESS
+```
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/PwnedPasswordsPorFaixaTest.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `cachorro late no quintal` passa sem maiúscula, número ou símbolo; `Tr0ub4dor&3xyz`, cheia de "complexidade", é recusada por ter 14 caracteres.
+- `contaCodePoints` usa 15 emojis de cacto: `length()` diz 30, a política diz 15. Uma política com `length()` aceitaria 8 emojis como se fossem 16 caracteres.
+- `palavrasDoContexto` recusa o nome da clínica e o usuário do e-mail. Este só conta a partir de 4 letras: com `al@email.com`, recusar toda senha com "al" pegaria "natal" e "salada".
+- `variosProblemas`: os problemas vêm juntos, e a consulta de vazadas, que pode ir à rede, **não roda** quando a senha já foi recusada.
+- Em `kAnonimato`, a "API" é uma lambda que guarda os prefixos recebidos: só `5BAA6` saiu. A resposta usa o hash real de `password`, presente mais de 52 milhões de vezes na base. `preenchimento` garante que as linhas falsas do `Add-Padding` não recusam ninguém.
+- `apiForaDoAr` documenta a decisão de **fail-open**: com a API fora do ar, a senha é aceita e o problema vai para o log. A visão de pleno e sênior discute a alternativa.
+
+### Passo 4: o bloqueio progressivo, com o tempo sob controle
+
+**O que vamos fazer e por quê.** O bloqueio depende do relógio: "30 segundos depois da 4ª falha". Um teste que chama `Thread.sleep(30_000)` é lento e instável. Como no módulo 10, o tempo entra como dependência: o `ControleDeTentativas` recebe um `java.time.Clock`, e o teste usa um relógio que só anda quando ele manda.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/ControleDeTentativas.java" semImports />
+
+O relógio de teste é uma subclasse de `Clock` com um método `avancar`:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/RelogioDeTeste.java" semImports />
+
+```bash
+mvn test -Dtest=ControleDeTentativasTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.ControleDeTentativasTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s
+[INFO] BUILD SUCCESS
+```
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/ControleDeTentativasTest.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `quartaFalha` testa a borda dos dois lados (29 e 30 segundos): é o par que pega um `isAfter` trocado por `!isBefore`.
+- `esperaDobra` testa a fórmula sem relógio, porque `espera(int)` é uma função pura: 30 s, 1 min, 2 min, 4 min, 8 min e o teto de 15 min. Somando, 100 tentativas levam mais de 23 horas.
+- A chave do mapa é o **e-mail**: o controle não sabe se a conta existe, e é isso que impede a enumeração pelo bloqueio.
+- `limiteAbsoluto` cobre o *SHALL* da NIST: na 100ª falha, só `limpar` (chamado pela recuperação de senha) libera.
+- O `compute` do `ConcurrentHashMap` é atômico por chave. Com um `get` seguido de `put`, falhas simultâneas se perderiam, e um robô com 50 conexões paralelas ganharia tentativas de graça.
+
+### Passo 5: cadastro e login sem vazar informação
+
+**O que vamos fazer e por quê.** Agora as peças se juntam no `ServicoDeAcesso`. As regras estão no Javadoc; o detalhe que merece atenção é a linha do `matches`.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/ServicoDeAcesso.java" semImports />
+
+Repare na ordem dentro de `codificador.matches(senha, hash) && conta.isPresent()`. O `&&` do Java é de curto-circuito: se o lado esquerdo for falso, o direito nem roda. Por isso o `matches` vem **primeiro**: ele roda sempre, contra o hash da conta ou o fictício, e só depois o código olha se a conta existe. Escrito na ordem "natural", `conta.isPresent() && codificador.matches(...)`, o e-mail inexistente nunca calcularia hash, e o tempo denunciaria. Em "Quando dá errado" você vê o teste pegando exatamente essa troca.
+
+Para conferir quantas vezes o hash foi calculado, os testes usam um codificador que delega para o real e conta as chamadas:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/CodificadorQueConta.java" semImports />
+
+```bash
+mvn test -Dtest=ServicoDeAcessoTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.ServicoDeAcessoTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.759 s
+[INFO] BUILD SUCCESS
+```
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/ServicoDeAcessoTest.java" semImports />
+
+**O que acabou de acontecer.**
+
+- `cadastroRepetido` é a defesa contra enumeração no cadastro: nenhuma exceção, a senha original continua valendo, e o aviso vai para quem é dono do e-mail.
+- `mesmaResposta` e `mesmoTrabalho` são o par mais importante da suíte: um confere a **resposta**, o outro o **trabalho** (uma conferência de hash nos dois casos). A resposta pode ser idêntica e o tempo, não.
+- `esperaProgressiva`: um e-mail existente e um inexistente recebem o mesmo `AguardeAte`, com o mesmo instante.
+- `senhaGigante` manda 1 milhão de caracteres, recusados **antes** do hash: sem esse limite, cada requisição faria o Argon2id processar 1 MB, um jeito barato de gastar a CPU do servidor. O limite vale para qualquer e-mail, então não revela nada.
+- `migraNoLogin`: a senha errada não mexe no hash; a certa transforma `{bcrypt}` em `{argon2id}`.
+
+**Medindo como o atacante mede.** Os testes contam conferências; o programa `MedicaoDoLogin` mede milissegundos, que é o que um atacante enxerga de fora:
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/MedicaoDoLogin.java" semImports />
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=dev.trilhajava.m11.aulas.senhas.MedicaoDoLogin
+```
+
+```text
+conta Argon2id, senha errada:     41 ms
+e-mail inexistente:               37 ms
+conta legada, senha errada:      572 ms
+```
+
+As duas primeiras linhas são indistinguíveis: missão cumprida. A terceira é um aviso, e é o tema do checkpoint: uma conta que ainda tem o hash legado (`{bcrypt-sha1}`, com BCrypt custo 12, mais lento que o Argon2id do portal) responde mais devagar. Quem mede consegue separar "contas antigas que nunca entraram no portal novo". Não revela se o e-mail existe em geral, mas revela algo, e você vai corrigir isso.
+
+### Passo 6: a migração em lote do legado
+
+**O que vamos fazer e por quê.** As 80 mil contas do sistema antigo chegaram à base nova com SHA-1 sem salt, sem prefixo: `a94a8fe5ccb19ba61c4c0873d391e987982fbbd3`. Esperar cada pessoa entrar para migrar é aceitável para o `{bcrypt}` custo 10 do passo 5 (que já é um hash lento), mas não para SHA-1: se a base vazar de novo antes disso, essas contas caem em minutos. E sem a senha não dá para calcular um Argon2id.
+
+A saída é o **hash em camadas** (a OWASP chama de *onion approach*): calcular `bcrypt(sha1)` a partir do SHA-1 que já está no banco. A conta passa a ter um hash lento hoje, sem que ninguém precise entrar. No próximo login, a senha digitada passa pelo SHA-1, depois pelo BCrypt, confere, e o `upgradeEncoding` troca tudo por um Argon2id limpo.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/EnvelopeSha1Legado.java" semImports />
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/MigracaoDeHashesLegados.java" semImports />
+
+```bash
+mvn test -Dtest=MigracaoDeHashesLegadosTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.MigracaoDeHashesLegadosTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.473 s
+[INFO] BUILD SUCCESS
+```
+
+**O que acabou de acontecer.**
+
+- `lote` migra a conta legada, ignora a que já tem `{argon2id}`, e rodar de novo devolve 0: a migração é **idempotente**, porque 80 mil linhas vão ser interrompidas em algum momento e precisam poder recomeçar. O hash migrado começa com `{bcrypt-sha1}$2a$12$` e não contém o SHA-1.
+- `loteDepoisLogin` faz o caminho completo: SHA-1 cru → lote → login → `{argon2id}`, graças ao `upgradeEncoding` do envelope, que devolve sempre `true`.
+
+<Callout tipo="atencao" titulo="As camadas têm um custo">
+O hash em camadas é um remédio de transição, não um formato final. A OWASP alerta para o risco chamado *password shucking*: se o mesmo SHA-1 sem salt da pessoa vazou em **outro** lugar, o atacante não precisa quebrar a senha, só testar os SHA-1 vazados contra a camada de BCrypt, o que é bem mais barato. Por isso a migração no login continua necessária, e contas que seguirem no formato envelopado depois de um prazo (seis meses, por exemplo) devem ser forçadas a redefinir a senha.
+</Callout>
+
+### Passo 7: recuperação de senha segura
+
+**O que vamos fazer e por quê.** O "esqueci a senha" é um segundo login, muitas vezes mais fraco que o primeiro. Quem controla o fluxo de recuperação controla a conta. As regras:
+
+- o token é **imprevisível**: 32 bytes do `SecureRandom` (256 bits), em Base64 URL, 43 caracteres. Nada de UUID versão 1 (baseado em relógio), `Random` ou `System.currentTimeMillis()`;
+- o servidor guarda só o **SHA-256 do token**, nunca o token: quem lê o banco (um backup, um analista com acesso de leitura) não consegue usar os pedidos pendentes. Aqui SHA-256 serve, ao contrário das senhas: o token já tem 256 bits de aleatoriedade, então não há lista de "tokens comuns" para testar;
+- vale **uma vez** e por **20 minutos**, e um pedido novo invalida o anterior;
+- a solicitação responde igual para e-mail cadastrado ou não;
+- depois da troca, o dono é avisado, e o bloqueio de tentativas é zerado.
+
+<CodigoJava caminho="m11-seguranca/aulas/src/main/java/dev/trilhajava/m11/aulas/senhas/RecuperacaoDeSenha.java" semImports />
+
+```bash
+mvn test -Dtest=RecuperacaoDeSenhaTest
+```
+
+```text
+[INFO] Running dev.trilhajava.m11.aulas.senhas.RecuperacaoDeSenhaTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.222 s
+[INFO] BUILD SUCCESS
+```
+
+<CodigoJava caminho="m11-seguranca/aulas/src/test/java/dev/trilhajava/m11/aulas/senhas/RecuperacaoDeSenhaTest.java" semImports />
+
+**O que acabou de acontecer.**
+
+- O teste não tem acesso ao token pelo serviço: ele o tira do **corpo do e-mail**, como a pessoa faria clicando no link. Se o teste precisasse de um getter para o token, o desenho estaria errado.
+- `usoUnico`: a segunda tentativa com o mesmo token dá `TOKEN_INVALIDO`. O `pedidos.remove(chave, pedido)` é atômico: de duas requisições simultâneas com o mesmo token, só uma passa. Num banco, o equivalente é um `DELETE ... WHERE hash = ?` conferindo o número de linhas afetadas.
+- `expiracao` avança exatamente 20 minutos: no instante da expiração, o token já não vale (`!isBefore`, não `isAfter`).
+- `senhaNovaRecusada`: se a senha nova não passa na política, o token **não** é consumido, e a pessoa tenta outra sem pedir outro e-mail.
+- `redefine` parte de uma conta com 100 falhas e confere que a troca de senha a libera: é o caminho de volta que a NIST pressupõe.
+
+<Callout tipo="dica" titulo="O que fica fora do código, mas faz parte do fluxo">
+O link com o token passa pela barra de endereços. Por isso a página de redefinição deve responder com `Referrer-Policy: no-referrer` (senão o token vaza no cabeçalho `Referer` para qualquer recurso externo da página) e trocar o token por um formulário via `POST` logo na abertura. O envio do e-mail deve ser assíncrono, numa fila: se ele demorar 800 ms só quando a conta existe, a solicitação volta a revelar quem é paciente. E, se a pessoa tinha sessões abertas, a troca de senha deve encerrá-las.
+</Callout>
+
+### Passo 8: a suíte inteira
+
+```bash
+mvn test
+```
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in ...CalibracaoDeCustoTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ...ControleDeTentativasTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0 -- in ...HashDeSenhaTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0 -- in ...MigracaoDeHashesLegadosTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0 -- in ...PoliticaDeSenhaTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0 -- in ...PwnedPasswordsPorFaixaTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0 -- in ...RecuperacaoDeSenhaTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0 -- in ...ServicoDeAcessoTest
+[INFO] Tests run: 45, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Cerca de 13 segundos, quase todos de Argon2id e BCrypt: os testes usam os parâmetros de produção para conferir os formatos reais. Numa suíte grande, um custo menor (BCrypt custo 4, Argon2id com 1 MiB) é aceitável nos testes que não tratam do hash em si.
+
+## Quando dá errado
+
+As mensagens abaixo foram copiadas da execução real.
+
+### Hash sem prefixo no `DelegatingPasswordEncoder`
+
+O time troca o `BCryptPasswordEncoder` pelo `DelegatingPasswordEncoder` e, no primeiro login, todo mundo falha com erro 500:
+
+```text
+java.lang.IllegalArgumentException: Given that there is no default password encoder configured, each
+password must have a password encoding prefix. Please either prefix this password with '{noop}' or set
+a default password encoder in `DelegatingPasswordEncoder`.
+```
+
+**Causa:** a base tem hashes BCrypt crus (`$2a$10$...`), sem `{bcrypt}`. **Correção:** uma migração SQL que acrescenta o prefixo (`UPDATE conta SET hash = '{bcrypt}' || hash WHERE hash LIKE '$2a$%'`), que deixa a base explícita; ou, na transição, `setDefaultPasswordEncoderForMatches(new BCryptPasswordEncoder())`. **Nunca** siga a sugestão do `{noop}` para hashes reais: `{noop}` significa texto puro.
+
+### Id desconhecido
+
+```text
+java.lang.IllegalArgumentException: There is no password encoder mapped for the id 'md5x'. Check your
+configuration to ensure it matches one of the registered encoders.
+```
+
+**Causa:** um hash com um prefixo que não está no mapa, por erro de digitação na migração ou porque alguém removeu do mapa um id que ainda existe na base. **Correção:** antes de remover um id, conte quantas linhas ainda o usam (`WHERE hash LIKE '{bcrypt}%'`). Um id só sai do mapa quando a contagem chega a zero.
+
+### Senha de mais de 72 bytes no BCrypt
+
+```text
+java.lang.IllegalArgumentException: password cannot be more than 72 bytes
+```
+
+**Causa:** `encode` com BCrypt de uma senha longa ou com muitos acentos; aparece como erro 500 no cadastro. **Correção:** limite em bytes na política (como o exercício 11.01 pede) ou Argon2id, que não tem o limite.
+
+### Argon2 sem o Bouncy Castle
+
+Sem a dependência `bcprov-jdk18on`, o projeto compila e sobe normalmente. O erro só aparece no **primeiro `encode`**, ou seja, no primeiro cadastro ou na primeira migração de hash em produção:
+
+```text
+Exception in thread "main" java.lang.NoClassDefFoundError: org/bouncycastle/crypto/params/Argon2Parameters$Builder
+	at org.springframework.security.crypto.argon2.Argon2PasswordEncoder.encodeNonNullPassword(Argon2PasswordEncoder.java:115)
+	at org.springframework.security.crypto.password.AbstractValidatingPasswordEncoder.encode(AbstractValidatingPasswordEncoder.java:42)
+	at dev.trilhajava.m11.aulas.senhas.CalibracaoDeCusto.medianaMs(CalibracaoDeCusto.java:36)
+Caused by: java.lang.ClassNotFoundException: org.bouncycastle.crypto.params.Argon2Parameters$Builder
+```
+
+**Correção:** a dependência no `pom.xml`, e um teste que chame `encode` (como o `HashDeSenhaTest`), para que o CI pegue o problema antes do deploy. O `Argon2PasswordEncoder` é criado sem erro: um teste que só monta o bean passaria.
+
+### O "ajuste" que reabre a enumeração
+
+Alguém revisa o `ServicoDeAcesso`, acha estranho calcular hash para uma conta que não existe, e "otimiza" a linha para `conta.isPresent() && codificador.matches(senha, hash)`. Todos os testes de resposta continuam passando. O de trabalho, não:
+
+```text
+[ERROR] dev.trilhajava.m11.aulas.senhas.ServicoDeAcessoTest.mesmoTrabalho -- Time elapsed: 0.103 s <<< FAILURE!
+org.opentest4j.AssertionFailedError:
+
+expected: 1
+ but was: 0
+	at dev.trilhajava.m11.aulas.senhas.ServicoDeAcessoTest.mesmoTrabalho(ServicoDeAcessoTest.java:88)
+```
+
+**Como ler:** para o e-mail inexistente, houve 0 conferências de hash em vez de 1: é o vazamento por tempo. **Correção:** desfazer a troca e comentar na linha por que a ordem importa. Sem esse teste, a otimização passaria no code review.
+
+## Armadilhas e quando NÃO usar
+
+<Comparar antes="Hash rápido, mensagens que ajudam o atacante" depois="Hash de senha, resposta única, mesmo trabalho">
+```java
+String hash = sha256(salt + senha);   // rápido demais
+
+Optional<Conta> conta = contas.buscar(email);
+if (conta.isEmpty()) {
+    throw new NaoEncontradoException(
+        "E-mail não cadastrado");
+}
+if (!sha256(salt + senha).equals(conta.get().hash())) {
+    throw new SenhaInvalidaException(
+        "Senha incorreta");
+}
+```
+
+```java
+String hash = codificador.encode(senha); // {argon2id}...
+
+Optional<Conta> conta = contas.buscar(email);
+String alvo = conta.map(Conta::hashDaSenha)
+        .orElse(hashFicticio);
+boolean confere = codificador.matches(senha, alvo)
+        && conta.isPresent();
+if (!confere) {
+    return new Recusada(); // uma resposta só
+}
+```
+</Comparar>
+
+O lado esquerdo tem quatro problemas: hash rápido, duas mensagens, um caminho sem hash (tempo diferente) e `equals` de `String`, que para no primeiro caractere diferente. Os codificadores do Spring comparam em tempo constante; para comparar segredos à mão, use `MessageDigest.isEqual`.
+
+Outras armadilhas frequentes:
+
+- **Validar a senha só no front-end.** Um `curl` pula qualquer JavaScript; quem garante a política é o servidor.
+- **Logar o corpo da requisição de login.** Um filtro de log "para depurar" grava a senha em texto puro num sistema que dezenas de pessoas acessam. Mascare os campos sensíveis na origem, e cuide das mensagens de exceção: o `SenhaRecusadaException` lista os problemas, nunca a senha.
+- **Bloqueio permanente.** Vira uma arma contra os próprios usuários.
+- **Recuperação que revela a conta** ("enviamos para m\*\*\*\*a@gmail.com") ou que manda uma senha temporária por e-mail, que fica na caixa de entrada para sempre.
+- **Aumentar o custo sem medir.** BCrypt custo 14 "porque é mais seguro" leva segundos por login e transforma cada ataque numa negação de serviço contra você.
+- **Reinventar o hash.** `sha256` mil vezes "para ficar lento", com salt de 4 bytes. Use os codificadores do Spring Security, com formatos padronizados e auditados.
+
+**Quando NÃO usar o que esta aula construiu.** Se a sua aplicação pode delegar a autenticação a um provedor de identidade (Keycloak, Microsoft Entra ID, Google, Auth0, Okta) via OpenID Connect, **faça isso**: você deixa de guardar senhas, e MFA, passkeys, recuperação e detecção de anomalias vêm prontos (a aula 07 do módulo trata disso). Guardar senhas é responsabilidade e custo contínuo. E, para autenticação entre serviços (um job chamando uma API), senha não é o mecanismo certo: use credenciais de cliente OAuth2, mTLS ou chaves de API com escopo e rotação.
+
+## Visão de pleno e sênior: decisões e trade-offs
+
+**Construir ou delegar.** A primeira decisão não é qual algoritmo usar, é se o sistema deve guardar senhas. Um provedor gerenciado custa por usuário ativo e cria dependência de fornecedor; um auto-hospedado (Keycloak) custa operação; construir custa o que esta aula mostrou, mais auditoria e o risco de errar um detalhe. Num B2C com milhões de contas, o custo por usuário pesa e muitas empresas mantêm autenticação própria; num sistema interno ou B2B, delegar quase sempre ganha. Para justificar ao time, compare custo mensal, tempo de implementação, o que vem pronto (MFA, passkeys, detecção de credential stuffing) e quem acorda de madrugada quando a autenticação cai.
+
+**Custo do hash é capacidade.** O serviço de autenticação precisa ser dimensionado para o pico de logins **mais** a carga de ataque: credential stuffing a 500 tentativas por segundo, com Argon2id a 58 ms, consome 29 núcleos só calculando hashes. Por isso o limite de requisições (aula 6) vem **antes** do hash, e algumas empresas isolam a autenticação num serviço próprio, que pode cair sem derrubar o resto. Revise o custo uma vez por ano ou ao trocar de instância, e aumente-o com `upgradeEncoding`: as contas migram sozinhas.
+
+**Memória do Argon2id em contêineres.** O parâmetro `m` multiplica pelos logins simultâneos, e um pico de logins com limites de memória apertados vira `OOMKilled` em cascata. Dimensione com `m` × concorrência máxima do endpoint, limite essa concorrência (um semáforo ou o `@ConcurrencyLimit` do Spring Framework 7) e, com pouca memória, prefira uma combinação da OWASP com menos memória e mais passadas.
+
+**Fail-open ou fail-closed na checagem de vazadas.** Se a API cair, o cadastro para ou segue sem a checagem? O portal escolheu seguir, com log e alerta: a checagem é uma camada a mais, parar os cadastros de uma clínica por um serviço de terceiros custa caro, e a senha pode ser checada de novo no próximo login. Um banco faria outra escolha, ou manteria uma cópia local da base (o Pwned Passwords permite download completo). O importante é a escolha ser explícita, registrada num ADR e testada, como o `apiForaDoAr`.
+
+**Estado do bloqueio em produção.** O `ConcurrentHashMap` só funciona com uma instância: com três réplicas, o atacante ganha três vezes mais tentativas, e o estado some a cada deploy. Em produção, ele vai para um armazenamento compartilhado com expiração, como Redis (`INCR` e `EXPIRE`, módulo 15) ou uma tabela com limpeza periódica, o que também impede o mapa de crescer sem limite com e-mails inventados. A interface do controle não muda.
+
+**Observabilidade sem dados sensíveis.** Taxa de `Recusada` por minuto, número de `AguardeAte` e de `ExigeRedefinicao` viram métricas (módulo 14) e eventos de auditoria, com o e-mail mascarado, nunca a senha. Um alerta para "falhas de login 10 vezes acima do normal" detecta credential stuffing em minutos; sem ele, você descobre pelo suporte.
+
+**MFA e o que conta como fator forte.** Uma senha bem guardada continua sendo um fator só, e phishing a captura inteira. Por ordem de força:
+
+| Método | Como funciona | Resiste a phishing? | Observações |
+|---|---|---|---|
+| SMS | Código enviado por mensagem | Não | Vulnerável a troca de chip (*SIM swap*); a NIST o trata como "restrito" |
+| **TOTP** (RFC 6238) | Código de 6 dígitos que muda a cada 30 s, calculado com um segredo compartilhado no cadastro (o QR code) | Não | Barato e sem custo por envio; o segredo precisa ser guardado **cifrado** no servidor, e códigos usados devem ser recusados se reapresentados |
+| Link ou código por e-mail (*one-time token*) | Token de uso único enviado por e-mail | Não | Bom como login sem senha para sistemas de uso raro; o Spring Security 7 tem `oneTimeTokenLogin()` |
+| **Passkeys** (WebAuthn) | Par de chaves gerado no dispositivo; o servidor guarda só a chave pública; o navegador só assina para a **origem** registrada | **Sim** | Sem segredo no servidor; sincronizadas entre dispositivos pelo ecossistema (Apple, Google, Microsoft); o Spring Security 7 tem `webAuthn()`, com a dependência `spring-security-webauthn` |
+
+A resistência a phishing das passkeys vem de um detalhe de protocolo: a assinatura inclui a origem (`https://portal.clinica.example`), verificada pelo navegador. Uma página falsa em `portal-clinica.example` simplesmente não consegue obter a assinatura. Com TOTP, a página falsa pede o código e o repassa em tempo real. No Spring Security 7, o MFA foi redesenhado em torno de **autoridades de fator**: cada mecanismo de login acrescenta uma autoridade como `FACTOR_PASSWORD`, `FACTOR_OTT` ou `FACTOR_WEBAUTHN` (constantes de `FactorGrantedAuthority`), e `@EnableMultiFactorAuthentication(authorities = ...)` exige as que você listar. A aula 02 mostra a configuração.
+
+Para o portal: senha como base, passkeys oferecidas depois do login como caminho preferido, e TOTP obrigatório na área administrativa. E, para qualquer fator, a **recuperação** precisa ser tão forte quanto o login: um MFA que se desliga com um e-mail de "perdi o celular" vale tanto quanto o e-mail.
+
+**Quando trocar de abordagem.** O custo do hash já não cabe no orçamento de CPU (delegue ou isole a autenticação); os chamados de recuperação de conta crescem (passkeys); clientes corporativos pedem login com a identidade da empresa (SSO via OpenID Connect ou SAML). E a LGPD não exige um mecanismo específico, mas exige medidas de segurança aptas a proteger os dados: um incidente com senhas mal guardadas pesa na avaliação da ANPD.
+
+<Callout tipo="entrevista">
+Perguntas que aparecem para Pleno e Sênior, e o que uma boa resposta contém:
+
+- **"Como você guardaria as senhas?"** Argon2id ou BCrypt com salt, nunca criptografia nem SHA puro; custo medido no hardware de produção; `DelegatingPasswordEncoder` e migração com `upgradeEncoding`. Bônus: 72 bytes do BCrypt e o custo de girar um pepper.
+- **"Herdamos uma base com MD5. O que fazer?"** Hash em camadas em lote já, Argon2id no login, prazo para forçar redefinição, e a ressalva do *password shucking*.
+- **"Como evitar enumeração?"** Mesma mensagem, mesmo status, mesmo trabalho (hash fictício) e mesmos efeitos (bloqueio por e-mail digitado, cadastro e recuperação com resposta única).
+- **"Bloqueio de conta?"** Progressivo com teto, limite absoluto de 100 com recuperação, limite por IP contra credential stuffing, estado compartilhado entre instâncias.
+- **"Senha, TOTP ou passkey?"** Resistência a phishing, custo, experiência, e a recuperação como a força real.
+</Callout>
+
+## Checkpoint
+
+O passo 5 terminou com um vazamento: uma conta que ainda está no formato `{bcrypt-sha1}` responde em 572 ms, contra cerca de 40 ms das demais. O atacante não descobre se um e-mail existe, mas descobre quais contas **antigas** nunca entraram no portal novo: boas candidatas para phishing ("seu cadastro precisa ser atualizado").
+
+**O desafio:** proponha duas correções diferentes, com o trade-off de cada uma, e escreva a mudança de código da mais simples. Pense nos números da calibração do passo 2.
+
+<details>
+<summary>Ver uma solução</summary>
+
+**Correção 1: igualar o custo das camadas ao custo atual.** O envelope usa BCrypt custo 12 (cerca de 290 ms na calibração). Se ele usar um custo cujo tempo seja próximo ao do Argon2id do portal (custo 10, cerca de 52 ms, contra 58 ms), as três linhas da medição ficam indistinguíveis. A mudança é uma linha no `EnvelopeSha1Legado`:
+
+```java
+private final BCryptPasswordEncoder bcrypt = new BCryptPasswordEncoder(10);
+```
+
+Trade-off: custo 10 é o mínimo da OWASP para BCrypt, aceitável para um formato de transição que vai sumir. E a regra geral fica registrada: **todos os formatos ativos devem ter custo parecido**, e o hash fictício deve ter o custo do formato mais comum. Ao aumentar o custo do Argon2id no futuro, o envelope precisa acompanhar.
+
+**Correção 2: tempo mínimo de resposta.** O login sempre responde depois de um piso fixo (600 ms, por exemplo), esperando o que falta. Esconde qualquer diferença menor que o piso, inclusive as ainda não descobertas. Trade-off: todo login fica mais lento, a espera prende uma thread de plataforma (com virtual threads, o custo é baixo) e uma diferença maior que o piso continua visível.
+
+**Correção 3 (de processo): acabar com o formato.** Forçar a redefinição das contas que continuam em `{bcrypt-sha1}` depois do prazo. Elimina a diferença na origem, ao custo de um e-mail para quem nunca voltou.
+
+A correção 1 é a mais simples e resolve o caso; a 3 é a que encerra o problema. Uma boa resposta de Sênior combina as duas e acrescenta uma medição como a do `MedicaoDoLogin` ao checklist de cada mudança no codificador.
+
+</details>
+
+<Quiz
+  id="11-01-senhas"
+  questoes={[
+    {
+      pergunta: 'Um sistema guarda SHA-256(salt + senha), com salt aleatório de 16 bytes por usuário. Qual o principal problema?',
+      opcoes: ['Nenhum: o salt resolve', 'SHA-256 é rápido demais; o salt impede pré-cálculo, mas não deixa cada tentativa cara', 'SHA-256 é reversível', 'O salt deveria ser secreto'],
+      correta: 1,
+      explicacao: 'O salt obriga o atacante a trabalhar conta por conta, mas cada tentativa continua custando frações de microssegundo. Senhas precisam de um algoritmo com fator de custo (Argon2id, BCrypt, scrypt, PBKDF2).',
+    },
+    {
+      pergunta: 'O login devolve a mesma mensagem para e-mail inexistente e senha errada, mas só calcula o hash quando a conta existe. O que um atacante consegue?',
+      opcoes: ['Nada, as mensagens são iguais', 'Descobrir quais e-mails têm conta medindo o tempo de resposta', 'Descobrir as senhas', 'Fazer SQL injection'],
+      correta: 1,
+      explicacao: 'Sem o hash fictício, o e-mail inexistente responde em poucos milissegundos e o existente no tempo do Argon2id. Basta medir a mediana de algumas requisições. A correção é fazer o mesmo trabalho nos dois caminhos.',
+    },
+    {
+      pergunta: 'No Spring Security 7, o que acontece ao conferir com `BCryptPasswordEncoder.matches` uma senha de 80 bytes cujos primeiros 72 bytes são a senha certa?',
+      opcoes: ['Lança IllegalArgumentException', 'Devolve false', 'Devolve true, porque o BCrypt só considera os primeiros 72 bytes', 'Devolve null'],
+      correta: 2,
+      explicacao: 'O `encode` recusa mais de 72 bytes, mas o `matches` trunca. Por isso a política deve limitar o tamanho em bytes quando houver hashes BCrypt, e a NIST proíbe truncar na verificação.',
+    },
+    {
+      pergunta: 'Qual combinação está de acordo com a NIST SP 800-63B rev. 4 para senha usada como fator único?',
+      opcoes: ['Mínimo de 8, com maiúscula, número e símbolo', 'Mínimo de 15, sem regras de composição, sem troca periódica, com lista de senhas vazadas', 'Mínimo de 12 e troca a cada 90 dias', 'Máximo de 16 caracteres para caber no BCrypt'],
+      correta: 1,
+      explicacao: 'A revisão 4 exige 15 caracteres quando a senha é o único fator (8 quando faz parte de MFA), proíbe composição obrigatória e troca periódica sem evidência de comprometimento, e pede comparação com listas de bloqueio.',
+    },
+    {
+      pergunta: 'Por que o portal guarda o SHA-256 do token de recuperação, e não o token?',
+      opcoes: ['Para economizar espaço', 'Para que quem leia o banco (um backup, por exemplo) não consiga usar os pedidos pendentes', 'Porque o token precisa ser lento de conferir', 'Porque o e-mail não aceita tokens longos'],
+      correta: 1,
+      explicacao: 'O token é uma credencial temporária. Guardando só o hash, o banco sozinho não permite redefinir senhas. SHA-256 basta porque o token tem 256 bits aleatórios: não há lista de tokens comuns para testar.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- **Autenticação** é provar quem você é (falhou: 401); **autorização** é decidir o que você pode (falhou: 403 ou 404).
+- Senhas se guardam com **hash de senha**: mão única, **salt** por senha e **fator de custo**. Argon2id é a primeira escolha; BCrypt continua bom, com o limite de **72 bytes**. SHA-256, MD5 e criptografia reversível ficam de fora. O **pepper** é um segredo fora do banco, com custo de rotação.
+- **Calibre o custo medindo** na máquina de produção, contando CPU e memória no pico de logins.
+- O **`DelegatingPasswordEncoder`** guarda o algoritmo no prefixo `{id}`; `upgradeEncoding` permite migrar no login. Hashes rápidos legados recebem um **hash em camadas** em lote e migram de vez no login.
+- Política da **NIST SP 800-63B rev. 4**: 15 caracteres como fator único, code points, sem composição, sem troca periódica, lista de vazadas (com **k-anonimato**) e palavras do contexto.
+- **Mesma resposta, mesmo trabalho, mesmos efeitos**: hash fictício, bloqueio por e-mail digitado, cadastro e recuperação com resposta única.
+- **Bloqueio progressivo** com teto e limite absoluto de 100 falhas; limite de requisições por IP contra credential stuffing.
+- **Recuperação**: token de 256 bits, guardado como hash, de uso único e com prazo curto.
+- **MFA**: TOTP é bom e barato; **passkeys** resistem a phishing. A recuperação define a força real de qualquer fator.
+
+## Próximo passo
+
+Pratique tudo isso no [exercício 11.01, Credenciais](../../../exercicios/11-seguranca/01-senhas/), num domínio diferente e com regras próprias: BCrypt com o limite de 72 bytes, bloqueio fixo e migração de senhas em texto puro. Depois, na aula [Spring Security 7](../../11-seguranca/02-spring-security-7/), você liga estas peças à cadeia de filtros do Spring: `SecurityFilterChain`, `DaoAuthenticationProvider`, `UserDetailsPasswordService` para a migração automática e as autoridades de fator para MFA.
+
+## Referências
+
+- NIST SP 800-63B-4 — *Digital Identity Guidelines: Authentication and Authenticator Management* (ago/2025): https://pages.nist.gov/800-63-4/sp800-63b.html
+- OWASP Cheat Sheet Series — *Password Storage*: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+- OWASP Cheat Sheet Series — *Authentication*: https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html
+- OWASP Cheat Sheet Series — *Forgot Password*: https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html
+- Spring Security — *Password Storage*: https://docs.spring.io/spring-security/reference/features/authentication/password-storage.html
+- Spring Security — *Multi-Factor Authentication*: https://docs.spring.io/spring-security/reference/servlet/authentication/mfa.html
+- Spring Security — *Passkeys*: https://docs.spring.io/spring-security/reference/servlet/authentication/passkeys.html
+- Have I Been Pwned — *API v3, Pwned Passwords*: https://haveibeenpwned.com/API/v3#PwnedPasswords
+- RFC 6238 — *TOTP: Time-Based One-Time Password Algorithm*: https://www.rfc-editor.org/rfc/rfc6238
+- W3C — *Web Authentication Level 3*: https://www.w3.org/TR/webauthn-3/

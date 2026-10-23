@@ -1,0 +1,63 @@
+---
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import CommandPalette from '../components/CommandPalette.astro';
+import { url } from '../lib/url';
+
+interface Props {
+  title: string;
+  description?: string;
+  /** remove o rodapé (usado em páginas de leitura em modo foco) */
+  compact?: boolean;
+}
+
+const {
+  title,
+  description = 'Do básico até a vaga de backend Java Júnior/Pleno: aulas, exercícios com soluções testadas, simulador de entrevistas e flashcards.',
+  compact = false,
+} = Astro.props;
+const fullTitle = title === 'Trilha Java Backend' ? title : `${title} · Trilha Java Backend`;
+---
+
+<!doctype html>
+<html lang="pt-BR" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#0f0d0b" />
+    <link rel="icon" href={url('favicon.svg')} type="image/svg+xml" />
+    <link rel="manifest" href={url('manifest.webmanifest')} />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <script is:inline>
+      (function () {
+        try {
+          var t = localStorage.getItem('trilha-java:tema');
+          if (t !== 'light' && t !== 'dark') {
+            t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+          }
+          document.documentElement.dataset.theme = t;
+          if (localStorage.getItem('trilha-java:foco') === '1') document.documentElement.dataset.foco = '';
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#conteudo">Pular para o conteúdo</a>
+    <Header />
+    <main id="conteudo">
+      <slot />
+    </main>
+    {!compact && <Footer />}
+    <CommandPalette />
+    <script>
+      if ('serviceWorker' in navigator && import.meta.env.PROD) {
+        navigator.serviceWorker.register(`${import.meta.env.BASE_URL.replace(/\/$/, '')}/sw.js`).catch(() => {});
+      }
+    </script>
+  </body>
+</html>

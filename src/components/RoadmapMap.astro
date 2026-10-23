@@ -1,0 +1,324 @@
+---
+import Icon from './Icon.astro';
+import { camadas, getAulas, getExercicios, getModulos, NIVEL_LABEL, pad2 } from '../lib/conteudo';
+import { url } from '../lib/url';
+
+const [modulos, aulas, exercicios] = await Promise.all([getModulos(), getAulas(), getExercicios()]);
+const niveis = camadas(modulos);
+const itensPorModulo = (id: string) => [
+  ...aulas.filter((a) => a.data.modulo.id === id).map((a) => `a:${a.id}`),
+  ...exercicios.filter((e) => e.data.modulo.id === id).map((e) => `e:${e.id}`),
+];
+---
+
+<div class="roadmap" data-roadmap>
+  <svg class="edges" aria-hidden="true"></svg>
+  <ol class="layers">
+    {
+      niveis.map((camada) => (
+        <li class="layer">
+          <ul>
+            {camada.map((m) => {
+              const itens = itensPorModulo(m.id);
+              const emBreve = m.data.status === 'em-breve';
+              return (
+                <li>
+                  <a
+                    class:list={['node', `nivel-${m.data.nivel}`, { 'em-breve': emBreve }]}
+                    href={url(`modulos/${m.id}`)}
+                    data-node={m.id}
+                    data-req={m.data.requisitos.join(',')}
+                    data-itens={JSON.stringify(itens)}
+                  >
+                    <span class="node-num">{pad2(m.data.numero)}</span>
+                    <span class="node-body">
+                      <span class="node-title">{m.data.titulo}</span>
+                      <span class="node-meta">
+                        <span class={`badge-dot lvl lvl-${m.data.nivel}`}>{NIVEL_LABEL[m.data.nivel]}</span>
+                        <span class="sep">·</span>
+                        <span>{emBreve ? 'Em breve' : `${m.data.horas}h`}</span>
+                        {m.data.marcoProjeto && (
+                          <span class="marco" title={m.data.marcoProjeto}>
+                            <Icon name="flag" size={13} />
+                          </span>
+                        )}
+                      </span>
+                      {!emBreve && (
+                        <span class="progress node-progress" aria-hidden="true">
+                          <span />
+                        </span>
+                      )}
+                    </span>
+                    <span class="node-check" aria-hidden="true">
+                      <Icon name="check" size={14} />
+                    </span>
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </li>
+      ))
+    }
+  </ol>
+</div>
+
+<script>
+  import { aoMudar, ler } from '../lib/progresso';
+
+  function progresso() {
+    const p = ler();
+    document.querySelectorAll<HTMLElement>('[data-node]').forEach((n) => {
+      const itens: string[] = JSON.parse(n.dataset.itens || '[]');
+      if (!itens.length) return;
+      const feitos = itens.filter((i) =>
+        i.startsWith('a:') ? p.aulas[i.slice(2)] : p.exercicios[i.slice(2)]?.status === 'concluido',
+      ).length;
+      const pct = Math.round((feitos / itens.length) * 100);
+      n.querySelector<HTMLElement>('.node-progress')?.style.setProperty('--value', String(pct));
+      n.classList.toggle('iniciado', pct > 0 && pct < 100);
+      n.classList.toggle('concluido', pct === 100);
+      n.setAttribute('aria-label', `${n.querySelector('.node-title')?.textContent}: ${pct}% concluído`);
+    });
+    desenhar();
+  }
+
+  function desenhar() {
+    document.querySelectorAll<HTMLElement>('[data-roadmap]').forEach((mapa) => {
+      const svg = mapa.querySelector<SVGSVGElement>('.edges')!;
+      const box = mapa.getBoundingClientRect();
+      svg.setAttribute('viewBox', `0 0 ${box.width} ${box.height}`);
+      svg.setAttribute('width', String(box.width));
+      svg.setAttribute('height', String(box.height));
+      const nos = new Map([...mapa.querySelectorAll<HTMLElement>('[data-node]')].map((n) => [n.dataset.node!, n]));
+      let paths = '';
+      for (const [, destino] of nos) {
+        const reqs = (destino.dataset.req || '').split(',').filter(Boolean);
+        const d = destino.getBoundingClientRect();
+        for (const r of reqs) {
+          const origem = nos.get(r);
+          if (!origem) continue;
+          const o = origem.getBoundingClientRect();
+          const x1 = o.left + o.width / 2 - box.left;
+          const y1 = o.bottom - box.top;
+          const x2 = d.left + d.width / 2 - box.left;
+          const y2 = d.top - box.top;
+          const my = (y1 + y2) / 2;
+          const feito = origem.classList.contains('concluido');
+          paths += `<path class="${feito ? 'on' : ''}" d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}"/>`;
+        }
+      }
+      svg.innerHTML = paths;
+    });
+  }
+
+  progresso();
+  aoMudar(progresso);
+  new ResizeObserver(desenhar).observe(document.querySelector('[data-roadmap]')!);
+  document.fonts?.ready.then(desenhar);
+</script>
+
+<style>
+  .roadmap {
+    position: relative;
+  }
+  .edges {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: visible;
+  }
+  .edges :global(path) {
+    fill: none;
+    stroke: var(--border-strong);
+    stroke-width: 1.6;
+    stroke-dasharray: 4 5;
+  }
+  .edges :global(path.on) {
+    stroke: var(--accent);
+    stroke-dasharray: none;
+    opacity: 0.8;
+  }
+  .layers,
+  .layers ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .layers {
+    position: relative;
+    display: grid;
+    gap: 44px;
+  }
+  .layer ul {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 16px 28px;
+  }
+  .node {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    width: 272px;
+    padding: 14px 16px;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    text-decoration: none;
+    transition:
+      transform 0.2s var(--ease),
+      border-color 0.2s,
+      box-shadow 0.2s;
+  }
+  .node:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent);
+    box-shadow:
+      var(--shadow-lift),
+      0 0 0 4px var(--accent-soft);
+  }
+  .node-num {
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: var(--surface-3);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--text-2);
+  }
+  .node.nivel-base .node-num {
+    color: var(--lvl-base);
+  }
+  .node.nivel-jr .node-num,
+  .node.nivel-jr-pleno .node-num {
+    color: var(--lvl-jr);
+  }
+  .node.nivel-pleno .node-num {
+    color: var(--lvl-pleno);
+  }
+  .node.nivel-todos .node-num {
+    color: var(--accent);
+  }
+  .node-body {
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+  .node-title {
+    font-family: var(--font-display);
+    font-weight: 650;
+    font-size: 1.02rem;
+    line-height: 1.25;
+    color: var(--text);
+  }
+  .node-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.76rem;
+    color: var(--text-3);
+  }
+  .lvl {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 600;
+  }
+  .lvl::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .marco {
+    margin-left: auto;
+    color: var(--accent);
+    display: inline-flex;
+  }
+  .node-progress {
+    margin-top: 6px;
+    height: 4px;
+  }
+  .node-check {
+    position: absolute;
+    top: -8px;
+    right: -8px;
+    display: none;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--ok);
+    color: var(--accent-ink);
+    box-shadow: 0 0 0 3px var(--bg);
+  }
+  .node.concluido {
+    border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+  }
+  .node.concluido .node-check {
+    display: grid;
+  }
+  .node.iniciado {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+  .node.em-breve {
+    background: var(--bg-soft);
+    border-style: dashed;
+    box-shadow: none;
+  }
+  .node.em-breve .node-title {
+    color: var(--text-2);
+  }
+
+  @media (max-width: 640px) {
+    .edges {
+      display: none;
+    }
+    .layers {
+      gap: 12px;
+      padding-left: 20px;
+    }
+    .layers::before {
+      content: '';
+      position: absolute;
+      left: 6px;
+      top: 20px;
+      bottom: 20px;
+      width: 2px;
+      background: linear-gradient(var(--accent), var(--border-strong));
+      border-radius: 2px;
+    }
+    .layer ul {
+      flex-direction: column;
+      gap: 12px;
+    }
+    .node {
+      width: 100%;
+    }
+    .node::before {
+      content: '';
+      position: absolute;
+      left: -19px;
+      top: 26px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--bg);
+      border: 2px solid var(--border-strong);
+    }
+    .node.iniciado::before,
+    .node.concluido::before {
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+  }
+</style>

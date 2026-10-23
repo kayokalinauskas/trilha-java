@@ -1,0 +1,142 @@
+---
+titulo: Busca semântica com trechos, cosseno e isolamento por cliente
+codigo: "16.02"
+resumo: Construa à mão a parte de recuperação de um RAG. Divida documentos em trechos com sobreposição, gere os embeddings em lote, calcule a similaridade de cosseno e devolva os K trechos mais parecidos acima de um limiar. Um cliente nunca pode enxergar os documentos de outro.
+modulo: 16-ia-backend
+ordem: 2
+dificuldade: medio
+tempo: 1h30–2h
+conceitos: [RAG, embeddings, EmbeddingModel, similaridade de cosseno, chunking, sobreposição, top-K, limiar, multi-tenant, reindexação]
+aulas: [16-ia-backend/03-rag-e-embeddings]
+java:
+  modulo: m16-ia-backend
+  teste: BaseDeConhecimentoTest
+---
+
+## Contexto
+
+Uma plataforma de atendimento atende vários bancos (os *tenants*). Cada banco sobe os próprios documentos: regras do Pix, tarifas, prazos do cartão. O assistente responde aos clientes com base neles. Antes de chamar o LLM, o sistema precisa encontrar os **trechos** dos documentos que têm a ver com a pergunta. Essa é a parte "R" (*retrieval*) do RAG.
+
+Em produção, isso seria um `VectorStore` com pgvector (aula 3). Aqui, você implementa a mesma lógica em memória, para entender o que acontece por dentro:
+
+- por que os documentos são divididos em trechos;
+- o que é o cosseno;
+- por que um limiar mínimo importa;
+- como o filtro por cliente precisa ser aplicado.
+
+Os testes usam um `ModeloDeEmbeddingFalso`: cada palavra relevante vira uma dimensão, e o vetor conta quantas vezes ela aparece. Ele não entende sinônimos, como um modelo real entenderia, mas é determinístico.
+
+## O que já existe
+
+Em `dev.trilhajava.m16.rag`:
+
+- `record Trecho(String documentoId, int indice, String texto, double similaridade)`;
+- `BaseDeConhecimento`, com todos os métodos em `TODO`.
+
+## Os requisitos
+
+**1. `dividir(texto, palavras, sobreposicao)`.** Divida o texto em palavras e monte janelas de `palavras` palavras, unidas por um espaço. Cada janela começa `palavras - sobreposicao` palavras depois da anterior.
+
+- Qualquer sequência de espaços, tabs ou quebras de linha conta como um único separador.
+- Pare quando uma janela chegar ao fim do texto. Não gere um trecho final que seja só a repetição da sobreposição.
+- Texto `null` ou em branco gera uma lista vazia.
+- `palavras <= 0`, `sobreposicao < 0` ou `sobreposicao >= palavras` lançam `IllegalArgumentException`. O construtor faz a mesma validação.
+
+| Texto | Palavras, sobreposição | Trechos |
+|---|---|---|
+| `a b c d e f g h i j` | 4, 1 | `a b c d`, `d e f g`, `g h i j` |
+| `a b c d e f g h i j` | 4, 0 | `a b c d`, `e f g h`, `i j` |
+| `a b c d e f g` | 4, 1 | `a b c d`, `d e f g` |
+
+**2. `cosseno(a, b)`.** Calcule o produto escalar dividido pelo produto das normas.
+
+- Some em `double`, porque somar `float` perde precisão em vetores de 1.536 dimensões.
+- Se algum dos vetores for zerado, o resultado é `0.0`, e não `NaN`.
+- Vetores com dimensões diferentes lançam `IllegalArgumentException`: isso indica embeddings de modelos diferentes misturados.
+
+**3. `indexar(tenant, documentoId, texto)`.**
+
+- Divida o texto com a configuração do construtor e gere os embeddings de **todos** os trechos numa **única** chamada ao modelo, com `embed(List<String>)`.
+- Reindexar o mesmo documento **substitui** os trechos antigos.
+- O mesmo `documentoId` em outro tenant é **outro** documento.
+- Indexar um texto vazio remove o documento.
+- `tenant` e `documentoId` são obrigatórios: sem eles, lance `IllegalArgumentException`.
+
+**4. `buscar(tenant, pergunta, topK, limiarMinimo)`.**
+
+- Gere o embedding da pergunta e compare com os trechos **só daquele tenant**.
+- Descarte os trechos com similaridade abaixo do limiar.
+- Ordene do mais parecido para o menos parecido; em caso de empate, por `documentoId` e depois por `indice`.
+- Devolva no máximo `topK` trechos.
+- `tenant` ou `pergunta` em branco e `topK <= 0` lançam `IllegalArgumentException`.
+
+**5. `remover(tenant, documentoId)` e `totalDeTrechos()`.** `remover` apaga o documento daquele tenant; `totalDeTrechos` conta os trechos guardados, somando todos os tenants.
+
+## Critérios de aceite
+
+- [ ] `BaseDeConhecimentoTest` passa (18 testes).
+- [ ] Nenhum caminho de `buscar` deixa passar um trecho de outro tenant, nem por um instante.
+- [ ] Um documento com 50 trechos gera **uma** chamada ao modelo de embeddings, e não 50.
+
+## Desafios opcionais
+
+- Troque a janela por palavras por uma janela por **frases** (quebre em `.`, `?` e `!` e agrupe até N palavras). Os trechos ficam melhores? E um documento com uma tabela?
+- Implemente a mesma interface com o `SimpleVectorStore` do Spring AI, usando `SearchRequest.builder().query(...).topK(...).similarityThreshold(...).filterExpression("tenant == 'banco-a'")`. Os testes continuam passando?
+- Normalize os vetores ao indexar (divida pela norma). Agora o cosseno é só o produto escalar. Quanto tempo isso economiza com 100 mil trechos?
+- Monte o "G" do RAG: um `ChatClient` que recebe os 3 melhores trechos e responde **só** com base neles, ou diz "não encontrei". O que acontece quando `buscar` devolve uma lista vazia?
+
+<Dicas>
+<Dica nivel={1}>
+Guarde os trechos agrupados pela dupla (tenant, documento): um `Map` cuja chave é um record com esses dois campos. Reindexar vira um `put`, e remover vira um `remove`. Na busca, filtre pelo tenant **antes** de calcular qualquer similaridade: assim, trechos de outro cliente nunca entram na conta.
+</Dica>
+<Dica nivel={2}>
+- Divisão: `texto.strip().split("\\s+")` e um laço com `inicio += passo`. Calcule `fim = Math.min(inicio + palavras, total)` e pare quando `fim == total`.
+- Janela: `String.join(" ", Arrays.copyOfRange(todas, inicio, fim))`.
+- Embeddings: `modelo.embed(trechos)` devolve um `List<float[]>` na mesma ordem dos trechos, e `modelo.embed(pergunta)` devolve um `float[]`.
+- Guarde o `float[]` de cada trecho ao lado do texto e do índice.
+</Dica>
+<Dica nivel={3}>
+```java
+return documentos.entrySet().stream()
+        .filter(e -> e.getKey().tenant().equals(tenant))
+        .flatMap(e -> e.getValue().stream())
+        .map(i -> new Trecho(i.documentoId(), i.indice(), i.texto(), cosseno(consulta, i.vetor())))
+        .filter(t -> t.similaridade() >= limiarMinimo)
+        .sorted(Comparator.comparingDouble(Trecho::similaridade).reversed()
+                .thenComparing(Trecho::documentoId).thenComparingInt(Trecho::indice))
+        .limit(topK)
+        .toList();
+```
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m16-ia-backend/solucao/src/main/java/dev/trilhajava/m16/rag/BaseDeConhecimento.java" />
+
+### Passo a passo
+
+1. **Por que dividir em trechos.** Um embedding resume o texto **inteiro** num único vetor. Num documento de 20 páginas, o vetor é a "média" de tudo, e uma pergunta sobre um detalhe da página 14 fica longe dele. Com trechos pequenos, cada vetor representa um assunto, e a busca acha o pedaço certo. Além disso, só os trechos relevantes vão para o prompt, e não o documento inteiro (tokens custam dinheiro).
+2. **Por que a sobreposição.** Sem ela, uma frase importante pode ser cortada ao meio entre dois trechos, e nenhum dos dois a contém inteira. Com a sobreposição, o fim de um trecho se repete no começo do próximo. O custo é armazenar e gerar embeddings um pouco mais.
+3. **O cosseno.** Ele mede o ângulo entre os vetores, e não o tamanho deles. Um trecho que repete "Pix" dez vezes e um que diz "Pix" uma vez apontam na mesma direção. O acumulador em `double` evita perder precisão ao somar milhares de produtos.
+4. **Em lote.** Uma chamada com 50 textos custa uma ida e volta de rede, e não 50. Os provedores cobram por token, e não por chamada, mas o limite de requisições por minuto e a latência são por chamada.
+5. **O tenant filtra primeiro.** Buscar em todos os tenants e filtrar depois do `limit` é o erro clássico: os 5 melhores trechos podem ser todos de outro banco, e o resultado vem vazio ou, pior, vaza dados se alguém esquecer o filtro. Aqui, a chave do mapa inclui o tenant, e o filtro roda antes de tudo. Com um `VectorStore` real, isso é a `filterExpression` na **própria** consulta, nunca um filtro em Java depois dela.
+6. **O limiar.** Sem ele, uma pergunta sobre ações na bolsa receberia "os 3 trechos menos piores" sobre fatura de cartão, e o LLM, com esse contexto, inventaria uma resposta convincente. Uma lista vazia permite responder "não encontrei isso nos documentos".
+
+### Alternativas e trade-offs
+
+- **pgvector** (aula 3): os vetores ficam no PostgreSQL que você já tem, com um índice HNSW para buscar em milhões de trechos sem comparar com todos. O filtro por tenant vira um `WHERE`, na mesma transação dos seus dados.
+- **Busca híbrida:** combine o cosseno com uma busca por palavra-chave (o *full-text search* do PostgreSQL, BM25). Embeddings são ruins com códigos exatos ("erro PIX-0042", um número de protocolo); a busca por palavra é ótima nisso.
+- **Reranking:** busque 20 trechos pelo cosseno e peça a um modelo menor para reordená-los por relevância real. Isso melhora a precisão e custa uma chamada a mais.
+- **Tamanho do trecho:** trechos pequenos são mais precisos, mas perdem contexto; trechos grandes têm contexto, mas são mais "genéricos". Não existe um número mágico: meça com perguntas reais (a aula 3 mostra como avaliar).
+
+### Avalie sua solução
+
+- A sua busca calcula o cosseno para trechos de outros tenants e só depois filtra? O resultado é o mesmo, mas o custo, não. E se um dia alguém tirar o filtro, o que acontece?
+- O que o seu `dividir` faz com `palavras = 1` e `sobreposicao = 0`? E com um texto de uma palavra só?
+- Troque o modelo de embeddings (de 768 para 1.536 dimensões) sem reindexar. Onde o seu código percebe o problema?
+- Duas threads indexam documentos ao mesmo tempo. A sua classe aguenta? O que você mudaria?
+
+</Solucao>

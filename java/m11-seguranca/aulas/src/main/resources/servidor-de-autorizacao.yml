@@ -1,0 +1,55 @@
+# Aula 11.07: o servidor de autorização da loja (Spring Authorization Server).
+# Carregado com spring.config.name=servidor-de-autorizacao.
+# Os segredos chegam por variável de ambiente, já no formato do PasswordEncoder
+# ("{bcrypt}$2a$10$..." em produção; os testes usam "{noop}...").
+server:
+  port: 9000
+loja:
+  senha-da-ana: ${SENHA_DA_ANA}
+spring:
+  security:
+    oauth2:
+      authorizationserver:
+        issuer: ${EMISSOR:http://localhost:9000}
+        client:
+          faturamento:
+            registration:
+              client-id: servico-de-faturamento
+              client-secret: ${FATURAMENTO_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: pedidos:ler
+          relatorios:
+            registration:
+              client-id: servico-de-relatorios
+              client-secret: ${RELATORIOS_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: relatorios:gerar
+          auditoria:
+            registration:
+              client-id: servico-de-auditoria
+              client-secret: ${AUDITORIA_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic, client_secret_post
+              authorization-grant-types: client_credentials
+              scopes: pedidos:auditar
+          portal:
+            registration:
+              client-id: portal-web
+              client-secret: ${PORTAL_CLIENT_SECRET}
+              client-authentication-methods: client_secret_basic
+              authorization-grant-types: authorization_code, refresh_token
+              redirect-uris: http://localhost/login/oauth2/code/portal, http://localhost:8080/login/oauth2/code/portal
+              post-logout-redirect-uris: http://localhost/, http://localhost:8080/
+              scopes: openid, profile, email, pedidos:ler
+            require-proof-key: true
+          app-da-loja:
+            registration:
+              client-id: app-da-loja
+              client-authentication-methods: none   # cliente público: um app instalado não guarda segredo
+              authorization-grant-types: authorization_code
+              redirect-uris: http://127.0.0.1:8765/callback
+              scopes: openid, profile, email
+            require-proof-key: true
+            token:
+              access-token-time-to-live: 5m

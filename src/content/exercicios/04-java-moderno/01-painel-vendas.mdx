@@ -1,0 +1,94 @@
+---
+titulo: Painel analítico de vendas com Streams
+codigo: "04.01"
+resumo: Construa os números de um painel de e-commerce — faturamento por categoria e por mês, ticket médio, top clientes e contagem por status — cada um com um único pipeline de Stream.
+modulo: 04-java-moderno
+ordem: 1
+dificuldade: medio
+tempo: 2h
+conceitos: [Streams, Collectors, groupingBy, partitioningBy, BigDecimal]
+aulas: [04-java-moderno/02-streams, 04-java-moderno/03-collectors]
+java:
+  modulo: m04-java-moderno
+  teste: PainelVendasTest
+---
+
+## Contexto
+
+O time comercial de uma loja online hoje exporta os pedidos para uma planilha e monta os gráficos à mão, toda segunda-feira. Você vai escrever o **serviço de métricas** que alimenta o novo painel. O código antigo tinha um método de 180 linhas com laços aninhados e seis `HashMap` temporários; a meta agora é que **cada métrica seja um pipeline claro e testável**.
+
+## Requisitos
+
+`PainelVendas` recebe uma `List<Pedido>` (record pronto, com `id`, `cliente`, `categoria`, `data`, `valor` e `status`). Salvo indicação, **só pedidos `PAGO`** entram nas contas de dinheiro.
+
+| Método | Resultado |
+|---|---|
+| `faturamentoPorCategoria` | `Map<String, BigDecimal>` com as categorias em **ordem alfabética** |
+| `ticketMedio` | Média dos valores pagos, 2 casas, `HALF_EVEN`; sem pedidos pagos: `0.00` |
+| `topClientes(pedidos, n)` | Os `n` clientes com maior valor pago; empate pelo nome (A→Z); lista **imutável** |
+| `contagemPorStatus` | Quantidade de pedidos (todos) por status, com **todos os status presentes** (inclusive zero), na ordem do enum |
+| `faturamentoMensal` | `Map<YearMonth, BigDecimal>` em ordem cronológica |
+| `particionarPorValor(pedidos, limite)` | Ids dos pagos: `true` = valor ≥ limite, `false` = abaixo, mantendo a ordem original |
+| `clientesPorCategoria` | Para cada categoria com venda paga: clientes **distintos** em ordem alfabética |
+
+## Exemplo
+
+Com os 7 pedidos do teste (5 pagos, 1 cancelado, 1 pendente):
+
+```text
+faturamentoPorCategoria → {Eletrônicos=3499.90, Livros=245.50}   (Casa só teve pedido cancelado/pendente)
+ticketMedio             → 749.08
+topClientes(2)          → [bruno, carla]
+contagemPorStatus       → {PENDENTE=1, PAGO=5, CANCELADO=1}
+```
+
+## Restrições
+
+- **Um pipeline de Stream por método**, sem `for`/`while`. (A exceção aceitável é completar chaves ausentes no `contagemPorStatus`.)
+- Nenhum `double` para dinheiro.
+- Nada de efeitos colaterais dentro das lambdas (nada de `forEach` alimentando mapas externos).
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `PainelVendasTest` passam.
+- [ ] Cada método cabe em poucas linhas legíveis (uma operação por linha).
+- [ ] A soma de `BigDecimal` por grupo não está repetida em vários métodos (extraia um coletor reutilizável).
+
+## Desafios opcionais
+
+- `resumo(pedidos)` que devolve, em **uma única passada**, quantidade e total pagos, com `Collectors.teeing`.
+- Com Java 24+: `mediaMovelDeFaturamento(pedidos, dias)` usando `Gatherers.windowSliding`.
+
+<Dicas>
+<Dica nivel={1}>
+Quase todos os métodos seguem o mesmo esqueleto: `pedidos.stream().filter(Pedido::pago).collect(groupingBy(chave, fábricaDoMapa, downstream))`. O que muda é a chave, o tipo do mapa e o downstream.
+</Dica>
+<Dica nivel={2}>
+Para somar `BigDecimal` por grupo: `reducing(BigDecimal.ZERO, Pedido::valor, BigDecimal::add)`. Guarde-o numa constante `private static final Collector<Pedido, ?, BigDecimal> SOMA_VALOR`. Para chaves ordenadas: `TreeMap::new`; para a ordem do enum: `() -> new EnumMap<>(StatusPedido.class)`.
+</Dica>
+<Dica nivel={3}>
+`topClientes`: agrupe com `SOMA_VALOR`, depois `.entrySet().stream().sorted(Map.Entry.<String, BigDecimal>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey())).limit(n).map(Map.Entry::getKey).toList()`. Em `clientesPorCategoria`, o downstream é `mapping(Pedido::cliente, collectingAndThen(toCollection(TreeSet::new), List::copyOf))`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m04-java-moderno/solucao/src/main/java/dev/trilhajava/m04/vendas/PainelVendas.java" />
+
+### Destaques
+
+- **`SOMA_VALOR` reutilizado** em três métodos: a regra "como somar dinheiro" existe uma vez.
+- **A fábrica do mapa define a ordem**: `TreeMap` para categorias e meses, `EnumMap` para status. Sem ela, `groupingBy` devolve um `HashMap` e a ordem do painel muda a cada execução.
+- **`groupingBy` não cria grupos vazios**: por isso `contagemPorStatus` completa os status ausentes com `putIfAbsent`. Uma alternativa 100% funcional seria partir de `Arrays.stream(StatusPedido.values())` e contar cada status — mais elegante, mas percorre os pedidos uma vez por status.
+- **`ticketMedio` separa "coletar" de "calcular"**: primeiro obtém a lista de valores, depois soma e divide. `Collectors.averagingDouble` resolveria em uma linha, mas passaria o dinheiro por `double`.
+- **`Stream.toList()`** já devolve lista imutável — o teste `imutavel` confere.
+
+### Avalie sua solução
+
+- Se o cancelado de "Casa" aparece no faturamento, faltou o `filter(Pedido::pago)`.
+- Você usou `forEach` para montar algum mapa? Troque por um coletor.
+- O `topClientes` desempata pelo nome? Rode o teste `topClientes` com os dois clientes empatados.
+
+</Solucao>

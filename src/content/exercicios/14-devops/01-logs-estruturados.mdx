@@ -1,0 +1,156 @@
+---
+titulo: Logs que o suporte consegue usar
+codigo: "14.01"
+resumo: Transforme os logs em texto de uma API de pedidos em JSON no formato ECS, com um id de correlação (X-Request-Id) em todas as linhas da requisição, campos estruturados em vez de dados presos na mensagem, CPF mascarado e o mesmo id devolvido no corpo dos erros.
+modulo: 14-devops
+ordem: 1
+dificuldade: medio
+tempo: 2h
+conceitos: [logs estruturados, ECS, MDC, id de correlação, OncePerRequestFilter, SLF4J 2, LGPD, Problem Details]
+aulas: [14-devops/05-observabilidade]
+java:
+  modulo: m14-devops
+  teste: LogsEstruturadosTest
+---
+
+## Contexto
+
+Um cliente liga para o suporte: "tentei criar um pedido às 14h32 e deu erro". O suporte abre o agregador de logs e encontra 40 mil linhas daquele minuto, todas em texto livre, de 12 instâncias. Não há como saber quais linhas são da requisição do cliente. Para piorar, a busca por "pedido" traz linhas assim:
+
+```text
+INFO  ServicoDePedidos : pedido 3f2c... criado para o CPF 52998224725 no valor de 259.90
+```
+
+São três problemas numa linha só: ninguém consegue **filtrar** por pedido nem **somar** valores (os dados estão presos no texto), o **CPF vaza inteiro** (LGPD), e não há nada ligando essa linha às outras da mesma requisição.
+
+Sua missão é deixar os logs úteis para quem vai ler de madrugada: **uma linha JSON por evento, com o id da requisição em todas**.
+
+## O que já existe
+
+Em `dev.trilhajava.m14.logs` (a `LogsApplication`):
+
+- `PedidoController`: `POST /pedidos` (`{"cliente", "cpf", "valor"}` → 201 com `{"id", "cliente", "valor"}`) e `GET /pedidos/{id}`. Pronto;
+- `ServicoDePedidos`: cria e busca pedidos. O `criar` tem o log problemático acima;
+- `Mascaras.cpf(String)`: `"52998224725"` → `"***.***.*47-25"`. Pronta;
+- `PedidoNaoEncontradoException` e o `TratadorDeErros`, que já devolve um `ProblemDetail` 404;
+- `FiltroDeCorrelacao` (esboço), um `OncePerRequestFilter` com as constantes `HEADER = "X-Request-Id"` e `CHAVE_MDC = "requestId"`.
+
+Você mexe no `FiltroDeCorrelacao`, no `ServicoDePedidos`, no `TratadorDeErros` e no `src/main/resources/application.properties`.
+
+## Os requisitos
+
+**1. Logs em JSON (ECS).** Toda a saída do console vira JSON no formato ECS (Elastic Common Schema), um objeto por linha, com o nome de serviço `trilha-m14`. Nada de `logback-spring.xml`: o Spring Boot já sabe fazer isso com duas propriedades.
+
+**2. Id de correlação.** O `FiltroDeCorrelacao` roda **antes de todos os outros filtros** e:
+
+| `X-Request-Id` recebido | Id usado |
+|---|---|
+| ausente | um `UUID` novo |
+| válido: casa com `[A-Za-z0-9._-]{1,64}` | o próprio valor (o id atravessa gateway → serviço → serviço) |
+| inválido: espaço, aspas, quebra de linha, mais de 64 caracteres | um `UUID` novo |
+
+O id vai para o **MDC** na chave `requestId` (e daí, sozinho, para cada linha de log da requisição) e para o header `X-Request-Id` da **resposta**. No fim da requisição, o MDC é limpo, **mesmo se der exceção**.
+
+**3. Campos estruturados.** O log de criação passa a ter a mensagem fixa `pedido criado` e três campos próprios no JSON:
+
+| Campo | Valor |
+|---|---|
+| `pedido` | o id do pedido criado |
+| `valor` | o valor (259.90) |
+| `cpf` | `Mascaras.cpf(cpf)`, nunca o CPF inteiro |
+
+**4. Erros com o id.** O `ProblemDetail` do 404 ganha a propriedade `requestId`: é o número que o cliente passa para o suporte.
+
+## Critérios de aceite
+
+- [ ] `LogsEstruturadosTest` passa (8 testes).
+- [ ] O CPF `52998224725` não aparece em **nenhuma** linha da saída.
+- [ ] Um `X-Request-Id` com `"` ou quebra de linha nunca chega ao log.
+- [ ] Depois da requisição, `MDC.get("requestId")` é `null`.
+
+<Callout tipo="erro" titulo="Armadilha: logging em @PropertySource">
+As propriedades `logging.*` precisam estar no `application.properties` (ou em variáveis de ambiente, argumentos de linha de comando…). Num `@PropertySource` elas **não funcionam**: o sistema de logging é inicializado antes de o Spring ler essas fontes. O teste passa a ver texto em vez de JSON, e nenhuma mensagem de erro explica por quê.
+</Callout>
+
+## Desafios opcionais
+
+- Propague o id para as chamadas que **saem** da aplicação: um `ClientHttpRequestInterceptor` no `RestClient` que copia o `requestId` do MDC para o header `X-Request-Id`.
+- Rode uma tarefa com `@Async` e veja o `requestId` sumir do log da outra thread. Resolva com um `TaskDecorator` que copia o MDC (`MDC.getCopyOfContextMap()` / `MDC.setContextMap`).
+- Troque o id próprio pelo *trace id* do OpenTelemetry (Micrometer Tracing): o que muda no filtro? Ele ainda é necessário?
+
+<Dicas>
+<Dica nivel={1}>
+Faça em três passos, rodando os testes a cada um: (1) as duas propriedades de logging estruturado, e veja a saída do teste virar JSON; (2) o filtro; (3) o log do serviço e o `ProblemDetail`. A ordem importa: sem o JSON, os testes de campos nem conseguem ler as linhas.
+</Dica>
+<Dica nivel={2}>
+- JSON: `logging.structured.format.console=ecs` e `logging.structured.ecs.service.name=trilha-m14`. O Spring Boot coloca o conteúdo do MDC como campos do JSON.
+- Ordem do filtro: `@Order(Ordered.HIGHEST_PRECEDENCE)` no `@Component`.
+- Validação: um `Pattern` compilado uma vez (`static final`) e `matcher(recebido).matches()`. Cuidado com o `null` quando o header não vem.
+</Dica>
+<Dica nivel={3}>
+- `MDC.put(CHAVE_MDC, id)`, `resposta.setHeader(HEADER, id)` e `cadeia.doFilter(...)` dentro de um `try`, com `MDC.remove(CHAVE_MDC)` no `finally`.
+- Campos estruturados com a API fluente do SLF4J 2: `log.atInfo().addKeyValue("pedido", ...).addKeyValue("valor", ...).addKeyValue("cpf", Mascaras.cpf(cpf)).log("pedido criado")`. O formatador ECS do Spring Boot transforma cada par chave-valor em um campo do JSON.
+- No `TratadorDeErros`: `problema.setProperty("requestId", MDC.get(FiltroDeCorrelacao.CHAVE_MDC))`. O handler roda na mesma thread da requisição, ainda dentro do filtro.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="FiltroDeCorrelacao">
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/logs/FiltroDeCorrelacao.java" />
+</Tab>
+<Tab rotulo="ServicoDePedidos">
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/logs/ServicoDePedidos.java" />
+</Tab>
+<Tab rotulo="TratadorDeErros">
+<CodigoJava caminho="m14-devops/solucao/src/main/java/dev/trilhajava/m14/logs/TratadorDeErros.java" />
+</Tab>
+</Tabs>
+
+```properties
+# application.properties (trecho do 14.01)
+logging.structured.format.console=ecs
+logging.structured.ecs.service.name=trilha-m14
+```
+
+Uma linha de log da requisição, resumida e formatada aqui para leitura (na saída real é uma linha só, com mais campos do ECS):
+
+```json
+{
+  "@timestamp": "2026-09-29T17:32:08.114Z",
+  "log": { "level": "INFO", "logger": "dev.trilhajava.m14.logs.ServicoDePedidos" },
+  "service": { "name": "trilha-m14" },
+  "message": "pedido criado",
+  "requestId": "gateway-7f3a9c",
+  "pedido": "3f2c9a4e-8d1b-4c55-a1f0-6b2e9d7c1a30",
+  "valor": 259.90,
+  "cpf": "***.***.*47-25"
+}
+```
+
+### Passo a passo
+
+1. **Configuração, não código.** Desde o Spring Boot 3.4 o logging estruturado é nativo: `ecs`, `gelf` e `logstash` são formatos prontos. O formatador inclui o MDC e os pares chave-valor do SLF4J como campos, sem nenhuma dependência nova.
+2. **O filtro é a porta de entrada.** Com `HIGHEST_PRECEDENCE`, ele roda antes da segurança, do tratamento de erros e de qualquer outro filtro: até os logs desses filtros saem com o `requestId`.
+3. **Validar o header é segurança.** O valor vem do cliente. Sem a validação, alguém manda `x" ,"nivel":"forjado` ou uma quebra de linha e injeta campos ou linhas falsas no log (*log injection*). A lista de caracteres permitidos e o limite de 64 cortam o problema pela raiz; quem manda lixo recebe um UUID novo.
+4. **O `finally` protege a próxima requisição.** O Tomcat reaproveita threads. Se o `MDC.remove` não roda (porque o controller lançou exceção), a próxima requisição daquela thread herda o id da anterior, e o suporte passa a investigar o pedido errado.
+5. **Mensagem fixa, dados em campos.** `"pedido criado"` é igual em todas as linhas, então dá para contar ("quantos pedidos por minuto?") e filtrar (`message: "pedido criado" AND valor > 1000`). Os dados que variam ficam em campos com tipo.
+6. **O id no erro fecha o ciclo.** O cliente recebe `requestId` no corpo do 404, manda para o suporte, e o suporte filtra por `requestId: "..."` e vê a requisição inteira, de todas as instâncias.
+
+### Alternativas e trade-offs
+
+- **`logback-spring.xml` com o `logstash-logback-encoder`**: mais controle (renomear campos, mascarar por padrão de texto), ao custo de uma dependência e de XML para manter. Faz sentido quando a empresa já tem um formato padrão diferente do ECS.
+- **`StructuredArguments.kv(...)` do logstash-encoder** em vez de `addKeyValue`: funciona, mas prende o código a uma biblioteca de formatação. A API fluente é do próprio SLF4J 2.
+- **Aceitar qualquer `X-Request-Id`** e só escapar na hora de escrever: o ECS já escapa aspas no JSON, mas um id de 10 KB ainda vira 10 KB em cada linha. Validar na entrada é mais barato e mais simples de auditar.
+- **Tracing (OpenTelemetry)** resolve a correlação entre serviços de forma padronizada (`traceparent`), e o Micrometer Tracing também coloca `traceId` no MDC. O filtro próprio continua útil como id "amigável" para o suporte, ou quando não há tracing.
+
+### Avalie sua solução
+
+- Procure no código qualquer `log.info("... {}", cpf)` ou `toString()` de um objeto que contenha CPF: o teste só verifica **este** log. Como você garantiria isso no projeto todo (revisão, ArchUnit, um `MaskingJsonGenerator`)?
+- Se uma requisição dispara uma mensagem para o RabbitMQ (módulo 12), como o `requestId` chega ao consumidor? (Pense em headers da mensagem e em quem coloca o id no MDC do outro lado.)
+- Seu filtro funciona se o header vier em minúsculas (`x-request-id`)? Por quê?
+
+</Solucao>

@@ -1,0 +1,1440 @@
+---
+titulo: "Resenha — voz, chat e transmissão de jogos a 60 fps entre amigos"
+resumo: "Aplicativo desktop e web no estilo Discord para grupos de amigos: comunidades, canais de texto e de voz, presença em tempo real e transmissão de tela de jogos em 1080p a 60 fps, com o backend Java controlando identidade, permissões, sessões em tempo real e a mídia num SFU WebRTC, e a qualidade da transmissão medida como SLO."
+nivel: senior
+ordem: 3
+dominio: "Comunicação em tempo real · jogos"
+horas: 226
+stack: [Java 25, Spring Boot 4, Spring Security 7, Spring Modulith, WebSocket, PostgreSQL 18, Redis 8, Keycloak, LiveKit (SFU WebRTC), SeaweedFS (S3), Electron, TypeScript, Testcontainers 2, k6, OpenTelemetry, Grafana, Docker Compose, Caddy, GitHub Actions]
+competencias:
+  - Arquitetura de tempo real com plano de controle (Java) e plano de mídia (SFU) separados, com a fronteira justificada em ADRs e números de banda
+  - Gateway WebSocket próprio, com protocolo versionado, heartbeat, retomada de sessão sem perda, fan-out entre réplicas e deploy sem derrubar ninguém
+  - Transmissão de tela de jogos em 1080p a 60 fps com simulcast, perfis ditados pelo servidor e a fluidez medida como SLO a partir das estatísticas do WebRTC
+  - Concorrência e consistência sob eventos externos — vagas e limites atômicos, webhooks duplicados e fora de ordem, reconciliação periódica
+  - Segurança de ponta a ponta — OIDC com PKCE para app desktop, autorização por comunidade sem BOLA, tokens de mídia de curta duração, webhooks assinados e Electron endurecido
+  - Produto de verdade em produção — instalador publicado pelo CI, servidor numa VPS com TLS, observabilidade, custo de banda calculado e uso real com amigos
+modulos: [06-concorrencia, 07-sql, 08-spring-boot, 09-persistencia, 10-testes, 11-seguranca, 12-mensageria, 13-arquitetura, 14-devops, 15-system-design]
+marcos:
+  - { id: fundacao, titulo: "Fundação e prova de vida da mídia", resumo: "Repositório, Compose, CI e um protótipo que transmite 1080p a 60 fps pelo LiveKit, medido antes de qualquer regra de negócio." }
+  - { id: identidade, titulo: "Identidade: Keycloak, PKCE no desktop e perfil", resumo: "Cadastro e login pelo Keycloak, login do app desktop pelo navegador do sistema e usuário provisionado no primeiro acesso." }
+  - { id: comunidades, titulo: "Comunidades, canais, papéis e convites", resumo: "Comunidades com canais de texto e de voz, matriz de permissões por papel e convites com limite de uso atômico." }
+  - { id: gateway, titulo: "Gateway WebSocket: sessão, retomada e presença", resumo: "Protocolo próprio com heartbeat, retomada sem perda, fan-out entre duas réplicas pelo Redis e presença em tempo real." }
+  - { id: mensagens, titulo: "Chat: mensagens, anexos e não lidas", resumo: "Mensagens com sequência por canal, idempotência por nonce, paginação, anexos por URL pré-assinada e contagem de não lidas." }
+  - { id: voz, titulo: "Canais de voz com LiveKit", resumo: "Token de mídia emitido pelo backend, vagas por canal, webhooks idempotentes, reconciliação, moderação e um ensaio pela internet numa VPS." }
+  - { id: transmissao, titulo: "Transmissão de jogos a 60 fps", resumo: "Reserva de vaga, permissão de publicação concedida em tempo real, perfis com simulcast, assistir sob demanda e a decisão sobre o áudio do jogo." }
+  - { id: qualidade, titulo: "Qualidade medida: telemetria, SLOs e rede ruim", resumo: "Estatísticas do WebRTC viram SLOs de fluidez, latência e início; testes com rede degradada e carga no gateway." }
+  - { id: entrega, titulo: "Produção, instalador e release v1.0.0", resumo: "VPS com TLS e LiveKit, instalador Windows publicado pelo CI, backups, custo, runbooks e o uso real com amigos." }
+---
+
+## Visão geral
+
+Um grupo de amigos que joga junto precisa de três coisas: **conversar por voz sem atraso**, **trocar mensagens e clipes** e **mostrar a tela do jogo para os outros com fluidez**. Nos planos gratuitos dos serviços populares, a transmissão costuma ficar presa em 720p e 30 fps, e um jogo de ação a 30 fps parece travado para quem assiste. Este projeto existe para resolver isso com o que você aprendeu na trilha, e com o cuidado de quem vai usar o próprio produto toda semana.
+
+Você vai construir o **Resenha**, um aplicativo no estilo Discord, reduzido ao essencial e muito bom no que faz: **transmitir jogos em 1080p a 60 fps**. O ponto central da arquitetura é uma divisão que todo sistema de vídeo em tempo real faz:
+
+- **Plano de controle (o seu backend Java):** quem é você, de quais comunidades participa, o que pode fazer, quem está em qual sala, quem está transmitindo, quantas transmissões cabem, quando alguém é expulso. Também entrega mensagens e eventos em tempo real por um gateway WebSocket e mede a qualidade.
+- **Plano de mídia (um SFU pronto, o LiveKit):** recebe o vídeo do jogo uma vez e reencaminha para cada amigo, escolhendo a camada de qualidade que a rede de cada um aguenta. O vídeo **não passa pelo Java**.
+
+O que será construído:
+
+- **Identidade:** cadastro e login pelo Keycloak (OIDC), login do app desktop pelo navegador do sistema com PKCE, perfil com nome, handle e avatar.
+- **Comunidades:** criação, canais de texto e de voz, papéis (dono, admin, moderador, membro), convites com validade e limite de uso, expulsão e banimento com auditoria.
+- **Gateway em tempo real:** protocolo WebSocket próprio, inspirado no do Discord, com heartbeat, retomada de sessão sem perder eventos, fan-out entre réplicas pelo Redis e presença (online, ausente, não perturbe, invisível).
+- **Chat:** mensagens com ordem garantida por canal, edição, exclusão, respostas, menções, "digitando…", não lidas e anexos (imagens e clipes MP4) enviados direto ao armazenamento de objetos por URL pré-assinada.
+- **Voz:** o backend emite o token de mídia, controla vagas por canal, processa os webhooks do LiveKit e permite moderar (silenciar, desconectar).
+- **Transmissão de jogos:** reserva de vaga, permissão de publicação concedida em tempo real, perfis de qualidade ditados pelo servidor (720p60, 1080p60, 1440p60 experimental e um perfil "nítido" para código e texto), simulcast, áudio do jogo sem eco e "Assistir" sob demanda.
+- **Qualidade medida:** o cliente coleta as estatísticas do WebRTC (`getStats`), o backend agrega e transforma em SLOs (fluidez a 60 fps, latência, tempo até o primeiro quadro), com testes de rede degradada.
+- **Cliente:** um app Electron (Windows como alvo principal) e a mesma interface no navegador, para quem só quer assistir e conversar.
+- **Produção:** uma VPS com TLS, o LiveKit com as portas UDP certas, o instalador gerado pelo CI no GitHub Releases, backups, custo de banda calculado e um grupo real de amigos usando.
+
+**Pitch de uma frase:** "Construí um app de voz e transmissão de jogos que meus amigos usam toda semana: o backend em Java cuida de identidade, permissões, sessões WebSocket e da orquestração de um SFU WebRTC, e a transmissão roda em 1080p a 60 fps com 98% das janelas medidas acima de 55 fps — tenho os gráficos, os ADRs e o instalador para provar."
+
+**Por que chama atenção num portfólio Sênior.** É raro ver um projeto de portfólio com **usuários reais** e com uma meta de qualidade **percebida** (fluidez de vídeo) transformada em número. O projeto mostra julgamento: o que construir (controle, permissões, tempo real) e o que **não** construir (um SFU próprio), com números de banda que justificam cada escolha. E toca em temas que aparecem em entrevistas de sistemas em tempo real: conexões longas, retomada de sessão, entrega pelo menos uma vez × no máximo uma vez, eventos externos fora de ordem e deploy sem derrubar ninguém.
+
+<Callout tipo="atencao" titulo="Este projeto tem cliente, e a mídia é a parte mais arriscada">
+São cerca de 226 horas, das quais umas 60 vão para o cliente (Electron, TypeScript e WebRTC no navegador). O foco da avaliação continua sendo o backend, mas a transmissão só existe no cliente, então ele faz parte do escopo. Por isso o marco 1 começa com uma **prova de vida da mídia**: antes de escrever qualquer regra de negócio, você mede se o seu hardware e a sua rede entregam 1080p a 60 fps pelo LiveKit. Se não entregarem, você descobre no dia 2, não no mês 3.
+</Callout>
+
+<Callout tipo="dica" titulo="Fez a Arquibancada antes?">
+O projeto Pleno [Arquibancada](../../pleno/03-arquibancada/) é a base deste: prova de vida da mídia, perfis de transmissão, reserva de vagas, permissão concedida em tempo real, webhooks e telemetria de qualidade. Se você já o fez, reaproveite esse código e esses ADRs, e conte umas 50 horas a menos nos marcos 1, 6, 7 e 8.
+</Callout>
+
+## Contexto de negócio
+
+A ideia nasce de um grupo concreto: oito a quinze amigos que jogam juntos à noite, em dois ou três jogos ao mesmo tempo, e querem ver a tela uns dos outros com fluidez. O Resenha começa como ferramenta desse grupo e é desenhado para poder virar produto: várias comunidades independentes no mesmo servidor, limites explícitos e custo por hora de transmissão conhecido.
+
+Os números que orientam o projeto (use-os no dimensionamento, nos testes e no custo):
+
+| Grandeza | Valor de referência |
+|---|---|
+| Comunidade típica | 10 a 30 membros; limite de 100 por comunidade |
+| Pessoas num canal de voz | 3 a 8; limite configurável de 2 a 25 (padrão 10) |
+| Transmissões simultâneas por canal | até 3 (por exemplo, três amigos em jogos diferentes) |
+| Espectadores por transmissão | 1 a 8 |
+| Perfil padrão de transmissão | 1920×1080 a 60 fps, teto de 8 Mbps na camada alta |
+| Upload do streamer | ≥ 15 Mbps para o perfil padrão (detalhe na RN-58) |
+| Download do espectador | ≥ 10 Mbps para a camada alta |
+| Meta de carga do gateway (para o portfólio) | 5.000 conexões WebSocket em 2 réplicas, 100 mensagens/s |
+
+### Atores
+
+| Ator | O que faz no sistema |
+|---|---|
+| **Membro** | Entra em comunidades por convite, conversa por texto e voz, transmite e assiste. |
+| **Moderador** | Tudo o que o membro faz, mais excluir mensagens, silenciar e desconectar pessoas da voz, encerrar transmissões e expulsar membros (de papel inferior). |
+| **Admin** | Tudo o que o moderador faz, mais gerenciar canais, convites, papéis abaixo de admin, banimentos e configurações da comunidade. |
+| **Dono** | Tudo o que o admin faz, mais promover admins, transferir a comunidade e excluí-la. Exatamente um por comunidade. |
+| **LiveKit** (sistema) | SFU que recebe e reencaminha áudio e vídeo; avisa o backend por webhooks assinados e obedece à API de servidor. |
+| **Keycloak** (sistema) | Provedor de identidade: cadastro, login, verificação de e-mail, proteção contra força bruta e emissão de tokens. |
+
+### Glossário
+
+| Termo | Significado |
+|---|---|
+| **Comunidade** | O equivalente ao "servidor" do Discord. Usamos outro nome para não confundir com servidor de backend. |
+| **Canal de texto / canal de voz** | Canal de texto guarda mensagens. Canal de voz corresponde a uma **sala** no LiveKit chamada `voz-<canalId>`. |
+| **Gateway** | Conexão WebSocket de longa duração por onde o servidor empurra eventos (mensagens novas, presença, quem entrou na voz). As escritas continuam pela API REST. |
+| **Sessão do gateway** | Estado de uma conexão identificada: usuário, número de sequência dos eventos enviados e buffer para retomada. Sobrevive a uma queda de conexão por até 2 minutos. |
+| **SFU** | *Selective Forwarding Unit*: servidor de mídia que recebe o fluxo de cada participante e o reencaminha aos outros **sem decodificar**. Diferente de um MCU, que decodifica, mistura e recodifica (caro em CPU). |
+| **Trilha (track)** | Um fluxo de mídia publicado no LiveKit. Fontes usadas: `MICROPHONE`, `SCREEN_SHARE` e `SCREEN_SHARE_AUDIO`. |
+| **Transmissão** | Uma trilha `SCREEN_SHARE` (e, opcionalmente, o áudio do jogo) publicada num canal de voz, com ciclo de vida controlado pelo backend. |
+| **Simulcast** | O streamer codifica o mesmo vídeo em 2 ou 3 camadas (ex.: 1080p60, 720p60, 360p30). O SFU manda a cada espectador a camada que cabe na rede dele. |
+| **Dynacast** | O SFU avisa o streamer para pausar a codificação de camadas que ninguém está assistindo, poupando o upload e a GPU dele. |
+| **Janela de qualidade** | Agregado de 10 s das estatísticas do WebRTC de um participante numa transmissão (fps, resolução, perda, congelamentos). É a unidade dos SLOs. |
+| **Latência ponta a ponta** (*glass-to-glass*) | Tempo entre um quadro aparecer na tela do streamer e aparecer na tela do espectador. |
+
+## Escopo
+
+### Dentro
+
+- O backend `resenha-api` (monólito modular em Spring Boot 4) rodando em duas réplicas, com PostgreSQL, Redis, Keycloak e um armazenamento compatível com S3 (SeaweedFS).
+- O LiveKit auto-hospedado como SFU, com TURN embutido para redes que bloqueiam UDP.
+- O cliente Electron para Windows (transmitir e assistir) e a mesma interface servida como web (assistir, conversar e falar; transmitir pelo navegador é permitido, mas sem áudio do jogo).
+- Comunidades com até 100 membros, canais públicos para todos os membros da comunidade (sem canais privados).
+- Contratos versionados: OpenAPI para a API REST e um documento do protocolo do gateway (AsyncAPI ou JSON Schema dos eventos), verificados no CI.
+- Telemetria de qualidade, SLOs, dashboards e testes de rede degradada e de carga do gateway.
+- Ambiente de desenvolvimento com Docker Compose e ambiente de produção numa VPS com Caddy, instalador publicado no GitHub Releases.
+
+### Fora
+
+- Um SFU próprio. O porquê está no ADR-002, e estudar um SFU em Java está em [O que estudar além da trilha](#o-que-estudar-além-da-trilha).
+- Mensagens diretas, lista de amigos, canais privados e permissões por canal.
+- Gravação de transmissões e clipes no servidor (nada de mídia é gravado; isso é uma decisão de privacidade, não só de escopo).
+- Criptografia ponta a ponta da mídia (o SFU termina o DTLS-SRTP; fica em [Para ir além](#para-ir-além)).
+- Apps móveis, macOS e Linux como alvo de transmissão (o cliente web roda neles para assistir).
+- Push-to-talk global, soundboard, bots, emojis personalizados, busca de mensagens.
+- Comunidades grandes (mais de 100 membros) e carregamento preguiçoso da lista de membros.
+
+<Callout tipo="dica" titulo="O núcleo que não se corta">
+Se o prazo apertar, preserve a fatia que conta a história: login → comunidade com convite → gateway com retomada → canal de voz com token emitido pelo backend → transmissão 1080p60 com reserva de vaga → janela de qualidade medida e um SLO no dashboard. Anexos, presença "invisível", o perfil 1440p60, o perfil "nítido" e a moderação de voz são os primeiros candidatos a "próximos passos" no README.
+</Callout>
+
+## Requisitos funcionais
+
+As regras são numeradas de forma contínua (RN-01 a RN-79) para que testes, ADRs e commits possam citá-las (`fix(transmissoes): RN-55 corrida na reserva`). Horários em UTC na API e no banco. Textos são medidos em *code points*, não em bytes nem em `char` do Java.
+
+### RF-01 · Conta, perfil e provisionamento
+
+O cadastro e o login acontecem no Keycloak. O backend conhece o usuário pelo `sub` do token e cria o registro local no primeiro acesso.
+
+- **RN-01 — Política de senha no Keycloak.** Mínimo de 15 code points e máximo de 64, sem regra de composição (NIST SP 800-63B rev. 4 para senha como único fator), verificação de e-mail obrigatória e detecção de força bruta ligada no realm. O backend nunca recebe senha.
+- **RN-02 — Provisionamento no primeiro acesso.** Qualquer requisição autenticada de um `sub` sem registro cria o usuário com `nomeExibicao` vindo do claim `name` (ou `preferred_username`) e `handle` derivado do `preferred_username`. Duas requisições simultâneas do mesmo usuário novo criam **um** registro (restrição `UNIQUE (sub)` e `INSERT … ON CONFLICT DO NOTHING` seguido de leitura).
+- **RN-03 — Handle.** De 3 a 32 caracteres em `a–z`, `0–9`, `_` e `.`, sem dois pontos seguidos e sem ponto no início ou no fim; único sem diferenciar maiúsculas. No provisionamento, se o handle derivado estiver em uso, acrescenta-se `_2`, `_3` … até `_99`; depois disso, 4 dígitos aleatórios. Exemplo: `Kayo.K` vira `kayo.k`; se já existir, `kayo.k_2`. Na troca pelo usuário (`PATCH /v1/eu`), handle em uso → `409 handle-em-uso`.
+- **RN-04 — Nome de exibição e avatar.** `nomeExibicao` com 1 a 32 code points, sem quebras de linha. O avatar segue o fluxo de anexos (RF-09), só imagem, até 2 MB, e é servido a qualquer usuário autenticado que compartilhe uma comunidade com o dono.
+- **RN-05 — Perfil de terceiros.** `GET /v1/usuarios/{id}` devolve `id`, `handle`, `nomeExibicao` e `avatarUrl` somente se quem pede compartilha ao menos uma comunidade com o usuário; caso contrário, `404` (não revela que a conta existe).
+
+### RF-02 · Comunidades
+
+- **RN-06 — Criação.** Nome com 2 a 100 code points. Quem cria vira `DONO`. A comunidade nasce com dois canais: `geral` (texto) e `Sala de jogos` (voz). Cada usuário pode ser dono de até 10 comunidades e membro de até 100 → `422 limite-atingido`.
+- **RN-07 — Edição e exclusão.** Nome e ícone: `ADMIN` ou acima. Exclusão: só o `DONO`, enviando `confirmacaoNome` igual ao nome atual (senão `422 confirmacao-invalida`). A exclusão é lógica; as salas de voz são encerradas no LiveKit, as transmissões terminam com motivo `SALA_ENCERRADA` e todas as sessões recebem `COMUNIDADE_REMOVIDA`.
+- **RN-08 — Transferência.** O `DONO` transfere para outro membro; o antigo dono vira `ADMIN`. Numa única transação; nunca há zero ou dois donos (`UNIQUE` parcial em `membro (comunidade_id) WHERE papel = 'DONO'`).
+- **RN-09 — Sair.** Qualquer membro sai com `DELETE /v1/comunidades/{id}/membros/eu`, exceto o dono → `409 dono-nao-pode-sair`. Sair desconecta da voz daquela comunidade e encerra a transmissão, se houver.
+
+### RF-03 · Papéis e permissões
+
+- **RN-10 — Hierarquia.** `DONO` > `ADMIN` > `MODERADOR` > `MEMBRO`. Toda ação sobre outra pessoa (mudar papel, expulsar, banir, silenciar, desconectar, excluir mensagem, encerrar transmissão) só vale sobre alguém de papel **estritamente inferior**. Moderador tentando expulsar outro moderador → `403 acesso-negado`.
+- **RN-11 — Matriz de permissões.** É a fonte da verdade para a autorização e para os testes (cada célula vira um caso):
+
+| Ação | Membro | Moderador | Admin | Dono |
+|---|---|---|---|---|
+| Ler e enviar mensagens, entrar na voz, transmitir, assistir | ✓ | ✓ | ✓ | ✓ |
+| Criar convite | ✓ | ✓ | ✓ | ✓ |
+| Revogar convite de outra pessoa | — | ✓ | ✓ | ✓ |
+| Excluir mensagem de outra pessoa (papel inferior) | — | ✓ | ✓ | ✓ |
+| Silenciar ou desconectar da voz, encerrar transmissão de outra pessoa | — | ✓ | ✓ | ✓ |
+| Expulsar | — | ✓ | ✓ | ✓ |
+| Banir e desbanir | — | — | ✓ | ✓ |
+| Criar, editar, ordenar e excluir canais | — | — | ✓ | ✓ |
+| Mudar papel para `MEMBRO` ou `MODERADOR` | — | — | ✓ | ✓ |
+| Promover a `ADMIN`, transferir, excluir a comunidade | — | — | — | ✓ |
+| Ver a auditoria de moderação | — | — | ✓ | ✓ |
+
+- **RN-12 — Sem BOLA.** Qualquer recurso de uma comunidade da qual o usuário não é membro (canal, mensagem, anexo, transmissão, convite listado) responde `404 recurso-nao-encontrado`, nunca `403`: não revelamos que existe. A verificação acontece no serviço, a partir do `comunidadeId` **do recurso no banco**, nunca de um parâmetro enviado pelo cliente.
+- **RN-13 — Permissão vale na hora.** Rebaixar alguém de moderador para membro tem efeito na próxima requisição (sem cache de papel de mais de 5 s) e gera `MEMBRO_ATUALIZADO` no gateway.
+
+### RF-04 · Convites
+
+- **RN-14 — Código.** 8 caracteres base62 gerados com `SecureRandom` (62⁸ ≈ 2,2 × 10¹⁴ combinações). Validade: 30 min, 1 h, 6 h, 12 h, 1 dia, 7 dias (padrão) ou sem expiração. Usos máximos: 1, 5, 10, 25, 50, 100 ou ilimitado (padrão).
+- **RN-15 — Pré-visualização.** `GET /v1/convites/{codigo}` (autenticado) devolve o nome, o ícone e o número de membros da comunidade, e a expiração. Convite expirado, esgotado, revogado ou inexistente → `410 convite-invalido` (os quatro casos com a mesma resposta).
+- **RN-16 — Aceite atômico.** O uso é consumido com um único `UPDATE … SET usos = usos + 1 WHERE codigo = ? AND revogado_em IS NULL AND (expira_em IS NULL OR expira_em > now()) AND (usos_max IS NULL OR usos < usos_max) RETURNING comunidade_id`, na mesma transação que cria o membro. Critério: convite com `usosMax = 1` aceito por duas pessoas ao mesmo tempo → exatamente um novo membro; a outra recebe `410`.
+- **RN-17 — Casos do aceite.** Já membro → `200` com a comunidade, sem consumir uso. Banido → `403 banido`. Comunidade com 100 membros → `422 limite-atingido`, sem consumir uso. Aceite com sucesso → `201`, evento `MEMBRO_ENTROU` e a comunidade passa a chegar pelo gateway às sessões do novo membro.
+- **RN-18 — Limites contra abuso.** Criação de até 20 convites por hora por usuário. Até 10 consultas ou aceites de códigos **inexistentes** por minuto por usuário; acima disso, `429 limite-excedido` com `Retry-After` (dificulta adivinhar códigos).
+
+### RF-05 · Canais
+
+- **RN-19 — Nomes.** Canal de texto: 1 a 100 code points, normalizado para minúsculas, com espaços trocados por hífen (`Clipes Bons` → `clipes-bons`). Canal de voz: 1 a 100 code points, livre. Nome único por comunidade e tipo, sem diferenciar maiúsculas → `409 nome-em-uso`. Até 50 canais por comunidade.
+- **RN-20 — Configuração de voz.** `limiteUsuarios` de 2 a 25 (padrão 10) e `perfilMaximo` entre `TEXTO`, `720p60`, `1080p60` (padrão) e `1440p60`. O `1440p60` só pode ser escolhido explicitamente por um admin (ele dobra o consumo de banda; veja a RN-58).
+- **RN-21 — Ordem e exclusão.** `PUT /v1/comunidades/{id}/canais/ordem` recebe a lista **completa** dos ids; lista com id faltando, sobrando ou repetido → `400`. Excluir um canal de texto exclui logicamente as mensagens; excluir um canal de voz encerra a sala no LiveKit (`DeleteRoom`) e as transmissões com motivo `SALA_ENCERRADA`.
+
+### RF-06 · Gateway: conexão, sessão e retomada
+
+O gateway é **só de leitura para o cliente**, com quatro exceções (identificar, heartbeat, retomar e atualizar presença). Tudo o que altera dados vai pela API REST. Isso mantém a autorização, a validação e a idempotência num lugar só.
+
+- **RN-22 — Formato.** Cada quadro é um JSON `{"op": "...", "d": {...}, "s": 42, "t": "MENSAGEM_CRIADA"}`. `s` e `t` só existem em `op = "DISPATCH"`. Quadros do cliente têm no máximo 4 KB; o servidor fecha com `4002` se passar disso ou se o JSON for inválido.
+- **RN-23 — Abertura.** Ao conectar em `wss://<api>/gateway?v=1`, o servidor envia `HELLO` com `intervaloHeartbeatMs = 30000`. O cliente tem 10 s para mandar `IDENTIFY` (com o access token) ou `RESUME`; senão, fecha com `4003`. **O token nunca vai na URL** (URLs aparecem em logs de proxy).
+- **RN-24 — READY.** Com o token válido, o servidor responde `READY` com o `sessaoId`, o usuário, as comunidades (com canais, `ultimaSeq` e `ultimaSeqLida` de cada canal de texto), o estado de voz de cada canal, as transmissões ativas e a presença dos membros online. É o *snapshot* inicial; tudo depois chega como `DISPATCH`.
+- **RN-25 — Heartbeat.** O cliente envia `HEARTBEAT` a cada `intervaloHeartbeatMs`, sendo o primeiro após `intervalo × aleatório(0, 1)` (jitter para que milhares de clientes reconectados não batam juntos). O servidor responde `HEARTBEAT_ACK`. Sem heartbeat em 45 s → fecha com `4009`. Se o cliente não receber o `ACK` antes do próximo heartbeat, considera a conexão morta ("zumbi"), fecha e tenta `RESUME`.
+- **RN-26 — Sequência e buffer.** Cada `DISPATCH` de uma sessão recebe `s` crescente, começando em 1, sem lacunas. O servidor guarda no Redis os últimos 1.000 eventos da sessão por até 2 minutos depois da desconexão.
+- **RN-27 — Retomada.** `RESUME` com `sessaoId`, token e `ultimoSeq`: se a sessão existe, pertence ao mesmo usuário e todos os eventos depois de `ultimoSeq` ainda estão no buffer, o servidor reenvia esses eventos na ordem e depois manda `RESUMED`. A retomada funciona **em qualquer réplica** (o estado está no Redis). Caso contrário, `SESSAO_INVALIDA` com `retomavel: false`, e o cliente faz um `IDENTIFY` novo (e recebe um `READY` completo). Exemplo: o cliente viu até `s = 57` e o buffer guarda de 40 a 63 → recebe 58 a 63 e `RESUMED`. Se o buffer guarda de 70 a 1.069 → `SESSAO_INVALIDA`.
+- **RN-28 — Token que expira.** O servidor guarda o `exp` do token da sessão. O cliente envia `REAUTENTICAR` com um token novo antes disso; se o `exp` passar, o servidor fecha com `4004`. Token de outro usuário no `REAUTENTICAR` → `4004`.
+- **RN-29 — Limites e encerramentos.** Até 120 quadros por minuto por conexão (`4008`), até 5 `IDENTIFY` por minuto por usuário e até 5 sessões simultâneas por usuário (a sexta é recusada com `4011`). Códigos de fechamento na seção [Contrato do gateway](#contrato-do-gateway).
+- **RN-30 — Deploy sem derrubar ninguém.** Ao receber `SIGTERM`, a réplica para de aceitar conexões e envia `RECONECTAR` às suas sessões, espalhadas ao longo de 20 s (jitter). Os clientes reconectam por `RESUME` noutra réplica. Critério: um rollout durante a carga termina com ≥ 99% das sessões `RESUMED` e zero lacunas de `seq` de mensagem nos clientes sintéticos.
+- **RN-31 — Perda de assinatura no Redis.** O Pub/Sub do Redis entrega **no máximo uma vez**: se a réplica perder a conexão com o Redis, pode ter perdido eventos. Ao reconectar, ela envia `SESSAO_INVALIDA` (`retomavel: false`) às sessões afetadas, que se identificam de novo e recebem um snapshot correto. Melhor um `READY` a mais do que um estado errado na tela.
+
+### RF-07 · Presença
+
+- **RN-32 — Estados.** `ONLINE`, `AUSENTE`, `NAO_PERTURBE` e `INVISIVEL`, escolhidos pelo cliente com o op `ATUALIZAR_PRESENCA`. O cliente marca `AUSENTE` sozinho após 10 min sem interação. `INVISIVEL` aparece como `OFFLINE` para os outros.
+- **RN-33 — Online e offline.** O usuário está online enquanto tiver pelo menos uma sessão viva (heartbeat em dia). Quando a última sessão termina, ele só vira `OFFLINE` depois de 15 s sem nova sessão, para que uma reconexão rápida não pisque "offline → online" para os amigos. Se uma réplica morrer sem fechar as sessões, as chaves de sessão expiram no Redis em 60 s e uma rotina marca o usuário como offline.
+- **RN-34 — Quem vê.** `PRESENCA_ATUALIZADA` vai só para membros de comunidades em comum. Mudanças são agrupadas: no máximo um evento por usuário a cada 2 s (o último estado vence).
+
+### RF-08 · Mensagens
+
+- **RN-35 — Conteúdo.** De 1 a 2.000 code points depois de remover espaços das pontas, ou vazio desde que haja de 1 a 4 anexos confirmados (RF-09) do próprio autor e ainda não usados. Mensagem só com espaços e sem anexo → `400`.
+- **RN-36 — Sequência por canal.** Cada mensagem recebe `seq`, sequencial e **sem lacunas** dentro do canal, atribuída na mesma transação que grava a mensagem (`UPDATE canal SET ultima_seq = ultima_seq + 1 WHERE id = ? RETURNING ultima_seq`). Se a transação falhar, o número volta junto. É o `seq` que permite ao cliente detectar que perdeu algo.
+- **RN-37 — Idempotência por nonce.** O cliente envia um `nonce` (1 a 36 caracteres) gerado por ele. Mesmo autor, mesmo canal e mesmo `nonce` em até 10 minutos → `200` com a mensagem já criada, sem nova `seq` e sem novo evento. O evento `MENSAGEM_CRIADA` devolve o `nonce`, para o cliente trocar a mensagem "enviando…" pela confirmada.
+- **RN-38 — Detecção de lacuna no cliente.** Ao receber `MENSAGEM_CRIADA` com `seq` maior que `ultimaSeqConhecida + 1`, o cliente busca o intervalo faltante com `GET /v1/canais/{id}/mensagens?depoisDe=<ultimaSeqConhecida>`. Esse requisito está no cliente, mas o contrato da API existe por causa dele.
+- **RN-39 — Listagem.** `?antesDe=<seq>` (ordem decrescente) ou `?depoisDe=<seq>` (ordem crescente), `limite` de 1 a 100 (padrão 50). Os dois juntos → `400`. Mensagens excluídas aparecem como lápide `{"id", "seq", "excluida": true}`, para a sequência continuar contínua.
+- **RN-40 — Edição.** Só o autor edita, com as mesmas regras de conteúdo; a `seq` não muda, `editadaEm` é preenchido, evento `MENSAGEM_EDITADA`. Mensagem excluída → `404`.
+- **RN-41 — Exclusão.** O autor exclui a própria; moderador ou acima exclui de papel inferior (RN-10). O conteúdo é apagado (`conteudo = NULL`), os anexos são removidos do armazenamento por uma rotina assíncrona, e o evento `MENSAGEM_EXCLUIDA` leva `id`, `canalId` e `seq`.
+- **RN-42 — Respostas e menções.** `respondeA` precisa ser uma mensagem do mesmo canal (senão `400`). Menções no formato `<@usuarioId>`, até 20 por mensagem; só ids de membros da comunidade entram no array `mencoes` do evento. O cliente destaca e notifica.
+- **RN-43 — Não lidas.** `PUT /v1/canais/{id}/leitura` com `ultimaSeqLida`. O valor só avança: um número menor que o guardado é ignorado e a resposta traz o valor atual. Não lidas = `ultimaSeq − ultimaSeqLida` (aproximado se houver exclusões, e isso é aceito).
+- **RN-44 — Digitando e limite.** `POST /v1/canais/{id}/digitando` gera `DIGITANDO` com `ate = agora + 8 s`, no máximo um por usuário e canal a cada 5 s (o excesso responde `204` sem evento). Envio de mensagens: até 5 a cada 5 s por usuário e canal → `429 limite-excedido` com `Retry-After`.
+
+### RF-09 · Anexos
+
+- **RN-45 — Pedido de upload.** `POST /v1/anexos` com `nomeArquivo`, `tipoMime` e `tamanhoBytes`. Tipos aceitos: `image/png`, `image/jpeg`, `image/gif` e `image/webp` (até 10 MB) e `video/mp4` (até 50 MB, para clipes). Outro tipo → `415 tipo-de-anexo-nao-suportado`; maior → `413 anexo-muito-grande`. A resposta traz uma **URL de PUT pré-assinada**, válida por 10 minutos, com `Content-Type` e `Content-Length` entre os cabeçalhos assinados: o armazenamento recusa um envio com outro tipo ou outro tamanho. O arquivo vai direto do cliente para o armazenamento; ele não passa pela API. A confirmação (RN-46) confere tudo de novo, então a regra continua valendo mesmo num armazenamento que ignore algum cabeçalho.
+- **RN-46 — Confirmação.** `POST /v1/anexos/{id}/confirmacao`: o backend consulta o objeto (`HeadObject`), confere o tamanho e lê os primeiros 16 bytes (`GetObject` com `Range: bytes=0-15`) para validar a assinatura do formato (PNG `89 50 4E 47`, JPEG `FF D8 FF`, GIF `47 49 46 38`, WebP `RIFF` + `WEBP` no byte 8, MP4 `ftyp` no byte 4). Divergência → objeto apagado e `415`. Sucesso → `CONFIRMADO`.
+- **RN-47 — Uso e limpeza.** Um anexo confirmado só pode ser usado numa mensagem, do mesmo autor. Anexos pendentes ou não usados há mais de 1 hora são apagados por uma rotina. Cota de upload: 500 MB por usuário por dia → `429`.
+- **RN-48 — Download.** `GET /v1/anexos/{id}/conteudo` verifica se quem pede é membro da comunidade do canal da mensagem (RN-12) e responde `302` para uma URL pré-assinada de 5 minutos com `Content-Disposition`. Nenhum objeto é público.
+
+### RF-10 · Canais de voz
+
+- **RN-49 — Token de mídia.** `POST /v1/canais/{id}/voz/token` (membro, canal de voz) devolve `url` do LiveKit, `token` e `expiraEm`. O token é um JWT assinado com o *API secret* do LiveKit, que **só o backend conhece**, com: `identity = usuarioId`, `name = nomeExibicao`, sala `voz-<canalId>`, `roomJoin`, `canSubscribe = true`, `canPublish = true`, `canPublishSources = [MICROPHONE]`, `canPublishData = false` e validade de 10 minutos. Tela, nunca: a permissão de transmitir é concedida depois, pela RN-57.
+- **RN-50 — Vaga no canal.** Antes de emitir o token, o backend reserva uma vaga: participantes ativos + reservas pendentes do canal precisam ser menores que `limiteUsuarios`. A conferência e a reserva são atômicas (script Lua no Redis); a reserva vale 30 s e é consumida pelo webhook `participant_joined` daquela pessoa. Canal cheio → `409 canal-cheio`. Critério: canal com limite 10, 9 pessoas dentro e 3 pedidos simultâneos → exatamente 1 token emitido.
+- **RN-51 — Um canal de voz por vez.** Se chegar `participant_joined` de alguém que o estado mostra em outro canal, o backend remove a pessoa da sala antiga (`RemoveParticipant`) e encerra a transmissão dela lá, se houver.
+- **RN-52 — Estado de voz.** Para cada participante: `canalId`, `participantSid`, `mutado`, `ensurdecido`, `silenciadoPeloServidor`, `transmitindo` e `entrouEm`, no Redis. `PATCH /v1/voz/eu` altera `mutado` e `ensurdecido` (ensurdecer implica mutar); fora da voz → `409 fora-do-canal-de-voz`. Cada mudança gera `ESTADO_VOZ_ATUALIZADO`.
+- **RN-53 — Webhooks do LiveKit.** O endpoint `POST /webhooks/livekit` valida a assinatura (JWT no cabeçalho `Authorization`, assinado com o *API secret*, contendo o SHA-256 do corpo) sobre os **bytes exatos** do corpo; inválido → `401` e métrica. Eventos usados: `participant_joined`, `participant_left`, `track_published`, `track_unpublished`, `room_finished`. O processamento é idempotente pelo `id` do evento (guardado por 24 h).
+- **RN-54 — Eventos fora de ordem.** Cada entrada numa sala gera um `participantSid` novo. Um `participant_left` só remove o estado se o `participantSid` dele for o atual. Exemplo da corrida clássica de reconexão: chegam `participant_joined` (sid B) e depois `participant_left` (sid A, da conexão antiga) → o estado continua com B, e a pessoa continua na voz.
+- **RN-55 — Reconciliação.** A cada 60 s, para cada sala com participantes no estado, o backend lista os participantes no LiveKit (`ListParticipants`) e corrige divergências (webhook perdido, réplica que caiu no meio). Cada correção incrementa `resenha_voz_divergencias_total`; esse número deveria ficar perto de zero, e um alerta avisa se não ficar.
+
+### RF-11 · Transmissão de tela
+
+Este é o coração do projeto. O fluxo completo está no diagrama da seção [O fluxo de uma transmissão](#o-fluxo-de-uma-transmissão).
+
+- **RN-56 — Pré-condições e reserva.** `POST /v1/canais/{id}/transmissoes` com `perfil`, `comAudio` e `titulo` opcional (até 100 code points, ex.: "Hollow Knight"). Exige: estar naquele canal de voz agora (estado da RN-52), não ter outra transmissão `RESERVADA` ou `AO_VIVO` em lugar nenhum (`409 ja-transmitindo`), o canal ter menos de 3 transmissões ativas (`409 limite-de-transmissoes`) e o perfil não ultrapassar o `perfilMaximo` do canal (`422 perfil-nao-permitido`). As duas contagens e a reserva são atômicas (script Lua). Critério: canal com 2 transmissões e 5 pedidos simultâneos de pessoas diferentes → exatamente 1 `201`; os outros 4 recebem `409 limite-de-transmissoes`.
+- **RN-57 — Permissão concedida em tempo real.** Com a vaga reservada, o backend chama `UpdateParticipant` na API do LiveKit, acrescentando `SCREEN_SHARE` (e `SCREEN_SHARE_AUDIO` se `comAudio`) às fontes permitidas daquela pessoa, sem tirar o `MICROPHONE` (a menos que ela esteja silenciada pelo servidor). Timeout de 2 s e uma nova tentativa; se falhar, a reserva é desfeita e a resposta é `503 midia-indisponivel` com `Retry-After: 5`. A transmissão nasce `RESERVADA`, com `reservaExpiraEm = agora + 30 s`. O cliente só publica depois que o SDK avisar que as permissões mudaram (até 5 s); se o aviso não chegar, ele cancela com `DELETE` e tenta de novo.
+- **RN-58 — Perfis ditados pelo servidor.** A resposta do `201` traz os **parâmetros de codificação**, e o cliente os aplica sem decidir nada sozinho. Assim dá para ajustar bitrate e camadas sem lançar uma versão nova do app.
+
+| Perfil | Captura máxima | fps | Teto da camada alta | Camadas extras (fator de redução · fps · teto) | Upload total aproximado | Upload mínimo exigido | `contentHint` | `degradationPreference` |
+|---|---|---|---|---|---|---|---|---|
+| `720p60` | 1280×720 | 60 | 4,5 Mbps | 2× · 30 · 0,6 Mbps | 5,1 Mbps | 7 Mbps | `motion` | `maintain-framerate` |
+| `1080p60` (padrão) | 1920×1080 | 60 | 8 Mbps | 1,5× · 60 · 3 Mbps; 3× · 30 · 0,6 Mbps | 11,6 Mbps | 15 Mbps | `motion` | `maintain-framerate` |
+| `1440p60` (experimental) | 2560×1440 | 60 | 14 Mbps | 2× · 60 · 3 Mbps; 4× · 30 · 0,6 Mbps | 17,6 Mbps | 23 Mbps | `motion` | `maintain-framerate` |
+| `TEXTO` (código, documentos) | 1920×1080 | 15 | 2,5 Mbps | 3× · 15 · 0,4 Mbps | 2,9 Mbps | 4 Mbps | `detail` | `maintain-resolution` |
+
+O upload mínimo exigido é o total com cerca de 30% de folga. Os tetos são pontos de partida; o marco 8 mede e o ADR-009 registra o ajuste.
+
+- **RN-59 — Encaixe da resolução.** A captura é reduzida para caber na caixa do perfil **mantendo a proporção**, nunca ampliada, com largura e altura arredondadas para número par (exigência comum dos codificadores). Fator = `min(1, larguraMax / largura, alturaMax / altura)`. Exemplos no `1080p60`: monitor 2560×1440 → 1920×1080; ultrawide 3440×1440 → fator 0,5581 → 1920×804; janela 1600×1200 (4:3) → 1440×1080; janela 1280×720 → continua 1280×720. As camadas extras dividem a resolução final pelo fator de redução (1920×804 ÷ 1,5 → 1280×536).
+- **RN-60 — Codec.** Padrão: **H.264**, porque quase toda placa de vídeo dos últimos anos codifica H.264 em hardware e todo navegador decodifica. Opcional por usuário: **AV1** (melhor qualidade por bit nas GPUs que codificam AV1 em hardware), publicado com camadas escaláveis (SVC) e codec de reserva H.264 para quem não decodifica AV1. Se o cliente detectar codificação por software (`powerEfficientEncoder = false`) e limitação por CPU (`qualityLimitationReason = "cpu"`) por mais de 20 s, ele sugere baixar o perfil.
+- **RN-61 — Ao vivo.** O webhook `track_published` com fonte `SCREEN_SHARE` de quem tem reserva leva a transmissão a `AO_VIVO`, grava `trackSid` e `iniciadaEm` e publica `TRANSMISSAO_INICIADA`. Um `track_published` de `SCREEN_SHARE_AUDIO` marca `comAudio = true`.
+- **RN-62 — Reserva expirada.** Sem `track_published` em 30 s (o usuário desistiu no seletor de tela, o app travou), a transmissão vira `ENCERRADA` com motivo `RESERVA_EXPIRADA`, a permissão é revogada e a vaga é liberada.
+- **RN-63 — Encerramento.** A primeira causa que chegar vence (`UPDATE … WHERE status IN ('RESERVADA', 'AO_VIVO')`): `track_unpublished` da tela → `ENCERRADA_PELO_USUARIO`; `participant_left` → `SAIU_DA_VOZ`; `DELETE /v1/transmissoes/{id}` por moderador → `ENCERRADA_POR_MODERADOR`; `room_finished` ou canal excluído → `SALA_ENCERRADA`. Em todos os casos: permissão de tela revogada, vaga liberada e `TRANSMISSAO_ENCERRADA` com motivo e duração. No encerramento por moderador, se a trilha ainda existir 5 s depois da revogação, o backend chama `MutePublishedTrack` e registra.
+- **RN-64 — Publicação sem reserva.** Não deveria acontecer (sem reserva não há permissão), mas, se chegar `track_published` de tela sem reserva, o backend silencia a trilha, revoga a permissão, registra `WARN` e incrementa `resenha_transmissao_sem_reserva_total`. Defesa em profundidade: a regra não depende só do LiveKit.
+- **RN-65 — Seleção da fonte e áudio do jogo.** No Electron, o seletor lista telas e janelas com miniaturas (as janelas do próprio Resenha ficam de fora). O app avisa que jogos em tela cheia exclusiva podem aparecer pretos e recomenda o modo "janela sem bordas". O áudio do jogo segue o ADR-010 com um critério inegociável: **quem assiste não pode ouvir a própria voz de volta**. Teste: um espectador fala por 10 s durante a transmissão, e o áudio da transmissão gravado do lado dele não contém a fala. **Plano B:** se nenhuma opção do ADR-010 passar nesse critério no prazo do marco 7, a v1.0 sai com vídeo sem áudio do jogo; `comAudio: true` responde `422 audio-do-jogo-indisponivel` até a configuração ser ligada, e o cliente esconde a opção.
+
+### RF-12 · Assistir a uma transmissão
+
+- **RN-66 — Sob demanda.** O cliente assina automaticamente as trilhas de microfone, mas **nunca** as de tela. A tela só é assinada quando a pessoa clica em "Assistir", e o dynacast faz o streamer parar de codificar camadas que ninguém assiste. Assistir exige estar no mesmo canal de voz (`409 fora-do-canal-de-voz`).
+- **RN-67 — Contagem de espectadores.** `POST` e `DELETE /v1/transmissoes/{id}/espectadores/eu` registram quem está assistindo (idempotentes). A contagem vai em `TRANSMISSAO_ATUALIZADA`, no máximo um evento a cada 2 s por transmissão. Ao sair da voz, a pessoa sai das contagens.
+- **RN-68 — Qualidade escolhida pelo espectador.** "Automático" (padrão): o SFU escolhe a camada pelo tamanho do elemento de vídeo e pela banda. "Original": força a camada alta. Em tela cheia, a camada alta é pedida automaticamente.
+- **RN-69 — Estatísticas visíveis.** Um painel sobreposto (atalho `Ctrl+Shift+E`) mostra fps, resolução, camada, codec, bitrate, perda, jitter, RTT, congelamentos e, para o streamer, o codificador e o motivo de limitação. É o que você vai mostrar no vídeo e na entrevista.
+
+### RF-13 · Telemetria de qualidade
+
+- **RN-70 — Coleta.** Streamer e espectadores chamam `getStats()` a cada 2 s e fecham janelas de 10 s. Streamer, por camada (`rid`): `framesPerSecond`, `frameWidth`, `frameHeight`, bitrate pelo delta de `bytesSent`, `qualityLimitationReason` predominante na janela, `encoderImplementation` e `powerEfficientEncoder`; do `remote-inbound-rtp`, RTT e perda. Espectador: `framesPerSecond`, resolução, bitrate pelo delta de `bytesReceived`, perda pelo delta de `packetsLost`, `jitter`, delta de `freezeCount` e de `totalFreezesDuration`, codec e camada recebida.
+- **RN-71 — Envio.** `POST /v1/telemetria/qualidade` a cada 30 s com até 20 janelas (mais que isso → `413`), resposta `202`. Idempotente por `(sessaoCliente, transmissaoId, papel, janelaInicio)`: reenviar o mesmo lote não duplica. Valores fora de faixa (fps acima de 240, perda acima de 100%) → a janela é descartada e contada, mas o lote é aceito.
+- **RN-72 — Janela saudável.** Do streamer: perfil de 60 fps com `framesPerSecond` ≥ 55 na camada alta (≥ 13 no perfil `TEXTO`). Do espectador: recebendo a camada alta, `framesPerSecond` ≥ 55 e nenhum congelamento novo. São as definições usadas nos SLOs (RNF-01 e RNF-02).
+- **RN-73 — Relatório da transmissão.** `GET /v1/transmissoes/{id}/qualidade` (para quem transmitiu e para moderadores) devolve: duração, % de janelas saudáveis do streamer e dos espectadores, fps p50 e p5, motivo de limitação predominante e codificador usado. Exemplo de leitura: "92% do tempo a 60 fps; nas quedas, o motivo foi banda (`bandwidth`)". O cliente mostra isso ao fim da transmissão.
+- **RN-74 — Retenção.** Janelas brutas por 30 dias (tabela particionada por dia; a partição inteira é descartada). O resumo da RN-73 fica por 1 ano. Nenhuma janela guarda IP.
+
+### RF-14 · Moderação
+
+- **RN-75 — Expulsar e banir.** Expulsar (moderador ou acima) remove o membro, desconecta da voz, encerra a transmissão e envia `COMUNIDADE_REMOVIDA` às sessões dele, que deixam de receber eventos daquela comunidade. Banir (admin ou acima) faz o mesmo, impede novo aceite de convite (RN-17) e pode apagar as mensagens das últimas 0, 24 ou 168 horas (rotina assíncrona, evento `MENSAGENS_EXCLUIDAS_EM_LOTE` por canal).
+- **RN-76 — Silenciar e desconectar.** Silenciar pelo servidor (`POST …/voz/participantes/{usuarioId}/silenciamento`) chama `MutePublishedTrack` no microfone **e** tira `MICROPHONE` das fontes permitidas. Sem isso, o cliente poderia publicar de novo. Desfazer devolve a permissão. Desconectar chama `RemoveParticipant`.
+- **RN-77 — Auditoria.** Toda ação das RN-75, RN-76 e RN-63 (encerramento por moderador), além de mudanças de papel e exclusões de mensagem de terceiros, gera um registro com quem, sobre quem, a ação, o motivo opcional e quando. Admins consultam por 90 dias.
+
+### RF-15 · Privacidade e conta
+
+- **RN-78 — Exclusão de conta.** `DELETE /v1/eu` exige não ser dono de nenhuma comunidade (`409 possui-comunidades`, com a lista). Efeitos: o usuário é desativado no Keycloak (por uma conta de serviço com permissão mínima), sai de todas as comunidades e da voz, tem avatar e anexos apagados e as sessões do gateway fechadas com `4010`. As mensagens continuam nas conversas, com o autor anonimizado ("Usuário excluído"): são parte da conversa de outras pessoas, e isso está escrito no aviso de privacidade.
+- **RN-79 — Exportação e transparência.** `GET /v1/eu/exportacao` devolve um JSON com perfil, comunidades, papéis e as mensagens do usuário. O aviso de privacidade (`docs/privacidade.md` e uma tela no app) diz o que é guardado, por quanto tempo, que a mídia não é gravada e que ela passa decifrada pelo SFU (sem criptografia ponta a ponta na v1).
+
+## Requisitos não funcionais
+
+Os SLOs de mídia são medidos com a telemetria (RF-13) em sessões reais e nos testes do marco 8. A **máquina de referência** é a do streamer que você declarar no README (CPU, GPU, upload). As metas valem para quem cumpre os requisitos mínimos de rede da RN-58.
+
+| RNF | Requisito | Meta mensurável | Como verificar |
+|---|---|---|---|
+| RNF-01 | Fluidez do streamer (SLO) | ≥ 99% das janelas do streamer saudáveis (RN-72) no perfil `1080p60`, na máquina de referência | Telemetria; painel "fluidez do streamer" no Grafana |
+| RNF-02 | Fluidez do espectador (SLO) | ≥ 95% das janelas saudáveis para espectadores com ≥ 10 Mbps de download e perda ≤ 1% | Telemetria; mesmo painel, por espectador |
+| RNF-03 | Latência ponta a ponta | Mediana ≤ 250 ms e máximo ≤ 400 ms em 20 medições, com RTT ao servidor ≤ 50 ms | Método do relógio (marco 8) |
+| RNF-04 | Início | p95 ≤ 2 s entre o clique em "Assistir" e o primeiro quadro | Medido no cliente e enviado na telemetria |
+| RNF-05 | Degradação graciosa | Com o espectador limitado a 5 Mbps e 3% de perda, ele passa para a camada de 720p em até 5 s e não tem congelamento acima de 1 s depois da adaptação | Teste de rede degradada (marco 8) |
+| RNF-06 | Chat em tempo real | p95 ≤ 300 ms entre o `201` do `POST` e o `MENSAGEM_CRIADA` nos outros membros, com 5.000 conexões em 2 réplicas e 100 mensagens/s | Cliente sintético + k6 |
+| RNF-07 | Memória por conexão | Medida e documentada; meta inicial ≤ 100 KB por conexão ociosa no gateway | Heap antes e depois de abrir 5.000 conexões |
+| RNF-08 | Deploy sem perda | Rollout sob carga com ≥ 99% de sessões `RESUMED` e zero lacunas de `seq` nos clientes sintéticos (RN-30) | Teste do marco 8 |
+| RNF-09 | API REST | 99,9% sem `5xx`; p99 ≤ 300 ms | Métricas `http.server.requests`; k6 |
+| RNF-10 | Segurança | Matriz da RN-11 coberta por testes; webhook com assinatura inválida → `401`; segredo do LiveKit fora do cliente e do repositório; checklist de segurança do Electron cumprido | Testes de fatia; varredura de segredos no CI; revisão da configuração do Electron |
+| RNF-11 | Privacidade | Zero tokens, conteúdo de mensagens e e-mails em logs `INFO` ou acima; retenção da RN-74 automatizada | Teste de log; job de retenção com relógio simulado |
+| RNF-12 | Observabilidade | `traceId` em 100% dos logs de requisição; traces cobrindo REST → banco → Redis → gateway; dashboards de transmissão, voz e gateway | Capturas de tela no README |
+| RNF-13 | Custo conhecido | Custo mensal para o seu grupo calculado pelas fórmulas da seção de entregáveis, com os preços consultados e a data | `docs/custo/` |
+| RNF-14 | Reprodutibilidade | Do clone ao ambiente de desenvolvimento rodando com 1 comando em até 10 min; instalador Windows gerado pelo CI a cada tag | Cronometrar; GitHub Releases |
+| RNF-15 | Qualidade de código | Cobertura de linhas ≥ 80% nos módulos de domínio; contratos (OpenAPI e protocolo do gateway) verificados no CI; zero vulnerabilidade crítica conhecida nas dependências | JaCoCo, job de contrato, varredura de dependências |
+
+## Modelo de dados
+
+Um banco PostgreSQL para o `resenha-api`, um schema por módulo (`identidade`, `comunidades`, `mensagens`, `anexos`, `voz`, `transmissoes`, `qualidade`, `moderacao`). Identificadores em UUID v7 (`uuidv7()` no PostgreSQL 18), datas em `timestamptz`. Nenhum módulo lê tabela de outro: conversam pela API pública do módulo ou por eventos do Spring Modulith.
+
+<Figura legenda="Entidades principais. O estado efêmero (presença, sessões do gateway, estado de voz, vagas) vive no Redis; o PostgreSQL guarda o que precisa sobreviver">
+<svg viewBox="0 0 860 400" width="860" role="img" aria-labelledby="rs-er-t rs-er-d">
+  <title id="rs-er-t">Modelo de entidades do Resenha</title>
+  <desc id="rs-er-d">Usuário se liga a comunidade por membro, com papel. Comunidade tem canais; canal de texto tem mensagens, que têm anexos; canal de voz tem sessões de voz e transmissões; transmissão tem amostras de qualidade. Comunidade tem convites, banimentos e ações de moderação.</desc>
+  <defs><marker id="rs-er-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="20" y="30" width="150" height="70" rx="8" class="d-box"/>
+  <text x="95" y="55" text-anchor="middle" class="d-title">usuario</text>
+  <text x="95" y="76" text-anchor="middle" class="d-label">sub · handle · nome</text>
+  <text x="95" y="92" text-anchor="middle" class="d-label">avatar · excluido_em</text>
+  <rect x="250" y="30" width="150" height="70" rx="8" class="d-box"/>
+  <text x="325" y="55" text-anchor="middle" class="d-title">membro</text>
+  <text x="325" y="76" text-anchor="middle" class="d-label">papel · apelido</text>
+  <text x="325" y="92" text-anchor="middle" class="d-label">PK (comunidade, usuário)</text>
+  <rect x="480" y="30" width="150" height="70" rx="8" class="d-accent"/>
+  <text x="555" y="55" text-anchor="middle" class="d-title">comunidade</text>
+  <text x="555" y="76" text-anchor="middle" class="d-label">nome · ícone</text>
+  <text x="555" y="92" text-anchor="middle" class="d-label">excluida_em</text>
+  <rect x="700" y="20" width="140" height="40" rx="8" class="d-info"/>
+  <text x="770" y="45" text-anchor="middle" class="d-text">convite</text>
+  <rect x="700" y="70" width="140" height="40" rx="8" class="d-info"/>
+  <text x="770" y="95" text-anchor="middle" class="d-text">banimento</text>
+  <rect x="700" y="120" width="140" height="40" rx="8" class="d-info"/>
+  <text x="770" y="145" text-anchor="middle" class="d-text">acao_moderacao</text>
+  <path d="M170 65 L248 65" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M478 65 L402 65" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M630 50 L698 40" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M630 72 L698 90" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M630 92 L698 138" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <rect x="480" y="160" width="150" height="70" rx="8" class="d-accent"/>
+  <text x="555" y="185" text-anchor="middle" class="d-title">canal</text>
+  <text x="555" y="206" text-anchor="middle" class="d-label">tipo · ultima_seq</text>
+  <text x="555" y="222" text-anchor="middle" class="d-label">limite · perfil_maximo</text>
+  <path d="M555 100 L555 158" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <rect x="250" y="160" width="150" height="70" rx="8" class="d-box"/>
+  <text x="325" y="185" text-anchor="middle" class="d-title">mensagem</text>
+  <text x="325" y="206" text-anchor="middle" class="d-label">seq · nonce · conteúdo</text>
+  <text x="325" y="222" text-anchor="middle" class="d-label">UNIQUE (canal, seq)</text>
+  <path d="M478 195 L402 195" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <rect x="20" y="160" width="150" height="70" rx="8" class="d-box"/>
+  <text x="95" y="185" text-anchor="middle" class="d-title">anexo</text>
+  <text x="95" y="206" text-anchor="middle" class="d-label">chave · tipo · tamanho</text>
+  <text x="95" y="222" text-anchor="middle" class="d-label">status</text>
+  <path d="M248 195 L172 195" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <rect x="250" y="290" width="150" height="70" rx="8" class="d-box"/>
+  <text x="325" y="315" text-anchor="middle" class="d-title">sessao_voz</text>
+  <text x="325" y="336" text-anchor="middle" class="d-label">participant_sid</text>
+  <text x="325" y="352" text-anchor="middle" class="d-label">entrou_em · saiu_em</text>
+  <rect x="480" y="290" width="150" height="70" rx="8" class="d-ok"/>
+  <text x="555" y="315" text-anchor="middle" class="d-title">transmissao</text>
+  <text x="555" y="336" text-anchor="middle" class="d-label">perfil · status</text>
+  <text x="555" y="352" text-anchor="middle" class="d-label">motivo_fim · track_sid</text>
+  <rect x="700" y="290" width="140" height="70" rx="8" class="d-violet"/>
+  <text x="770" y="315" text-anchor="middle" class="d-title">janela_qualidade</text>
+  <text x="770" y="336" text-anchor="middle" class="d-label">particionada</text>
+  <text x="770" y="352" text-anchor="middle" class="d-label">por dia · 30 dias</text>
+  <path d="M520 230 L380 288" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M555 230 L555 288" class="d-line" marker-end="url(#rs-er-seta)"/>
+  <path d="M630 325 L698 325" class="d-line" marker-end="url(#rs-er-seta)"/>
+</svg>
+</Figura>
+
+Tabelas e restrições que importam (o resto você deriva dos requisitos):
+
+| Tabela | Colunas principais | Restrições e índices |
+|---|---|---|
+| `identidade.usuario` | `id`, `sub`, `handle`, `nome_exibicao`, `avatar_anexo_id`, `criado_em`, `excluido_em` | `UNIQUE (sub)`; `UNIQUE (lower(handle))`; `CHECK` do formato do handle |
+| `comunidades.comunidade` | `id`, `nome`, `icone_anexo_id`, `criada_em`, `excluida_em` | — |
+| `comunidades.membro` | `comunidade_id`, `usuario_id`, `papel`, `apelido`, `entrou_em` | PK `(comunidade_id, usuario_id)`; `UNIQUE (comunidade_id) WHERE papel = 'DONO'`; índice em `usuario_id` (o `READY` lista as comunidades de um usuário) |
+| `comunidades.canal` | `id`, `comunidade_id`, `tipo`, `nome`, `posicao`, `ultima_seq`, `limite_usuarios`, `perfil_maximo`, `excluido_em` | `UNIQUE (comunidade_id, tipo, lower(nome)) WHERE excluido_em IS NULL`; `CHECK` de `limite_usuarios` entre 2 e 25 |
+| `comunidades.convite` | `codigo`, `comunidade_id`, `criado_por`, `expira_em`, `usos_max`, `usos`, `revogado_em` | PK `codigo`; `CHECK (usos_max IS NULL OR usos <= usos_max)` |
+| `comunidades.banimento` | `comunidade_id`, `usuario_id`, `motivo`, `por`, `em` | PK `(comunidade_id, usuario_id)` |
+| `mensagens.mensagem` | `id`, `canal_id`, `seq`, `autor_id` (nulo se excluído), `conteudo`, `responde_a`, `nonce`, `criada_em`, `editada_em`, `excluida_em` | `UNIQUE (canal_id, seq)`; `UNIQUE (canal_id, autor_id, nonce)`; listagem por `(canal_id, seq)` |
+| `mensagens.leitura` | `usuario_id`, `canal_id`, `ultima_seq_lida` | PK `(usuario_id, canal_id)` |
+| `anexos.anexo` | `id`, `autor_id`, `mensagem_id`, `chave`, `tipo_mime`, `tamanho_bytes`, `status`, `criado_em` | Índice parcial `WHERE status <> 'USADO'` para a limpeza |
+| `voz.sessao_voz` | `id`, `canal_id`, `usuario_id`, `participant_sid`, `entrou_em`, `saiu_em` | `UNIQUE (participant_sid)` (histórico; o estado atual é o do Redis) |
+| `voz.webhook_processado` | `evento_id`, `tipo`, `recebido_em` | PK `evento_id`; limpeza após 24 h |
+| `transmissoes.transmissao` | `id`, `canal_id`, `usuario_id`, `perfil`, `com_audio`, `titulo`, `status`, `track_sid`, `reservada_em`, `reserva_expira_em`, `iniciada_em`, `encerrada_em`, `motivo_fim` | `UNIQUE (usuario_id) WHERE status IN ('RESERVADA','AO_VIVO')` (segunda barreira da RN-56) |
+| `qualidade.janela_qualidade` | `transmissao_id`, `usuario_id`, `papel`, `sessao_cliente`, `janela_inicio`, `fps`, `largura`, `altura`, `bitrate_kbps`, `perda_pct`, `jitter_ms`, `rtt_ms`, `congelamentos`, `congelado_ms`, `motivo_limitacao`, `codec`, `codificador_hardware`, `camada` | Particionada por `janela_inicio` (diária); `UNIQUE (sessao_cliente, transmissao_id, papel, janela_inicio)` dentro da partição |
+| `qualidade.resumo_transmissao` | `transmissao_id`, `duracao_s`, `pct_saudavel_streamer`, `pct_saudavel_espectadores`, `fps_p50`, `fps_p5`, `motivo_predominante`, `codificador` | PK `transmissao_id` |
+| `moderacao.acao` | `id`, `comunidade_id`, `ator_id`, `alvo_id`, `tipo`, `motivo`, `em` | Índice `(comunidade_id, em DESC)` |
+
+**No Redis** (tudo com dono e TTL definidos; documente as chaves no README):
+
+| Chave | Conteúdo | TTL |
+|---|---|---|
+| `gw:sessao:<id>` | usuário, `exp` do token, último `s`, réplica | 2 min após a desconexão |
+| `gw:sessao:<id>:buffer` | últimos 1.000 eventos (lista com `LTRIM`) | igual à sessão |
+| `presenca:<usuarioId>` | status escolhido e sessões vivas | renovada pelo heartbeat (60 s) |
+| `voz:canal:<canalId>` | hash `usuarioId → estado` (RN-52) | sem TTL; corrigida pela reconciliação |
+| `voz:reservas:<canalId>` | sorted set `usuarioId → expiração` (RN-50) | itens de 30 s |
+| `tx:canal:<canalId>` e `tx:usuario:<usuarioId>` | transmissões ativas (RN-56) | sem TTL; corrigida pela reconciliação |
+| `rl:<regra>:<chave>` | baldes de rate limit | janela da regra |
+| canal Pub/Sub `com:<comunidadeId>` | eventos da comunidade para as réplicas | — |
+
+**Migrations:** `V1` schemas e identidade; `V2` comunidades, canais, convites; `V3` mensagens e leitura; `V4` anexos; `V5` voz e webhooks; `V6` transmissões; `V7` qualidade (com as partições dos próximos 7 dias e um job que cria as seguintes); `V8` moderação. A tabela `event_publication` do Spring Modulith entra na `V1`, copiada do DDL publicado com a versão que você usa.
+
+## Contrato da API
+
+Base `https://api.<seu-domínio>/v1`, JSON, autenticação `Bearer` com o access token do Keycloak (audiência `resenha-api`). OpenAPI 3.1 gerado e versionado em `contracts/openapi/`.
+
+| Método | Rota | Quem | Resultado |
+|---|---|---|---|
+| `GET` / `PATCH` | `/eu` | autenticado | Perfil (RN-02 a RN-04) |
+| `DELETE` | `/eu` | autenticado | `204` (RN-78) |
+| `GET` | `/eu/exportacao` | autenticado | JSON (RN-79) |
+| `GET` | `/usuarios/{id}` | compartilha comunidade | Perfil público (RN-05) |
+| `POST` / `GET` | `/comunidades` | autenticado | Criar (`201`) e listar as minhas |
+| `GET` / `PATCH` / `DELETE` | `/comunidades/{id}` | membro / admin / dono | RN-07 |
+| `POST` | `/comunidades/{id}/transferencia` | dono | RN-08 |
+| `GET` | `/comunidades/{id}/membros` | membro | Lista (até 100) |
+| `PATCH` | `/comunidades/{id}/membros/{usuarioId}` | admin+ | Papel e apelido (RN-10, RN-11) |
+| `DELETE` | `/comunidades/{id}/membros/{usuarioId}` | moderador+ | Expulsar (RN-75) |
+| `DELETE` | `/comunidades/{id}/membros/eu` | membro | Sair (RN-09) |
+| `POST` / `GET` / `DELETE` | `/comunidades/{id}/banimentos[/{usuarioId}]` | admin+ | RN-75 |
+| `GET` | `/comunidades/{id}/auditoria` | admin+ | RN-77 |
+| `POST` | `/comunidades/{id}/canais` | admin+ | RN-19, RN-20 |
+| `PATCH` / `DELETE` | `/canais/{id}` | admin+ | RN-21 |
+| `PUT` | `/comunidades/{id}/canais/ordem` | admin+ | RN-21 |
+| `POST` / `GET` | `/comunidades/{id}/convites` | membro | RN-14 |
+| `GET` / `DELETE` | `/convites/{codigo}` | autenticado / autor ou moderador+ | RN-15 |
+| `POST` | `/convites/{codigo}/aceitar` | autenticado | RN-16, RN-17 |
+| `GET` / `POST` | `/canais/{id}/mensagens` | membro | RN-35 a RN-39 |
+| `PATCH` / `DELETE` | `/mensagens/{id}` | autor / autor ou moderador+ | RN-40, RN-41 |
+| `POST` | `/canais/{id}/digitando` | membro | RN-44 |
+| `PUT` | `/canais/{id}/leitura` | membro | RN-43 |
+| `POST` | `/anexos` | autenticado | RN-45 |
+| `POST` | `/anexos/{id}/confirmacao` | autor | RN-46 |
+| `GET` | `/anexos/{id}/conteudo` | membro | `302` (RN-48) |
+| `POST` | `/canais/{id}/voz/token` | membro | RN-49, RN-50 |
+| `PATCH` | `/voz/eu` | na voz | RN-52 |
+| `POST` / `DELETE` | `/canais/{id}/voz/participantes/{usuarioId}/silenciamento` | moderador+ | RN-76 |
+| `DELETE` | `/canais/{id}/voz/participantes/{usuarioId}` | moderador+ | RN-76 |
+| `POST` / `GET` | `/canais/{id}/transmissoes` | na voz / membro | RN-56 a RN-58 |
+| `DELETE` | `/transmissoes/{id}` | quem transmite ou moderador+ | RN-63 |
+| `POST` / `DELETE` | `/transmissoes/{id}/espectadores/eu` | na voz | RN-66, RN-67 |
+| `GET` | `/transmissoes/{id}/qualidade` | quem transmitiu ou moderador+ | RN-73 |
+| `POST` | `/telemetria/qualidade` | autenticado | `202` (RN-70, RN-71) |
+| `POST` | `/webhooks/livekit` (fora do `/v1`) | LiveKit (assinatura) | `200` (RN-53) |
+
+### Enviar mensagem
+
+```http
+POST /v1/canais/0199c1a2-3b4c-7d5e-8f60-1a2b3c4d5e6f/mensagens
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+
+{
+  "nonce": "c7a1f3e0-2b9d-4c51-9a77-0e5f1d2c3b4a",
+  "conteudo": "olha esse clipe <@0198ff10-2b3c-7a40-9e11-4c5d6e7f8a90>",
+  "anexos": ["0199c1b0-0000-7a00-8000-0000000000a1"],
+  "respondeA": null
+}
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /v1/mensagens/0199c1b3-5f2e-7c10-a4d2-6b7e8f901234
+
+{
+  "id": "0199c1b3-5f2e-7c10-a4d2-6b7e8f901234",
+  "canalId": "0199c1a2-3b4c-7d5e-8f60-1a2b3c4d5e6f",
+  "seq": 1842,
+  "nonce": "c7a1f3e0-2b9d-4c51-9a77-0e5f1d2c3b4a",
+  "autor": { "id": "0199a001-...", "handle": "kayo.k", "nomeExibicao": "Kayo" },
+  "conteudo": "olha esse clipe <@0198ff10-2b3c-7a40-9e11-4c5d6e7f8a90>",
+  "mencoes": ["0198ff10-2b3c-7a40-9e11-4c5d6e7f8a90"],
+  "anexos": [{ "id": "0199c1b0-0000-7a00-8000-0000000000a1", "tipoMime": "video/mp4", "tamanhoBytes": 18874368, "url": "/v1/anexos/0199c1b0-0000-7a00-8000-0000000000a1/conteudo" }],
+  "respondeA": null,
+  "criadaEm": "2026-10-10T23:14:05.112Z",
+  "editadaEm": null
+}
+```
+
+### Iniciar uma transmissão
+
+```http
+POST /v1/canais/0199c1a2-9d00-7e11-8a22-334455667788/transmissoes
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+
+{ "perfil": "1080p60", "comAudio": true, "titulo": "Hollow Knight" }
+```
+
+```http
+HTTP/1.1 201 Created
+
+{
+  "id": "0199c1c4-1a2b-7c3d-9e4f-5a6b7c8d9e0f",
+  "status": "RESERVADA",
+  "reservaExpiraEm": "2026-10-10T23:20:31Z",
+  "parametros": {
+    "captura": { "larguraMax": 1920, "alturaMax": 1080, "fps": 60 },
+    "codec": "h264",
+    "contentHint": "motion",
+    "degradationPreference": "maintain-framerate",
+    "camadas": [
+      { "rid": "f", "reduzirPor": 1,   "fpsMax": 60, "bitrateMaxKbps": 8000 },
+      { "rid": "h", "reduzirPor": 1.5, "fpsMax": 60, "bitrateMaxKbps": 3000 },
+      { "rid": "q", "reduzirPor": 3,   "fpsMax": 30, "bitrateMaxKbps": 600 }
+    ],
+    "audio": { "habilitado": true, "stereo": true, "bitrateKbps": 128 }
+  }
+}
+```
+
+Em seguida, o cliente publica a trilha com exatamente esses parâmetros. No SDK JavaScript do LiveKit, isso significa preencher `screenShareEncoding` e `screenShareSimulcastLayers` com os valores recebidos e passar `degradationPreference` nas opções de publicação. Os *presets* prontos do SDK para tela param em 30 fps, então os de 60 fps são sempre personalizados.
+
+### Webhook do LiveKit (resumido)
+
+```http
+POST /webhooks/livekit
+Authorization: eyJhbGciOiJIUzI1NiJ9...   (JWT assinado com o API secret; contém o sha256 do corpo)
+Content-Type: application/webhook+json
+
+{
+  "event": "track_published",
+  "id": "EV_3kq9ZmTn8RwA",
+  "createdAt": "1760138412",
+  "room": { "sid": "RM_x8Yt2", "name": "voz-0199c1a2-9d00-7e11-8a22-334455667788" },
+  "participant": { "sid": "PA_7HnQ1", "identity": "0199a001-...", "name": "Kayo" },
+  "track": { "sid": "TR_b4Kd9", "type": "VIDEO", "source": "SCREEN_SHARE", "width": 1920, "height": 1080, "simulcast": true, "mimeType": "video/H264" }
+}
+```
+
+Confira os nomes exatos dos campos na versão do LiveKit que você usa e prefira o `WebhookReceiver` do SDK de servidor para Java/Kotlin (`io.livekit:livekit-server`). Se validar à mão, leia o corpo como bytes (`String` ou `byte[]` no controller, nunca um objeto já desserializado) e confira o hash antes de qualquer coisa.
+
+### Erros (Problem Details, RFC 9457)
+
+```json
+{
+  "type": "https://resenha.example/problemas/limite-de-transmissoes",
+  "title": "O canal já tem 3 transmissões ao vivo",
+  "status": 409,
+  "detail": "Encerre uma transmissão ou espere alguém parar.",
+  "instance": "/v1/canais/0199c1a2-9d00-7e11-8a22-334455667788/transmissoes",
+  "transmissoesAtivas": 3,
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+| Status | `type` (sufixo) | Quando |
+|---|---|---|
+| 400 | `requisicao-invalida` | Validação; extensão `erros` com `campo` e `mensagem` |
+| 401 | `nao-autenticado` | Token ausente, expirado, com audiência errada; webhook com assinatura inválida |
+| 403 | `acesso-negado` | Papel insuficiente ou alvo de papel igual ou superior (RN-10) |
+| 403 | `banido` | RN-17 |
+| 404 | `recurso-nao-encontrado` | Inexistente **ou de comunidade da qual você não é membro** (RN-12) |
+| 409 | `handle-em-uso`, `nome-em-uso` | RN-03, RN-19 |
+| 409 | `dono-nao-pode-sair`, `possui-comunidades` | RN-09, RN-78 |
+| 409 | `canal-cheio`, `fora-do-canal-de-voz` | RN-50, RN-52, RN-66 |
+| 409 | `ja-transmitindo`, `limite-de-transmissoes` | RN-56 |
+| 410 | `convite-invalido` | RN-15 |
+| 413 | `anexo-muito-grande`, `lote-muito-grande` | RN-45, RN-71 |
+| 415 | `tipo-de-anexo-nao-suportado` | RN-45, RN-46 |
+| 422 | `limite-atingido`, `perfil-nao-permitido`, `confirmacao-invalida`, `audio-do-jogo-indisponivel` | RN-06, RN-17, RN-56, RN-07, RN-65 |
+| 429 | `limite-excedido` | Rate limits, com `Retry-After` |
+| 503 | `midia-indisponivel` | LiveKit fora ou lento (RN-57), com `Retry-After` |
+
+## Contrato do gateway
+
+Documentado em `contracts/gateway/` (AsyncAPI 3 ou JSON Schema por evento). A versão vai na URL (`?v=1`); dentro de uma versão, só mudanças compatíveis (campos novos opcionais, eventos novos que o cliente ignora se não conhecer).
+
+```text
+servidor → HELLO          {"op":"HELLO","d":{"intervaloHeartbeatMs":30000}}
+cliente  → IDENTIFY       {"op":"IDENTIFY","d":{"token":"eyJ...","cliente":{"tipo":"DESKTOP","versao":"1.0.0"}}}
+servidor → READY          {"op":"DISPATCH","t":"READY","s":1,"d":{"sessaoId":"gw_8Kq2...","usuario":{...},"comunidades":[...],"presencas":[...]}}
+cliente  → HEARTBEAT      {"op":"HEARTBEAT","d":{"ultimoSeq":1}}
+servidor → HEARTBEAT_ACK  {"op":"HEARTBEAT_ACK"}
+servidor → DISPATCH       {"op":"DISPATCH","t":"MENSAGEM_CRIADA","s":2,"d":{"comunidadeId":"...","mensagem":{...,"seq":1842,"nonce":"c7a1..."}}}
+cliente  → RESUME         {"op":"RESUME","d":{"sessaoId":"gw_8Kq2...","token":"eyJ...","ultimoSeq":57}}
+servidor → RESUMED        {"op":"RESUMED","d":{"reenviados":6}}
+cliente  → REAUTENTICAR   {"op":"REAUTENTICAR","d":{"token":"eyJ..."}}
+cliente  → ATUALIZAR_PRESENCA {"op":"ATUALIZAR_PRESENCA","d":{"status":"NAO_PERTURBE"}}
+servidor → RECONECTAR     {"op":"RECONECTAR"}
+servidor → SESSAO_INVALIDA {"op":"SESSAO_INVALIDA","d":{"retomavel":false}}
+```
+
+**Eventos (`t` do `DISPATCH`):** `READY`, `MENSAGEM_CRIADA`, `MENSAGEM_EDITADA`, `MENSAGEM_EXCLUIDA`, `MENSAGENS_EXCLUIDAS_EM_LOTE`, `DIGITANDO`, `PRESENCA_ATUALIZADA`, `ESTADO_VOZ_ATUALIZADO`, `TRANSMISSAO_INICIADA`, `TRANSMISSAO_ATUALIZADA`, `TRANSMISSAO_ENCERRADA`, `CANAL_CRIADO`, `CANAL_ATUALIZADO`, `CANAL_EXCLUIDO`, `CANAIS_REORDENADOS`, `MEMBRO_ENTROU`, `MEMBRO_ATUALIZADO`, `MEMBRO_SAIU`, `COMUNIDADE_ATUALIZADA`, `COMUNIDADE_ADICIONADA` (você entrou numa comunidade) e `COMUNIDADE_REMOVIDA` (saiu, foi expulso ou a comunidade foi excluída).
+
+**Códigos de fechamento:**
+
+| Código | Significado | O cliente deve |
+|---|---|---|
+| `4000` | Erro desconhecido | Reconectar com `RESUME` |
+| `4001` | `op` desconhecido | Corrigir o cliente; reconectar |
+| `4002` | Payload inválido ou maior que 4 KB | Corrigir o cliente; reconectar |
+| `4003` | Não identificado em 10 s, ou operação antes do `IDENTIFY` | Reconectar com `IDENTIFY` |
+| `4004` | Autenticação falhou (token inválido ou expirado) | Renovar o token; só então reconectar |
+| `4005` | `IDENTIFY` repetido na mesma conexão | Corrigir o cliente |
+| `4007` | `ultimoSeq` inválido no `RESUME` (maior que o último enviado) | `IDENTIFY` novo |
+| `4008` | Limite de quadros excedido | Reconectar com backoff |
+| `4009` | Heartbeat atrasado | Reconectar com `RESUME` |
+| `4010` | Sessão encerrada pelo servidor (conta excluída ou desativada) | Não reconectar; voltar ao login |
+| `4011` | Limite de 5 sessões simultâneas | Fechar outra sessão |
+
+**Reconexão do cliente:** backoff exponencial com jitter (1 s, 2 s, 4 s … até 30 s); `RESUME` se tiver `sessaoId`, `IDENTIFY` se não tiver ou se receber `SESSAO_INVALIDA`.
+
+## Arquitetura
+
+<Figura legenda="Plano de controle e plano de mídia. O vídeo vai do app direto ao SFU e do SFU aos amigos; o backend Java nunca toca na mídia, só decide quem pode publicar e assistir e reage aos webhooks">
+<svg viewBox="0 0 860 430" width="860" role="img" aria-labelledby="rs-arq-t rs-arq-d">
+  <title id="rs-arq-t">Arquitetura do Resenha</title>
+  <desc id="rs-arq-d">O app desktop e o navegador falam com o Caddy por HTTPS e WebSocket, que encaminha para duas réplicas do resenha-api. A mídia WebRTC vai dos clientes direto ao LiveKit. O resenha-api chama a API de servidor do LiveKit e recebe webhooks assinados. Abaixo, Keycloak, PostgreSQL, Redis, o armazenamento S3 (SeaweedFS) e a pilha de observabilidade.</desc>
+  <defs><marker id="rs-arq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <path d="M85 70 L85 24 L750 24 L750 58" class="d-line" marker-start="url(#rs-arq-seta)" marker-end="url(#rs-arq-seta)"/>
+  <text x="420" y="16" text-anchor="middle" class="d-label">mídia WebRTC (DTLS-SRTP sobre UDP, TURN se preciso): clientes ↔ SFU, sem passar pela API</text>
+  <rect x="10" y="70" width="150" height="56" rx="8" class="d-box"/>
+  <text x="85" y="94" text-anchor="middle" class="d-text">App desktop</text>
+  <text x="85" y="113" text-anchor="middle" class="d-label">Electron · captura 60 fps</text>
+  <rect x="10" y="150" width="150" height="56" rx="8" class="d-box"/>
+  <text x="85" y="174" text-anchor="middle" class="d-text">Navegador</text>
+  <text x="85" y="193" text-anchor="middle" class="d-label">assistir · chat · voz</text>
+  <path d="M160 98 L198 98" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M160 178 L198 178" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <rect x="200" y="70" width="110" height="136" rx="8" class="d-info"/>
+  <text x="255" y="128" text-anchor="middle" class="d-title">Caddy</text>
+  <text x="255" y="148" text-anchor="middle" class="d-label">TLS automático</text>
+  <text x="255" y="164" text-anchor="middle" class="d-label">HTTPS · WSS</text>
+  <path d="M310 138 L348 138" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <rect x="350" y="60" width="250" height="250" rx="10" class="d-accent"/>
+  <text x="475" y="88" text-anchor="middle" class="d-title">resenha-api (2 réplicas)</text>
+  <text x="475" y="108" text-anchor="middle" class="d-label">Spring Boot 4 · monólito modular</text>
+  <text x="370" y="140" class="d-label">identidade · comunidades</text>
+  <text x="370" y="162" class="d-label">gateway WebSocket</text>
+  <text x="370" y="184" class="d-label">mensagens · anexos</text>
+  <text x="370" y="206" class="d-label">voz · transmissões</text>
+  <text x="370" y="228" class="d-label">qualidade · moderação</text>
+  <text x="370" y="260" class="d-mono">virtual threads</text>
+  <text x="370" y="280" class="d-mono">Spring Modulith</text>
+  <rect x="650" y="60" width="200" height="120" rx="10" class="d-violet"/>
+  <text x="750" y="90" text-anchor="middle" class="d-title">LiveKit (SFU)</text>
+  <text x="750" y="112" text-anchor="middle" class="d-label">encaminha sem decodificar</text>
+  <text x="750" y="130" text-anchor="middle" class="d-label">simulcast · dynacast</text>
+  <text x="750" y="148" text-anchor="middle" class="d-label">TURN embutido</text>
+  <path d="M600 100 L648 100" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M648 150 L602 150" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <text x="650" y="202" class="d-label">→ API de servidor: permissões,</text>
+  <text x="650" y="218" class="d-label">   silenciar, remover, listar</text>
+  <text x="650" y="240" class="d-label">← webhooks assinados</text>
+  <rect x="200" y="350" width="120" height="56" rx="8" class="d-info"/>
+  <text x="260" y="374" text-anchor="middle" class="d-text">Keycloak</text>
+  <text x="260" y="393" text-anchor="middle" class="d-label">OIDC · PKCE</text>
+  <rect x="345" y="350" width="120" height="56" rx="8" class="d-box"/>
+  <text x="405" y="374" text-anchor="middle" class="d-text">PostgreSQL 18</text>
+  <text x="405" y="393" text-anchor="middle" class="d-label">dados duráveis</text>
+  <rect x="480" y="350" width="120" height="56" rx="8" class="d-ok"/>
+  <text x="540" y="374" text-anchor="middle" class="d-text">Redis</text>
+  <text x="540" y="393" text-anchor="middle" class="d-label">presença · Pub/Sub</text>
+  <rect x="615" y="350" width="110" height="56" rx="8" class="d-box"/>
+  <text x="670" y="374" text-anchor="middle" class="d-text">SeaweedFS</text>
+  <text x="670" y="393" text-anchor="middle" class="d-label">anexos · S3</text>
+  <rect x="740" y="350" width="110" height="56" rx="8" class="d-info"/>
+  <text x="795" y="374" text-anchor="middle" class="d-text">Observab.</text>
+  <text x="795" y="393" text-anchor="middle" class="d-label">OTel · LGTM</text>
+  <path d="M380 310 L290 348" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M405 310 L405 348" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M540 310 L540 348" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M590 310 L655 348" class="d-line" marker-end="url(#rs-arq-seta)"/>
+  <path d="M600 290 L785 348" class="d-line" marker-end="url(#rs-arq-seta)"/>
+</svg>
+</Figura>
+
+### Por que a mídia não passa pelo Java
+
+A conta que decide a arquitetura: uma transmissão 1080p60 com simulcast sobe **11,6 Mbps** do computador do streamer. Com 4 amigos assistindo:
+
+| Modelo | Upload do streamer | O que o servidor faz | Veredito |
+|---|---|---|---|
+| P2P em malha (cada amigo recebe direto do streamer) | 4 × 8 Mbps = **32 Mbps**, e cresce com cada espectador; sem simulcast, o pior espectador derruba a qualidade de todos | Só sinalização | Inviável para a maioria dos uploads domésticos |
+| MCU (servidor decodifica e recodifica) | 8 Mbps | Decodifica e recodifica 1080p60: GPU ou muita CPU por transmissão | Caro e adiciona latência |
+| **SFU (LiveKit)** | **11,6 Mbps, fixo**, não importa quantos assistem | Reencaminha pacotes; escolhe a camada por espectador | **Escolhido** |
+| SFU próprio em Java | 11,6 Mbps | Você implementa ICE, DTLS-SRTP, RTP/RTCP, NACK, controle de congestionamento, troca de camadas… | Anos de trabalho; o Jitsi Videobridge (Java e Kotlin) mostra que é possível, mas não é o que um time de produto faria |
+
+O valor de mercado está no **plano de controle**: identidade, permissões, estado em tempo real, consistência com um sistema externo e operação. É isso que o projeto pede de você, e o ADR-002 registra a decisão com estes números.
+
+### O fluxo de uma transmissão
+
+<Figura legenda="Do clique em Transmitir ao primeiro quadro na tela do amigo. O backend reserva a vaga e concede a permissão; quem confirma que a transmissão começou é o webhook, não o cliente">
+<svg viewBox="0 0 860 440" width="860" role="img" aria-labelledby="rs-seq-t rs-seq-d">
+  <title id="rs-seq-t">Sequência para iniciar e assistir a uma transmissão</title>
+  <desc id="rs-seq-d">O streamer pede a transmissão à API, que reserva a vaga no Redis e concede a permissão de tela no LiveKit, devolvendo os parâmetros de codificação. O streamer publica a trilha com simulcast no LiveKit, que envia o webhook track_published à API. A API avisa os amigos pelo gateway e um amigo clica em Assistir, assinando a trilha no LiveKit.</desc>
+  <defs><marker id="rs-seq-seta" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="30" y="20" width="120" height="36" rx="8" class="d-box"/>
+  <text x="90" y="43" text-anchor="middle" class="d-text">Streamer</text>
+  <rect x="230" y="20" width="120" height="36" rx="8" class="d-accent"/>
+  <text x="290" y="43" text-anchor="middle" class="d-text">resenha-api</text>
+  <rect x="390" y="20" width="120" height="36" rx="8" class="d-ok"/>
+  <text x="450" y="43" text-anchor="middle" class="d-text">Redis</text>
+  <rect x="550" y="20" width="120" height="36" rx="8" class="d-violet"/>
+  <text x="610" y="43" text-anchor="middle" class="d-text">LiveKit</text>
+  <rect x="720" y="20" width="120" height="36" rx="8" class="d-box"/>
+  <text x="780" y="43" text-anchor="middle" class="d-text">Amigos</text>
+  <path d="M90 56 L90 425" class="d-line"/>
+  <path d="M290 56 L290 425" class="d-line"/>
+  <path d="M450 56 L450 425" class="d-line"/>
+  <path d="M610 56 L610 425" class="d-line"/>
+  <path d="M780 56 L780 425" class="d-line"/>
+  <text x="190" y="88" text-anchor="middle" class="d-label">1. POST /transmissoes (1080p60)</text>
+  <path d="M92 96 L286 96" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="370" y="128" text-anchor="middle" class="d-label">2. reserva atômica (Lua)</text>
+  <path d="M292 136 L446 136" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="450" y="168" text-anchor="middle" class="d-label">3. UpdateParticipant (+SCREEN_SHARE)</text>
+  <path d="M292 176 L606 176" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="190" y="208" text-anchor="middle" class="d-label">4. 201 + parâmetros de codificação</text>
+  <path d="M286 216 L94 216" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="350" y="248" text-anchor="middle" class="d-label">5. publica a tela: 1080p60 · 720p60 · 360p30</text>
+  <path d="M92 256 L606 256" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="450" y="288" text-anchor="middle" class="d-label">6. webhook track_published (assinado)</text>
+  <path d="M606 296 L294 296" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="535" y="328" text-anchor="middle" class="d-label">7. TRANSMISSAO_INICIADA pelo gateway</text>
+  <path d="M292 336 L776 336" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="695" y="368" text-anchor="middle" class="d-label">8. "Assistir": assina a trilha</text>
+  <path d="M776 376 L614 376" class="d-line" marker-end="url(#rs-seq-seta)"/>
+  <text x="695" y="406" text-anchor="middle" class="d-label">9. camada escolhida pela banda</text>
+  <path d="M614 414 L776 414" class="d-line" marker-end="url(#rs-seq-seta)"/>
+</svg>
+</Figura>
+
+Dois detalhes deste fluxo valem perguntas de entrevista:
+
+- **Quem confirma é o webhook (passo 6), não o cliente.** Se o cliente dissesse "comecei", um cliente modificado poderia mentir, e uma queda entre publicar e avisar deixaria o estado errado. O LiveKit é a fonte da verdade sobre o que está publicado; o backend é a fonte da verdade sobre o que **pode** ser publicado.
+- **A permissão é concedida só depois da reserva (passo 3).** O token de voz nunca permite tela (RN-49). Assim, o limite de 3 transmissões por canal não depende de o cliente se comportar.
+
+### Módulos do `resenha-api`
+
+| Módulo | Responsabilidade | Fala com |
+|---|---|---|
+| `identidade` | Provisionamento, perfil, exclusão e exportação | Keycloak (API de admin), `anexos` |
+| `comunidades` | Comunidades, membros, papéis, canais, convites, banimentos; a **matriz de permissões** como API pública do módulo | — |
+| `gateway` | WebSocket, sessões, buffer, presença, fan-out pelo Redis | escuta eventos de todos os módulos |
+| `mensagens` | Mensagens, `seq`, leitura, digitando | `comunidades` (permissão), `anexos` |
+| `anexos` | URLs pré-assinadas, confirmação, limpeza | armazenamento S3 |
+| `voz` | Token de mídia, vagas, estado de voz, webhooks, reconciliação, moderação de voz | LiveKit |
+| `transmissoes` | Reserva, permissão de tela, perfis, ciclo de vida | `voz`, LiveKit |
+| `qualidade` | Telemetria, janelas, resumos, métricas | — |
+| `moderacao` | Expulsão, banimento, auditoria | `comunidades`, `voz`, `transmissoes` |
+
+Os módulos publicam eventos de domínio (`MensagemCriada`, `MembroRemovido`, `TransmissaoIniciada` …) pelo Spring Modulith, com o registro de publicações ligado. O `gateway` escuta esses eventos **depois do commit** e os publica no Redis; nenhum evento sai para os clientes antes de o dado estar gravado. O ArchUnit e o `ApplicationModules.verify()` garantem que um módulo só usa a API pública de outro.
+
+**Por que um monólito modular e não microsserviços.** O gateway tem um perfil de carga diferente (conexões longas), mas, no volume deste produto, duas réplicas do mesmo artefato dão conta e evitam consistência distribuída entre "quem é membro" e "quem recebe o evento". O ADR-004 registra o critério de extração: separar o gateway quando o número de conexões exigir escalar os dois de forma diferente, ou quando um deploy da API passar a derrubar conexões que deveriam ficar de pé.
+
+### Organização do repositório
+
+```text
+resenha/
+├── backend/                      # Spring Boot 4, Java 25, pacotes por módulo (Spring Modulith)
+├── cliente/
+│   ├── src/main/                 # processo principal do Electron: janelas, seletor de fonte, login PKCE
+│   ├── src/preload/              # ponte mínima com contextBridge
+│   └── src/renderer/             # interface (React + TypeScript sugerido), também empacotada para web
+├── nativo/audio-processo/        # se o ADR-010 escolher a captura de áudio por processo
+├── ferramentas/
+│   ├── prova-de-vida/            # protótipo de mídia do marco 1
+│   ├── relogio/                  # página do método do relógio (marco 8)
+│   ├── cliente-sintetico/        # Java: milhares de clientes do gateway com virtual threads
+│   ├── k6/                       # carga na API REST
+│   └── rede-degradada/           # contêiner com tc netem para o espectador
+├── contracts/{openapi,gateway}/
+├── deploy/{dev,producao,grafana}/      # dev/ tem o Compose, o realm do Keycloak, o s3.json e o livekit.yaml
+└── docs/{adr,runbooks,slo,custo,privacidade.md}
+```
+
+### Decisões para registrar em ADRs
+
+Cada ADR tem contexto, opções, decisão, consequências e "como saberemos que erramos". As recomendações abaixo são uma base; você pode decidir diferente, desde que justifique.
+
+| ADR | Pergunta | Opções e trade-offs | Recomendação de base |
+|---|---|---|---|
+| 001 | A meta de 60 fps é viável? | Resultado medido do protótipo do marco 1: fps, resolução, codificador, uso de GPU e CPU | Seguir só se o protótipo sustentar ≥ 55 fps na sua máquina; senão, ajustar a meta antes de construir |
+| 002 | Como distribuir a mídia? | Malha P2P × MCU × SFU pronto × SFU próprio (tabela acima) × Media over QUIC (WebTransport + WebCodecs: promissor, mas ainda rascunho no IETF; você escreveria codificação, controle de banda e troca de qualidade à mão) × HLS/LL-HLS (2 a 10 s de atraso) | SFU pronto (LiveKit); reavaliar MoQ quando virar RFC e houver um servidor com SDK maduro |
+| 003 | LiveKit auto-hospedado ou gerenciado? | Auto-hospedado (controle, custo previsível, você opera as portas UDP e o TURN) × LiveKit Cloud (zero operação; custo por uso; dependência) | Auto-hospedado, com o gerenciado como plano B documentado e o custo comparado |
+| 004 | Monólito modular ou serviços? | Um artefato com módulos e 2 réplicas × gateway separado × microsserviços | Monólito modular, com critério de extração do gateway |
+| 005 | Protocolo de tempo real | WebSocket com protocolo próprio (controle total, retomada) × STOMP (pronto no Spring; menos controle sobre sessão e retomada) × SSE + REST (simples; sem op de heartbeat e presença do cliente) × Socket.IO | WebSocket próprio, enxuto, só de leitura para o cliente |
+| 006 | Fan-out entre réplicas | Redis Pub/Sub (simples, no máximo uma vez; compensado por `seq` e `SESSAO_INVALIDA`) × Redis Streams (durável; mais estado por consumidor) × Kafka (durável; peça pesada para este volume) | Redis Pub/Sub, com a perda tratada explicitamente (RN-31, RN-38) |
+| 007 | Ordem das mensagens | `seq` por canal sem lacunas (contenção por canal; detecção de perda) × UUID v7 (ordenável, mas com lacunas: não detecta perda) × timestamp (empates e relógios) | `seq` por canal; mostrar no teste de carga que a contenção não é gargalo no volume-alvo |
+| 008 | Tecnologia do cliente | Electron (Chromium inteiro, `desktopCapturer`, áudio por loopback, instalador grande) × Tauri (leve; depende do WebView do sistema e de plugins para captura) × só web (sem seletor próprio, sem áudio do jogo controlado) | Electron, com o Electron Forge (template Vite + TypeScript) para criar, empacotar e publicar |
+| 009 | Codec e perfis | H.264 (hardware quase universal) × VP9 (bom, mas pesado em software a 1080p60) × AV1 (melhor por bit; hardware só em GPUs recentes) | H.264 padrão, AV1 opcional com reserva; tetos de bitrate ajustados pela medição |
+| 010 | Áudio do jogo sem eco | Loopback **por processo** do Windows, incluindo só a árvore de processos do jogo (sem eco; exige módulo nativo e Windows recente) × loopback do sistema excluindo o próprio app, se a sua versão do Electron/Chromium oferecer (verifique) × sem áudio do jogo | Escolha pela prova: o critério da RN-65 precisa passar |
+| 011 | Login do app desktop | Navegador do sistema com PKCE e redirecionamento de loopback, como pede a RFC 8252 × janela de login embutida (a RFC 8252 desaconselha: o app veria a senha) | Navegador do sistema + PKCE com porta de loopback fixa e configurável (`127.0.0.1:47615`), registrada exatamente assim no Keycloak; tokens guardados com `safeStorage` do Electron |
+| 012 | Upload de anexos | PUT pré-assinado com tipo e tamanho assinados, mais verificação na confirmação (funciona em qualquer S3 compatível) × POST com política (limite no próprio armazenamento, mas nem todo S3 compatível implementa) × upload pela API (simples; ocupa a API e a banda dela) | PUT pré-assinado com verificação na confirmação |
+| 013 | Onde hospedar | Uma VPS com IP público (simples, barata, ponto único de falha) × nuvem gerenciada (resiliente, cara para banda) × servidor em casa (CGNAT, upload limitado, IP dinâmico) | Uma VPS, com backup, runbooks e a limitação assumida |
+| 014 | Armazenamento de objetos | MinIO (o repositório da edição comunitária foi arquivado e não há imagens oficiais novas desde outubro de 2025) × SeaweedFS (Apache 2.0, imagem oficial, S3 com URLs pré-assinadas) × Garage (leve; mais configuração inicial) × S3 gerenciado (Cloudflare R2, Backblaze B2 ou o do provedor da VPS; zero operação, custo por uso) | SeaweedFS no desenvolvimento e na VPS; S3 gerenciado como alternativa documentada. Todo acesso pelo AWS SDK, para trocar só a configuração |
+
+<Callout tipo="erro" titulo="Confiar no cliente para os limites">
+"O app só mostra o botão Transmitir se houver vaga" não é um limite: qualquer pessoa com o token de mídia e o SDK do LiveKit publica o que a permissão deixar. Os limites deste projeto são impostos em três lugares que o cliente não controla: a permissão no token (RN-49), a permissão concedida em tempo real (RN-57) e a reação aos webhooks (RN-64).
+</Callout>
+
+## Antes de começar
+
+Esta parte não é um marco, mas leva umas 4 horas (já contadas no marco 1) e evita as surpresas que costumam matar projetos assim no segundo mês: hardware que não dá conta, rede que não deixa o vídeo passar, prazo que ninguém estimou.
+
+### O que você precisa ter
+
+| Item | Mínimo | Por quê | Como conferir |
+|---|---|---|---|
+| Computador de quem transmite | Windows 10 ou 11 de 64 bits, placa de vídeo com codificador H.264 em hardware, 16 GB de RAM (32 GB é confortável) | Durante o desenvolvimento, o mesmo PC roda o jogo, a IDE e uns 3 a 4 GB de contêineres | Marco 1, passo 4: o `encoderImplementation` mostra se a codificação é por hardware |
+| Segundo dispositivo | Qualquer notebook ou PC com Chrome na mesma rede | Medir a transmissão entre duas máquinas de verdade (ADR-001) | — |
+| Rede de quem transmite | Upload ≥ 15 Mbps, de preferência por cabo | É o mínimo do perfil `1080p60` (RN-58) | Teste de velocidade; anote o resultado no ADR-001 |
+| Um amigo fora da sua rede | Alguém disposto a testar por 30 minutos no marco 6 | Só alguém de fora prova que o vídeo atravessa NAT e firewall | — |
+| Software | JDK 25, Docker Desktop (com WSL 2), Node.js LTS, Git, Google Chrome, IntelliJ (ou outra IDE Java) e VS Code (para TypeScript) | Ambiente completo | [Aula de ambiente](../../../aulas/00-comece-aqui/02-ambiente/) |
+| Contas | GitHub (obrigatória); um provedor de VPS com cobrança por hora (marco 6); um domínio, próprio ou de DNS dinâmico gratuito (marco 9) | Ensaio e produção | — |
+
+### Orçamento
+
+Defina o teto antes de gastar, e anote em `docs/custo/orcamento.md`:
+
+- **VPS para o ensaio do marco 6:** algumas horas de uma máquina cobrada por hora, destruída no fim do dia.
+- **VPS de produção:** a partir do marco 9. Comece com 4 vCPUs e 8 GB e confirme o tamanho com as medições do marco 8. Confira se o plano inclui tráfego suficiente para a conta da seção de custo (cerca de 1,3 TB por mês no cenário de referência).
+- **Domínio:** opcional; um subdomínio gratuito de DNS dinâmico funciona com o Caddy.
+- **Assinatura de código do instalador:** fora da v1 (o SmartScreen avisa, e o README explica).
+
+### Cronograma
+
+As horas somam 226. Com 15 horas por semana, são umas 15 semanas de trabalho mais 3 de folga, perto de 4 meses e meio. Com 10 horas por semana, conte uns 6 meses.
+
+| Semanas (15 h/semana) | Marco | Ponto de decisão no fim |
+|---|---|---|
+| 1–2 | 1 · Fundação e prova de vida | **Decisão 1:** 60 fps é viável? |
+| 3 | 2 · Identidade | — |
+| 4–5 | 3 · Comunidades | — |
+| 5–7 | 4 · Gateway | — |
+| 7–8 | 5 · Chat | — |
+| 9–10 | 6 · Voz | **Decisão 2:** a mídia atravessa a internet? |
+| 10–12 | 7 · Transmissão | **Decisão 3:** áudio do jogo entra na v1? |
+| 12–14 | 8 · Qualidade | **Decisão 4:** os SLOs fecham? |
+| 14–15 | 9 · Produção | Release `v1.0.0` |
+| 16–18 | Folga | Imprevistos, ou "Para ir além" |
+
+**Regra de atraso:** se um marco passar 50% do previsto, pare e corte escopo com a lista do [núcleo que não se corta](#escopo). Não empurre o atraso para frente.
+
+### Organize o trabalho antes de escrever código
+
+1. Leia esta especificação inteira uma vez e anote as dúvidas em `docs/duvidas.md`. Responda cada uma com uma decisão sua; as que mudarem a arquitetura viram ADR.
+2. Crie o repositório público `resenha` com a estrutura da seção [Organização do repositório](#organização-do-repositório), um README de uma linha e a licença.
+3. Crie um quadro no GitHub Projects com as colunas "A fazer", "Fazendo" e "Feito". Transforme **cada passo** dos marcos abaixo numa issue com o nome `M<marco>-P<passo> <título> (RN-xx)`, por exemplo `M3-P4 Aceite atômico do convite (RN-16)`, e com o "Confira" do passo como critério de aceite. São perto de 90 issues; criar todas agora é o que faz o plano existir antes do código.
+4. Combine o ritual: um PR por passo ou por grupo pequeno de passos, um PR de fechamento por marco com a definição de pronto marcada, e 15 minutos por semana para comparar horas gastas com as previstas numa planilha simples.
+
+**Confira:** o quadro tem as issues de todos os marcos, e `docs/duvidas.md` não tem pergunta sem resposta.
+
+## Plano de execução
+
+**Como usar.** Cada marco tem objetivo, passo a passo, entregáveis e definição de pronto. Cada passo termina com um **Confira**, a evidência de que ele acabou. Não avance com um "Confira" falhando: o próximo passo sempre depende dele. Os pontos de decisão dizem o que fazer quando a realidade não bate com o plano, então nenhuma surpresa precisa ser improvisada.
+
+**Começo** (marco 1): o esqueleto existe **e a mídia foi provada** antes de qualquer regra de negócio. **Meio** (marcos 2 a 7): cada marco é uma fatia vertical que termina com algo que dá para usar no app. **Fim** (marcos 8 e 9): você mede, coloca em produção, publica o instalador e entrega para os amigos.
+
+**Dependências:** 1 → 2 → 3 → 4 → 5. O 6 depende do 3 (permissões) e do 4 (eventos). O 7 depende do 6. O 8 depende do 7. O 9 depende do 8. Os marcos 5 e 6 podem ser feitos em qualquer ordem entre si.
+
+<Marco id="fundacao" numero={1} titulo="Fundação e prova de vida da mídia" horas={24}>
+
+**Objetivo:** provar que 1080p a 60 fps é viável no seu hardware e na sua rede, e deixar o esqueleto de ponta a ponta pronto. Inclui as 4 horas de [Antes de começar](#antes-de-começar).
+
+**Passo a passo**
+
+1. **Infraestrutura local.** Crie `deploy/dev/compose.yaml`. Fixe a versão de cada imagem (a que você testou), em vez de `latest`.
+
+   ```yaml
+   name: resenha
+   services:
+     postgres:
+       image: postgres:18
+       environment: { POSTGRES_USER: resenha, POSTGRES_PASSWORD: resenha, POSTGRES_DB: resenha }
+       ports: ["127.0.0.1:5432:5432"]
+       volumes:
+         - pg:/var/lib/postgresql                       # a partir do 18, monte o diretório pai
+         - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # CREATE DATABASE keycloak;
+       healthcheck: { test: ["CMD-SHELL", "pg_isready -U resenha"], interval: 5s, retries: 20 }
+     redis:
+       image: redis:8
+       ports: ["127.0.0.1:6379:6379"]
+     keycloak:
+       image: quay.io/keycloak/keycloak:26.x          # troque pela versão exata
+       command: start-dev --import-realm
+       environment:
+         KC_BOOTSTRAP_ADMIN_USERNAME: admin
+         KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+         KC_DB: postgres
+         KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+         KC_DB_USERNAME: resenha
+         KC_DB_PASSWORD: resenha
+       ports: ["127.0.0.1:8180:8080"]
+       volumes: ["./keycloak:/opt/keycloak/data/import"]
+       depends_on: { postgres: { condition: service_healthy } }
+     s3:
+       image: chrislusf/seaweedfs:<versão>
+       command: server -ip.bind=0.0.0.0 -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+       ports: ["127.0.0.1:8333:8333"]
+       volumes: ["./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro", "s3:/data"]
+     mailpit:
+       image: axllent/mailpit
+       ports: ["127.0.0.1:1025:1025", "127.0.0.1:8025:8025"]
+     livekit:
+       image: livekit/livekit-server:<versão>
+       command: --config /etc/livekit.yaml
+       ports: ["7880:7880", "7881:7881", "7882:7882/udp"]   # sem 127.0.0.1: a outra máquina precisa alcançar
+       volumes: ["./livekit/livekit.yaml:/etc/livekit.yaml:ro"]
+     lgtm:
+       image: grafana/otel-lgtm
+       ports: ["127.0.0.1:3000:3000", "127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
+   volumes: { pg: {}, s3: {} }
+   ```
+
+   O `s3.json` do SeaweedFS define uma identidade com chave de acesso e segredo. Sem ele, o S3 aceita escrita anônima. **Confira:** `docker compose up -d` e, depois de 2 minutos, `docker compose ps` mostra tudo rodando; o Grafana abre em `localhost:3000`, o Keycloak em `localhost:8180` e o Mailpit em `localhost:8025`.
+
+2. **LiveKit alcançável na rede local.** Crie `deploy/dev/livekit/livekit.yaml`:
+
+   ```yaml
+   port: 7880
+   bind_addresses: ["0.0.0.0"]
+   rtc:
+     tcp_port: 7881
+     udp_port: 7882            # uma porta UDP só, fácil de liberar no firewall
+     use_external_ip: false
+     node_ip: 192.168.0.10     # o IP da SUA máquina na rede local (ipconfig)
+   keys:
+     resenha-dev: troque-por-um-segredo-com-32-caracteres-ou-mais
+   webhook:
+     api_key: resenha-dev
+     urls: ["http://host.docker.internal:8080/webhooks/livekit"]
+   ```
+
+   Sem o `node_ip`, o LiveKit dentro do Docker anuncia o IP interno do contêiner, e a outra máquina não consegue mandar mídia. Confira os nomes das chaves no `config-sample.yaml` do repositório do LiveKit, na versão que você fixou. Libere as portas 7880 e 7881 TCP e 7882 UDP no Firewall do Windows para a rede privada. **Confira:** do segundo dispositivo, `http://<seu-ip>:7880` responde `OK`.
+
+3. **Prova de vida: publicar.** Crie `ferramentas/prova-de-vida/` com `npm create vite@latest prova-de-vida -- --template vanilla-ts` e `npm i livekit-client`. Gere dois tokens com o CLI do LiveKit (`lk token create --api-key resenha-dev --api-secret <segredo> --join --room prova --identity streamer --valid-for 24h`, e outro com `--identity espectador`). A página de publicação, em essência:
+
+   ```ts
+   import { Room, Track, VideoPreset, createLocalScreenTracks } from 'livekit-client';
+
+   const room = new Room({ adaptiveStream: true, dynacast: true });
+   await room.connect('ws://192.168.0.10:7880', TOKEN_STREAMER);
+   const [tela] = await createLocalScreenTracks({
+     audio: false,
+     resolution: { width: 1920, height: 1080, frameRate: 60 },
+     contentHint: 'motion',
+   });
+   await room.localParticipant.publishTrack(tela, {
+     source: Track.Source.ScreenShare,
+     videoCodec: 'h264',
+     degradationPreference: 'maintain-framerate',
+     screenShareEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 },
+     screenShareSimulcastLayers: [new VideoPreset(1280, 720, 3_000_000, 60), new VideoPreset(640, 360, 600_000, 30)],
+   });
+   ```
+
+   Os nomes das opções seguem o SDK JavaScript do LiveKit; confira na versão que você instalou. **Confira:** a trilha aparece publicada no log do LiveKit.
+
+4. **Prova de vida: assistir e medir.** Uma segunda página conecta com o token do espectador e prende a trilha de tela num `<video>`. Abra um jogo com bastante movimento em janela sem bordas, transmita e assista do segundo dispositivo. Em `chrome://webrtc-internals`, nos dois lados, anote: `framesPerSecond` enviado (por camada) e recebido, `frameWidth`/`frameHeight`, `encoderImplementation`, `qualityLimitationReason` e o uso de CPU e GPU no Gerenciador de Tarefas. **Confira:** 5 minutos com ≥ 55 fps recebidos na camada alta, com uma captura de tela.
+
+5. **Decisão 1: 60 fps é viável?** Escreva o ADR-001 com os números. Se passou, siga. Se não passou, investigue nesta ordem antes de mudar a meta:
+   - `encoderImplementation` indica software → atualize o driver de vídeo e confira se o Chrome usa a GPU (`chrome://gpu`).
+   - `qualityLimitationReason = bandwidth` → teste por cabo, ou com as duas máquinas na mesma rede cabeada.
+   - Captura abaixo de 60 → o jogo em tela cheia exclusiva? Troque para janela sem bordas.
+   - Se nada resolver, rebaixe a meta para `720p60` (o perfil padrão passa a ser ele) e registre isso no ADR-001 e no README. Não siga com uma meta que você já sabe que não vai cumprir.
+
+6. **Backend vazio.** No start.spring.io: Maven, Java 25, Spring Boot 4, dependências Web, WebSocket, Security, OAuth2 Resource Server, Data JPA, Flyway, PostgreSQL, Data Redis, Validation, Actuator, Spring Modulith e Testcontainers. Ligue `spring.threads.virtual.enabled=true`, logs em JSON e o exportador OpenTelemetry para o `lgtm`. Crie os pacotes dos módulos vazios. **Confira:** `./mvnw verify` passa; `GET /actuator/health` responde `UP`; uma requisição aparece como trace no Grafana (Tempo).
+
+7. **CI.** Workflow no GitHub Actions com build e testes do backend (cache do Maven), verificação de formatação, varredura de dependências e de segredos. Proteção da `main` exigindo o CI. **Confira:** um PR com um teste falhando é bloqueado.
+
+8. **ADRs e README.** ADR-002 (SFU), ADR-003 (LiveKit auto-hospedado), ADR-004 (monólito modular) e ADR-014 (armazenamento S3), com o modelo de contexto, opções, decisão, consequências e "como saberemos que erramos". README com o problema, o diagrama e "como rodar". **Confira:** um colega (ou você daqui a uma semana) entende o README sem perguntar nada.
+
+**Entregáveis:** repositório público, `compose.yaml`, prova de vida em `ferramentas/prova-de-vida/`, ADRs 001 a 004 e 014, README inicial.
+
+**Definição de pronto:** `docker compose up -d` sobe tudo e os health checks ficam `UP`; a prova de vida sustenta a meta do ADR-001 por 5 minutos entre duas máquinas, com captura de tela; o CI está verde com proteção de branch.
+
+**Aulas de apoio:** [Ambiente](../../../aulas/00-comece-aqui/02-ambiente/), [Docker e Compose](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Git no time](../../../aulas/14-devops/01-git-no-time/), [ADRs e evolução da arquitetura](../../../aulas/13-arquitetura/08-decisoes-e-evolucao-da-arquitetura/), [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/), [Observabilidade](../../../aulas/14-devops/05-observabilidade/).
+
+<Callout tipo="erro" titulo="Medir na mesma máquina e concluir que está ótimo">
+Duas janelas no mesmo computador não passam por rede nenhuma e dividem a mesma GPU. Serve para começar, mas o ADR-001 precisa de pelo menos uma medição entre duas máquinas. E se o fps cair, olhe o `qualityLimitationReason`: `cpu` aponta para codificação em software (verifique o `encoderImplementation`), `bandwidth` aponta para a rede.
+</Callout>
+
+</Marco>
+
+<Marco id="identidade" numero={2} titulo="Identidade: Keycloak, PKCE no desktop e perfil" horas={18}>
+
+**Objetivo:** pessoas se cadastram, entram pelo app desktop e pela web, e o backend as conhece.
+
+**Passo a passo**
+
+1. **Realm.** No console do Keycloak, crie o realm `resenha`:
+   - Cadastro e verificação de e-mail ligados, com SMTP apontando para o Mailpit (`mailpit:1025`).
+   - Política de senha da RN-01 (comprimento mínimo de 15 e máximo de 64) e detecção de força bruta ligada.
+   - Clientes públicos `resenha-desktop` (redirecionamento `http://127.0.0.1:47615/callback`) e `resenha-web` (redirecionamento `http://localhost:5173/callback` em desenvolvimento), os dois com fluxo *standard* e PKCE `S256` obrigatório.
+   - Mapeador de audiência que coloca `resenha-api` no `aud`. Access token de 5 minutos, rotação de refresh token ligada.
+   - Cliente confidencial `resenha-admin` com conta de serviço e só o papel `manage-users` do `realm-management` (para a RN-78).
+
+   Exporte com o Keycloak parado: `docker compose run --rm keycloak export --dir /opt/keycloak/data/import --realm resenha --users skip`. **Confira:** `docker compose down -v && docker compose up -d` recria o realm sozinho a partir do arquivo.
+
+2. **Resource server.** Configure o Spring Security 7 para validar o JWT pelo emissor do realm, exigir a audiência `resenha-api` e responder `401` em Problem Details. **Confira:** teste de fatia com token sem a audiência → `401`; com a audiência → `200`.
+
+3. **Provisionamento.** Implemente as RN-02 e RN-03 (com os exemplos como testes parametrizados) e `GET`/`PATCH /v1/eu` e `GET /v1/usuarios/{id}` (RN-05). **Confira:** teste com 10 requisições simultâneas do mesmo `sub` novo → 1 registro.
+
+4. **Cliente Electron.** `npm init electron-app@latest cliente -- --template=vite-typescript` e React no renderer. Antes de qualquer tela, aplique o checklist de segurança do Electron: `contextIsolation` e `sandbox` ligados, `nodeIntegration` desligado, `contextBridge` expondo só funções nomeadas, CSP, `setWindowOpenHandler` negando por padrão, navegação restrita à própria origem e permissões de mídia concedidas só a ela. **Confira:** no DevTools do renderer, `window.require` e `process` não existem.
+
+5. **Login no desktop.** No processo principal: gere o `code_verifier`, abra o navegador do sistema (`shell.openExternal`) na URL de autorização, suba um servidor HTTP temporário em `127.0.0.1:47615` para receber o `code`, troque pelo token e feche o servidor. Guarde o refresh token cifrado com `safeStorage` e nunca o entregue ao renderer: o renderer pede um access token pela ponte. Se a porta estiver ocupada, mostre um erro claro (a porta é configurável). **Confira:** login, fechar e reabrir o app (continua logado), esperar 6 minutos (o token é renovado sem pedir login).
+
+6. **Login na web.** O mesmo fluxo com PKCE no navegador, com o redirecionamento do `resenha-web`. **Confira:** login na web e no desktop com a mesma conta, e o `GET /v1/eu` retorna o mesmo usuário.
+
+7. **Telas e ADR.** Telas de login e de perfil (nome, handle, avatar fica para o marco 5). ADR-011 escrito. **Confira:** cadastro novo → e-mail no Mailpit → verificação → login → perfil editado.
+
+**Entregáveis:** realm exportado em `deploy/dev/keycloak/`, telas de login e perfil, testes do provisionamento concorrente e da audiência.
+
+**Definição de pronto:** cadastro, verificação de e-mail e login funcionam no app e na web; os testes das RN-02 e RN-03 passam; o ADR-011 está escrito; o checklist do Electron está no README do cliente, todo marcado.
+
+**Aulas de apoio:** [Autenticação e senhas](../../../aulas/11-seguranca/01-autenticacao-e-senhas/), [Spring Security 7](../../../aulas/11-seguranca/02-spring-security-7/), [JWT e resource server](../../../aulas/11-seguranca/03-jwt-e-resource-server/), [OAuth 2 e OpenID Connect](../../../aulas/11-seguranca/07-oauth2-e-openid-connect/), [Testcontainers](../../../aulas/10-testes/05-testcontainers/).
+
+<Callout tipo="erro" titulo="Guardar o refresh token em localStorage do Electron">
+O `localStorage` fica num arquivo legível por qualquer processo do usuário. No desktop, use o `safeStorage` (que cifra com a proteção do sistema operacional) no processo principal, e nunca exponha o refresh token ao renderer: o renderer pede um access token pela ponte do `contextBridge`.
+</Callout>
+
+</Marco>
+
+<Marco id="comunidades" numero={3} titulo="Comunidades, canais, papéis e convites" horas={22}>
+
+**Objetivo:** amigos criam comunidades, convidam uns aos outros e organizam canais, com permissões corretas.
+
+**Passo a passo**
+
+1. **Migrations e modelo.** `V2` com comunidade, membro, canal, convite e banimento, com todas as restrições da tabela do [Modelo de dados](#modelo-de-dados). **Confira:** um teste tenta inserir dois donos na mesma comunidade e o banco recusa.
+
+2. **Matriz de permissões.** Um componente só (por exemplo, `Permissoes.exigir(usuario, comunidadeId, Acao.EXPULSAR, alvo)`), com a hierarquia da RN-10 e a matriz da RN-11, exposto como API pública do módulo `comunidades`. Escreva os testes **antes** da implementação: um teste parametrizado com uma linha por célula da matriz. **Confira:** os testes cobrem todas as células, e todos passam.
+
+3. **Comunidades e canais.** RF-02 e RF-05, com a RN-12 (sempre o `comunidade_id` do recurso no banco). **Confira:** acessar canal de comunidade alheia → `404`; criar o 51º canal → `422`.
+
+4. **Convites.** RN-14 a RN-17, com o `UPDATE` condicional da RN-16. **Confira:** teste com 2 aceites simultâneos de um convite de uso único → 1 membro novo e um `410`.
+
+5. **Limites.** RN-18 com baldes no Redis. **Confira:** a 11ª tentativa de código inexistente no mesmo minuto → `429` com `Retry-After`.
+
+6. **Cliente.** Lista de comunidades e canais, criação, tela de convite (copiar link `resenha://convite/<codigo>` e link web) e aceite. Registre o protocolo `resenha://` no Electron. **Confira:** clicar no link do convite com o app fechado abre o app na tela de aceite.
+
+7. **Contrato.** OpenAPI dos endpoints e coleção `.http` com o fluxo criar → convidar → aceitar → mudar papel → expulsar. **Confira:** a coleção roda de ponta a ponta sem edição manual.
+
+**Entregáveis:** endpoints com OpenAPI, testes da matriz, telas, coleção `.http`.
+
+**Definição de pronto:** cada célula da matriz da RN-11 tem um teste; o aceite concorrente passa; acesso a recurso de comunidade alheia devolve `404`.
+
+**Aulas de apoio:** [Design de APIs REST](../../../aulas/08-spring-boot/02-design-de-apis-rest/), [Validação e erros](../../../aulas/08-spring-boot/05-validacao-e-erros/), [Autorização e BOLA](../../../aulas/11-seguranca/04-autorizacao-e-bola/), [Transações com Spring](../../../aulas/09-persistencia/05-transacoes-com-spring/), [Testes de fatia](../../../aulas/10-testes/04-testes-de-fatia-no-spring/), [Domain-Driven Design](../../../aulas/13-arquitetura/07-domain-driven-design/).
+
+<Callout tipo="erro" titulo="Checar permissão com o comunidadeId da URL">
+Em `PATCH /v1/canais/{id}`, o cliente não manda a comunidade; se mandasse, um admin da comunidade A poderia editar um canal da comunidade B passando o id de A. Carregue o canal, pegue o `comunidade_id` **dele** e só então consulte a matriz.
+</Callout>
+
+</Marco>
+
+<Marco id="gateway" numero={4} titulo="Gateway WebSocket: sessão, retomada e presença" horas={30}>
+
+**Objetivo:** o app recebe tudo em tempo real, sobrevive a quedas de conexão e a deploys, e mostra quem está online.
+
+**Passo a passo**
+
+1. **Contrato primeiro.** Escreva `contracts/gateway/` com os ops, os eventos (JSON Schema de cada um) e os códigos de fechamento do [Contrato do gateway](#contrato-do-gateway). **Confira:** um teste valida os exemplos do contrato contra os schemas.
+
+2. **Conexão e identificação.** `WebSocketHandler` com `HELLO`, prazo de 10 s para o `IDENTIFY`, validação do token com o mesmo decodificador de JWT da API, `READY` e os fechamentos `4002`, `4003`, `4004` e `4005`. Envio serializado com `ConcurrentWebSocketSessionDecorator` (por exemplo, 10 s de limite de envio e 512 KB de buffer). **Confira:** testes de integração com um cliente WebSocket Java cobrindo cada fechamento.
+
+3. **Heartbeat.** RN-25, com o relógio injetado para testar sem esperar 45 s de verdade. **Confira:** cliente que para de mandar heartbeat é fechado com `4009`.
+
+4. **Sessão e buffer no Redis.** RN-26 e RN-27: sessão, último `s` e os últimos 1.000 eventos (lista com `LTRIM`, TTL renovado). **Confira:** testes de retomada com buffer suficiente (recebe os eventos que faltam e `RESUMED`) e insuficiente (`SESSAO_INVALIDA`).
+
+5. **Fan-out entre réplicas.** Eventos de domínio do Spring Modulith, ouvidos **depois do commit**, publicados no canal `com:<comunidadeId>`; cada réplica assina só as comunidades que têm sessão local, com contagem de referências. RN-31 ao perder a conexão com o Redis. **Confira:** com duas instâncias da aplicação (portas 8080 e 8081), um evento gerado numa chega aos clientes conectados na outra; um teste prova que uma transação desfeita não gera evento.
+
+6. **Presença.** RF-07, com a carência de 15 s e a expiração de sessões de réplica morta. **Confira:** matar uma réplica com `kill -9` deixa os usuários dela offline em até 75 s (60 s de TTL mais a carência).
+
+7. **Reautenticação, limites e desligamento.** RN-28, RN-29 e RN-30. **Confira:** encerrar uma réplica normalmente faz os clientes dela retomarem na outra com `RESUMED`.
+
+8. **Cliente sintético.** `ferramentas/cliente-sintetico/` em Java: N conexões com `java.net.http.WebSocket` em virtual threads, heartbeat, `RESUME` e medição de atraso e de lacunas. **Confira:** 1.000 conexões por 10 minutos sem desconexões inesperadas.
+
+9. **Cliente do app.** Reconexão com backoff e jitter, `RESUME`, indicador "reconectando…" e presença na lista de membros. **Confira:** desligar o Wi-Fi por 20 s e religar resulta em `RESUMED`, sem perder nada.
+
+10. **ADRs.** 005 (protocolo) e 006 (fan-out). **Confira:** os dois citam os testes que provam as garantias.
+
+**Entregáveis:** gateway, documento do protocolo, cliente sintético, ADRs 005 e 006.
+
+**Definição de pronto:** os "Confira" dos passos 2 a 9 passam; um quadro de 5 KB fecha a conexão com `4002`.
+
+**Aulas de apoio:** [HTTP na prática](../../../aulas/08-spring-boot/01-http-na-pratica/), [Virtual threads](../../../aulas/06-concorrencia/05-virtual-threads/), [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/), [Redis](../../../aulas/15-system-design/02-redis/), [Por que mensageria](../../../aulas/12-mensageria/01-por-que-mensageria/), [Monólito modular](../../../aulas/13-arquitetura/04-monolito-modular/).
+
+<Callout tipo="erro" titulo="Escrever na mesma sessão WebSocket de várias threads">
+A sessão WebSocket do Jakarta não é segura para envios concorrentes: dois eventos chegando juntos de threads diferentes geram `IllegalStateException` ou quadros corrompidos. Serialize o envio por sessão (o decorador do Spring faz isso) e defina o que acontece com o cliente lento: é melhor desconectá-lo e deixá-lo retomar do que acumular memória sem limite.
+</Callout>
+
+</Marco>
+
+<Marco id="mensagens" numero={5} titulo="Chat: mensagens, anexos e não lidas" horas={22}>
+
+**Objetivo:** conversar por texto e mandar clipes, com ordem garantida e nada duplicado.
+
+**Passo a passo**
+
+1. **Mensagens.** `V3` e RN-35 a RN-37: `seq` atribuída pelo `UPDATE … RETURNING` na mesma transação, nonce com `UNIQUE`. **Confira:** 20 envios simultâneos no mesmo canal geram `seq` de 1 a 20, sem lacuna nem repetição; o mesmo nonce duas vezes devolve a mesma mensagem.
+
+2. **Listagem, edição e exclusão.** RN-39 a RN-41, com lápides. **Confira:** a listagem depois de uma exclusão continua com a `seq` contínua.
+
+3. **Respostas, menções, digitando, não lidas e limite.** RN-42 a RN-44. **Confira:** a 6ª mensagem em 5 s → `429`; `PUT /leitura` com valor menor não recua.
+
+4. **Armazenamento.** Crie o bucket `anexos` no SeaweedFS (pela API S3, no início da aplicação ou num script). Use o AWS SDK for Java 2 com `endpointOverride` e acesso por caminho (*path-style*). **Confira:** um teste de integração com o SeaweedFS no Testcontainers grava e lê um objeto.
+
+5. **Upload.** RN-45 (URL de PUT pré-assinada com `Content-Type` e `Content-Length` assinados), RN-46 (confirmação com `HeadObject` e leitura dos primeiros 16 bytes) e RN-47 (uso único, limpeza agendada, cota). **Confira:** um `.exe` renomeado para `.png` é apagado e recusado com `415`; um envio com tamanho diferente do declarado é recusado pelo armazenamento.
+
+6. **Download.** RN-48 com `302` para URL pré-assinada de 5 minutos. **Confira:** um não membro recebe `404`.
+
+7. **Cliente.** Lista com rolagem infinita, envio otimista com nonce, detecção de lacuna (RN-38), não lidas, upload com progresso, prévia de imagem, player de MP4 e avatar no perfil. **Confira:** matar a API no meio de um envio e voltar não duplica a mensagem.
+
+8. **ADRs.** 007 (ordem) e 012 (upload). **Confira:** o 007 traz o resultado de um teste de contenção (por exemplo, 50 mensagens por segundo num só canal com o p99 do `POST`).
+
+**Entregáveis:** endpoints, testes, telas, ADRs 007 e 012.
+
+**Definição de pronto:** os "Confira" dos passos 1, 5 e 6 são testes automatizados no CI.
+
+**Aulas de apoio:** [Locking e Flyway](../../../aulas/09-persistencia/06-locking-e-flyway/), [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/), [Transações e JDBC](../../../aulas/07-sql/06-transacoes-e-jdbc/), [Consumidores idempotentes](../../../aulas/12-mensageria/05-consumidores-idempotentes/), [OWASP Top 10](../../../aulas/11-seguranca/05-owasp-top-10/), [Defesas da API](../../../aulas/11-seguranca/06-defesas-da-api/).
+
+<Callout tipo="erro" titulo="Paginar por OFFSET ou por data">
+`OFFSET 50` desloca a página quando chegam mensagens novas, e `criada_em` tem empates. Pagine pela `seq` (keyset), que é única e crescente dentro do canal, com índice em `(canal_id, seq)`.
+</Callout>
+
+</Marco>
+
+<Marco id="voz" numero={6} titulo="Canais de voz com LiveKit" horas={26}>
+
+**Objetivo:** amigos entram num canal de voz e conversam, com o backend controlando quem entra e sabendo quem está lá, **testado através da internet**.
+
+**Passo a passo**
+
+1. **Token de mídia.** Adicione o SDK de servidor (`io.livekit:livekit-server`, versão mais recente) e implemente a RN-49. **Confira:** um teste decodifica o token e confere a identidade, a sala, as fontes permitidas (só `MICROPHONE`) e a validade.
+
+2. **Vagas.** RN-50 com script Lua (participantes + reservas pendentes menores que o limite → reserva). **Confira:** canal com limite 10, 9 dentro e 3 pedidos simultâneos → 1 token.
+
+3. **Webhooks.** Endpoint que recebe o corpo como `String`, valida com o `WebhookReceiver` do SDK, deduplica pelo `id` (RN-53) e aplica a regra do `participantSid` (RN-54). O LiveKit do Compose já aponta para `host.docker.internal:8080`. **Confira:** testes com webhook duplicado, fora de ordem e com assinatura inválida (`401`).
+
+4. **Estado de voz, um canal por vez e reconciliação.** RN-51, RN-52 e RN-55 (`ListParticipants` a cada 60 s). **Confira:** apagar a chave do canal no Redis com gente na voz e, em até 60 s, o estado volta certo, com a métrica de divergência incrementada.
+
+5. **Resiliência.** Cliente da API do LiveKit com timeout, nova tentativa limitada e circuit breaker (Resilience4j). **Confira:** com o contêiner do LiveKit parado, `POST /voz/token` responde `503` em menos de 3 s, e o chat continua funcionando.
+
+6. **Moderação de voz.** RN-76. **Confira:** a pessoa silenciada não consegue se dessilenciar pelo app nem publicando o microfone de novo.
+
+7. **Cliente.** Entrar e sair, participantes com indicador de quem fala, mutar, ensurdecer, escolha de dispositivo e microfone com `echoCancellation`, `noiseSuppression` e `autoGainControl`. Assinatura automática só das trilhas de microfone (RN-66). **Confira:** duas pessoas conversam na rede local por 10 minutos sem eco.
+
+8. **Teste de integração com o LiveKit real.** LiveKit em modo de desenvolvimento num Testcontainer, com a aplicação exposta ao contêiner (`Testcontainers.exposeHostPorts`) e o webhook apontando para `host.testcontainers.internal`. Um participante simulado entra (por exemplo, com o CLI do LiveKit dentro do contêiner) e o teste espera o estado de voz. **Confira:** o teste roda no CI.
+
+9. **Decisão 2: a mídia atravessa a internet?** Alugue uma VPS cobrada por hora, suba só o LiveKit nela com `use_external_ip: true`, TURN/UDP ligado e as portas liberadas, e aponte a sua API local para ela. Faça uma chamada de voz com o amigo de fora da sua rede por 30 minutos e destrua a VPS no fim. Se não conectar: confira o firewall do provedor (UDP 7882 e 3478), o `use_external_ip` e, como último recurso, o TURN/TLS na porta 443. **Confira:** registro no `docs/resultados.md` com a rede do amigo, o RTT e se precisou de TURN.
+
+**Entregáveis:** voz funcionando entre amigos, testes de webhook, dashboard de voz, registro do ensaio na VPS.
+
+**Definição de pronto:** os critérios das RN-50 e RN-54 passam em teste; a reconciliação corrige o estado; o ensaio pela internet funcionou.
+
+**Aulas de apoio:** [Resiliência](../../../aulas/13-arquitetura/06-resiliencia/), [RestClient e OpenAPI](../../../aulas/08-spring-boot/06-restclient-versionamento-openapi/), [Retry e DLQ](../../../aulas/12-mensageria/06-retry-e-dlq/), [Hexagonal](../../../aulas/13-arquitetura/03-hexagonal/), [Testes de contrato](../../../aulas/10-testes/07-testes-de-contrato/), [Modelagem de ameaças e dados sensíveis](../../../aulas/11-seguranca/08-modelagem-de-ameacas-e-dados-sensiveis/).
+
+<Callout tipo="erro" titulo="Deixar o Spring desserializar o corpo do webhook">
+A assinatura cobre os **bytes exatos** do corpo. Se o controller receber um objeto já convertido e você serializar de novo para conferir o hash, qualquer diferença de espaços ou ordem de campos invalida a assinatura (ou, pior, você passa a aceitar qualquer coisa). Receba `String`, valide, e só depois converta. O `Content-Type` do LiveKit não é `application/json`, então configure o endpoint para aceitar o tipo que ele envia.
+</Callout>
+
+</Marco>
+
+<Marco id="transmissao" numero={7} titulo="Transmissão de jogos a 60 fps" horas={34}>
+
+**Objetivo:** transmitir um jogo em 1080p a 60 fps para os amigos, com os limites e o ciclo de vida controlados pelo backend.
+
+**Passo a passo**
+
+1. **Perfis e encaixe.** Os perfis da RN-58 como configuração (não constantes espalhadas) e o cálculo da RN-59. Escreva primeiro os testes parametrizados com os quatro exemplos da RN-59. **Confira:** os testes passam, inclusive 3440×1440 → 1920×804.
+
+2. **Reserva e permissão.** `V6` e RN-56 e RN-57: script Lua com as duas contagens, linha `RESERVADA` (com o índice único da segunda barreira) e `UpdateParticipant` com timeout e uma nova tentativa. **Confira:** canal com 2 transmissões e 5 pedidos simultâneos → exatamente 1 `201`; com o LiveKit parado → `503` e nenhuma vaga presa.
+
+3. **Ciclo de vida pelos webhooks.** RN-61 a RN-64: `AO_VIVO` no `track_published`, expiração da reserva (rotina a cada 5 s), encerramentos com "a primeira causa vence" e a defesa contra publicação sem reserva. **Confira:** testes de cada motivo de encerramento e de uma reserva abandonada liberada em até 35 s.
+
+4. **Seletor de fonte no Electron.** No processo principal, `desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize })` alimenta um seletor próprio (sem as janelas do Resenha). A fonte escolhida fica guardada no processo principal, e o `session.setDisplayMediaRequestHandler` a entrega quando o renderer chamar `getDisplayMedia`. **Confira:** escolher a janela do jogo e ver a prévia no app.
+
+5. **Publicação.** O renderer chama `POST /transmissoes`, espera o evento de permissões alteradas do SDK (até 5 s; se não chegar, `DELETE` e nova tentativa), captura com os parâmetros recebidos e publica como no passo 3 do marco 1, agora com os valores do servidor. **Confira:** o painel de estatísticas (próximo passo) mostra 60 fps enviados na camada alta.
+
+6. **Assistir e painel.** Grade de transmissões, "Assistir" com assinatura sob demanda (RN-66), contagem de espectadores (RN-67), "Automático/Original" (RN-68), tela cheia e o painel da RN-69 lendo o `getStats()`. **Confira:** 10 minutos de jogo assistidos de outra máquina com ≥ 55 fps no painel.
+
+7. **Decisão 3: áudio do jogo, com prazo de 8 horas.** Prototipe as opções do ADR-010 nesta ordem:
+   - **(a)** O loopback do sistema que o Electron oferece no Windows (`audio: 'loopback'` no `setDisplayMediaRequestHandler`), verificando se a sua versão permite excluir o áudio do próprio app.
+   - **(b)** Captura por processo com a API de loopback de processo do Windows (incluir só a árvore de processos do jogo), num módulo nativo de Node em `nativo/audio-processo/`, partindo do exemplo oficial da Microsoft (*ApplicationLoopback*). O módulo entrega áudio PCM ao renderer, que cria uma trilha e a publica como `SCREEN_SHARE_AUDIO`.
+
+   Aplique o critério da RN-65 (o espectador fala e não se ouve de volta). Se uma opção passar dentro das 8 horas, implemente-a. Se nenhuma passar, a v1.0 sai **sem áudio do jogo** (RN-65, plano B), e o áudio vira o primeiro item dos próximos passos no README. Escreva o ADR-010 com o que foi testado. **Confira:** o ADR-010 tem o resultado de cada opção e a decisão.
+
+8. **Perfis extras.** `TEXTO` e o `1440p60` experimental liberado só por admin (RN-20). **Confira:** um membro pedindo `1440p60` num canal sem liberação recebe `422`.
+
+9. **Teste da defesa.** Um script com o SDK do LiveKit, usando um token de voz válido, tenta publicar tela sem reserva. **Confira:** a publicação é recusada pelo LiveKit (sem permissão) e, se você forçar a permissão por fora, a trilha é silenciada e a métrica da RN-64 sobe.
+
+10. **ADRs e vídeo curto.** ADRs 008, 009 e 010; um vídeo de 1 minuto com o painel a 60 fps. **Confira:** o vídeo está no README.
+
+**Entregáveis:** transmissão funcionando com amigos, ADRs 008 a 010, vídeo curto.
+
+**Definição de pronto:** os "Confira" dos passos 2, 3, 6 e 9 passam; a decisão sobre o áudio está registrada e, se o áudio entrou, o critério de eco da RN-65 passa.
+
+**Aulas de apoio:** [Structured concurrency](../../../aulas/06-concorrencia/06-structured-concurrency/), [Sincronização](../../../aulas/06-concorrencia/02-sincronizacao/), [Redis](../../../aulas/15-system-design/02-redis/), [Escala e consistência](../../../aulas/15-system-design/05-escala-e-consistencia/), [TDD e arquitetura](../../../aulas/10-testes/06-tdd-e-arquitetura/), [Padrões de projeto](../../../aulas/13-arquitetura/02-padroes-de-projeto/).
+
+<Callout tipo="erro" titulo="Confundir fps de captura com fps entregue">
+Pedir `frameRate: 60` ao `getDisplayMedia` é um pedido, não uma garantia: o navegador pode capturar menos, o codificador pode descartar quadros e a rede do espectador pode forçar outra camada. Confira os três números separadamente no `getStats()`: quadros capturados (`media-source`), enviados por camada (`outbound-rtp`) e recebidos (`inbound-rtp`). É assim que você descobre onde está o gargalo, e é o que a entrevista vai perguntar.
+</Callout>
+
+</Marco>
+
+<Marco id="qualidade" numero={8} titulo="Qualidade medida: telemetria, SLOs e rede ruim" horas={24}>
+
+**Objetivo:** transformar "está fluido" em números, e saber o que acontece quando a rede piora e quando o gateway está cheio.
+
+**Passo a passo**
+
+1. **Coleta no cliente.** RN-70 e RN-71: `getStats()` a cada 2 s, janelas de 10 s, lotes a cada 30 s, reenvio idempotente. Inclua o tempo até o primeiro quadro (RNF-04), medido do clique ao primeiro quadro desenhado (`requestVideoFrameCallback`). **Confira:** depois de 2 minutos de transmissão, a tabela tem janelas do streamer e do espectador.
+
+2. **Backend.** `V7` com a tabela particionada e o job que cria as partições futuras, RN-72 a RN-74 e métricas no Micrometer. **Confira:** o resumo da RN-73 sai certo para uma transmissão de teste com janelas conhecidas.
+
+3. **Dashboards e SLOs.** Painéis de transmissão, voz e gateway no Grafana (versionados em `deploy/grafana/`), SLOs das RNF-01 a RNF-04 em `docs/slo/` e um alerta simples (menos de 90% de janelas saudáveis em 15 min). **Confira:** os painéis mostram uma sessão real.
+
+4. **Latência pelo método do relógio.** `ferramentas/relogio/`: uma página com milissegundos e um contador de quadros. Transmita essa janela pela VPS de ensaio (ou pela de produção, se já existir) e abra o espectador na mesma máquina, lado a lado. 20 capturas de tela; diferença entre os relógios em cada uma. **Confira:** mediana e máximo registrados no `docs/resultados.md`.
+
+5. **Rede degradada.** `ferramentas/rede-degradada/`: um contêiner Linux com `--cap-add NET_ADMIN`, Google Chrome (no Playwright, `channel: 'chrome'`, porque o Chromium do Playwright pode não decodificar H.264) e um script que entra na sala como espectador e assiste. Aplique `tc qdisc add dev eth0 root netem loss 3% delay 40ms rate 5mbit`. **Confira:** a telemetria mostra a troca para a camada de 720p em até 5 s e nenhum congelamento acima de 1 s depois disso (RNF-05).
+
+6. **Carga no gateway.** 5.000 conexões do cliente sintético em 2 réplicas e 100 mensagens/s pela API com k6. Meça o atraso de entrega (RNF-06) e a memória por conexão (heap antes e depois, RNF-07). Repita com um rollout no meio (RNF-08). **Confira:** os números estão no `docs/resultados.md` com gráfico, método e data.
+
+7. **Capacidade do SFU.** Na VPS de ensaio, o `lk load-test` simula publicadores e assinantes de vídeo; meça CPU e banda da máquina. **Confira:** o resultado define o tamanho da VPS de produção e entra na conta de custo.
+
+8. **Decisão 4: os SLOs fecham?** Para cada SLO não atingido, escolha e registre uma ação: ajustar o teto de bitrate (ADR-009), mudar a meta com justificativa, ou aceitar e explicar no README. **Confira:** nenhum SLO fica sem valor medido ou sem decisão.
+
+**Entregáveis:** dashboards, `docs/slo/`, `docs/resultados.md` com gráficos.
+
+**Definição de pronto:** os SLOs têm valores medidos e uma decisão para cada um; o relatório cobre latência, início, degradação, carga do gateway e capacidade do SFU; nenhuma lacuna de `seq` no teste de rollout.
+
+**Aulas de apoio:** [Observabilidade](../../../aulas/14-devops/05-observabilidade/), [SLI, SLO, RED e alertas](../../../aulas/14-devops/05-observabilidade/#sli-slo-red-e-alertas), [Testes de desempenho e carga](../../../aulas/10-testes/08-desempenho-e-carga/), [Framework de system design](../../../aulas/15-system-design/04-framework-system-design/), [Índices e EXPLAIN](../../../aulas/07-sql/05-indices-e-explain/).
+
+<Callout tipo="erro" titulo="Medir só a média de fps">
+Uma média de 58 fps esconde dez segundos travados a 10 fps num minuto bom. Por isso a unidade é a janela de 10 s e a meta é um percentual de janelas saudáveis, junto com os congelamentos. O mesmo raciocínio dos SLOs de latência: percentis e proporções, nunca médias.
+</Callout>
+
+</Marco>
+
+<Marco id="entrega" numero={9} titulo="Produção, instalador e release v1.0.0" horas={26}>
+
+**Objetivo:** o Resenha no ar, instalado no computador dos amigos, sendo usado de verdade.
+
+**Passo a passo**
+
+1. **VPS e DNS.** Contrate a VPS no tamanho medido no marco 8 (Linux, IP público). Crie os registros DNS `api`, `auth`, `rtc`, `s3` e `turn` apontando para ela. Firewall do provedor e do sistema (por exemplo, `ufw`) liberando só 22, 80 e 443 TCP, 7881 TCP, 7882 UDP e 3478 UDP. **Confira:** uma varredura de portas feita de fora mostra só essas portas.
+
+2. **Compose de produção.** `deploy/producao/compose.yaml`: PostgreSQL, Redis, Keycloak (em modo `start`, com `KC_HOSTNAME=https://auth.<domínio>` e cabeçalhos de proxy), SeaweedFS e **duas** instâncias da API (`api-1` na porta 8080 e `api-2` na 8081), todos publicando portas só em `127.0.0.1`. O Caddy e o LiveKit rodam com rede do host (`network_mode: host`). Segredos num `.env` com permissão `600`, fora do Git; chaves do LiveKit diferentes das de desenvolvimento.
+
+   ```text
+   api.seudominio.com {
+       reverse_proxy 127.0.0.1:8080 127.0.0.1:8081 {
+           health_uri /actuator/health/readiness
+       }
+   }
+   auth.seudominio.com { reverse_proxy 127.0.0.1:8180 }
+   rtc.seudominio.com  { reverse_proxy 127.0.0.1:7880 }
+   s3.seudominio.com   { reverse_proxy 127.0.0.1:8333 }
+   ```
+
+   **Confira:** os quatro endereços abrem com HTTPS válido; o `/actuator/health` responde pela internet só com o status.
+
+3. **LiveKit de produção.** `livekit.yaml` com `use_external_ip: true`, `udp_port: 7882`, `tcp_port: 7881`, TURN ligado na UDP 3478 com o domínio `turn.<domínio>`, e o webhook apontando para `https://api.<domínio>/webhooks/livekit`: o Caddy entrega a qualquer réplica, e qualquer uma processa, porque o estado está no Redis e no banco. **Confira:** voz e transmissão funcionam com o amigo de fora, como no ensaio do marco 6.
+
+4. **Deploy sem derrubar ninguém.** Um script que atualiza `api-1`, espera a prontidão e só então atualiza `api-2` (`docker compose up -d --no-deps api-1`, e depois `api-2`). **Confira:** um deploy durante uma chamada de voz não derruba ninguém, e os clientes mostram `RESUMED`.
+
+5. **Backup e restore.** `pg_dump -Fc` diário por `cron`, enviado para um armazenamento fora da VPS (por exemplo, com `rclone`), com retenção de 14 dias. Execute **um restore** numa base vazia e cronometre. **Confira:** o runbook de restore tem o tempo medido.
+
+6. **Instalador pelo CI.** Workflow de release disparado por tag `v*`: num runner `windows-latest`, `npm ci` e `npm run make` no `cliente/` (Electron Forge com o maker do Squirrel.Windows) e publicação no GitHub Releases; a imagem do backend vai para o GitHub Container Registry. A URL da API de produção é configuração do build, não código. **Confira:** a tag `v0.9.0` gera um instalador que um amigo instala e usa.
+
+7. **Cliente web em produção.** O renderer empacotado para web, servido pelo Caddy (por exemplo, em `app.<domínio>`), com o redirecionamento do `resenha-web` atualizado no realm. **Confira:** assistir a uma transmissão pelo navegador de um celular ou notebook.
+
+8. **Runbooks e privacidade.** `docs/runbooks/`: LiveKit fora, Redis fora, disco cheio, certificado expirando, restaurar backup. `docs/privacidade.md` e a tela de privacidade no app (RN-79). **Confira:** cada runbook tem sintoma, diagnóstico e ação, e foi ensaiado ao menos uma vez.
+
+9. **Uso real.** Pelo menos 3 sessões de jogo com amigos. Guarde o relatório da RN-73 de cada uma e anote no `docs/resultados.md` um problema encontrado e o que você mudou por causa dele. **Confira:** três relatórios e uma melhoria feita a partir do uso.
+
+10. **Release.** Custo calculado (seção de entregáveis), README final, vídeo, post, notas de versão e a tag `v1.0.0`. **Confira:** a definição de pronto abaixo.
+
+**Entregáveis:** ambiente de produção, instalador público, runbooks, relatório de uso real, release.
+
+**Definição de pronto:** um amigo instala pelo link do Release, entra pelo convite e assiste a uma transmissão; o restore foi executado; os SLOs aparecem no dashboard de produção; a tag `v1.0.0` existe com notas de versão.
+
+**Aulas de apoio:** [Kubernetes e cloud](../../../aulas/14-devops/06-kubernetes-e-cloud/), [Docker e Compose](../../../aulas/14-devops/03-docker/), [CI/CD com GitHub Actions](../../../aulas/14-devops/04-ci-cd-github-actions/), [Portfólio e GitHub](../../../aulas/17-carreira/01-portfolio-e-github/), [Assistentes de código](../../../aulas/16-ia-backend/06-assistentes-de-codigo/).
+
+<Callout tipo="erro" titulo="Abrir as portas do Postgres e do Redis para a internet">
+No Compose de produção, só o Caddy (80 e 443) e as portas do LiveKit ficam expostas. PostgreSQL, Redis, Keycloak (o console de administração), as portas internas do SeaweedFS e a observabilidade ficam presos em `127.0.0.1`. Um `ports: ["5432:5432"]` esquecido publica o banco em todas as interfaces, e o Docker abre a porta por fora do `ufw`. Confira com uma varredura de portas a partir de fora da VPS e anexe o resultado ao runbook.
+</Callout>
+
+</Marco>
+
+### Riscos conhecidos e o plano para cada um
+
+| Risco | Sinal de alerta | Plano |
+|---|---|---|
+| Hardware de quem transmite não sustenta 60 fps | Decisão 1 falha | Diagnóstico do passo 5 do marco 1; meta em `720p60` |
+| A mídia não atravessa a rede de alguém | Decisão 2 falha | TURN/UDP; depois TURN/TLS na 443; documentar redes incompatíveis |
+| Áudio do jogo com eco ou sem solução | Decisão 3 falha | v1.0 sem áudio do jogo; áudio como primeiro próximo passo |
+| Mudança de API no LiveKit, Keycloak ou Electron | Erro de compilação ou comportamento diferente da spec | Versões fixas no Compose e no `package.json`; atualizar uma por vez, com o CI verde |
+| Frontend consumindo o tempo do backend | Marcos 2 a 7 estourando por causa da interface | Interface simples e funcional; assistente de código na UI, revisão humana no código de mídia |
+| Custo de banda acima do orçamento | Painel do provedor | Limitar `1440p60`, reduzir o teto de bitrate, limitar espectadores |
+| Atraso geral | Marco acima de 150% do previsto | Cortar escopo pela lista do núcleo; usar as semanas de folga |
+
+## Estratégia de testes
+
+O foco são os testes que provam as regras difíceis, não a cobertura pela cobertura.
+
+| Nível | O que cobre | Ferramentas |
+|---|---|---|
+| Unidade (domínio) | Matriz de permissões e hierarquia, encaixe de resolução e parâmetros por perfil, regras do handle, máquina de estados da transmissão, regra do `participantSid`, janela saudável | JUnit 6, AssertJ, testes parametrizados, `Clock` fixo |
+| Fatia | Controllers (validação, Problem Details, `404` de BOLA), assinatura de webhook | `@WebMvcTest` com segurança |
+| Integração | Banco, Redis (scripts Lua de vaga), SeaweedFS (URL pré-assinada), Keycloak, LiveKit em modo de desenvolvimento, gateway de ponta a ponta com cliente WebSocket | Testcontainers 2, Awaitility |
+| Contrato | OpenAPI e protocolo do gateway verificados no CI; eventos do gateway validados contra o schema no teste do produtor | Validador de JSON Schema; diff de contrato |
+| Arquitetura | Módulos só usam a API pública dos outros | `ApplicationModules.verify()`, ArchUnit |
+| Carga, rede e mídia | RNF-01 a RNF-08 | Cliente sintético, k6, `tc netem` com Google Chrome via Playwright (`channel: 'chrome'`), `lk load-test`, método do relógio |
+
+**Cenários obrigatórios** (com o número da regra no nome do teste, como `deveLiberarVagaQuandoReservaExpira_RN62`): o aceite concorrente do convite de uso único; os 20 envios simultâneos com `seq` contínua; o nonce repetido; a retomada com o buffer suficiente e insuficiente; a réplica que perde o Redis (RN-31); as 3 entradas simultâneas na última vaga de voz; o webhook duplicado, o fora de ordem e o de assinatura inválida; os 5 pedidos simultâneos de transmissão; a reserva expirada; a publicação sem reserva; e o membro de outra comunidade recebendo `404`.
+
+## Entregáveis do portfólio
+
+**README** (o gestor lê os primeiros 30 segundos; capriche no topo):
+
+```markdown
+# Resenha — voz, chat e transmissão de jogos a 60 fps entre amigos
+
+App desktop e web no estilo Discord. Backend Java (Spring Boot 4) controla identidade,
+permissões, sessões WebSocket e um SFU WebRTC (LiveKit); a transmissão roda em 1080p60
+com simulcast e a fluidez é medida como SLO.
+
+[Baixar para Windows](link do Release) · [Vídeo de 3 min](link) · ![CI](badge)
+
+![GIF: transmissão a 60 fps com o painel de estatísticas](docs/img/transmissao.gif)
+
+## Resultados medidos
+| SLO | Meta | Medido |
+|---|---|---|
+| Janelas do espectador a ≥ 55 fps | ≥ 95% | 98,1% (3 sessões reais, 6 h) |
+| Latência ponta a ponta | mediana ≤ 250 ms | 180 ms (máx. 310 ms) |
+| Entrega de mensagem com 5.000 conexões | p95 ≤ 300 ms | ... |
+
+## Arquitetura          (diagrama de controle × mídia + por que um SFU, com os números)
+## Rodando localmente   (1 comando)
+## Decisões e trade-offs (os 5 ADRs mais importantes, uma linha cada)
+## Qualidade e carga    (gráficos e o que aprendi)
+## Produção e custo     (VPS, portas, backup, custo por hora de transmissão)
+## Privacidade          (o que é guardado e o que não é)
+## O que eu faria diferente / próximos passos
+```
+
+**Diagramas:** os três desta especificação, refeitos por você, mais o diagrama de estados da transmissão (`RESERVADA` → `AO_VIVO` → `ENCERRADA`, com os motivos).
+
+**Estimativa de custo** (`docs/custo/`): sem preços inventados. Use os preços do provedor escolhido, com a data da consulta. Em vídeo, quem pesa é o **tráfego de saída do SFU**:
+
+| Componente | Como estimar | Exemplo com os números de referência |
+|---|---|---|
+| Tráfego de saída por transmissão | bitrate da camada recebida × espectadores × horas | 8 Mbps × 4 espectadores = 32 Mbps = 4 MB/s → **14,4 GB por hora** |
+| Tráfego de entrada | upload do streamer × horas (costuma ser gratuito, mas confira) | 11,6 Mbps → ~5,2 GB por hora |
+| Uso do grupo por mês | horas de transmissão por dia × dias × tráfego por hora | 3 h/dia × 30 × 14,4 GB ≈ **1,3 TB por mês** |
+| VPS | vCPU e memória medidas no marco 8 com folga de 50% | a partir do `docker stats` com carga |
+| Armazenamento | anexos por dia × tamanho médio × retenção | clipes MP4 dominam; defina uma retenção |
+
+Feche com o custo por hora de transmissão assistida e com uma frase de produto: o que mudaria no custo com 100 comunidades ativas (spoiler: a banda, não a CPU do Java).
+
+**Vídeo de até 3 minutos:** (1) 20 s — o problema e o diagrama de controle × mídia; (2) 60 s — dois computadores: entrar pelo convite, falar na voz, transmitir um jogo e mostrar o painel a 60 fps; (3) 40 s — limitar a banda do espectador ao vivo e mostrar a troca de camada sem travar; (4) 40 s — derrubar uma réplica da API e mostrar que ninguém caiu da voz nem perdeu mensagens; (5) 20 s — o que você aprendeu.
+
+**Post para o LinkedIn:** o problema em uma frase, o GIF do painel a 60 fps, três decisões com o trade-off de cada uma (SFU em vez de P2P, gateway com retomada, permissão de tela concedida pelo backend) e o link do instalador.
+
+## Rubrica de autoavaliação
+
+| Critério | Abaixo do nível | No nível | Acima do nível |
+|---|---|---|---|
+| Arquitetura controle × mídia | Mídia passando pelo Java ou P2P sem justificativa | SFU com ADR e os números de banda | Comparação medida com o gerenciado e com P2P para 2 pessoas |
+| Gateway em tempo real | Reconecta e perde eventos | Heartbeat, retomada em qualquer réplica, `seq` e snapshot | Rollout sob carga sem lacunas, com gráficos |
+| Consistência com o LiveKit | Confia no cliente para o estado | Webhooks idempotentes, regra do `participantSid`, reconciliação | Métrica de divergência perto de zero em uso real, com análise |
+| Limites e concorrência | Contagem com `SELECT` e depois `INSERT` | Scripts atômicos, restrições no banco e testes de corrida | Explica as garantias de cada barreira e o que acontece se o Redis cair |
+| Transmissão | 30 fps ou qualidade fixa | 1080p60 com simulcast, perfis do servidor, assistir sob demanda | Ajuste dos tetos de bitrate justificado pela telemetria de sessões reais |
+| Qualidade medida | "Ficou bom" | SLOs de fluidez, latência e início com valores medidos | Teste de rede degradada automatizado e relatório pós-transmissão útil para o usuário |
+| Segurança | Segredo do LiveKit no cliente ou `403` revelando recursos | Matriz testada, BOLA tratada, PKCE, webhooks assinados, Electron endurecido | Modelo de ameaças com mitigações rastreáveis a testes |
+| Privacidade | Sem política | Aviso de privacidade, retenção automatizada, exclusão e exportação | Explica o que o operador do SFU consegue ver e o caminho para E2EE |
+| Operação | Roda só na sua máquina | VPS com TLS, backup restaurado, runbooks, instalador no CI | Alertas de SLO em produção e um postmortem de um problema real |
+| Produto | Ninguém usa | Amigos usando, com relatórios de qualidade | Retorno dos usuários registrado e uma melhoria feita a partir dele |
+| Comunicação | README com "como rodar" | README com resultados, decisões e custo | Vídeo e post que alguém não técnico entende |
+
+## Como apresentar na entrevista
+
+**Pitch (60–90 s):** "O Resenha é um app de voz e transmissão de jogos que eu e meus amigos usamos. O ponto central foi separar o plano de controle do plano de mídia: o vídeo vai do computador de quem transmite para um SFU, o LiveKit, que reencaminha para cada amigo a camada de qualidade que a rede dele aguenta. Fiz a conta: em P2P, quem transmite precisaria de 32 Mbps de upload para 4 amigos; com o SFU são 11,6, fixos. O backend em Java decide quem pode publicar: o token de voz nunca permite tela, e a permissão de transmitir é concedida em tempo real depois de reservar uma vaga atômica no Redis. O estado vem dos webhooks do LiveKit, tratados como idempotentes e fora de ordem, com reconciliação. Tem um gateway WebSocket próprio com retomada de sessão, então um deploy não derruba ninguém. E eu medi: 98% das janelas de 10 s dos espectadores acima de 55 fps em sessões reais, latência mediana de 180 ms."
+
+**Perguntas prováveis**
+
+1. **Por que não escreveu o servidor de mídia em Java?** A tabela de modelos, o que um SFU faz (ICE, DTLS-SRTP, RTP/RTCP, controle de congestionamento, troca de camadas), o Jitsi Videobridge como prova de que dá, e por que o valor do produto estava no controle.
+2. **Como você chega a 60 fps?** O caminho inteiro: captura, codificador em hardware, `contentHint` e `degradationPreference`, simulcast, SFU, escolha de camada, decodificação; e como você descobriu cada gargalo pelo `getStats()`.
+3. **O que acontece quando a internet de um amigo piora?** Estimativa de banda e controle de congestionamento do WebRTC, troca de camada no SFU, o dynacast poupando o streamer; mostre o teste de rede degradada.
+4. **Por que o servidor dita os parâmetros de codificação?** Ajuste sem nova versão do app, perfis coerentes com o limite do canal, e a telemetria fechando o ciclo.
+5. **Como garante no máximo 3 transmissões por canal?** Script atômico, permissão concedida só depois, restrição no banco como segunda barreira, reação ao webhook como terceira; o que acontece numa corrida.
+6. **Webhooks podem chegar duplicados ou fora de ordem. E aí?** Idempotência pelo `id`, a regra do `participantSid` e a reconciliação; por que o LiveKit é a fonte da verdade do que está publicado.
+7. **Como o gateway sobrevive a um deploy?** Sessão e buffer no Redis, `RECONECTAR` com jitter, `RESUME` em outra réplica; o que muda se o Redis perder dados.
+8. **Como o cliente sabe que perdeu uma mensagem?** `seq` sem lacunas por canal, Pub/Sub entregando no máximo uma vez, snapshot e busca do intervalo; por que não UUID v7 para isso.
+9. **Quais são os riscos de segurança?** Segredo do LiveKit, tokens curtos, BOLA, webhooks, uploads (assinatura do formato, política de tamanho), Electron (isolamento, CSP, IPC mínimo), login por PKCE no navegador do sistema.
+10. **Quanto custa e como escala?** A banda de saída do SFU domina; a conta por hora; o que mudaria com 100 comunidades (vários nós do LiveKit, o gateway separado, Redis gerenciado).
+11. **Com metade do prazo, o que você cortaria?** O núcleo da seção de escopo; nunca a reserva atômica, a retomada nem a medição.
+12. **Isso viraria produto?** O que falta: moderação e denúncias, termos de uso e obrigações legais, suporte a macOS, custo de banda por usuário e como cobrar, e a concorrência com produtos gratuitos.
+
+**Trade-offs para mencionar sem esperar a pergunta:** Pub/Sub no máximo uma vez compensado pelo cliente; `seq` por canal com contenção aceitável no volume; Electron pesado em troca de captura e áudio controlados; mídia sem criptografia ponta a ponta na v1; uma VPS como ponto único de falha, assumido e com runbook.
+
+## Para ir além
+
+- Criptografia ponta a ponta da mídia (o LiveKit oferece E2EE com *insertable streams*), com a troca de chaves feita pelo seu backend.
+- Clipes dos últimos 30 segundos gravados no servidor com o LiveKit Egress, com consentimento de quem transmite e retenção definida.
+- Push-to-talk global (atalho funcionando com o jogo em foco), soundboard e legendas automáticas.
+- Mensagens diretas, lista de amigos, canais privados e permissões por canal (o modelo de permissões vira uma lista de controle de acesso por canal).
+- Gateway como serviço separado com escala própria, e o LiveKit em vários nós com Redis para salas maiores.
+- Assistente com Spring AI: "o que perdi?" resumindo o canal desde a última leitura, só com mensagens que a pessoa pode ver (módulo 16).
+- Assinatura de código do instalador e auto-atualização com canal beta.
+- Cliente para macOS e Linux transmitindo, com as APIs de captura de cada sistema.
+
+## O que estudar além da trilha
+
+A trilha vai do básico ao Pleno, e as aulas avançadas (módulos 10 a 13) já trazem a visão sênior de decisões e trade-offs. Os tópicos abaixo vão além delas. Estes tópicos aparecem neste projeto e em entrevistas para times de tempo real; cada um tem o mínimo para começar e onde aprofundar.
+
+**Fundamentos do WebRTC.** ICE, STUN e TURN (como dois computadores atrás de NAT se encontram), SDP (a negociação de codecs), DTLS-SRTP (a criptografia da mídia), RTP e RTCP (transporte e retorno), NACK e pedidos de quadro-chave (recuperação de perdas), estimativa de banda e controle de congestionamento, simulcast e SVC. Referências: [WebRTC for the Curious](https://webrtcforthecurious.com/) (livro gratuito); [RFC 8825 — visão geral do WebRTC](https://www.rfc-editor.org/rfc/rfc8825); [RFC 8445 — ICE](https://www.rfc-editor.org/rfc/rfc8445); [RFC 8656 — TURN](https://www.rfc-editor.org/rfc/rfc8656).
+
+**Estatísticas e captura de tela no navegador.** O que cada campo do `getStats()` significa, como pedir captura com `getDisplayMedia` e o que as dicas de conteúdo mudam no codificador. Referências: [Identifiers for WebRTC's Statistics API (W3C)](https://www.w3.org/TR/webrtc-stats/); [Screen Capture (W3C)](https://www.w3.org/TR/screen-capture/); [MediaStreamTrack Content Hints (W3C)](https://www.w3.org/TR/mst-content-hint/).
+
+**Vídeo para quem é de backend.** Quadros-chave e intervalo entre eles, controle de bitrate, por que movimento rápido custa mais bits, codificadores em hardware e a diferença prática entre H.264, VP9 e AV1. Um bom começo é a documentação de codecs do [MDN Web Docs](https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Video_codecs).
+
+**LiveKit por dentro.** Como o SFU escolhe camadas, o que são dynacast e *adaptive stream*, a API de servidor, webhooks, portas e o teste de carga. Referências: [documentação do LiveKit](https://docs.livekit.io/); [SDK de servidor para Java/Kotlin](https://github.com/livekit/server-sdk-kotlin); [código do servidor](https://github.com/livekit/livekit).
+
+**Um SFU escrito em Java.** Para ver como seria construir o plano de mídia na JVM: o [Jitsi Videobridge](https://github.com/jitsi/jitsi-videobridge), em Java e Kotlin, que roda o meet.jit.si. Ler o tratamento de RTP e a troca de camadas é um ótimo estudo de concorrência e de desempenho na JVM.
+
+**WebSocket e protocolos de tempo real.** O protocolo, códigos de fechamento, *backpressure*, proxies e balanceadores com conexões longas, e como serviços grandes desenham o gateway. Referências: [RFC 6455 — WebSocket](https://www.rfc-editor.org/rfc/rfc6455); [documentação do gateway do Discord](https://discord.com/developers/docs/events/gateway) (fonte de inspiração do protocolo deste projeto).
+
+**OAuth para apps nativos.** Por que o login vai para o navegador do sistema, o redirecionamento de loopback e o PKCE. Referências: [RFC 8252 — OAuth 2.0 for Native Apps](https://www.rfc-editor.org/rfc/rfc8252); [RFC 7636 — PKCE](https://www.rfc-editor.org/rfc/rfc7636).
+
+**Electron com segurança.** Isolamento de contexto, sandbox, IPC mínimo e o que pode dar errado num app que carrega conteúdo web. Referências: [Security checklist do Electron](https://www.electronjs.org/docs/latest/tutorial/security); [desktopCapturer](https://www.electronjs.org/docs/latest/api/desktop-capturer).
+
+**TypeScript e um framework de interface.** O mínimo para construir o cliente com segurança: tipos, módulos, `async/await` e o modelo de componentes de uma biblioteca como o React. Um assistente de código ajuda muito na interface, mas o código de captura e de WebRTC precisa ser entendido linha a linha, porque é dele que vêm as perguntas da entrevista. Referências: [TypeScript Handbook](https://www.typescriptlang.org/docs/handbook/intro.html); [documentação do React](https://react.dev/learn).
+
+**Um livro para fechar:** *High Performance Browser Networking*, de Ilya Grigorik (O'Reilly, [leitura gratuita on-line](https://hpbn.co/)), cobre TCP, UDP, TLS, WebSocket e WebRTC do ponto de vista de quem constrói sistemas, e é a base de quase tudo o que este projeto pede.

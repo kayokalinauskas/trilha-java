@@ -1,0 +1,158 @@
+---
+titulo: Como esta trilha funciona
+descricao: O mapa até a vaga, o método de estudo que funciona para programação e como usar aulas, exercícios, dicas e soluções sem se enganar.
+modulo: 00-comece-aqui
+ordem: 1
+duracao: 20
+objetivos:
+  - Entender o caminho completo, do básico até o nível Pleno
+  - Conhecer o ciclo aprender → praticar → destravar → fixar
+  - Saber quanto tempo reservar e como medir seu progresso
+tags: [método, carreira]
+flashcards:
+  - frente: Qual é o ciclo de estudo da trilha?
+    verso: Aprender (aula + quiz) → Praticar (exercício com testes) → Destravar (dicas progressivas, depois solução) → Fixar (flashcards e simulador de entrevista).
+  - frente: Por que tentar recordar antes de reler o conteúdo?
+    verso: Porque a recuperação ativa (tentar lembrar) fortalece a memória muito mais do que a releitura passiva — é o "efeito de teste".
+  - frente: O que diferencia um Júnior de um Pleno, de forma resumida?
+    verso: O Júnior entrega tarefas bem definidas com apoio. O Pleno entrega funcionalidades inteiras com autonomia, toma decisões técnicas justificadas e antecipa problemas (performance, concorrência, falhas).
+---
+
+Você já sabe o que é uma variável, um `if` e um laço. Talvez já tenha feito um curso introdutório, alguns exercícios de lógica ou até um CRUD seguindo um tutorial. O que falta agora é **transformar isso em competência profissional** — o tipo de conhecimento que passa em uma entrevista técnica e, principalmente, que sobrevive ao primeiro mês de trabalho.
+
+Esta trilha foi desenhada exatamente para esse salto.
+
+## O caminho completo
+
+A trilha tem 18 módulos, organizados em três faixas de nível. Os módulos não são uma lista para "consumir": cada um depende dos anteriores, como mostra o mapa na página inicial.
+
+| Faixa | Módulos | Ao final, você consegue… |
+|---|---|---|
+| **Base** | 00 e 01 | Escrever, rodar, testar e depurar programas Java com confiança. |
+| **Júnior** | 02 a 05, 07, 08 | Modelar um domínio com objetos, usar coleções com critério, escrever SQL e construir uma API REST com Spring Boot. |
+| **Júnior → Pleno** | 09, 10, 14, 16 | Persistir dados sem armadilhas de performance, testar de verdade, colocar em produção e usar IA com responsabilidade. |
+| **Pleno** | 06, 11, 12, 13, 15 | Lidar com concorrência, segurança, mensageria, arquitetura e system design — os temas que separam um Pleno de um Júnior experiente. |
+| **Carreira** | 17 | Portfólio, currículo, entrevistas no Brasil e no exterior, formatos de contratação. |
+
+<Callout tipo="info" titulo="Júnior, Pleno… qual a diferença de verdade?">
+Não é tempo de casa. De forma simplificada: o **Júnior** entrega tarefas bem definidas, com apoio e revisão. O **Pleno** entrega funcionalidades inteiras com autonomia, justifica decisões técnicas e antecipa problemas — o que acontece se dois usuários fizerem isso ao mesmo tempo? E se o serviço externo cair? Essa trilha vai te levar a pensar dessa forma.
+</Callout>
+
+## O ciclo de estudo
+
+Todo módulo segue o mesmo ciclo de quatro etapas. Ele foi construído em cima de duas ideias bem estabelecidas sobre aprendizagem: **recuperação ativa** (tentar lembrar/fazer antes de consultar) e **prática espaçada** (revisar em intervalos crescentes).
+
+<Figura legenda="O ciclo que se repete em todos os módulos">
+<svg viewBox="0 0 640 220" width="640" role="img" aria-label="Ciclo: Aprender, Praticar, Destravar, Fixar, voltando a Aprender">
+  <defs><marker id="seta1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="70" width="130" height="80" rx="14" class="d-info"/>
+  <text x="75" y="105" text-anchor="middle" class="d-title">1. Aprender</text>
+  <text x="75" y="127" text-anchor="middle" class="d-label">aula + quiz</text>
+  <rect x="170" y="70" width="130" height="80" rx="14" class="d-accent"/>
+  <text x="235" y="105" text-anchor="middle" class="d-title">2. Praticar</text>
+  <text x="235" y="127" text-anchor="middle" class="d-label">testes ficam verdes</text>
+  <rect x="330" y="70" width="130" height="80" rx="14" class="d-ok"/>
+  <text x="395" y="105" text-anchor="middle" class="d-title">3. Destravar</text>
+  <text x="395" y="127" text-anchor="middle" class="d-label">dicas → solução</text>
+  <rect x="490" y="70" width="140" height="80" rx="14" class="d-violet"/>
+  <text x="560" y="105" text-anchor="middle" class="d-title">4. Fixar</text>
+  <text x="560" y="127" text-anchor="middle" class="d-label">flashcards + entrevista</text>
+  <path d="M140 110 H166" class="d-line" marker-end="url(#seta1)"/>
+  <path d="M300 110 H326" class="d-line" marker-end="url(#seta1)"/>
+  <path d="M460 110 H486" class="d-line" marker-end="url(#seta1)"/>
+  <path d="M560 150 C560 205, 75 205, 75 154" class="d-line" stroke-dasharray="5 5" marker-end="url(#seta1)"/>
+  <text x="318" y="210" text-anchor="middle" class="d-label">próxima aula</text>
+</svg>
+</Figura>
+
+### 1. Aprender: aulas com quiz
+
+Cada aula começa pela **intuição** (por que isso existe? que problema resolve?), passa pelo conceito com código que você pode rodar e termina com as **armadilhas comuns** e um bloco sobre **como o tema cai em entrevista**. O quiz no final não vale nota: ele existe para você descobrir o que *achou* que entendeu.
+
+### 2. Praticar: exercícios com testes automatizados
+
+Aqui está a maior diferença em relação a listas de exercícios comuns. Cada exercício tem:
+
+- um **enunciado no formato de demanda real** — contexto de negócio, regras, casos de erro e critérios de aceite;
+- um **projeto Maven pronto** na pasta `java/`, com o esqueleto das classes e uma **suíte de testes JUnit** que começa vermelha.
+
+Seu trabalho é fazer os testes passarem. É assim que se trabalha em qualquer empresa séria: o teste diz, sem opinião, se o comportamento está correto.
+
+### 3. Destravar: dicas antes da solução
+
+Travou? Ótimo — travar faz parte. Antes da solução, cada exercício oferece **três dicas progressivas**: a primeira aponta a direção, a segunda sugere o caminho e a terceira praticamente entrega a estrutura. A **solução de referência comentada** fica trancada e só abre se você pedir (e confirmar).
+
+<Callout tipo="atencao" titulo="A regra dos 30 minutos">
+Se você está travado há mais de 30 minutos **sem progresso nenhum**, abra a próxima dica. Menos que isso, insista. Mais que isso, você só está acumulando frustração. E quando abrir a solução, **não copie**: feche, espere uma hora e reescreva a sua versão de memória.
+</Callout>
+
+### 4. Fixar: flashcards e simulador de entrevista
+
+Ao concluir uma aula, os flashcards dela entram na sua fila de revisão. O algoritmo de **repetição espaçada** mostra cada cartão de novo logo antes de você esquecer — primeiro no dia seguinte, depois em 3 dias, depois em uma semana, e assim por diante. Cinco minutos por dia rendem mais do que duas horas de revisão na véspera.
+
+O **simulador de entrevista** traz perguntas reais de processos seletivos, com o que o entrevistador está avaliando e uma resposta-modelo. Você responde primeiro (em voz alta, de preferência), se autoavalia, e só então compara.
+
+## Quanto tempo leva?
+
+Depende da sua rotina, mas uma estimativa honesta para quem estuda **10 a 12 horas por semana**:
+
+| Objetivo | Módulos | Tempo estimado |
+|---|---|---|
+| Pronto para vagas Júnior | 00 a 05, 07, 08, 09, 10 e 14 (parcial) | 5 a 7 meses |
+| Pronto para vagas Pleno | Todos | +5 a 8 meses de estudo **e** experiência prática |
+
+<Callout tipo="dica">
+Consistência vence intensidade. Uma hora por dia, seis dias por semana, é muito melhor do que um "maratonão" de oito horas no sábado. O painel mostra sua **sequência de dias estudando** justamente para ajudar nisso.
+</Callout>
+
+## Como medir seu progresso
+
+Seu progresso fica salvo **no seu navegador** — não existe login nem servidor. No [painel](../../../painel/) você encontra:
+
+- percentual concluído por módulo;
+- um **diagnóstico de prontidão** para vagas Júnior e Pleno;
+- sua sequência de estudos;
+- **exportar/importar** o progresso em um arquivo JSON, para trocar de computador ou fazer backup.
+
+<Callout tipo="atencao">
+Como tudo fica no navegador, limpar os dados do site apaga seu progresso. Exporte um backup de vez em quando.
+</Callout>
+
+## O que você vai precisar
+
+- Um computador com Windows, macOS ou Linux (8 GB de RAM é suficiente até o módulo 08; a partir dos módulos com Docker, 16 GB deixam tudo mais confortável).
+- Disposição para ler mensagens de erro com calma. Sério: **ler o erro** é metade do trabalho de um desenvolvedor backend.
+- Inglês para leitura técnica ajuda muito. Se ainda não é o seu forte, tudo aqui está em português, mas o módulo 17 traz um plano específico para isso — especialmente se você mira vagas internacionais.
+
+<Quiz
+  id="00-como-estudar"
+  questoes={[
+    {
+      pergunta: 'Você está travado em um exercício há 10 minutos. O que a trilha recomenda?',
+      opcoes: ['Abrir a solução para não perder tempo', 'Insistir mais um pouco, relendo o enunciado e as mensagens dos testes', 'Pular para o próximo exercício', 'Refazer a aula inteira'],
+      correta: 1,
+      explicacao: 'Travar faz parte do aprendizado. A regra prática é insistir até uns 30 minutos sem progresso antes de abrir a próxima dica — e a solução só no fim.',
+    },
+    {
+      pergunta: 'Por que os exercícios vêm com testes automatizados?',
+      opcoes: ['Para dar nota ao aluno', 'Porque é assim que se valida comportamento no trabalho real, sem depender de opinião', 'Porque o Maven exige', 'Para substituir a leitura do enunciado'],
+      correta: 1,
+      explicacao: 'Testes são a especificação executável do comportamento esperado. Aprender a trabalhar guiado por eles é uma habilidade profissional por si só.',
+    },
+    {
+      pergunta: 'Qual estratégia de revisão rende mais retenção?',
+      opcoes: ['Reler o capítulo inteiro na véspera', 'Revisar em intervalos crescentes, tentando lembrar antes de ver a resposta', 'Copiar o resumo à mão', 'Assistir a aula de novo em velocidade 2x'],
+      correta: 1,
+      explicacao: 'Recuperação ativa + espaçamento é a combinação mais consistente na pesquisa sobre aprendizagem. É o que os flashcards da trilha fazem.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- A trilha vai do básico ao Pleno em 18 módulos com dependências claras.
+- O ciclo é sempre **aprender → praticar → destravar → fixar**.
+- Exercícios têm testes automatizados; soluções ficam trancadas até você pedir.
+- Seu progresso fica no navegador — faça backup pelo painel.
+
+Na próxima aula, você vai preparar o ambiente: JDK 25, Maven, Git e IntelliJ.

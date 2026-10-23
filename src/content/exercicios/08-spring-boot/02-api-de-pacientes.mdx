@@ -1,0 +1,145 @@
+---
+titulo: API REST de pacientes
+codigo: "08.02"
+resumo: Construa do zero uma API de cadastro de pacientes com os status certos, 201 com Location, validação com uma anotação @CpfValido própria, paginação com limites, conflito de CPF e dados sensíveis mascarados.
+modulo: 08-spring-boot
+ordem: 2
+dificuldade: medio
+tempo: 3–4h
+conceitos: [REST, "@RestController", Bean Validation, validação customizada, paginação, DTO, LGPD]
+aulas: [08-spring-boot/02-design-de-apis-rest, 08-spring-boot/04-spring-boot-e-spring-mvc, 08-spring-boot/05-validacao-e-erros]
+java:
+  modulo: m08-spring-boot
+  teste: PacientesApiTest
+---
+
+## Contexto
+
+A rede de clínicas do exercício 07.01 vai ganhar um aplicativo, e o aplicativo precisa de uma API. Você vai construir o recurso **pacientes**: cadastro, consulta, busca por nome, atualização e remoção.
+
+O time de segurança deixou duas exigências: nenhum dado de entrada pode chegar ao sistema sem validação, e o **CPF nunca sai inteiro** nas respostas (LGPD — princípio da necessidade).
+
+Os testes são **caixa-preta**: só enviam requisições HTTP e leem o JSON. Você é livre para organizar as classes como quiser dentro do pacote `dev.trilhajava.m08.pacientes`.
+
+## A API
+
+| Requisição | Sucesso | Erros |
+|---|---|---|
+| `POST /pacientes` | `201` + `Location: /pacientes/{id}` + paciente | `400` inválido · `409` CPF já cadastrado |
+| `GET /pacientes/{id}` | `200` + paciente | `404` |
+| `GET /pacientes?nome=&pagina=&tamanho=` | `200` + página | `400` paginação inválida |
+| `PUT /pacientes/{id}` | `200` + paciente | `400` · `404` · `409` CPF de **outro** paciente |
+| `DELETE /pacientes/{id}` | `204` | `404` |
+
+**Entrada** (POST e PUT):
+
+```json
+{"nome": "Ana Souza", "cpf": "52998224725", "email": "ana@email.com", "nascimento": "1990-05-10"}
+```
+
+**Saída**:
+
+```json
+{"id": 1, "nome": "Ana Souza", "cpf": "***.982.247-**", "email": "ana@email.com", "nascimento": "1990-05-10"}
+```
+
+**Página**:
+
+```json
+{"itens": [ ... ], "pagina": 0, "tamanho": 20, "totalItens": 3, "totalPaginas": 1}
+```
+
+## Regras
+
+| Campo | Regra |
+|---|---|
+| `nome` | obrigatório, até 120 caracteres |
+| `cpf` | obrigatório, **11 dígitos sem máscara**, dígitos verificadores válidos, não pode ter todos os dígitos iguais — valide com uma anotação **`@CpfValido`** criada por você |
+| `email` | opcional; se vier, formato válido |
+| `nascimento` | obrigatório, no passado |
+
+- JSON malformado → `400`.
+- Listagem: `nome` filtra por "contém", **sem diferenciar maiúsculas**; ordem alfabética por nome (também sem diferenciar maiúsculas); `pagina` ≥ 0 (padrão 0); `tamanho` entre 1 e 50 (padrão 20).
+- CPF mascarado na saída: `***.` + dígitos 4 a 6 + `.` + dígitos 7 a 9 + `-**`.
+- O armazenamento é **em memória**, mas precisa ser correto com requisições simultâneas (é um bean singleton).
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `PacientesApiTest` passam.
+- [ ] DTOs de entrada e saída separados (nenhum campo "vaza" do modelo interno).
+- [ ] O controller não tem regra de negócio: ela está num serviço.
+- [ ] Rodando `PacientesApplication`, os comandos `curl` da aula 1 funcionam de verdade.
+
+## Desafios opcionais
+
+- Acrescente `PATCH /pacientes/{id}` para alterar só o e-mail. Qual a diferença de semântica para o `PUT`?
+- Implemente paginação por **cursor**: `GET /pacientes?depoisDe=17&tamanho=20`.
+- Faça a busca por nome ignorar acentos (`"joao"` encontra `"João"`). Dica: `java.text.Normalizer`.
+
+<Dicas>
+<Dica nivel={1}>
+Comece pelo caminho feliz: um `record` de entrada, um de saída, um repositório com `ConcurrentHashMap` e um `AtomicLong` para os ids, um serviço e o controller com `POST` e `GET /{id}`. Rode os testes e vá acrescentando. Para o 201, retorne `ResponseEntity.created(uri).body(...)`.
+</Dica>
+<Dica nivel={2}>
+- 404 e 409 ficam fáceis com exceções anotadas com `@ResponseStatus(HttpStatus.NOT_FOUND)` e `@ResponseStatus(HttpStatus.CONFLICT)` — lançadas pelo serviço.
+- Os limites de paginação são anotações nos próprios parâmetros: `@RequestParam(defaultValue = "20") @Min(1) @Max(50) int tamanho`.
+- "Verificar CPF + inserir" é *check-then-act*: proteja com `synchronized` no serviço.
+</Dica>
+<Dica nivel={3}>
+A anotação própria:
+
+```java
+@Constraint(validatedBy = ValidadorDeCpf.class)
+@Target({FIELD, PARAMETER, RECORD_COMPONENT})
+@Retention(RUNTIME)
+public @interface CpfValido {
+    String message() default "CPF inválido";
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+```
+
+O `ValidadorDeCpf implements ConstraintValidator<CpfValido, String>` devolve `true` para `null` (o `@NotBlank` cuida da presença) e reaproveita o cálculo dos dígitos do exercício 01.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="Controller">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/PacienteController.java" />
+</Tab>
+<Tab rotulo="Serviço">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/ServicoDePacientes.java" />
+</Tab>
+<Tab rotulo="DTOs">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/DadosPaciente.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/PacienteResposta.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/Pagina.java" />
+</Tab>
+<Tab rotulo="@CpfValido">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/CpfValido.java" />
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/ValidadorDeCpf.java" />
+</Tab>
+<Tab rotulo="Repositório">
+<CodigoJava caminho="m08-spring-boot/solucao/src/main/java/dev/trilhajava/m08/pacientes/RepositorioDePacientes.java" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Controller fino**: traduz HTTP em chamadas ao serviço e devolve DTOs. Status e headers ficam aqui; regras, no serviço.
+- **Um DTO de entrada para POST e PUT**: as regras de validação são as mesmas. O `id` vem do caminho, nunca do corpo — o cliente não escolhe o id.
+- **`PacienteResposta.de(...)`**: a conversão num só lugar garante que o CPF **sempre** sai mascarado, inclusive na listagem.
+- **`synchronized` em `cadastrar` e `atualizar`**: sem ele, duas requisições simultâneas com o mesmo CPF passariam na verificação. Com banco de dados, a garantia real é a constraint `UNIQUE` do módulo 07 — e a exceção de violação vira o 409.
+- **Validação de parâmetros sem código**: `@Min`/`@Max` nos `@RequestParam` são aplicados pelo Spring MVC 6.1+ e viram 400 automaticamente.
+
+### Avalie sua solução
+
+- Algum caminho devolve o CPF completo (erro, log, listagem)?
+- O que acontece se o cliente mandar `"id": 999` no corpo do POST?
+- Seu repositório continua correto se 100 requisições cadastrarem pacientes ao mesmo tempo?
+
+</Solucao>

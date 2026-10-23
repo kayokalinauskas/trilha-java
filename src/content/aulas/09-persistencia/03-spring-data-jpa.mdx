@@ -1,0 +1,168 @@
+---
+titulo: Spring Data JPA na prática
+descricao: Repositórios por interface, consultas derivadas do nome, JPQL e SQL nativo com @Query, paginação e ordenação seguras, projeções em records e Specifications para filtros dinâmicos.
+modulo: 09-persistencia
+ordem: 3
+duracao: 60
+objetivos:
+  - Criar repositórios e consultas derivadas do nome do método
+  - Escrever consultas JPQL e nativas com @Query e parâmetros nomeados
+  - Paginar e ordenar com Pageable, Page, Slice e Limit
+  - Montar filtros dinâmicos com Specifications e devolver projeções
+tags: [Spring Data JPA, JPQL, paginação, projeções, Specifications]
+flashcards:
+  - frente: O que é uma consulta derivada no Spring Data?
+    verso: Um método cujo nome descreve a consulta (findByCidadeAndPrecoLessThan). O Spring Data gera a JPQL a partir do nome na subida da aplicação.
+  - frente: Diferença entre Page e Slice?
+    verso: Page traz o conteúdo e o total (executa uma consulta de contagem extra); Slice só sabe se há próxima página — mais barato quando o total não é necessário.
+  - frente: O que é uma projeção DTO com "select new"?
+    verso: Uma consulta JPQL que instancia diretamente um record/classe com só as colunas necessárias, sem carregar entidades gerenciadas.
+  - frente: Para que servem Specifications?
+    verso: Para montar consultas com filtros opcionais em tempo de execução, combinando pequenos predicados (cidade, faixa de preço…) com and/or, sem concatenar strings.
+  - frente: Por que não aceitar o campo de ordenação direto do request?
+    verso: Expõe colunas internas, permite ordenar por colunas sem índice (consultas caras) e pode abrir brechas. Use uma lista branca de ordenações com nomes de negócio.
+---
+
+Escrever `EntityManager.createQuery(...)` para cada consulta seria repetitivo. O **Spring Data JPA** gera a implementação dos repositórios a partir de interfaces — e oferece paginação, ordenação, projeções e filtros dinâmicos prontos. O segredo é saber qual ferramenta usar para cada consulta.
+
+## Repositórios
+
+```java
+public interface ContaJpa extends JpaRepository<Conta, UUID> { }
+```
+
+Só isso já traz `save`, `saveAll`, `findById`, `findAll(Pageable)`, `existsById`, `count`, `deleteById`, `flush`, `saveAndFlush`… O Spring cria a implementação na subida.
+
+## Consultas derivadas do nome
+
+```java
+List<Imovel> findByCidadeAndQuartosGreaterThanEqual(String cidade, int quartos);
+Optional<Transferencia> findByChaveIdempotencia(String chave);
+boolean existsByCpfAndTipo(Cpf cpf, TipoConta tipo);
+long countByTurmaIdAndStatus(long turmaId, StatusMatricula status);
+Page<Pedido> findByClienteIdOrderByCriadoEmDesc(long clienteId, Pageable pageable);
+List<Pedido> findTop10ByStatusOrderByCriadoEmDesc(StatusPedido status);
+```
+
+Palavras-chave: `And`, `Or`, `Between`, `LessThan`, `GreaterThanEqual`, `Like`, `ContainingIgnoreCase`, `In`, `IsNull`, `OrderBy…Desc`, `Top`/`First`. Nomes errados **falham na subida** — ótimo, o erro aparece cedo.
+
+Use derivadas para consultas **simples**. `findByClienteNomeContainingIgnoreCaseAndStatusInAndCriadoEmBetweenOrderByTotalDesc` é sinal de que a consulta merece `@Query`.
+
+## `@Query`: JPQL e SQL nativo
+
+```java
+@Query("""
+        select t.codigo from Matricula m join m.turma t
+         where m.aluno.id = :alunoId and m.status = StatusMatricula.ATIVA
+         order by t.codigo""")
+List<String> codigosDasTurmasAtivas(long alunoId);
+```
+
+**JPQL** fala de **entidades e atributos** (`Matricula`, `m.turma`), não de tabelas e colunas — o Hibernate traduz para o SQL do banco. Para recursos específicos do PostgreSQL (window functions complexas, `jsonb`, `FOR UPDATE SKIP LOCKED`), use `nativeQuery = true` com SQL de verdade.
+
+Parâmetros são sempre **vinculados** (`:alunoId`): nada de concatenar strings — as mesmas regras de SQL injection do JDBC valem aqui.
+
+Para `UPDATE`/`DELETE` em massa: `@Modifying @Query("update Conta c set c.ativa = false where c.ultimoAcesso < :limite")`. Atenção: isso não passa pelo contexto de persistência (entidades já carregadas ficam desatualizadas).
+
+## Paginação e ordenação
+
+```java
+Page<Pedido> pagina = pedidos.findByClienteIdOrderByCriadoEmDesc(3L, PageRequest.of(0, 20));
+pagina.getContent();        // os 20 pedidos
+pagina.getTotalElements();  // total (consulta COUNT extra)
+pagina.getTotalPages();
+```
+
+| Tipo | Traz | Custo |
+|---|---|---|
+| `Page<T>` | conteúdo + total | consulta + `COUNT` |
+| `Slice<T>` | conteúdo + "tem próxima?" | só a consulta (lê 1 a mais) |
+| `List<T>` com `Limit.of(10)` | os N primeiros | só a consulta |
+
+<Callout tipo="atencao" titulo="Ordenação vinda do cliente">
+`Pageable` aceita `?sort=preco,desc` direto do request. Isso deixa o cliente ordenar por **qualquer** atributo, inclusive colunas sem índice (consultas lentas) e campos internos. Prefira uma **lista branca** com nomes de negócio (`menor-preco`, `recentes`) mapeados para `Sort` no servidor — e termine sempre com um critério único (o `id`), senão empates "embaralham" os itens entre páginas. É o que o exercício 09.04 exige.
+</Callout>
+
+## Projeções: traga só o que vai usar
+
+Carregar entidades inteiras para mostrar três colunas custa memória, CPU e, com relacionamentos, consultas extras. Uma projeção DTO resolve com **uma** consulta:
+
+```java
+public record AlunoMatriculado(String nome, String email, Instant matriculadaEm) { }
+
+@Query("""
+        select new dev.trilhajava.m09.matriculas.AlunoMatriculado(a.nome, a.email, m.matriculadaEm)
+          from Matricula m join m.aluno a join m.turma t
+         where t.codigo = :codigoTurma and m.status = StatusMatricula.ATIVA
+         order by a.nome""")
+List<AlunoMatriculado> listaDeChamada(String codigoTurma);
+```
+
+O mesmo vale para agregações: `select new ...FaturamentoDoCliente(c.nome, sum(i.precoUnitario * i.quantidade)) ... group by c.nome` — o banco soma, o Java recebe o resultado (exercício 09.02). Projeções por **interface** (`interface ResumoView { String getNome(); }`) também funcionam em consultas derivadas.
+
+## Specifications: filtros dinâmicos
+
+Uma tela de busca com oito filtros opcionais geraria 2⁸ métodos derivados. **Specifications** montam a consulta em tempo de execução, combinando predicados pequenos:
+
+```java
+public interface ImovelRepository extends JpaRepository<Imovel, Long>, JpaSpecificationExecutor<Imovel> { }
+
+static Specification<Imovel> cidade(String cidade) {
+    if (cidade == null || cidade.isBlank()) {
+        return Specification.unrestricted();                           // filtro ausente: não restringe
+    }
+    return (raiz, consulta, cb) -> cb.equal(cb.lower(raiz.get("cidade")), cidade.toLowerCase(Locale.ROOT));
+}
+
+static Specification<Imovel> precoAte(BigDecimal maximo) {
+    return maximo == null ? Specification.unrestricted()
+            : (raiz, consulta, cb) -> cb.lessThanOrEqualTo(raiz.get("preco"), maximo);
+}
+
+// na busca:
+var spec = Specification.allOf(cidade(f.cidade()), tipo(f.tipo()), precoAte(f.precoMax()));
+Page<Imovel> pagina = imoveis.findAll(spec, PageRequest.of(0, 20, Sort.by("preco", "id")));
+```
+
+Cada filtro é uma função pequena e testável, e os valores viram **parâmetros** (sem injeção). No Spring Data JPA 4, `Specification.unrestricted()` substituiu o antigo `where(null)`, e `allOf`/`anyOf` combinam listas.
+
+<Callout tipo="dica" titulo="Alternativas para consultas dinâmicas">
+- **Query by Example** (`Example.of(sonda)`): simples, mas só igualdade e `like`.
+- **Querydsl** ou **jOOQ**: consultas tipadas em Java, muito usados em empresas com consultas complexas.
+- **Criteria API** pura: é o que as Specifications usam por baixo.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você faria uma busca com vários filtros opcionais e paginação?" Resposta: **Specifications** (ou Querydsl/jOOQ), `Pageable` com **ordenação por lista branca**, **projeção** para trazer só o necessário, **índices** alinhados aos filtros mais comuns (módulo 07) e `Slice` quando o total não for necessário. Se falar de `Page` × `Slice` e do custo do `COUNT`, você mostra que já viu isso em produção.
+</Callout>
+
+<Quiz
+  id="09-spring-data"
+  questoes={[
+    {
+      pergunta: 'Uma listagem infinita (feed) não mostra "página X de Y". Qual tipo de retorno evita uma consulta desnecessária?',
+      opcoes: ['Page', 'Slice', 'List sem limite', 'Stream'],
+      correta: 1,
+      explicacao: 'Slice só verifica se há próxima página; Page executa um COUNT extra.',
+    },
+    {
+      pergunta: 'Qual a vantagem de "select new ...Dto(...)" numa tela de listagem?',
+      opcoes: ['Nenhuma', 'Carrega só as colunas necessárias, numa consulta, sem entidades gerenciadas', 'Evita transações', 'Permite alterar os dados'],
+      correta: 1,
+      explicacao: 'Projeções evitam carregar entidades inteiras e relacionamentos.',
+    },
+    {
+      pergunta: 'Como tratar um filtro opcional ausente numa Specification?',
+      opcoes: ['Lançar exceção', 'Devolver Specification.unrestricted()', 'Concatenar "1=1" na consulta', 'Filtrar em memória'],
+      correta: 1,
+      explicacao: 'unrestricted() não restringe nada e combina normalmente com os demais filtros.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- `JpaRepository` dá o CRUD; **consultas derivadas** para o simples; **`@Query`** (JPQL ou nativa) para o resto, sempre com parâmetros.
+- **Paginação**: `Page` (com total), `Slice` (sem total) ou `Limit`; ordenação por **lista branca** terminando no `id`.
+- **Projeções** (`select new` em records, interfaces) trazem só o necessário; agregações ficam no banco.
+- **Specifications** combinam filtros opcionais com `allOf` e `unrestricted()`.

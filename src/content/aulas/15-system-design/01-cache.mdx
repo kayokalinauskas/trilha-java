@@ -1,0 +1,285 @@
+---
+titulo: "Cache: onde guardar, como invalidar e como não derrubar o banco"
+descricao: As camadas de cache (navegador, CDN, aplicação, banco), os padrões cache-aside, read-through, write-through e write-behind, TTL com jitter, invalidação por remoção, cache stampede, cache negativo, Caffeine × Redis e as armadilhas da abstração Spring Cache.
+modulo: 15-system-design
+ordem: 1
+duracao: 60
+objetivos:
+  - Escolher a camada e o padrão de cache adequados a cada tipo de dado
+  - Implementar cache-aside com TTL com jitter e invalidação depois do commit
+  - Prevenir cache stampede com single-flight e cache negativo
+  - Usar @Cacheable e @CacheEvict sem cair nas armadilhas do proxy e das chaves
+tags: [cache, cache-aside, TTL, invalidação, stampede, Caffeine, Redis, Spring Cache]
+flashcards:
+  - frente: Como funciona o cache-aside?
+    verso: A aplicação consulta o cache; se não achar (miss), lê do banco e grava no cache com TTL. Na escrita, grava no banco e APAGA a chave do cache. O cache não conhece o banco; quem coordena é a aplicação.
+  - frente: Por que apagar a chave em vez de atualizar o cache depois de uma escrita?
+    verso: Duas escritas concorrentes podem atualizar o cache em ordem diferente da do banco, e o valor velho fica lá até o TTL. Apagar é idempotente e a próxima leitura busca o valor atual.
+  - frente: O que é cache stampede?
+    verso: Uma chave muito acessada expira e centenas de requisições dão miss ao mesmo tempo, indo todas ao banco para calcular o mesmo valor. Defesas - single-flight (só uma busca, as outras esperam), renovação antecipada e jitter no TTL.
+  - frente: Para que serve o jitter no TTL?
+    verso: Espalhar as expirações. Se mil chaves forem gravadas juntas com o mesmo TTL, todas expiram juntas e o banco recebe o pico de uma vez.
+  - frente: O que é cache negativo?
+    verso: Guardar, com TTL curto, a informação de que algo NÃO existe. Evita que buscas repetidas por ids inexistentes (erro ou ataque) atravessem o cache e batam sempre no banco.
+  - frente: Por que @Cacheable não funciona numa chamada interna (this.metodo())?
+    verso: O cache é aplicado por um proxy do Spring. A chamada via this não passa pelo proxy, então vai direto ao método, sem consultar o cache.
+---
+
+O catálogo da loja recebe 5 mil consultas por segundo ao mesmo produto em dia de promoção, e o preço dele muda duas vezes por dia. Ir ao banco em cada consulta é desperdício: a resposta é quase sempre a mesma. Um **cache** guarda essa resposta num lugar mais rápido e mais barato de consultar.
+
+Mas cache não é de graça. Ele troca **consistência** por **velocidade**: por algum tempo, alguém pode ver o dado antigo. A frase atribuída a Phil Karlton resume o risco: as duas coisas difíceis em computação são invalidar cache e dar nomes às coisas. Esta aula é sobre fazer essa troca de forma consciente.
+
+## Onde cachear
+
+Um dado pode ser guardado em várias camadas entre o usuário e o banco. Quanto mais perto do usuário, mais rápido, e mais difícil de invalidar.
+
+<Figura legenda="As camadas de cache, da mais próxima do usuário à mais próxima do dado">
+<svg viewBox="0 0 680 230" width="680" role="img" aria-label="Navegador, CDN, cache local da aplicação, cache distribuído e banco de dados, com o que cada camada costuma guardar">
+  <defs><marker id="m1501" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker></defs>
+  <rect x="10" y="40" width="115" height="60" rx="8" class="d-info"/><text x="67" y="66" text-anchor="middle" class="d-title">Navegador</text><text x="67" y="86" text-anchor="middle" class="d-label">Cache-Control</text>
+  <rect x="148" y="40" width="115" height="60" rx="8" class="d-info"/><text x="205" y="66" text-anchor="middle" class="d-title">CDN</text><text x="205" y="86" text-anchor="middle" class="d-label">estáticos, GET</text>
+  <rect x="286" y="40" width="115" height="60" rx="8" class="d-ok"/><text x="343" y="66" text-anchor="middle" class="d-title">Local</text><text x="343" y="86" text-anchor="middle" class="d-mono">Caffeine</text>
+  <rect x="424" y="40" width="115" height="60" rx="8" class="d-violet"/><text x="481" y="66" text-anchor="middle" class="d-title">Distribuído</text><text x="481" y="86" text-anchor="middle" class="d-mono">Redis</text>
+  <rect x="562" y="40" width="110" height="60" rx="8" class="d-box"/><text x="617" y="66" text-anchor="middle" class="d-title">Banco</text><text x="617" y="86" text-anchor="middle" class="d-label">buffer pool</text>
+  <path d="M125 70 H144" class="d-line" marker-end="url(#m1501)"/>
+  <path d="M263 70 H282" class="d-line" marker-end="url(#m1501)"/>
+  <path d="M401 70 H420" class="d-line" marker-end="url(#m1501)"/>
+  <path d="M539 70 H558" class="d-line" marker-end="url(#m1501)"/>
+  <text x="10" y="140" class="d-label">mais perto do usuário: mais rápido, mais barato para o servidor,</text>
+  <text x="10" y="160" class="d-label">e mais difícil de invalidar (você não apaga o cache do navegador de alguém).</text>
+  <text x="10" y="195" class="d-label">Local: nanossegundos, mas cada instância tem a sua cópia.</text>
+  <text x="10" y="215" class="d-label">Distribuído: uma ida à rede, mas uma cópia só para todas as instâncias.</text>
+</svg>
+</Figura>
+
+- **Navegador e CDN**: controlados por cabeçalhos HTTP (`Cache-Control: max-age=60`, `ETag`). Ótimos para arquivos estáticos e respostas públicas. Nunca para dados de um usuário numa CDN compartilhada sem `Cache-Control: private`.
+- **Cache local** (na memória da instância): o mais rápido, sem rede. Cada instância tem a sua cópia, e elas divergem por até um TTL.
+- **Cache distribuído** (Redis): uma cópia compartilhada por todas as instâncias. Custa uma ida à rede, que dentro do mesmo datacenter fica na casa de fração de milissegundo.
+- **O próprio banco** já cacheia páginas em memória (o *shared buffers* do PostgreSQL). Antes de colocar um Redis na frente, confira se a consulta lenta não é só falta de índice (módulo 7).
+
+## Os quatro padrões
+
+| Padrão | Leitura | Escrita | Quando usar |
+|---|---|---|---|
+| **cache-aside** | a aplicação lê do cache; no miss, lê do banco e grava no cache | grava no banco e **apaga** a chave | o padrão mais comum; o cache é descartável |
+| **read-through** | o **cache** busca no banco no miss (um *loader*) | igual ao cache-aside | cache local com função de carga (`LoadingCache` do Caffeine) |
+| **write-through** | igual ao read-through | grava no cache, que grava no banco **na mesma operação** | dado lido logo após a escrita; a escrita fica mais lenta |
+| **write-behind** | igual | grava no cache; o banco é atualizado **depois**, em lote | contadores e métricas; risco de **perder** escritas se o cache cair |
+
+Na prática de backend, **cache-aside** resolve a grande maioria dos casos. Write-behind só entra quando perder algumas escritas é aceitável: nunca para saldo.
+
+## Cache-aside na prática
+
+Um cache-aside completo, com Redis (o exercício 15.01 implementa o mesmo padrão com Testcontainers, numa versão mais enxuta: chave sem versão, jitter de até 60 s e invalidação sem transação):
+
+```java
+@Service
+public class CatalogoDeProdutos {
+
+    private static final Duration TTL_BASE = Duration.ofMinutes(10);
+
+    private final StringRedisTemplate redis;
+    private final ProdutoRepository repositorio;
+    private final JsonMapper json;   // tools.jackson.databind.json.JsonMapper (Jackson 3)
+
+    public CatalogoDeProdutos(StringRedisTemplate redis, ProdutoRepository repositorio, JsonMapper json) {
+        this.redis = redis;
+        this.repositorio = repositorio;
+        this.json = json;
+    }
+
+    public Optional<ProdutoDto> buscar(long id) {
+        String chave = chave(id);
+        String emCache = redis.opsForValue().get(chave);
+        if (emCache != null) {
+            return Optional.of(json.readValue(emCache, ProdutoDto.class));   // hit
+        }
+        Optional<ProdutoDto> doBanco = repositorio.findById(id).map(ProdutoDto::de);   // miss
+        doBanco.ifPresent(p -> redis.opsForValue().set(chave, json.writeValueAsString(p), ttlComJitter()));
+        return doBanco;
+    }
+
+    @Transactional
+    public void alterarPreco(long id, BigDecimal novoPreco) {
+        repositorio.findById(id).orElseThrow().alterarPreco(novoPreco);
+        // apaga só DEPOIS do commit: antes, outra leitura poderia recolocar o valor antigo
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                redis.delete(chave(id));
+            }
+        });
+    }
+
+    private static String chave(long id) {
+        return "catalogo:produto:v1:" + id;   // prefixo + versão do formato
+    }
+
+    private static Duration ttlComJitter() {
+        return TTL_BASE.plusSeconds(ThreadLocalRandom.current().nextLong(0, 120));
+    }
+}
+```
+
+Três decisões aparecem nesse código:
+
+1. **A chave tem prefixo e versão.** `catalogo:produto:v1:42`. Se o formato do `ProdutoDto` mudar, você sobe para `v2` e as chaves antigas simplesmente expiram, sem erro de desserialização.
+2. **TTL com jitter.** Se uma carga inicial gravar 50 mil produtos com TTL de exatamente 10 minutos, os 50 mil expiram no mesmo segundo. Somar alguns segundos aleatórios espalha as expirações.
+3. **Apagar depois do commit.** Se você apagar antes, uma leitura concorrente pode dar miss, ler o valor **antigo** do banco (a transação ainda não confirmou) e recolocá-lo no cache.
+
+<Comparar antes="Atualizar o cache na escrita" depois="Apagar a chave e deixar a leitura recarregar">
+
+```java
+// duas escritas concorrentes:
+// A grava preço 10 no banco; B grava 12 no banco;
+// B atualiza o cache para 12; A atualiza para 10.
+// banco = 12, cache = 10 até o TTL vencer
+repositorio.save(produto);
+redis.opsForValue().set(chave, json.writeValueAsString(dto));
+```
+
+```java
+// a ordem das remoções não importa:
+// apagar duas vezes dá no mesmo
+repositorio.save(produto);
+// ... depois do commit:
+redis.delete(chave);
+// a próxima leitura busca o valor atual
+```
+
+</Comparar>
+
+<Callout tipo="atencao" titulo="Apagar não fecha todas as janelas">
+Ainda existe uma corrida rara: uma leitura dá miss, lê o valor antigo do banco, **demora**, e grava no cache depois que a escrita já apagou a chave. O valor velho fica até o TTL. Por isso o **TTL é a rede de segurança** de todo cache-aside: ele limita por quanto tempo um erro de invalidação pode durar. Nunca grave sem TTL.
+</Callout>
+
+## Cache stampede e single-flight
+
+A página inicial mostra "os mais vendidos", uma consulta de 800 ms. O resultado está no cache, com 5 mil leituras por segundo. A chave expira. Nos 800 ms seguintes, **todas** as requisições dão miss e disparam a mesma consulta pesada. O banco, que estava tranquilo, recebe milhares de consultas iguais e cai. É o **cache stampede** (ou *dogpile*, ou *thundering herd*).
+
+As defesas:
+
+- **Single-flight (request coalescing).** Só a primeira requisição busca; as outras **esperam o mesmo resultado**. Numa instância, o Caffeine já faz isso: `cache.get(chave, k -> carregar(k))` executa a função de carga uma vez por chave, e as chamadas concorrentes aguardam. No Spring, `@Cacheable(sync = true)` pede esse comportamento ao provedor, mas a sincronização vale **dentro de uma instância**: mesmo com o cache no Redis, duas instâncias ainda podem recalcular a mesma chave ao mesmo tempo.
+- **Entre instâncias**, um lock no Redis (`SET chave-lock valor NX PX 5000`, visto na próxima aula) faz só uma instância recalcular; as demais servem o valor antigo ou esperam um pouco.
+- **Renovação antecipada.** Recarregar a chave **antes** de ela expirar, em segundo plano. O Caffeine tem `refreshAfterWrite`: depois do tempo configurado, a próxima leitura dispara a recarga e continua recebendo o valor antigo enquanto isso.
+- **Jitter**, para que muitas chaves não expirem juntas.
+
+```java
+LoadingCache<Long, ProdutoDto> produtos = Caffeine.newBuilder()
+        .maximumSize(10_000)                          // limite de entradas: cache sem limite é vazamento de memória
+        .expireAfterWrite(Duration.ofMinutes(10))
+        .refreshAfterWrite(Duration.ofMinutes(8))     // recarrega em segundo plano antes de expirar
+        .build(id -> repositorio.findById(id).map(ProdutoDto::de).orElse(null));
+```
+
+## Cache negativo
+
+Um cliente (ou um robô) pede `/produtos/999999999` mil vezes por segundo. O produto não existe, o cache-aside não grava nada, e cada pedido vai ao banco. O **cache negativo** grava também a ausência, com TTL **curto** (30 a 60 segundos), para que um produto recém-criado apareça logo:
+
+```java
+if (doBanco.isEmpty()) {
+    redis.opsForValue().set(chave, AUSENTE, Duration.ofSeconds(30));   // AUSENTE = "__ausente__"
+}
+// e, na leitura, AUSENTE vira Optional.empty() sem ir ao banco (nem tentar desserializar)
+```
+
+## Caffeine × Redis
+
+| | Caffeine (local) | Redis (distribuído) |
+|---|---|---|
+| Latência | nanossegundos a microssegundos | uma ida à rede |
+| Cópias | uma por instância; podem divergir | uma, compartilhada |
+| Invalidação | só na instância que escreveu (as outras esperam o TTL) | um `DEL` vale para todas |
+| Sobrevive a um deploy | não | sim |
+| Serialização | nenhuma (guarda o objeto) | sim (JSON, bytes) |
+| Bom para | dados quase estáticos, configurações, altíssimo volume | dados que mudam e precisam ser iguais em todas as instâncias |
+
+Os dois se combinam: um cache local pequeno com TTL de segundos na frente do Redis (cache em dois níveis) absorve as chaves mais quentes sem ir à rede.
+
+## A abstração Spring Cache
+
+O Spring separa **o que** cachear (anotações) de **onde** (o `CacheManager`: Caffeine, Redis, outros):
+
+```java
+@Configuration
+@EnableCaching
+class ConfiguracaoDeCache { }
+
+@Service
+class ConsultaDeProdutos {
+
+    @Cacheable(cacheNames = "produtos", key = "#id", sync = true)
+    public ProdutoDto buscar(long id) { ... }
+
+    @CacheEvict(cacheNames = "produtos", key = "#comando.id()")
+    public void alterar(AlteracaoDeProduto comando) { ... }
+}
+```
+
+<Callout tipo="erro" titulo="As armadilhas clássicas do @Cacheable">
+- **Chamada interna.** `this.buscar(id)` dentro da mesma classe não passa pelo proxy: o cache é ignorado, sem erro nenhum. É o mesmo problema do `@Transactional` (módulo 13, aula 2).
+- **Chave errada.** Sem `key`, a chave é formada por **todos** os parâmetros. Um parâmetro a mais (um `Locale`, um objeto sem `equals`) gera chaves diferentes para a mesma consulta. O contrário é pior: uma `key` explícita que omite um parâmetro relevante gera a **mesma** chave para consultas diferentes, e um usuário recebe o resultado do outro.
+- **Objeto mutável no cache local.** O Caffeine devolve **a mesma instância**. Se quem chamou alterar o objeto, alterou o cache. Cacheie records imutáveis.
+- **`@CacheEvict` e transação.** A remoção acontece quando o método termina, o que pode ser antes do commit de uma transação externa. Para garantir a ordem, apague depois do commit, como no exemplo do cache-aside, ou use um cache ciente de transação (`TransactionAwareCacheManagerProxy`, ou `transactionAware()` no builder do `RedisCacheManager`), que adia o `put` e o `evict` para depois do commit.
+- **Sem TTL.** A abstração não define expiração: ela vem da configuração do provedor. Confira que existe.
+</Callout>
+
+<Callout tipo="dica" titulo="Meça antes e depois">
+Cache é otimização: comece medindo a taxa de acerto (*hit ratio*). O Caffeine com `recordStats()` e o Spring Boot Actuator publicam métricas de cache no Micrometer. Um cache com 20% de acerto só adiciona complexidade.
+</Callout>
+
+<Callout tipo="entrevista">
+"Como você colocaria um cache nesse sistema?" Estruture a resposta:
+
+1. **O que** cachear: dados muito lidos e pouco alterados; quanto de desatualização é aceitável.
+2. **Onde**: CDN, local, distribuído, e por quê.
+3. **Padrão**: cache-aside, com **TTL** (com jitter) como rede de segurança.
+4. **Invalidação**: apagar depois do commit, e a corrida que ainda sobra.
+5. **Falhas**: stampede (single-flight), chaves inexistentes (cache negativo), e o que acontece se o Redis cair (o ideal é o sistema continuar, mais lento, lendo do banco; isso não é automático: trate o erro do cache, por exemplo com um `CacheErrorHandler` no Spring Cache, e proteja o banco do tráfego extra).
+</Callout>
+
+<Quiz
+  id="15-cache"
+  questoes={[
+    {
+      pergunta: 'Depois de gravar o novo preço no banco, o que fazer com a chave do produto no cache-aside?',
+      opcoes: ['Atualizar o cache com o novo valor antes do commit', 'Apagar a chave depois do commit', 'Nada: o TTL resolve', 'Apagar todas as chaves do cache'],
+      correta: 1,
+      explicacao: 'Apagar é idempotente e não sofre com a ordem de escritas concorrentes. Depois do commit, para que nenhuma leitura recoloque o valor antigo.',
+    },
+    {
+      pergunta: 'Uma chave muito acessada expira e o banco recebe milhares de consultas iguais. Qual a defesa mais direta?',
+      opcoes: ['Aumentar o pool de conexões', 'Single-flight: só uma requisição recalcula e as outras esperam o resultado', 'Remover o TTL', 'Trocar Redis por Caffeine'],
+      correta: 1,
+      explicacao: 'É o cache stampede. Coalescer as requisições (e renovar antes de expirar) evita a avalanche.',
+    },
+    {
+      pergunta: 'Um método @Cacheable é chamado como this.buscar(id) dentro da mesma classe. O que acontece?',
+      opcoes: ['Funciona normalmente', 'O cache é ignorado, porque a chamada não passa pelo proxy', 'Lança exceção', 'O Spring cria outro cache'],
+      correta: 1,
+      explicacao: 'As anotações de cache são aplicadas por um proxy; a chamada interna vai direto ao método.',
+    },
+    {
+      pergunta: 'Por que guardar no cache a informação de que um produto NÃO existe?',
+      opcoes: ['Para economizar memória', 'Para que buscas repetidas por ids inexistentes não batam sempre no banco', 'Porque o Redis exige', 'Para evitar o jitter'],
+      correta: 1,
+      explicacao: 'É o cache negativo, com TTL curto para que um produto recém-criado apareça logo.',
+    },
+  ]}
+/>
+
+## Resumo
+
+- Cache troca consistência por velocidade: decida **quanto** de desatualização é aceitável.
+- Camadas: navegador e CDN (cabeçalhos HTTP), local (Caffeine), distribuído (Redis), o próprio banco.
+- **Cache-aside** é o padrão: lê do cache, no miss lê do banco e grava; na escrita, **apaga depois do commit**.
+- **TTL sempre**, com **jitter**; chaves com prefixo e versão.
+- **Stampede**: single-flight (`sync = true`, `LoadingCache`), renovação antecipada. **Cache negativo** com TTL curto.
+- `@Cacheable`: cuidado com chamada interna, chaves, objetos mutáveis e a ordem em relação ao commit.
+
+## Referências
+
+- Martin Kleppmann — *Designing Data-Intensive Applications* (O'Reilly)
+- Documentação do Spring Framework — *Cache Abstraction*
+- Documentação do Caffeine — *Population*, *Eviction* e *Refresh*
+- Documentação do Spring Data Redis — *Redis Cache*

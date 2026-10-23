@@ -1,0 +1,110 @@
+---
+titulo: Painel de pedidos sem N+1
+codigo: "09.02"
+resumo: O painel de pedidos funciona e devolve os dados certos — com dezenas de consultas por tela. Reescreva-o para usar no máximo 1 a 3 consultas, paginando no banco, e prove com as estatísticas do Hibernate.
+modulo: 09-persistencia
+ordem: 2
+dificuldade: dificil
+tempo: 3–4h
+conceitos: [N+1, JOIN FETCH, paginação, projeção, agregação, Statistics]
+aulas: [09-persistencia/04-n-mais-1-e-desempenho, 09-persistencia/03-spring-data-jpa]
+java:
+  modulo: m09-persistencia
+  teste: PainelDePedidosTest
+---
+
+## Contexto
+
+O painel administrativo de uma loja de cafés especiais levava 6 segundos para abrir em produção. O profiler mostrou o culpado: **214 consultas SQL** para montar uma tela com 25 pedidos. Em desenvolvimento, com dez pedidos de exemplo, ninguém tinha percebido.
+
+Diferente dos outros exercícios, aqui o código **já funciona**: `PainelDePedidos` devolve exatamente os dados esperados. O seu trabalho é fazê-lo devolver **os mesmos dados** com pouquíssimas consultas.
+
+## O que já existe
+
+- Entidades `Cliente`, `Produto`, `Pedido` (com `cliente` LAZY e a coleção `itens`) e `ItemPedido` (com `produto` LAZY).
+- 8 clientes, 12 produtos, 60 pedidos e 150 itens (migração `V2`).
+- `ResumoDoPedido(id, cliente, criadoEm, status, itens, total, produtos)` — `produtos` em ordem alfabética.
+- `PedidoRepository` e a implementação ingênua de `PainelDePedidos`.
+
+## As metas
+
+| Método | Resultado | Limite de comandos SQL |
+|---|---|---|
+| `ultimos(n)` | os `n` pedidos mais recentes (qualquer status) | **2**, qualquer que seja `n` |
+| `doCliente(clienteId, pagina)` | pedidos do cliente, do mais recente ao mais antigo, paginados | **3**, carregando **só** os pedidos da página |
+| `faturamentoPorCliente()` | total dos pedidos **PAGOS** por nome de cliente, em ordem alfabética | **1** |
+
+Os testes calculam o gabarito com SQL puro (JDBC, fora do Hibernate) e comparam, campo a campo, com o seu resultado. Depois conferem `getPrepareStatementCount()` das estatísticas do Hibernate. No `doCliente`, conferem também quantos `Pedido` foram carregados: paginar em memória carregaria todos os do cliente.
+
+## Como enxergar o problema
+
+1. Em `src/main/resources/pedidos.properties`, descomente `spring.jpa.show-sql=true`.
+2. Rode `mvn test -Dtest=PainelDePedidosTest` **antes de mudar qualquer coisa** e conte os `select` no console.
+3. Guarde esse número: é o seu "antes".
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `PainelDePedidosTest` passam.
+- [ ] Nenhum aviso `HHH90003004` (paginação em memória) no log.
+- [ ] O faturamento é somado pelo banco (`GROUP BY`), não em Java.
+- [ ] As entidades fornecidas não mudaram de LAZY para EAGER.
+
+## Desafios opcionais
+
+- Em vez de consultas específicas, ligue `hibernate.default_batch_fetch_size=50` e volte ao código original: quantas consultas sobram? Por que isso é uma boa rede de segurança, mas não uma solução completa?
+- Resolva `ultimos` com um `@EntityGraph`. Por que ele funciona para `ultimos`, mas não para `doCliente`?
+- Escreva `doCliente` com uma **projeção** e uma consulta nativa usando `string_agg` (PostgreSQL) e compare.
+
+<Dicas>
+<Dica nivel={1}>
+Cada acesso a `pedido.getCliente().getNome()`, `pedido.getItens()` e `item.getProduto().getNome()` dentro do laço pode virar uma consulta. A ideia é trazer esses dados **antes** do laço, em poucas consultas grandes, com `join fetch`.
+</Dica>
+<Dica nivel={2}>
+- `ultimos`: uma consulta de pedidos com `join fetch p.cliente` (um `@ManyToOne` não multiplica linhas, então dá para limitar com `Limit.of(n)`), e **outra** de itens com `join fetch i.produto where i.pedido.id in :ids`. Agrupe os itens por pedido em Java.
+- `faturamentoPorCliente`: `select new ...(c.nome, sum(i.precoUnitario * i.quantidade)) ... where p.status = StatusPedido.PAGO group by c.nome`.
+</Dica>
+<Dica nivel={3}>
+`doCliente` em duas etapas:
+
+```java
+@Query(value = "select p.id from Pedido p where p.cliente.id = :clienteId order by p.criadoEm desc, p.id desc",
+       countQuery = "select count(p) from Pedido p where p.cliente.id = :clienteId")
+Page<Long> idsDoCliente(long clienteId, Pageable pageable);
+
+@Query("select distinct p from Pedido p join fetch p.cliente join fetch p.itens i join fetch i.produto where p.id in :ids")
+List<Pedido> completos(Collection<Long> ids);
+```
+
+A segunda consulta não garante ordem: monte um `Map` por id e use `idsDaPagina.map(id -> ...)`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<Tabs>
+<Tab rotulo="PainelDePedidos">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/pedidos/PainelDePedidos.java" />
+</Tab>
+<Tab rotulo="PedidoRepository">
+<CodigoJava caminho="m09-persistencia/solucao/src/main/java/dev/trilhajava/m09/pedidos/PedidoRepository.java" />
+</Tab>
+<Tab rotulo="Antes (o starter)">
+<CodigoJava caminho="m09-persistencia/starter/src/main/java/dev/trilhajava/m09/pedidos/PainelDePedidos.java" titulo="starter/PainelDePedidos.java (com N+1)" />
+</Tab>
+</Tabs>
+
+### Por que assim
+
+- **Duas consultas em `ultimos`**: pedidos+clientes e itens+produtos. Juntar tudo numa consulta com `join fetch p.itens` e `LIMIT` levaria à paginação em memória, porque a coleção multiplica as linhas.
+- **Paginação em duas etapas em `doCliente`**: a primeira consulta só lida com ids, então o `LIMIT/OFFSET` vai para o banco; a segunda traz o grafo completo só para esses ids. Resultado: 3 consultas e 2 pedidos carregados, com mil ou com um milhão de pedidos no cliente.
+- **Agregação no banco**: o `GROUP BY` devolve 8 linhas; a versão ingênua carregava todos os pedidos, itens e clientes para somar em Java.
+- **Mesmo resultado**: a ordem dos pedidos, dos produtos e os totais são idênticos ao original. Otimizar sem mudar o comportamento é o que um teste com gabarito garante.
+
+### Avalie sua solução
+
+- Quantas consultas o seu `ultimos(500)` faz? E o original faria?
+- Se amanhã a tela passar a mostrar a forma de pagamento de cada pedido (outra coleção), o que muda na sua abordagem?
+
+</Solucao>

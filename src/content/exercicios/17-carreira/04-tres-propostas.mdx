@@ -1,0 +1,172 @@
+---
+titulo: "Três propostas: CLT, PJ e contractor"
+codigo: "17.04"
+resumo: Uma dev recebe três propostas, uma CLT, uma PJ e uma de contractor em dólar, e a maior no número mensal não é a maior no ano. Converta as três em valor anual comparável com as hipóteses dadas, encontre o valor PJ que empata com a CLT e a cotação do dólar que empata o contractor, e escreva a recomendação pesando o que o número não mostra.
+modulo: 17-carreira
+ordem: 4
+dificuldade: medio
+tempo: 1h30–2h
+conceitos: [CLT, PJ, contractor, remuneração anual, 13º, férias, FGTS, Fator R, câmbio, PTO, análise de sensibilidade]
+aulas: [17-carreira/05-clt-pj-e-contractor, 17-carreira/06-negociacao-e-primeiros-meses]
+---
+
+<Callout tipo="atencao" titulo="Números hipotéticos">
+Os valores e as alíquotas abaixo são **hipóteses simplificadas** para praticar o método. Não são referência de mercado nem regra tributária vigente. Numa decisão real, use as suas propostas, as tabelas do ano e a orientação de um contador.
+</Callout>
+
+## Contexto
+
+Júlia, desenvolvedora Pleno, recebeu três propostas na mesma semana:
+
+| | **A — CLT** | **B — PJ** | **C — Contractor** |
+|---|---|---|---|
+| Empresa | banco digital brasileiro | consultoria brasileira | startup dos EUA, contrato direto |
+| Valor | R$ 7.000/mês | R$ 10.000/mês | US$ 2.400/mês |
+| Férias | 30 dias + 1/3 (CLT) | 15 dias de recesso remunerado por ano | sem PTO: dia não trabalhado não é pago |
+| Benefícios | VR/VA de R$ 1.000/mês; plano de saúde; PLR | nenhum | nenhum |
+| Outros | — | contrato renovado a cada 6 meses | reunião diária às 11h (horário de Brasília) |
+
+**Hipóteses para as contas** (todas anuais):
+
+- Júlia tira **30 dias de férias por ano** em qualquer proposta.
+- **CLT**: desconto efetivo de INSS e IR de **18%** sobre salário, 13º e férias com 1/3. FGTS de 8% sobre o mesmo total, contado à parte. PLR histórica de **1 salário**, não garantida, com o mesmo desconto de 18%.
+- **Plano de saúde**: equivalente a **R$ 600/mês**. Na CLT, conta como benefício recebido; em B e C, é custo que Júlia paga.
+- **Equipamento** em B e C: um notebook de **R$ 4.000 a cada 3 anos**.
+- **PJ (B)**: Simples Nacional com Fator R, alíquota efetiva de **6%** sobre o faturado; contador a **R$ 300/mês**; pró-labore de **28%** do faturamento, com INSS de **11%** sobre o pró-labore; IR do pró-labore e da distribuição de lucros considerados **zero** neste exercício.
+- **Contractor (C)**: via CNPJ, com alíquota efetiva de **4%** (exportação de serviços); contador a **R$ 400/mês**; pró-labore de 28% da receita em reais com INSS de 11%; câmbio de **R$ 5,20** por dólar; tarifas e spread de recebimento de **1,5%** sobre o valor convertido.
+
+## O que entregar
+
+**1. O valor anual de cada proposta.** Uma tabela com receita, descontos, custos e **valor anual comparável** de A, B e C. Para A, mostre o valor sem PLR e com PLR, e o FGTS separado.
+
+**2. O valor mensal PJ que empata.** Qual o valor mensal de B que igualaria o valor anual de A (sem PLR)? Compare com a diferença mensal aparente de R$ 7.000 para R$ 10.000.
+
+**3. A cotação que empata.** Com que cotação do dólar a proposta C se iguala à A (sem PLR)? Calcule também C com o dólar a R$ 4,60.
+
+**4. O que o número não mostra.** Liste pelo menos cinco fatores não financeiros ou de risco, e diga a favor de qual proposta cada um pesa.
+
+**5. Recomendação.** Em até 8 linhas: qual proposta você recomendaria a Júlia, em que condições mudaria de ideia, e o que ela poderia **negociar** em cada uma.
+
+## Critérios de aceite
+
+- [ ] A tem cerca de 13,33 salários brutos, e o FGTS aparece separado.
+- [ ] B e C descontam os dias de férias que não são pagos.
+- [ ] O plano de saúde e o equipamento entram nas três de forma coerente.
+- [ ] O empate de B e o câmbio de empate de C estão calculados, com a fórmula.
+- [ ] A recomendação cita risco (estabilidade, câmbio, renovação) e não só o valor.
+
+<Dicas>
+<Dica nivel={1}>
+Comece pela receita anual. Na CLT: 12 salários, mais o 13º, mais 1/3 de um salário (o terço de férias). Em B: 15 dias de recesso pagos, e Júlia tira 30, então 15 dias ficam sem receber, ou seja, 11,5 meses faturados. Em C, sem PTO, são 11 meses.
+</Dica>
+<Dica nivel={2}>
+Some tudo como "valor que fica com Júlia ou equivalente a dinheiro": em A, o líquido + FGTS + VR/VA + o plano de saúde (que ela não precisa pagar). Em B e C, o faturado menos impostos, contador, INSS do pró-labore, plano de saúde e equipamento. O pró-labore não é custo em si, porque o dinheiro é dela: só o INSS sobre ele é.
+</Dica>
+<Dica nivel={3}>
+Para o empate de B: o custo proporcional ao faturamento é 6% + (28% × 11%) = 9,08%. Então 11,5 × X × (1 − 0,0908) − custos fixos = valor de A. Os custos fixos são contador, plano e equipamento. Para C, é a mesma ideia com 4% + 3,08% e o câmbio como incógnita: 2.400 × 11 × câmbio × 0,985 × (1 − 0,0708) − custos fixos = valor de A.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### 1. Valor anual
+
+**A — CLT**
+
+| Item | Conta | Valor |
+|---|---|---|
+| Salário bruto anual | 12 × 7.000 | 84.000,00 |
+| 13º | 1 × 7.000 | 7.000,00 |
+| 1/3 de férias | 7.000 ÷ 3 | 2.333,33 |
+| **Bruto** | | **93.333,33** |
+| Desconto 18% | 93.333,33 × 0,18 | −16.800,00 |
+| **Líquido** | | **76.533,33** |
+| FGTS 8% (à parte) | 93.333,33 × 0,08 | 7.466,67 |
+| VR/VA | 12 × 1.000 | 12.000,00 |
+| Plano de saúde (benefício) | 12 × 600 | 7.200,00 |
+| **Valor comparável sem PLR** | | **103.200,00** |
+| PLR (não garantida) | 7.000 × 0,82 | 5.740,00 |
+| **Com PLR** | | **108.940,00** |
+
+**B — PJ**
+
+| Item | Conta | Valor |
+|---|---|---|
+| Faturamento | 11,5 × 10.000 | 115.000,00 |
+| Simples (6%) | 115.000 × 0,06 | −6.900,00 |
+| Contador | 12 × 300 | −3.600,00 |
+| INSS do pró-labore | 115.000 × 0,28 × 0,11 | −3.542,00 |
+| Plano de saúde | 12 × 600 | −7.200,00 |
+| Equipamento | 4.000 ÷ 3 | −1.333,33 |
+| **Valor comparável** | | **92.424,67** |
+
+**C — Contractor**
+
+| Item | Conta | Valor |
+|---|---|---|
+| Receita em dólar | 11 × 2.400 | US$ 26.400 |
+| Convertida, menos 1,5% | 26.400 × 5,20 × 0,985 | 135.220,80 |
+| Simples, exportação (4%) | 135.220,80 × 0,04 | −5.408,83 |
+| Contador | 12 × 400 | −4.800,00 |
+| INSS do pró-labore | 135.220,80 × 0,28 × 0,11 | −4.164,80 |
+| Plano de saúde | 12 × 600 | −7.200,00 |
+| Equipamento | 4.000 ÷ 3 | −1.333,33 |
+| **Valor comparável** | | **112.313,84** |
+
+**Resumo**
+
+| | Mensal aparente | Valor anual comparável | vs. A (sem PLR) |
+|---|---|---|---|
+| A — CLT | R$ 7.000 | R$ 103.200 (R$ 108.940 com PLR) | — |
+| B — PJ | R$ 10.000 (+43%) | R$ 92.425 | **−10,4%** |
+| C — Contractor | ≈ R$ 12.480 (+78%) | R$ 112.314 | **+8,8%** |
+
+A proposta B parecia 43% maior e é **cerca de 10% menor**. A proposta C parecia 78% maior e é **cerca de 9% maior**, e só enquanto o dólar estiver a R$ 5,20.
+
+### 2. O empate de B
+
+Custo proporcional ao faturamento: 6% + 28% × 11% = **9,08%**. Custos fixos: 3.600 + 7.200 + 1.333,33 = **12.133,33**.
+
+```text
+11,5 × X × (1 − 0,0908) − 12.133,33 = 103.200,00
+11,5 × X × 0,9092 = 115.333,33
+X = 115.333,33 ÷ 10,4558 ≈ R$ 11.030,56 por mês
+```
+
+B precisaria de uns **R$ 11.000/mês** só para **empatar** no dinheiro com A, ou 58% acima do salário CLT, e não 43%. E empatar não basta: B não tem aviso prévio, multa do FGTS nem seguro-desemprego, e o contrato vence a cada seis meses. Um valor razoável para compensar esse risco fica **acima** do empate.
+
+### 3. A cotação que empata C
+
+Custo proporcional: 4% + 3,08% = **7,08%**. Custos fixos: 4.800 + 7.200 + 1.333,33 = **13.333,33**.
+
+```text
+2.400 × 11 × câmbio × 0,985 × (1 − 0,0708) − 13.333,33 = 103.200,00
+24.162,92 × câmbio = 116.533,33
+câmbio ≈ R$ 4,82
+```
+
+Com o dólar a **R$ 4,60**, C vale cerca de **R$ 97.816**, abaixo de A. Uma queda de uns 7% no dólar apaga a vantagem. O risco cambial não é teórico: a cotação já variou mais do que isso em poucos meses.
+
+### 4. O que o número não mostra
+
+| Fator | Pesa a favor de |
+|---|---|
+| Estabilidade: aviso prévio, multa de 40% do FGTS, seguro-desemprego | A |
+| Renovação a cada 6 meses; contrato pode acabar com aviso curto | contra B |
+| Risco cambial; mas também a chance do dólar subir | contra ou a favor de C |
+| Inglês diário, time internacional, experiência valorizada em processos futuros | C |
+| Fuso: reunião às 11h é tranquila; horário de trabalho compatível | C (neutro) |
+| PLR e reajustes anuais por convenção coletiva | A |
+| Crescimento: produto próprio (A, C) × alocação em cliente (B) | A e C |
+| Burocracia: CNPJ, contador, notas, câmbio | contra B e C |
+| Reserva de emergência maior, necessária para B e C | contra B e C |
+
+### 5. Recomendação (exemplo)
+
+> Com as hipóteses dadas, **B está abaixo de A** e deveria ser recusada ou renegociada para pelo menos R$ 12.000–12.500/mês, com recesso de 30 dias. **C rende cerca de 9% a mais** e dá experiência internacional, mas a vantagem some com o dólar abaixo de R$ 4,82 e não há proteção nenhuma em caso de desligamento. Se Júlia já tem reserva de 6 meses e quer carreira internacional, C é a melhor escolha, **negociando PTO** (ao menos 15 dias pagos) ou um valor maior. Se prioriza estabilidade, A, perguntando se há flexibilidade no salário ou revisão em 6 meses. Em qualquer caso, os impostos precisam ser confirmados com um contador antes de decidir.
+
+### Reflita
+
+Refaça as contas com o seu cenário: o seu salário, o seu plano de saúde, as suas férias. A forma da conta vale para qualquer proposta; os números da tabela, não.
+
+</Solucao>

@@ -1,0 +1,116 @@
+---
+titulo: Validador de CPF
+codigo: "01.01"
+resumo: Implemente a validação oficial dos dígitos verificadores do CPF, aceitando entradas com e sem máscara, e a formatação no padrão 000.000.000-00.
+modulo: 01-java-essencial
+ordem: 1
+dificuldade: facil
+tempo: 1–1,5h
+conceitos: [String, char, laços, métodos, validação]
+aulas: [01-java-essencial/03-lacos, 01-java-essencial/04-metodos, 01-java-essencial/05-arrays-e-strings]
+java:
+  modulo: m01-java-essencial
+  teste: ValidadorCpfTest
+---
+
+## Contexto
+
+Uma fintech está lançando o cadastro de contas digitais. Hoje, CPFs inválidos entram no banco de dados e só são barrados dias depois, na consulta ao bureau de crédito — o que gera retrabalho no atendimento e cadastros abandonados. O time decidiu validar o CPF **na entrada**, antes de qualquer chamada externa.
+
+Você vai implementar o componente de validação usado pela API de cadastro.
+
+## Como o CPF é validado
+
+Um CPF tem 11 dígitos: os 9 primeiros identificam a pessoa e os 2 últimos são **dígitos verificadores** (DV), calculados a partir dos anteriores. Exemplo com `529.982.247-25`:
+
+**1º dígito verificador** — multiplique os 9 primeiros dígitos pelos pesos 10, 9, 8, …, 2 e some:
+
+| Dígito | 5 | 2 | 9 | 9 | 8 | 2 | 2 | 4 | 7 |
+|---|---|---|---|---|---|---|---|---|---|
+| Peso | 10 | 9 | 8 | 7 | 6 | 5 | 4 | 3 | 2 |
+| Produto | 50 | 18 | 72 | 63 | 48 | 10 | 8 | 12 | 14 |
+
+Soma = 295. Resto da divisão por 11: `295 % 11 = 9`. Se o resto for **menor que 2**, o DV é `0`; senão, é `11 - resto` → `11 - 9 = 2`. ✔ O 10º dígito é 2.
+
+**2º dígito verificador** — mesma conta com os **10** primeiros dígitos (agora incluindo o 1º DV) e pesos de 11 a 2. O resultado deve bater com o 11º dígito (5).
+
+## Requisitos
+
+Implemente três métodos estáticos em `ValidadorCpf`:
+
+| Método | Comportamento |
+|---|---|
+| `somenteDigitos(String)` | Remove tudo que não é dígito. `null` vira `""`. |
+| `ehValido(String)` | `true` se o CPF é válido. Aceita `"52998224725"` ou `"529.982.247-25"`. **Nunca lança exceção.** |
+| `formatar(String)` | Devolve `"529.982.247-25"`. Se o CPF for inválido, lança `IllegalArgumentException` com mensagem contendo `"CPF inválido"`. |
+
+## Regras de negócio
+
+- Formatos aceitos: **exatamente** 11 dígitos, ou o padrão `000.000.000-00` (com espaços opcionais nas pontas). Qualquer outra coisa (letras, 10 ou 12 dígitos, máscara parcial) é inválida.
+- CPFs com **todos os dígitos iguais** (`000.000.000-00`, `111.111.111-11`…) passam na conta dos DVs, mas são **inválidos** por regra da Receita Federal.
+- `null` e texto vazio são inválidos (e `ehValido` devolve `false`, sem exceção).
+
+## Casos de teste que sua solução precisa cobrir
+
+- Válidos: `52998224725`, `529.982.247-25`, `111.444.777-35`, `00000000191`.
+- DV errado: `52998224724`, `529.982.247-26`.
+- Dígitos repetidos: `00000000000`, `111.111.111-11`.
+- Formato inválido: `null`, `""`, `"123"`, 12 dígitos, `"5299822472a"`, `"529.982.247-2x"`.
+
+## Critérios de aceite
+
+- [ ] Todos os testes de `ValidadorCpfTest` passam.
+- [ ] O cálculo do dígito verificador está em **um único método**, reutilizado para o 1º e o 2º dígito (sem copiar e colar).
+- [ ] Nenhum "número mágico" solto: o 11 do módulo e os pesos têm nome ou saem claramente da fórmula.
+
+## Etapas sugeridas
+
+1. `somenteDigitos` (o mais simples, destrava o resto).
+2. `ehValido` só para o formato (11 dígitos ou máscara completa).
+3. Cálculo do 1º DV, depois generalize para o 2º.
+4. Regra dos dígitos repetidos.
+5. `formatar`, reutilizando `ehValido` e `somenteDigitos`.
+
+## Desafios opcionais
+
+- Implemente `gerarValido()` que cria um CPF aleatório válido (útil para dados de teste). Escreva um teste que gera mil CPFs e valida todos.
+- O CNPJ passará a ser **alfanumérico** a partir de julho de 2026 (letras e números nas 12 primeiras posições). Pesquise a regra de cálculo e implemente `ValidadorCnpj` suportando os dois formatos.
+
+<Dicas>
+<Dica nivel={1}>
+Separe as responsabilidades: um método só para limpar, um só para validar o formato, um só para calcular um dígito verificador. O `ehValido` vira uma sequência de chamadas a esses métodos pequenos.
+</Dica>
+<Dica nivel={2}>
+Para converter um `char` numérico em `int`, use `c - '0'` (em Java, `char` é um número: `'7' - '0'` vale 7). Para o formato, uma expressão regular resolve em uma linha: `cpf.strip().matches("\\d{11}|\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2}")`.
+</Dica>
+<Dica nivel={3}>
+Escreva `calcularDigito(String digitos, int quantidade)`: some `digito[i] * peso` para `i` de `0` até `quantidade - 1`, com o peso começando em `quantidade + 1` e diminuindo. Com `quantidade = 9` você obtém o 1º DV; com `quantidade = 10`, o 2º. Depois: `resto < 2 ? 0 : 11 - resto`.
+</Dica>
+</Dicas>
+
+<Solucao>
+
+### A solução
+
+<CodigoJava caminho="m01-java-essencial/solucao/src/main/java/dev/trilhajava/m01/ValidadorCpf.java" />
+
+### Passo a passo
+
+1. **Formato primeiro.** A regex aceita só os dois formatos permitidos. Com isso, `somenteDigitos` sempre produz exatamente 11 dígitos daqui em diante, e o resto do código não precisa se preocupar com tamanho.
+2. **Um único cálculo de DV.** `calcularDigito(digitos, 9)` e `calcularDigito(digitos, 10)` usam a mesma fórmula; só muda quantos dígitos entram e, portanto, o peso inicial (`quantidade + 1`). Isso elimina a duplicação que costuma aparecer nas primeiras versões.
+3. **`peso--` dentro da expressão.** `soma += valorDe(digitos, i) * peso--` usa o peso atual e depois o decrementa. É idiomático, mas se achar menos legível, calcule o peso como `quantidade + 1 - i`.
+4. **`char` como número.** `digitos.charAt(i) - '0'` converte o caractere no valor numérico, sem criar objetos (ao contrário de `Integer.parseInt(String.valueOf(c))`).
+5. **`formatar` reutiliza `ehValido`.** A validação vive em um só lugar.
+
+### Alternativas e trade-offs
+
+- **Sem regex:** percorrer a String checando posições de `.` e `-` também funciona, mas é mais código e mais chance de erro. Regex é a ferramenta certa para validar formato — só não abuse delas para lógica de negócio.
+- **`ehValido` vs. exceção:** a API expõe as duas formas de propósito. `ehValido` serve para perguntar ("posso mostrar um aviso no formulário?"); `formatar` assume uma pré-condição e **lança** se ela for violada. No módulo 03 você vai aprofundar quando usar cada estilo.
+
+### Avalie sua solução
+
+- Seu `ehValido(null)` devolve `false` sem exceção?
+- Você tem o cálculo do DV duplicado? Se sim, refatore para um método parametrizado — os testes garantem que nada vai quebrar.
+- Você trata `111.111.111-11` como inválido **depois** de conferir o formato?
+
+</Solucao>
